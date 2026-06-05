@@ -10,6 +10,7 @@ import {
   Contract,
   xdr,
   Address,
+  Account,
   nativeToScVal,
   scValToNative,
   TransactionBuilder,
@@ -424,8 +425,8 @@ export class OnboardingBridgeSDK {
 
   private buildSimulationTx(method: string, args: any[]) {
     const source = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
-    const account = new (require('@stellar/stellar-sdk').Account)(source, '0');
-    return new (require('@stellar/stellar-sdk').TransactionBuilder)(account, {
+    const account = new Account(source, '0');
+    return new TransactionBuilder(account, {
       fee: '100',
       networkPassphrase: this.networkPassphrase,
     })
