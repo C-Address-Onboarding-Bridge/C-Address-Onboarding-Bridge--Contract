@@ -297,6 +297,119 @@ fn test_query_fee_bps_uninitialized() {
     bridge.query_fee_bps();
 }
 
+#[test]
+fn test_accrued_fees_single_deposit() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &500i128);
+
+    // 500 * 100 / 10000 = 5
+    assert_eq!(bridge.query_accrued_fees(&token_id), 5i128);
+}
+
+#[test]
+fn test_accrued_fees_accumulate_across_deposits() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32);
+    mint_tokens(&env, &token_id, &user, 3000i128);
+
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &500i128); // fee = 5
+    bridge.fund_c_address(&user, &target, &token_id, &1000i128); // fee = 10
+
+    assert_eq!(bridge.query_accrued_fees(&token_id), 15i128);
+}
+
+#[test]
+fn test_accrued_fees_batch_accumulate() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32);
+    mint_tokens(&env, &token_id, &user, 3000i128);
+
+    let target1 = Address::generate(&env);
+    let target2 = Address::generate(&env);
+    let targets = Vec::from_array(&env, [target1.clone(), target2.clone()]);
+    let amounts = Vec::from_array(&env, [1000i128, 500i128]);
+
+    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id);
+
+    // 1000*100/10000 + 500*100/10000 = 10 + 5 = 15
+    assert_eq!(bridge.query_accrued_fees(&token_id), 15i128);
+}
+
+#[test]
+fn test_withdraw_fees_decrements_accrued() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &500i128); // accrued = 5
+
+    bridge.withdraw_fees(&token_id, &3i128);
+
+    assert_eq!(bridge.query_accrued_fees(&token_id), 2i128);
+    assert_eq!(check_balance(&env, &token_id, &fee_collector), 3i128);
+}
+
+#[test]
+#[should_panic(expected = "amount exceeds accrued fees")]
+fn test_withdraw_fees_exceeds_accrued() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &500i128); // accrued = 5
+
+    bridge.withdraw_fees(&token_id, &6i128); // more than accrued
+}
+
+#[test]
+fn test_zero_fee_no_accrued_entry() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &500i128);
+
+    assert_eq!(bridge.query_accrued_fees(&token_id), 0i128);
+}
+
 /********** Minimal Test Token **********/
 
 #[contracttype]

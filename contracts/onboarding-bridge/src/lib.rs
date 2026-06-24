@@ -18,6 +18,7 @@ pub enum DataKey {
     FeeCollector,
     FeeBps,
     Initialized,
+    AccruedFees(Address),
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
@@ -66,6 +67,27 @@ fn check_initialized(env: &Env) {
 
 fn calculate_fee(amount: i128, fee_bps: u32) -> i128 {
     (amount * fee_bps as i128) / FEE_DENOMINATOR
+}
+
+fn read_accrued_fees(env: &Env, asset: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AccruedFees(asset.clone()))
+        .unwrap_or(0)
+}
+
+fn increment_accrued_fees(env: &Env, asset: &Address, fee: i128) {
+    let current = read_accrued_fees(env, asset);
+    env.storage()
+        .persistent()
+        .set(&DataKey::AccruedFees(asset.clone()), &(current + fee));
+}
+
+fn decrement_accrued_fees(env: &Env, asset: &Address, amount: i128) {
+    let current = read_accrued_fees(env, asset);
+    env.storage()
+        .persistent()
+        .set(&DataKey::AccruedFees(asset.clone()), &(current - amount));
 }
 
 #[contract]
@@ -156,6 +178,10 @@ impl OnboardingBridge {
                 token_client.transfer(&contract_addr, &target, &net_amount);
             }
 
+            if fee > 0 {
+                increment_accrued_fees(&env, &asset, fee);
+            }
+
             env.events().publish(
                 ("CAddressFunded", source.clone(), target),
                 (amount, fee, asset.clone()),
@@ -195,6 +221,13 @@ impl OnboardingBridge {
         let fee_collector = read_fee_collector(&env);
         fee_collector.require_auth();
 
+        let accrued = read_accrued_fees(&env, &asset);
+        if amount > accrued {
+            panic!("amount exceeds accrued fees");
+        }
+
+        decrement_accrued_fees(&env, &asset, amount);
+
         let token_client = token::Client::new(&env, &asset);
         token_client.transfer(&env.current_contract_address(), &fee_collector, &amount);
 
@@ -224,6 +257,11 @@ impl OnboardingBridge {
 
     pub fn query_is_initialized(env: Env) -> bool {
         read_initialized(&env)
+    }
+
+    pub fn query_accrued_fees(env: Env, asset: Address) -> i128 {
+        check_initialized(&env);
+        read_accrued_fees(&env, &asset)
     }
 }
 
