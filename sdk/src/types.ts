@@ -38,6 +38,11 @@ export interface WithdrawFeesOptions {
   amount: string;
 }
 
+export interface UpgradeOptions {
+  /** New wasm hash (32-byte hex string) to upgrade the contract to */
+  newWasmHash: string;
+}
+
 export interface OffRampConfig {
   /** Your Moonpay API key */
   moonpayApiKey?: string;

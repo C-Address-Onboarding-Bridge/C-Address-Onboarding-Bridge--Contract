@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, token, Address, Env, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Vec,
+};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -10,6 +12,7 @@ pub enum BridgeError {
     InvalidAmount = 3,
     FeeTooHigh = 4,
     MismatchedArrays = 5,
+    ContractPaused = 6,
 }
 
 #[contracttype]
@@ -73,10 +76,11 @@ fn read_paused(env: &Env) -> bool {
         .unwrap_or(false)
 }
 
-fn check_not_paused(env: &Env) {
+fn check_not_paused(env: &Env) -> Result<(), BridgeError> {
     if read_paused(env) {
-        panic!("contract is paused");
+        return Err(BridgeError::ContractPaused);
     }
+    Ok(())
 }
 
 fn calculate_fee(amount: i128, fee_bps: u32) -> i128 {
@@ -88,7 +92,12 @@ pub struct OnboardingBridge;
 
 #[contractimpl]
 impl OnboardingBridge {
-    pub fn initialize(env: Env, admin: Address, fee_collector: Address, fee_bps: u32) -> Result<(), BridgeError> {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        fee_collector: Address,
+        fee_bps: u32,
+    ) -> Result<(), BridgeError> {
         if read_initialized(&env) {
             return Err(BridgeError::AlreadyInitialized);
         }
@@ -111,6 +120,7 @@ impl OnboardingBridge {
         amount: i128,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -127,10 +137,8 @@ impl OnboardingBridge {
             token_client.transfer(&env.current_contract_address(), &target, &net_amount);
         }
 
-        env.events().publish(
-            ("CAddressFunded", source, target),
-            (amount, fee, asset),
-        );
+        env.events()
+            .publish(("CAddressFunded", source, target), (amount, fee, asset));
         Ok(())
     }
 
@@ -142,6 +150,7 @@ impl OnboardingBridge {
         asset: Address,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         if targets.len() != amounts.len() {
             return Err(BridgeError::MismatchedArrays);
         }
@@ -185,6 +194,7 @@ impl OnboardingBridge {
 
     pub fn set_fee_bps(env: Env, new_fee_bps: u32) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         if new_fee_bps > MAX_FEE_BPS {
             return Err(BridgeError::FeeTooHigh);
         }
@@ -196,6 +206,7 @@ impl OnboardingBridge {
 
     pub fn set_fee_collector(env: Env, new_fee_collector: Address) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         save_fee_collector(&env, &new_fee_collector);
@@ -204,6 +215,7 @@ impl OnboardingBridge {
 
     pub fn set_admin(env: Env, new_admin: Address) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         save_admin(&env, &new_admin);
@@ -212,6 +224,7 @@ impl OnboardingBridge {
 
     pub fn withdraw_fees(env: Env, asset: Address, amount: i128) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -250,24 +263,36 @@ impl OnboardingBridge {
         read_initialized(&env)
     }
 
-    pub fn pause(env: Env) {
-        check_initialized(&env);
+    pub fn pause(env: Env) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
         env.events().publish(("ContractPaused",), (admin,));
+        Ok(())
     }
 
-    pub fn unpause(env: Env) {
-        check_initialized(&env);
+    pub fn unpause(env: Env) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
         env.events().publish(("ContractUnpaused",), (admin,));
+        Ok(())
     }
 
     pub fn query_is_paused(env: Env) -> bool {
         read_paused(&env)
+    }
+
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        env.events().publish(("Upgraded",), (admin, new_wasm_hash));
+        Ok(())
     }
 }
 

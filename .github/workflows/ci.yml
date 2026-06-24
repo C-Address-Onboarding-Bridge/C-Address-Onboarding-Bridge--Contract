@@ -27,11 +27,11 @@ jobs:
       - name: Build contract
         run: cargo build -p onboarding-bridge --release
 
-      - name: Run contract tests
-        run: cargo test -p onboarding-bridge --features testutils
-
       - name: Build WASM (release)
         run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
+
+      - name: Run contract tests
+        run: cargo test -p onboarding-bridge --features testutils
 
       - name: Upload WASM artifact
         uses: actions/upload-artifact@v4

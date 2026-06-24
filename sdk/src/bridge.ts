@@ -3,6 +3,7 @@ import {
   FundCOptions,
   BatchFundCOptions,
   WithdrawFeesOptions,
+  UpgradeOptions,
   TransactionResult,
 } from './types';
 import {
@@ -375,6 +376,51 @@ export class OnboardingBridgeSDK {
       return {
         hash: response.hash,
         status: response.status === 'ERROR' ? 'failed' : 'pending',
+      };
+    } catch (error: any) {
+      return {
+        hash: '',
+        status: 'failed',
+        error: error.message || 'Unknown error',
+      };
+    }
+  }
+
+  /**
+   * Upgrade the contract to a new wasm implementation (admin only).
+   * The new_wasm_hash must reference wasm already uploaded to the network.
+   * Preserves all instance storage (admin, fee settings, etc.).
+   */
+  async upgrade(
+    options: UpgradeOptions,
+    adminKeypair: any,
+  ): Promise<TransactionResult> {
+    try {
+      const adminAccount = await this.provider.getAccount(
+        adminKeypair.publicKey(),
+      );
+
+      const wasmHashBytes = Buffer.from(options.newWasmHash, 'hex');
+      const wasmHashScVal = xdr.ScVal.scvBytes(wasmHashBytes);
+
+      const tx = new TransactionBuilder(adminAccount, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call('upgrade', wasmHashScVal),
+        )
+        .setTimeout(30)
+        .build();
+
+      const preparedTx = await this.provider.prepareTransaction(tx);
+      preparedTx.sign(adminKeypair);
+
+      const response = await this.provider.sendTransaction(preparedTx);
+
+      return {
+        hash: response.hash,
+        status: response.status === 'PENDING' ? 'success' : 'pending',
       };
     } catch (error: any) {
       return {
