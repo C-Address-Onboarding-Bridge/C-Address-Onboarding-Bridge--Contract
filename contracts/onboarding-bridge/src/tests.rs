@@ -549,6 +549,212 @@ fn test_upgrade_non_admin_rejected() {
     bridge.upgrade(&wasm_hash);
 }
 
+// --------- Blocklist / Allowlist Tests ---------
+
+fn setup_bridge(env: &Env) -> (crate::OnboardingBridgeClient, Address, Address, Address) {
+    let (bridge_id, token_id) = register_all_contracts(env);
+    let bridge = create_bridge_client(env, &bridge_id);
+    let (admin, user, fee_collector) = create_test_users(env);
+    init_token(env, &token_id, &admin);
+    bridge.initialize(&admin, &fee_collector, &0u32);
+    mint_tokens(env, &token_id, &user, 1000i128);
+    (bridge, user, token_id, admin)
+}
+
+#[test]
+fn test_blocklist_prevents_fund() {
+    let env = Env::default();
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+
+    bridge.add_to_blocklist(&target);
+    assert!(bridge.query_is_blocked(&target));
+
+    assert_eq!(
+        bridge.try_fund_c_address(&user, &target, &token_id, &500i128),
+        Err(Ok(crate::BridgeError::AddressBlocked))
+    );
+}
+
+#[test]
+fn test_remove_from_blocklist_allows_fund() {
+    let env = Env::default();
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+
+    bridge.add_to_blocklist(&target);
+    bridge.remove_from_blocklist(&target);
+    assert!(!bridge.query_is_blocked(&target));
+
+    bridge.fund_c_address(&user, &target, &token_id, &500i128);
+    assert_eq!(check_balance(&env, &token_id, &target), 500i128);
+}
+
+#[test]
+fn test_allowlist_mode_blocks_non_allowlisted() {
+    let env = Env::default();
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+
+    bridge.set_allowlist_mode(&true);
+    assert!(bridge.query_allowlist_mode());
+
+    assert_eq!(
+        bridge.try_fund_c_address(&user, &target, &token_id, &500i128),
+        Err(Ok(crate::BridgeError::AddressNotAllowlisted))
+    );
+}
+
+#[test]
+fn test_allowlist_mode_allows_allowlisted() {
+    let env = Env::default();
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+
+    bridge.set_allowlist_mode(&true);
+    bridge.add_to_allowlist(&target);
+    assert!(bridge.query_is_allowlisted(&target));
+
+    bridge.fund_c_address(&user, &target, &token_id, &500i128);
+    assert_eq!(check_balance(&env, &token_id, &target), 500i128);
+}
+
+#[test]
+fn test_remove_from_allowlist_blocks_in_allowlist_mode() {
+    let env = Env::default();
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+
+    bridge.set_allowlist_mode(&true);
+    bridge.add_to_allowlist(&target);
+    bridge.remove_from_allowlist(&target);
+    assert!(!bridge.query_is_allowlisted(&target));
+
+    assert_eq!(
+        bridge.try_fund_c_address(&user, &target, &token_id, &500i128),
+        Err(Ok(crate::BridgeError::AddressNotAllowlisted))
+    );
+}
+
+#[test]
+fn test_blocklist_overrides_allowlist() {
+    let env = Env::default();
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+
+    bridge.set_allowlist_mode(&true);
+    bridge.add_to_allowlist(&target);
+    bridge.add_to_blocklist(&target);
+
+    assert_eq!(
+        bridge.try_fund_c_address(&user, &target, &token_id, &500i128),
+        Err(Ok(crate::BridgeError::AddressBlocked))
+    );
+}
+
+#[test]
+fn test_batch_fund_blocked_address_fails() {
+    let env = Env::default();
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let t1 = Address::generate(&env);
+    let t2 = Address::generate(&env);
+
+    bridge.add_to_blocklist(&t2);
+
+    let targets = Vec::from_array(&env, [t1, t2]);
+    let amounts = Vec::from_array(&env, [200i128, 300i128]);
+
+    assert_eq!(
+        bridge.try_batch_fund_c_address(&user, &targets, &amounts, &token_id),
+        Err(Ok(crate::BridgeError::AddressBlocked))
+    );
+}
+
+#[test]
+fn test_allowlist_mode_off_allows_all() {
+    let env = Env::default();
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+
+    // allowlist mode off by default
+    assert!(!bridge.query_allowlist_mode());
+    bridge.fund_c_address(&user, &target, &token_id, &500i128);
+    assert_eq!(check_balance(&env, &token_id, &target), 500i128);
+}
+
+// --------- reclaim_tokens Tests ---------
+
+#[test]
+fn test_reclaim_accidentally_sent_tokens() {
+    let env = Env::default();
+    let (bridge, _user, token_id, admin) = setup_bridge(&env);
+
+    // Directly mint tokens to bridge (simulating accidental transfer, no fees accrued)
+    mint_tokens(&env, &token_id, &bridge.address, 500i128);
+
+    let destination = Address::generate(&env);
+    bridge.reclaim_tokens(&token_id, &500i128, &destination);
+
+    assert_eq!(check_balance(&env, &token_id, &destination), 500i128);
+    let _ = admin; // suppress unused warning
+}
+
+#[test]
+fn test_reclaim_cannot_take_accrued_fees() {
+    let env = Env::default();
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+
+    // Fund so fees (10%) accrue in contract
+    bridge.set_fee_bps(&1000u32); // 10%
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &1000i128);
+    // contract now holds 100 in accrued fees, 0 reclaimable
+
+    let destination = Address::generate(&env);
+    assert_eq!(
+        bridge.try_reclaim_tokens(&token_id, &1i128, &destination),
+        Err(Ok(crate::BridgeError::InsufficientReclaimable))
+    );
+}
+
+#[test]
+fn test_reclaim_only_excess_over_fees() {
+    let env = Env::default();
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+
+    bridge.set_fee_bps(&1000u32); // 10%
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &1000i128);
+    // 100 accrued fees in contract; mint 200 more directly
+    mint_tokens(&env, &token_id, &bridge.address, 200i128);
+
+    let destination = Address::generate(&env);
+    // Can reclaim exactly 200 (the excess)
+    bridge.reclaim_tokens(&token_id, &200i128, &destination);
+    assert_eq!(check_balance(&env, &token_id, &destination), 200i128);
+
+    // Cannot reclaim 1 more
+    let dest2 = Address::generate(&env);
+    assert_eq!(
+        bridge.try_reclaim_tokens(&token_id, &1i128, &dest2),
+        Err(Ok(crate::BridgeError::InsufficientReclaimable))
+    );
+}
+
+#[test]
+fn test_reclaim_emits_event() {
+    let env = Env::default();
+    let (bridge, _user, token_id, _admin) = setup_bridge(&env);
+
+    mint_tokens(&env, &token_id, &bridge.address, 300i128);
+    let destination = Address::generate(&env);
+    bridge.reclaim_tokens(&token_id, &300i128, &destination);
+
+    let events = env.events().all();
+    let (contract_id, _topics, _data) = &events.get(events.len() - 1).unwrap();
+    assert_eq!(contract_id, &bridge.address);
+}
+
 /********** Minimal Test Token **********/
 
 #[contracttype]
