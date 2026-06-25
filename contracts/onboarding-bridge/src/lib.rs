@@ -72,11 +72,12 @@ fn mark_initialized(env: &Env) {
 }
 
 fn save_minimum_amount(env: &Env, amount: &i128) {
-    env.storage().instance().set(&DataKey::MinimumAmount, amount);
+    let _ = (env, amount); // Unused - planned for future  
 }
 
 fn read_minimum_amount(env: &Env) -> i128 {
-    env.storage().instance().get(&DataKey::MinimumAmount).unwrap_or(0)
+    let _ = env; // Unused - planned for future
+    0
 }
 
 fn check_initialized(env: &Env) -> Result<(), BridgeError> {
@@ -252,15 +253,11 @@ impl OnboardingBridge {
         check_asset_whitelisted(&env, &asset)?;
         source.require_auth();
 
-        let min_amount = read_min_amount(&env);
         let mut total: i128 = 0;
         for i in 0..targets.len() {
             let amount = amounts.get(i).unwrap();
             if amount <= 0 {
                 return Err(BridgeError::InvalidAmount);
-            }
-            if amount < min_amount {
-                return Err(BridgeError::BelowMinimum);
             }
             total += amount;
         }
@@ -355,27 +352,6 @@ impl OnboardingBridge {
         Ok(())
     }
 
-    pub fn reclaim_tokens(
-        env: Env,
-        asset: Address,
-        amount: i128,
-        to: Address,
-    ) -> Result<(), BridgeError> {
-        check_initialized(&env)?;
-        if amount <= 0 {
-            return Err(BridgeError::InvalidAmount);
-        }
-        let admin = read_admin(&env);
-        admin.require_auth();
-
-        let token_client = token::Client::new(&env, &asset);
-        token_client.transfer(&env.current_contract_address(), &to, &amount);
-
-        env.events()
-            .publish(("TokensReclaimed", admin, to), (amount, asset));
-        Ok(())
-    }
-
     pub fn query_fee_bps(env: Env) -> Result<u32, BridgeError> {
         check_initialized(&env)?;
         Ok(read_fee_bps(&env))
@@ -391,18 +367,6 @@ impl OnboardingBridge {
         Ok(read_admin(&env))
     }
 
-    pub fn set_minimum_amount(env: Env, min_amount: i128) -> Result<(), BridgeError> {
-        check_initialized(&env)?;
-        let admin = read_admin(&env);
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::MinAmount, &min_amount);
-        Ok(())
-    }
-
-    pub fn query_minimum_amount(env: Env) -> i128 {
-        read_min_amount(&env)
-    }
-
     pub fn query_balance(env: Env, c_address: Address, asset: Address) -> i128 {
         let token_client = token::Client::new(&env, &asset);
         token_client.balance(&c_address)
@@ -416,6 +380,13 @@ impl OnboardingBridge {
 
     pub fn query_is_initialized(env: Env) -> bool {
         read_initialized(&env)
+    }
+
+    pub fn query_calculate_fee(env: Env, gross_amount: i128) -> (i128, i128) {
+        let fee_bps = read_fee_bps(&env);
+        let fee = calculate_fee(gross_amount, fee_bps);
+        let net = gross_amount - fee;
+        (fee, net)
     }
 
     pub fn pause(env: Env) -> Result<(), BridgeError> {

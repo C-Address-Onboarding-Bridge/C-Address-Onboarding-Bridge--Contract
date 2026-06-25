@@ -981,3 +981,47 @@ impl TestToken {
             .set(&(TDataKey::Balance, to), &(to_bal + amount));
     }
 }
+
+/********** query_calculate_fee tests **********/
+
+#[test]
+fn test_query_calculate_fee() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32);
+
+    let (fee, net) = bridge.query_calculate_fee(&1000i128);
+    assert_eq!(fee, 10i128);
+    assert_eq!(net, 990i128);
+}
+
+#[test]
+fn test_query_calculate_fee_zero_fee() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &0u32);
+
+    let (fee, net) = bridge.query_calculate_fee(&1000i128);
+    assert_eq!(fee, 0i128);
+    assert_eq!(net, 1000i128);
+}
+
+#[test]
+fn test_query_calculate_fee_max_fee() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &1000u32);
+
+    let (fee, net) = bridge.query_calculate_fee(&1000i128);
+    assert_eq!(fee, 100i128);
+    assert_eq!(net, 900i128);
+}
