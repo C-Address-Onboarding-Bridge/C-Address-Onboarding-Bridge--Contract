@@ -18,12 +18,28 @@ import {
   BASE_FEE,
 } from '@stellar/stellar-sdk';
 
+/**
+ * Client for building, simulating, signing, and submitting C-Address Onboarding Bridge contract calls.
+ *
+ * @example
+ * const sdk = new OnboardingBridgeSDK({
+ *   contractId: 'CA...',
+ *   rpcUrl: 'https://soroban-testnet.stellar.org',
+ *   networkPassphrase: Networks.TESTNET,
+ * });
+ */
 export class OnboardingBridgeSDK {
   private config: BridgeConfig;
   private contract: Contract;
   private provider: SorobanRpc.Server;
   private networkPassphrase: string;
 
+/**
+ * Creates a bridge SDK client for one deployed contract and network.
+ *
+ * @param config - Contract ID, RPC endpoint, network passphrase, and optional timeout values used by every call.
+ * @throws If the provided contract ID or RPC URL cannot be used by the Stellar SDK constructor.
+ */
   constructor(config: BridgeConfig) {
     this.config = config;
     this.contract = new Contract(config.contractId);
@@ -32,9 +48,20 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Fund a C-address from a source account.
-   * The source must have authorized the token transfer to the bridge contract.
-   */
+ * Funds a single C-address through the bridge contract.
+ *
+ * The source account signs the transaction and must be valid on the configured network. The contract calculates fees and emits funding events after successful execution.
+ *
+ * @param options - Source account, target C-address, asset contract address, and amount to route.
+ * @param sourceKeypair - Signer for the source account. It must expose the Stellar SDK keypair signing API.
+ * @returns Transaction hash and status. Failed submissions return status `failed` with an error message.
+ * @throws This method normalizes caught errors into `TransactionResult`; constructor or SDK setup errors may still throw before submission.
+ * @example
+ * const result = await sdk.fundCAddress(
+ *   { source: 'GA...', target: 'CC...', asset: 'CD...', amount: '10000000' },
+ *   sourceKeypair,
+ * );
+ */
   async fundCAddress(
     options: FundCOptions,
     sourceKeypair: any,
@@ -79,8 +106,15 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Batch fund multiple C-addresses from a single source in one transaction.
-   */
+ * Funds multiple target C-addresses in one bridge contract transaction.
+ *
+ * @param options - Source account, target C-address list, matching amount list, and shared asset contract address.
+ * @param sourceKeypair - Signer for the source account funding the batch.
+ * @returns Transaction hash and status for the submitted batch transaction.
+ * @throws This method returns a failed `TransactionResult` for caught RPC, signing, or contract errors.
+ * @example
+ * await sdk.batchFundCAddresses({ source: 'GA...', targets: ['CC...'], amounts: ['10000000'], asset: 'CD...' }, sourceKeypair);
+ */
   async batchFundCAddresses(
     options: BatchFundCOptions,
     sourceKeypair: any,
@@ -125,9 +159,15 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Withdraw accumulated fees from the bridge contract.
-   * Only the fee collector can call this.
-   */
+ * Withdraws accumulated bridge fees for one asset.
+ *
+ * @param options - Asset contract address and amount to withdraw.
+ * @param feeCollectorKeypair - Authorized fee collector signer.
+ * @returns Transaction hash and status for the withdrawal transaction.
+ * @throws This method returns a failed `TransactionResult` for caught authorization, RPC, or contract errors.
+ * @example
+ * await sdk.withdrawFees({ asset: 'CD...', amount: '5000000' }, feeCollectorKeypair);
+ */
   async withdrawFees(
     options: WithdrawFeesOptions,
     feeCollectorKeypair: any,
@@ -169,8 +209,13 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Get the current fee in basis points.
-   */
+ * Reads the configured bridge fee in basis points.
+ *
+ * @returns Current fee basis points, where 100 basis points equals 1%.
+ * @throws If Soroban simulation fails or returns no value.
+ * @example
+ * const feeBps = await sdk.getFee();
+ */
   async getFee(): Promise<number> {
     const result = await this.provider
       .simulateTransaction(
@@ -186,8 +231,13 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Get the fee collector address.
-   */
+ * Reads the fee collector address configured on the bridge contract.
+ *
+ * @returns Fee collector Stellar/Soroban address as a string.
+ * @throws If Soroban simulation fails or returns no value.
+ * @example
+ * const collector = await sdk.getFeeCollector();
+ */
   async getFeeCollector(): Promise<string> {
     const result = await this.provider
       .simulateTransaction(
@@ -203,8 +253,13 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Get the admin address.
-   */
+ * Reads the current bridge administrator address.
+ *
+ * @returns Admin address as a string.
+ * @throws If Soroban simulation fails or returns no value.
+ * @example
+ * const admin = await sdk.getAdmin();
+ */
   async getAdmin(): Promise<string> {
     const result = await this.provider
       .simulateTransaction(
@@ -220,8 +275,15 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Query the balance of a C-address for a given asset.
-   */
+ * Reads a token balance for a C-address through the bridge contract query path.
+ *
+ * @param cAddress - C-address whose balance should be queried.
+ * @param asset - Asset or token contract address to query.
+ * @returns Balance as an integer string.
+ * @throws If Soroban simulation fails or returns no value.
+ * @example
+ * const balance = await sdk.getCAddressBalance('CC...', 'CD...');
+ */
   async getCAddressBalance(
     cAddress: string,
     asset: string,
@@ -274,8 +336,15 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Set the fee in basis points (admin only).
-   */
+ * Updates the bridge fee basis points. Admin only.
+ *
+ * @param newFeeBps - New fee in basis points. The contract enforces its maximum.
+ * @param adminKeypair - Current admin signer.
+ * @returns Transaction hash and status for the admin update.
+ * @throws This method returns a failed `TransactionResult` for caught authorization, validation, RPC, or contract errors.
+ * @example
+ * await sdk.setFee(50, adminKeypair);
+ */
   async setFee(
     newFeeBps: number,
     adminKeypair: any,
@@ -317,8 +386,15 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Set the fee collector address (admin only).
-   */
+ * Updates the address that can withdraw accumulated fees. Admin only.
+ *
+ * @param newFeeCollector - New fee collector address.
+ * @param adminKeypair - Current admin signer.
+ * @returns Transaction hash and status for the admin update.
+ * @throws This method returns a failed `TransactionResult` for caught authorization, RPC, or contract errors.
+ * @example
+ * await sdk.setFeeCollector('G...', adminKeypair);
+ */
   async setFeeCollector(
     newFeeCollector: string,
     adminKeypair: any,
@@ -360,8 +436,15 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Set the admin address (admin only).
-   */
+ * Transfers bridge administration to a new address. Admin only.
+ *
+ * @param newAdmin - Address that should become the new contract admin.
+ * @param adminKeypair - Current admin signer authorizing the transfer.
+ * @returns Transaction hash and status for the admin update.
+ * @throws This method returns a failed `TransactionResult` for caught authorization, RPC, or contract errors.
+ * @example
+ * await sdk.setAdmin('G...', adminKeypair);
+ */
   async setAdmin(
     newAdmin: string,
     adminKeypair: any,
@@ -448,8 +531,12 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Convert JavaScript values to Soroban SCVals.
-   */
+ * Converts JavaScript arguments into Soroban `ScVal` values for contract invocation.
+ *
+ * @param args - JavaScript argument list to convert recursively.
+ * @returns Soroban XDR values suitable for `Contract.call`.
+ * @throws If an unsupported value cannot be converted by `nativeToScVal`.
+ */
   private toScVals(args: any[]): xdr.ScVal[] {
     return args.map((arg) => {
       if (arg === null || arg === undefined) {

@@ -1,0 +1,45 @@
+name: Publish contract crate
+
+on:
+  push:
+    tags:
+      - "contract-v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish crate and release WASM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Run contract tests
+        run: cargo test -p onboarding-bridge --features testutils
+
+      - name: Verify crate package
+        run: cargo package -p onboarding-bridge
+
+      - name: Publish crate to crates.io
+        run: cargo publish -p onboarding-bridge --token "$CARGO_REGISTRY_TOKEN"
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Build release WASM
+        run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/wasm32-unknown-unknown/release/onboarding_bridge.wasm
+          generate_release_notes: true

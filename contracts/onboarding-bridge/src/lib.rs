@@ -171,6 +171,28 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Funds a single C-address with tokens from a source account.
+    ///
+    /// The contract transfers the gross amount from `source`, deducts the configured fee, sends the net amount to `target`, and records the fee balance on the contract.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment for token calls and events.
+    /// * `source` - Account providing tokens; must authorize the transfer.
+    /// * `target` - C-address receiving the net amount.
+    /// * `asset` - Token contract address.
+    /// * `amount` - Gross amount before fee deduction.
+    ///
+    /// # Authorization
+    /// Requires authorization from `source`.
+    ///
+    /// # Events
+    /// Emits `CAddressFunded` with source, target, asset, net amount, and fee.
+    ///
+    /// # Panics
+    /// Panics if the contract is not initialized, amount is non-positive, auth fails, or the token transfer fails.
+    ///
+    /// # Security
+    /// Validate the target C-address and asset before asking a user to sign.
     pub fn fund_c_address(
         env: Env,
         source: Address,
@@ -203,6 +225,26 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Funds multiple C-addresses in one transaction.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment for token calls and events.
+    /// * `source` - Account providing tokens for every transfer; must authorize once.
+    /// * `targets` - C-address recipients.
+    /// * `asset` - Token contract address shared by the batch.
+    /// * `amounts` - Gross amounts matching the `targets` order.
+    ///
+    /// # Authorization
+    /// Requires authorization from `source`.
+    ///
+    /// # Events
+    /// Emits one `CAddressFunded` event for each successful target transfer.
+    ///
+    /// # Panics
+    /// Panics if the contract is not initialized, array lengths differ, an amount is invalid, authorization fails, or token transfer fails.
+    ///
+    /// # Security
+    /// Callers should cap batch sizes at the UI or service layer to keep fees and execution costs predictable.
     pub fn batch_fund_c_address(
         env: Env,
         source: Address,
@@ -318,6 +360,18 @@ impl OnboardingBridge {
         Ok(read_admin(&env))
     }
 
+    /// Reads a token balance for an address.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment for token client calls.
+    /// * `c_address` - Address whose balance should be read.
+    /// * `asset` - Token contract address.
+    ///
+    /// # Returns
+    /// Token balance as an `i128` amount.
+    ///
+    /// # Panics
+    /// Panics if the token contract call fails.
     pub fn query_balance(env: Env, c_address: Address, asset: Address) -> i128 {
         let token_client = token::Client::new(&env, &asset);
         token_client.balance(&c_address)

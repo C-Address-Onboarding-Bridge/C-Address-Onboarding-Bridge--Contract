@@ -1,0 +1,86 @@
+name: Documentation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-docs:
+    name: Build Rust and SDK docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Rust contract docs
+        run: cargo doc --no-deps --workspace
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: sdk/package-lock.json
+
+      - name: Install SDK dependencies
+        working-directory: sdk
+        run: npm ci
+
+      - name: Build SDK TypeDoc
+        working-directory: sdk
+        run: npx typedoc@^0.28.0 --entryPoints src/index.ts --out ../target/doc/sdk --readme none --name "C-Address Onboarding Bridge SDK"
+
+      - name: Prepare documentation site
+        run: |
+          mkdir -p docs-site/rust docs-site/sdk
+          cp -R target/doc/* docs-site/rust/
+          cp -R target/doc/sdk/* docs-site/sdk/
+          cat > docs-site/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <title>C-Address Onboarding Bridge Documentation</title>
+            </head>
+            <body>
+              <h1>C-Address Onboarding Bridge Documentation</h1>
+              <ul>
+                <li><a href="rust/">Rust contract API documentation</a></li>
+                <li><a href="sdk/">TypeScript SDK API documentation</a></li>
+              </ul>
+            </body>
+          </html>
+          HTML
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs-site
+
+  deploy-docs:
+    name: Deploy documentation to GitHub Pages
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build-docs
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

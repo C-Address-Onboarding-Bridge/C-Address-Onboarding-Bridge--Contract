@@ -1,17 +1,32 @@
 import { OffRampConfig } from './types';
 
+/**
+ * Builds fiat on-ramp URLs and CEX routing memos for C-address funding flows.
+ *
+ * @example
+ * const offramp = new OffRampIntegration({ moonpayApiKey, transakApiKey, testMode: true });
+ */
 export class OffRampIntegration {
   private config: OffRampConfig;
 
+/**
+ * Creates a provider URL and memo helper.
+ *
+ * @param config - Provider API keys and sandbox/test-mode setting.
+ */
   constructor(config: OffRampConfig) {
     this.config = config;
   }
 
   /**
-   * Generate a Moonpay purchase URL to fund a C-address via credit card.
-   * Users complete purchase on Moonpay; funds are forwarded to the C-address
-   * via the bridge contract.
-   */
+ * Builds a Moonpay purchase URL for funding a target C-address.
+ *
+ * @param params - Target C-address, purchase amount, crypto/fiat currency, and optional asset code.
+ * @returns A Moonpay URL with query parameters populated from the integration config.
+ * @throws If the runtime does not provide the standard `URL` API.
+ * @example
+ * const url = offramp.getMoonpayUrl({ targetCAddress: 'CC...', amount: '100', currency: 'USDC' });
+ */
   getMoonpayUrl(params: {
     targetCAddress: string;
     amount: string;
@@ -37,8 +52,14 @@ export class OffRampIntegration {
   }
 
   /**
-   * Generate a Transak purchase URL to fund a C-address via credit card.
-   */
+ * Builds a Transak purchase URL for funding a target C-address.
+ *
+ * @param params - Target C-address, fiat amount, crypto currency, and optional fiat currency override.
+ * @returns A Transak URL with wallet, amount, network, and API key parameters.
+ * @throws If the runtime does not provide the standard `URL` API.
+ * @example
+ * const url = offramp.getTransakUrl({ targetCAddress: 'CC...', amount: '100', currency: 'USDC', fiatCurrency: 'USD' });
+ */
   getTransakUrl(params: {
     targetCAddress: string;
     amount: string;
@@ -63,18 +84,27 @@ export class OffRampIntegration {
   }
 
   /**
-   * Generate a CEX (Centralized Exchange) deposit memo that encodes
-   * the target C-address so the bridge contract can route the funds.
-   *
-   * The memo format is: "bridge:<target_c_address>"
-   */
+ * Encodes a C-address in the memo format used by CEX deposit routing.
+ *
+ * @param targetCAddress - C-address that should receive bridged funds.
+ * @returns Memo string in `bridge:<target_c_address>` format.
+ * @throws This method does not throw; callers should validate the C-address before display.
+ * @example
+ * const memo = offramp.generateCEXDepositMemo('CC...');
+ */
   generateCEXDepositMemo(targetCAddress: string): string {
     return `bridge:${targetCAddress}`;
   }
 
   /**
-   * Decode a CEX deposit memo to extract the target C-address.
-   */
+ * Extracts the target C-address from a bridge CEX deposit memo.
+ *
+ * @param memo - Memo supplied by a user or exchange deposit flow.
+ * @returns The decoded C-address, or `null` when the memo is not a bridge memo.
+ * @throws This method does not throw.
+ * @example
+ * const target = offramp.decodeCEXDepositMemo('bridge:CC...');
+ */
   decodeCEXDepositMemo(memo: string): string | null {
     if (!memo.startsWith('bridge:')) {
       return null;
