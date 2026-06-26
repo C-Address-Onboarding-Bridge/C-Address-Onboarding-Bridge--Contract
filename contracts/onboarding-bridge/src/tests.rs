@@ -1070,3 +1070,89 @@ fn test_batch_all_succeed_no_refund() {
     assert_eq!(check_balance(&env, &token_id, &t2), 400i128);
     assert_eq!(user_before - user_after, 700i128);
 }
+
+/********** Daily Limits Tests (Issue #15) **********/
+
+#[test]
+fn test_set_source_daily_limit() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    
+    bridge.initialize(&admin, &fee_collector, &0u32);
+    
+    let source = Address::generate(&env);
+    bridge.set_source_daily_limit(&source, &token_id, &5000i128).unwrap();
+    
+    let limit = bridge.query_source_daily_limit(&source, &token_id).unwrap();
+    assert_eq!(limit, 5000i128);
+}
+
+#[test]
+fn test_daily_limit_enforced() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+    
+    bridge.initialize(&admin, &fee_collector, &0u32);
+    bridge.add_asset(&token_id);
+    bridge.set_source_daily_limit(&user, &token_id, &500i128).unwrap();
+    
+    mint_tokens(&env, &token_id, &user, 2000i128);
+    
+    let t1 = Address::generate(&env);
+    let t2 = Address::generate(&env);
+    
+    bridge.fund_c_address(&user, &t1, &token_id, &400i128).unwrap();
+    
+    assert_eq!(
+        bridge.try_fund_c_address(&user, &t2, &token_id, &200i128),
+        Err(Ok(BridgeError::DailyLimitExceeded))
+    );
+}
+
+#[test]
+fn test_daily_limit_allows_within_threshold() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+    
+    bridge.initialize(&admin, &fee_collector, &0u32);
+    bridge.add_asset(&token_id);
+    bridge.set_source_daily_limit(&user, &token_id, &1000i128).unwrap();
+    
+    mint_tokens(&env, &token_id, &user, 2000i128);
+    
+    let t1 = Address::generate(&env);
+    let t2 = Address::generate(&env);
+    
+    bridge.fund_c_address(&user, &t1, &token_id, &400i128).unwrap();
+    bridge.fund_c_address(&user, &t2, &token_id, &600i128).unwrap();
+    
+    assert_eq!(check_balance(&env, &token_id, &t1), 400i128);
+    assert_eq!(check_balance(&env, &token_id, &t2), 600i128);
+}
+
+#[test]
+fn test_daily_limit_default_unlimited() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+    
+    bridge.initialize(&admin, &fee_collector, &0u32);
+    bridge.add_asset(&token_id);
+    
+    mint_tokens(&env, &token_id, &user, 100000i128);
+    
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &50000i128).unwrap();
+    
+    assert_eq!(check_balance(&env, &token_id, &target), 50000i128);
+}

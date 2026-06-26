@@ -282,13 +282,15 @@ impl OnboardingBridge {
         }
         check_access(&env, &target)?;
         check_asset_whitelisted(&env, &asset)?;
+        check_daily_limit(&env, &source, &asset, amount)?;
         source.require_auth();
 
         let token_client = token::Client::new(&env, &asset);
         token_client.transfer(&source, &env.current_contract_address(), &amount);
 
-        let fee_bps = read_fee_bps(&env);
-        let fee = calculate_fee(amount, fee_bps);
+        let global_fee_bps = read_fee_bps(&env);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, global_fee_bps);
+        let fee = calculate_fee(amount, effective_fee_bps);
         let net_amount = amount - fee;
 
         if net_amount > 0 {
@@ -391,6 +393,28 @@ impl OnboardingBridge {
         admin.require_auth();
         save_fee_bps(&env, &new_fee_bps);
         Ok(())
+    }
+
+    pub fn set_source_daily_limit(
+        env: Env,
+        source: Address,
+        asset: Address,
+        limit_amount: i128,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        save_source_daily_limit(&env, &source, &asset, limit_amount);
+        Ok(())
+    }
+
+    pub fn query_source_daily_limit(
+        env: Env,
+        source: Address,
+        asset: Address,
+    ) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_source_daily_limit(&env, &source, &asset))
     }
 
     pub fn set_fee_collector(env: Env, new_fee_collector: Address) -> Result<(), BridgeError> {
