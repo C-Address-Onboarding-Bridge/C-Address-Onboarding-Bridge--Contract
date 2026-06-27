@@ -1,7 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Map,
+    Vec,
 };
 
 #[contracterror]
@@ -21,6 +22,9 @@ pub enum BridgeError {
 
     DuplicateNonce = 12,
     TransactionExpired = 13,
+    EmergencyWithdrawDisabled = 14,
+    ProofRequiredForLargeAmount = 15,
+    InsufficientUserDeposit = 16,
 }
 
 #[contracttype]
@@ -40,6 +44,9 @@ pub enum DataKey {
     SourceDailyLimit(Address, Address),
     AssetFeeCap(Address),
     Nonce(Address),
+    EmergencyMode,
+    UserDeposit(Address, Address),
+    EmergencyProofThreshold,
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
@@ -275,6 +282,43 @@ fn consume_nonce(env: &Env, caller: &Address, nonce: Option<u64>) -> Result<(), 
     Ok(())
 }
 
+// --- Emergency mode helpers ---
+
+fn read_emergency_mode(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::EmergencyMode)
+        .unwrap_or(false)
+}
+
+fn read_user_deposit(env: &Env, user: &Address, asset: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UserDeposit(user.clone(), asset.clone()))
+        .unwrap_or(0)
+}
+
+fn increment_user_deposit(env: &Env, user: &Address, asset: &Address, amount: i128) {
+    let current = read_user_deposit(env, user, asset);
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserDeposit(user.clone(), asset.clone()), &(current + amount));
+}
+
+fn decrement_user_deposit(env: &Env, user: &Address, asset: &Address, amount: i128) {
+    let current = read_user_deposit(env, user, asset);
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserDeposit(user.clone(), asset.clone()), &(current - amount));
+}
+
+fn read_emergency_proof_threshold(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::EmergencyProofThreshold)
+        .unwrap_or(1_000_000_0000000i128) // default 1M stroops
+}
+
 // --- Cross-chain relayer registry ---
 
 fn relayer_count(env: &Env) -> u32 {
@@ -461,6 +505,7 @@ impl OnboardingBridge {
             token_client.transfer(&env.current_contract_address(), &target, &net_amount);
         }
 
+        increment_user_deposit(&env, &source, &asset, amount);
         increment_accrued_fees(&env, &asset, fee);
         increment_total_bridged(&env, &asset, net_amount);
         increment_total_fees_collected(&env, &asset, fee);
@@ -909,6 +954,83 @@ impl OnboardingBridge {
     pub fn query_whitelisted_assets(env: Env) -> Result<Vec<Address>, BridgeError> {
         check_initialized(&env)?;
         Ok(read_whitelist(&env).keys())
+    }
+
+    // --- Emergency Withdraw ---
+
+    pub fn set_emergency_mode(env: Env, enabled: bool, nonce: Option<u64>) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyMode, &enabled);
+        env.events()
+            .publish(("EmergencyModeChanged",), (admin, enabled));
+        Ok(())
+    }
+
+    pub fn set_emergency_proof_threshold(
+        env: Env,
+        threshold: i128,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyProofThreshold, &threshold);
+        Ok(())
+    }
+
+    pub fn emergency_withdraw(
+        env: Env,
+        user: Address,
+        asset: Address,
+        amount: i128,
+        proof: Option<Bytes>,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let is_paused = read_paused(&env);
+        let is_emergency = read_emergency_mode(&env);
+        if !is_paused && !is_emergency {
+            return Err(BridgeError::EmergencyWithdrawDisabled);
+        }
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        user.require_auth();
+
+        let threshold = read_emergency_proof_threshold(&env);
+        if amount > threshold && proof.is_none() {
+            return Err(BridgeError::ProofRequiredForLargeAmount);
+        }
+
+        let user_deposit = read_user_deposit(&env, &user, &asset);
+        if user_deposit < amount {
+            return Err(BridgeError::InsufficientUserDeposit);
+        }
+
+        decrement_user_deposit(&env, &user, &asset, amount);
+
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&env.current_contract_address(), &user, &amount);
+
+        env.events()
+            .publish(("EmergencyWithdrawal", user, asset), (amount,));
+        Ok(())
+    }
+
+    pub fn query_user_deposit(env: Env, user: Address, asset: Address) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_user_deposit(&env, &user, &asset))
+    }
+
+    pub fn query_is_emergency_mode(env: Env) -> bool {
+        read_emergency_mode(&env)
     }
 
     // --- Cross-chain Onboarding ---
