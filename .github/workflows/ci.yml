@@ -33,6 +33,65 @@ jobs:
       - name: Run contract tests
         run: cargo test -p onboarding-bridge --features testutils
 
+      - name: Run benchmarks
+        run: |
+          cargo test -p onboarding-bridge --features testutils bench_ -- --nocapture 2>/dev/null \
+            | grep '^BENCH' \
+            | awk 'BEGIN{print "function\tcpu_instructions\tmemory_bytes"} {print $2"\t"$3"\t"$4}' \
+            > bench_results.txt
+          echo "--- Benchmark Results ---"
+          column -t bench_results.txt
+
+      - name: Check gas regressions
+        run: |
+          if [ -f bench_baseline.txt ]; then
+            python3 - <<'EOF'
+          import sys
+          baseline = {}
+          with open("bench_baseline.txt") as f:
+              next(f)  # skip header
+              for line in f:
+                  parts = line.strip().split("\t")
+                  if len(parts) == 3:
+                      baseline[parts[0]] = (int(parts[1]), int(parts[2]))
+          
+          results = {}
+          with open("bench_results.txt") as f:
+              next(f)  # skip header
+              for line in f:
+                  parts = line.strip().split("\t")
+                  if len(parts) == 3:
+                      results[parts[0]] = (int(parts[1]), int(parts[2]))
+          
+          THRESHOLD = 0.20  # 20% regression threshold
+          regressions = []
+          for name, (cpu, mem) in results.items():
+              if name in baseline:
+                  base_cpu, base_mem = baseline[name]
+                  if base_cpu > 0 and (cpu - base_cpu) / base_cpu > THRESHOLD:
+                      regressions.append(f"{name}: CPU {base_cpu} -> {cpu} (+{(cpu-base_cpu)*100//base_cpu}%)")
+                  if base_mem > 0 and (mem - base_mem) / base_mem > THRESHOLD:
+                      regressions.append(f"{name}: MEM {base_mem} -> {mem} (+{(mem-base_mem)*100//base_mem}%)")
+          
+          if regressions:
+              print("GAS REGRESSIONS DETECTED (>20% increase):")
+              for r in regressions:
+                  print(" ", r)
+              sys.exit(1)
+          else:
+              print("No gas regressions detected.")
+          EOF
+          else
+            echo "No baseline file found — saving current results as baseline."
+            cp bench_results.txt bench_baseline.txt
+          fi
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench_results.txt
+
       - name: Upload WASM artifact
         uses: actions/upload-artifact@v4
         with:

@@ -40,6 +40,7 @@ pub enum DataKey {
     SourceDailyLimit(Address, Address),
     AssetFeeCap(Address),
     Nonce(Address),
+    ReferralRate,
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
@@ -273,6 +274,19 @@ fn consume_nonce(env: &Env, caller: &Address, nonce: Option<u64>) -> Result<(), 
             .set(&DataKey::Nonce(caller.clone()), &(stored + 1));
     }
     Ok(())
+}
+
+// --- Referral rate helpers ---
+
+fn save_referral_rate(env: &Env, bps: u32) {
+    env.storage().instance().set(&DataKey::ReferralRate, &bps);
+}
+
+fn read_referral_rate(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::ReferralRate)
+        .unwrap_or(0)
 }
 
 // --- Cross-chain relayer registry ---
@@ -684,6 +698,82 @@ impl OnboardingBridge {
     pub fn query_fee_bps(env: Env) -> Result<u32, BridgeError> {
         check_initialized(&env)?;
         Ok(read_fee_bps(&env))
+    }
+
+    pub fn set_referral_rate(env: Env, bps: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        if bps > MAX_FEE_BPS {
+            return Err(BridgeError::FeeTooHigh);
+        }
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        save_referral_rate(&env, bps);
+        env.events().publish(("ReferralRateChanged", bps), ());
+        Ok(())
+    }
+
+    pub fn query_referral_rate(env: Env) -> Result<u32, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_referral_rate(&env))
+    }
+
+    pub fn fund_c_address_with_referral(
+        env: Env,
+        source: Address,
+        target: Address,
+        asset: Address,
+        amount: i128,
+        referrer: Option<Address>,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        check_access(&env, &target)?;
+        check_asset_whitelisted(&env, &asset)?;
+        check_daily_limit(&env, &source, &asset, amount)?;
+        source.require_auth();
+
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&source, &env.current_contract_address(), &amount);
+
+        let global_fee_bps = read_fee_bps(&env);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, global_fee_bps);
+        let fee = calculate_fee(amount, effective_fee_bps);
+        let net_amount = amount - fee;
+
+        if net_amount > 0 {
+            token_client.transfer(&env.current_contract_address(), &target, &net_amount);
+        }
+
+        // Split fee: referral portion goes directly to referrer
+        let referral_fee = if let Some(ref referrer_addr) = referrer {
+            let referral_rate = read_referral_rate(&env);
+            let rf = (fee * referral_rate as i128) / FEE_DENOMINATOR;
+            if rf > 0 {
+                token_client.transfer(&env.current_contract_address(), referrer_addr, &rf);
+                env.events().publish(
+                    ("ReferralPaid", source.clone(), referrer_addr.clone()),
+                    (rf, asset.clone()),
+                );
+            }
+            rf
+        } else {
+            0
+        };
+
+        let protocol_fee = fee - referral_fee;
+        increment_accrued_fees(&env, &asset, protocol_fee);
+        increment_total_bridged(&env, &asset, net_amount);
+        increment_total_fees_collected(&env, &asset, fee);
+
+        env.events().publish(
+            ("CAddressFunded", source, target),
+            (amount, fee, asset),
+        );
+        Ok(())
     }
 
     pub fn query_fee_collector(env: Env) -> Result<Address, BridgeError> {
@@ -1146,3 +1236,6 @@ impl OnboardingBridge {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod benchmarks;
