@@ -7,6 +7,7 @@ import {
   ReclaimTokensOptions,
   TransactionResult,
 } from './types';
+import { assertAccountAddress, assertContractAddress } from './validate';
 import {
   SorobanRpc,
   Contract,
@@ -26,6 +27,7 @@ export class OnboardingBridgeSDK {
   private networkPassphrase: string;
 
   constructor(config: BridgeConfig) {
+    assertContractAddress(config.contractId, 'contractId');
     this.config = config;
     this.contract = new Contract(config.contractId);
     this.provider = new SorobanRpc.Server(config.rpcUrl);
@@ -41,6 +43,9 @@ export class OnboardingBridgeSDK {
     sourceKeypair: any,
   ): Promise<TransactionResult> {
     try {
+      assertAccountAddress(options.source, 'source');
+      assertContractAddress(options.target, 'target');
+      assertContractAddress(options.asset, 'asset');
       const sourceAccount = await this.provider.getAccount(options.source);
 
       const tx = new TransactionBuilder(sourceAccount, {
@@ -87,6 +92,9 @@ export class OnboardingBridgeSDK {
     sourceKeypair: any,
   ): Promise<TransactionResult> {
     try {
+      assertAccountAddress(options.source, 'source');
+      options.targets.forEach((t, i) => assertContractAddress(t, `targets[${i}]`));
+      assertContractAddress(options.asset, 'asset');
       const sourceAccount = await this.provider.getAccount(options.source);
 
       const tx = new TransactionBuilder(sourceAccount, {
@@ -134,6 +142,7 @@ export class OnboardingBridgeSDK {
     feeCollectorKeypair: any,
   ): Promise<TransactionResult> {
     try {
+      assertContractAddress(options.asset, 'asset');
       const feeCollectorAccount = await this.provider.getAccount(
         feeCollectorKeypair.publicKey(),
       );
@@ -177,6 +186,8 @@ export class OnboardingBridgeSDK {
     adminKeypair: any,
   ): Promise<TransactionResult> {
     try {
+      assertContractAddress(options.asset, 'asset');
+      assertAccountAddress(options.to, 'to');
       const adminAccount = await this.provider.getAccount(
         adminKeypair.publicKey(),
       );
@@ -270,6 +281,8 @@ export class OnboardingBridgeSDK {
     cAddress: string,
     asset: string,
   ): Promise<string> {
+    assertContractAddress(cAddress, 'cAddress');
+    assertContractAddress(asset, 'asset');
     const result = await this.provider
       .simulateTransaction(
         this.buildSimulationTx('query_balance', [cAddress, asset]),
@@ -287,6 +300,7 @@ export class OnboardingBridgeSDK {
    * Get the fee balance held by the contract for a given asset.
    */
   async getFeeBalance(asset: string): Promise<string> {
+    assertContractAddress(asset, 'asset');
     const result = await this.provider
       .simulateTransaction(
         this.buildSimulationTx('query_fee_balance', [asset]),
@@ -305,6 +319,7 @@ export class OnboardingBridgeSDK {
    * Returns a map of asset address → balance string.
    */
   async getAllBalances(assets: string[]): Promise<Record<string, string>> {
+    assets.forEach((a, i) => assertContractAddress(a, `assets[${i}]`));
     const result = await this.provider
       .simulateTransaction(
         this.buildSimulationTx('query_all_balances', [assets]),
@@ -393,6 +408,7 @@ export class OnboardingBridgeSDK {
     adminKeypair: any,
   ): Promise<TransactionResult> {
     try {
+      assertAccountAddress(newFeeCollector, 'newFeeCollector');
       const adminAccount = await this.provider.getAccount(
         adminKeypair.publicKey(),
       );
@@ -436,6 +452,7 @@ export class OnboardingBridgeSDK {
     adminKeypair: any,
   ): Promise<TransactionResult> {
     try {
+      assertAccountAddress(newAdmin, 'newAdmin');
       const adminAccount = await this.provider.getAccount(
         adminKeypair.publicKey(),
       );

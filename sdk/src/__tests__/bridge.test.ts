@@ -30,6 +30,10 @@ jest.mock('@stellar/stellar-sdk', () => ({
     TESTNET: 'Test SDF Network ; September 2015',
     PUBLIC: 'Public Global Stellar Network ; September 2015',
   },
+  StrKey: {
+    isValidEd25519PublicKey: jest.fn((addr: string) => addr.startsWith('G') && addr.length === 56),
+    isValidContract: jest.fn((addr: string) => addr.startsWith('C') && addr.length === 56),
+  },
 }));
 
 const CONFIG = {
@@ -68,7 +72,7 @@ describe('OnboardingBridgeSDK', () => {
   describe('fundCAddress', () => {
     it('returns pending status on success', async () => {
       const result = await sdk.fundCAddress(
-        { source: MOCK_ADDRESS, target: MOCK_ADDRESS, asset: MOCK_ASSET, amount: '1000' },
+        { source: MOCK_ADDRESS, target: MOCK_ASSET, asset: MOCK_ASSET, amount: '1000' },
         mockKeypair,
       );
 
@@ -83,7 +87,7 @@ describe('OnboardingBridgeSDK', () => {
       mockProvider.sendTransaction.mockResolvedValue({ hash: 'err_hash', status: 'ERROR' });
 
       const result = await sdk.fundCAddress(
-        { source: MOCK_ADDRESS, target: MOCK_ADDRESS, asset: MOCK_ASSET, amount: '1000' },
+        { source: MOCK_ADDRESS, target: MOCK_ASSET, asset: MOCK_ASSET, amount: '1000' },
         mockKeypair,
       );
 
@@ -95,7 +99,7 @@ describe('OnboardingBridgeSDK', () => {
       mockProvider.getAccount.mockRejectedValue(new Error('Network timeout'));
 
       const result = await sdk.fundCAddress(
-        { source: MOCK_ADDRESS, target: MOCK_ADDRESS, asset: MOCK_ASSET, amount: '1000' },
+        { source: MOCK_ADDRESS, target: MOCK_ASSET, asset: MOCK_ASSET, amount: '1000' },
         mockKeypair,
       );
 
@@ -110,7 +114,7 @@ describe('OnboardingBridgeSDK', () => {
       const result = await sdk.batchFundCAddresses(
         {
           source: MOCK_ADDRESS,
-          targets: [MOCK_ADDRESS, MOCK_ADDRESS],
+          targets: [MOCK_ASSET, MOCK_ASSET],
           amounts: ['500', '500'],
           asset: MOCK_ASSET,
         },
@@ -127,7 +131,7 @@ describe('OnboardingBridgeSDK', () => {
       const result = await sdk.batchFundCAddresses(
         {
           source: MOCK_ADDRESS,
-          targets: [MOCK_ADDRESS],
+          targets: [MOCK_ASSET],
           amounts: ['500', '500'],
           asset: MOCK_ASSET,
         },
@@ -253,7 +257,7 @@ describe('OnboardingBridgeSDK', () => {
         results: [{ retval: {} }],
       });
 
-      const balance = await sdk.getCAddressBalance(MOCK_ADDRESS, MOCK_ASSET);
+      const balance = await sdk.getCAddressBalance(MOCK_ASSET, MOCK_ASSET);
 
       expect(balance).toBe('1000');
     });
@@ -261,7 +265,7 @@ describe('OnboardingBridgeSDK', () => {
     it('returns "0" when no results', async () => {
       mockProvider.simulateTransaction.mockResolvedValue({});
 
-      const balance = await sdk.getCAddressBalance(MOCK_ADDRESS, MOCK_ASSET);
+      const balance = await sdk.getCAddressBalance(MOCK_ASSET, MOCK_ASSET);
 
       expect(balance).toBe('0');
     });
@@ -315,5 +319,134 @@ describe('OnboardingBridgeSDK', () => {
 
       await expect(sdk.getAllBalances([MOCK_ASSET])).rejects.toThrow('Failed to get all balances');
     });
+  });
+});
+
+describe('address validation', () => {
+  let sdk: OnboardingBridgeSDK;
+  let mockKeypair: any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockKeypair = { publicKey: jest.fn().mockReturnValue(MOCK_ADDRESS), sign: jest.fn() };
+    const mockProvider = {
+      getAccount: jest.fn().mockResolvedValue({}),
+      prepareTransaction: jest.fn().mockResolvedValue({ sign: jest.fn() }),
+      sendTransaction: jest.fn().mockResolvedValue({ hash: 'h', status: 'PENDING' }),
+      simulateTransaction: jest.fn().mockResolvedValue({}),
+    };
+    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    sdk = new OnboardingBridgeSDK(CONFIG);
+  });
+
+  it('constructor rejects an invalid contractId', () => {
+    expect(() => new OnboardingBridgeSDK({ ...CONFIG, contractId: 'not-a-contract' }))
+      .toThrow(/Invalid contract address for "contractId"/);
+  });
+
+  it('constructor rejects a G-address as contractId', () => {
+    expect(() => new OnboardingBridgeSDK({ ...CONFIG, contractId: MOCK_ADDRESS }))
+      .toThrow(/Invalid contract address for "contractId"/);
+  });
+
+  it('fundCAddress rejects a C-address as source', async () => {
+    const result = await sdk.fundCAddress(
+      { source: MOCK_ASSET, target: MOCK_ASSET, asset: MOCK_ASSET, amount: '1000' },
+      mockKeypair,
+    );
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/Invalid account address for "source"/);
+  });
+
+  it('fundCAddress rejects a G-address as target', async () => {
+    const result = await sdk.fundCAddress(
+      { source: MOCK_ADDRESS, target: MOCK_ADDRESS, asset: MOCK_ASSET, amount: '1000' },
+      mockKeypair,
+    );
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/Invalid contract address for "target"/);
+  });
+
+  it('fundCAddress rejects a G-address as asset', async () => {
+    const result = await sdk.fundCAddress(
+      { source: MOCK_ADDRESS, target: MOCK_ASSET, asset: MOCK_ADDRESS, amount: '1000' },
+      mockKeypair,
+    );
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/Invalid contract address for "asset"/);
+  });
+
+  it('batchFundCAddresses rejects invalid source', async () => {
+    const result = await sdk.batchFundCAddresses(
+      { source: 'bad', targets: [MOCK_ASSET], amounts: ['100'], asset: MOCK_ASSET },
+      mockKeypair,
+    );
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/Invalid account address for "source"/);
+  });
+
+  it('batchFundCAddresses rejects G-address in targets', async () => {
+    const result = await sdk.batchFundCAddresses(
+      { source: MOCK_ADDRESS, targets: [MOCK_ADDRESS], amounts: ['100'], asset: MOCK_ASSET },
+      mockKeypair,
+    );
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/Invalid contract address for "targets\[0\]"/);
+  });
+
+  it('withdrawFees rejects G-address as asset', async () => {
+    const result = await sdk.withdrawFees({ asset: MOCK_ADDRESS, amount: '100' }, mockKeypair);
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/Invalid contract address for "asset"/);
+  });
+
+  it('reclaimTokens rejects G-address as asset', async () => {
+    const result = await sdk.reclaimTokens(
+      { asset: MOCK_ADDRESS, amount: '100', to: MOCK_ADDRESS },
+      mockKeypair,
+    );
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/Invalid contract address for "asset"/);
+  });
+
+  it('reclaimTokens rejects C-address as to', async () => {
+    const result = await sdk.reclaimTokens(
+      { asset: MOCK_ASSET, amount: '100', to: MOCK_ASSET },
+      mockKeypair,
+    );
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/Invalid account address for "to"/);
+  });
+
+  it('setFeeCollector rejects a C-address', async () => {
+    const result = await sdk.setFeeCollector(MOCK_ASSET, mockKeypair);
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/Invalid account address for "newFeeCollector"/);
+  });
+
+  it('setAdmin rejects a C-address', async () => {
+    const result = await sdk.setAdmin(MOCK_ASSET, mockKeypair);
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/Invalid account address for "newAdmin"/);
+  });
+
+  it('getCAddressBalance rejects a G-address as cAddress', async () => {
+    await expect(sdk.getCAddressBalance(MOCK_ADDRESS, MOCK_ASSET))
+      .rejects.toThrow(/Invalid contract address for "cAddress"/);
+  });
+
+  it('getCAddressBalance rejects a G-address as asset', async () => {
+    await expect(sdk.getCAddressBalance(MOCK_ASSET, MOCK_ADDRESS))
+      .rejects.toThrow(/Invalid contract address for "asset"/);
+  });
+
+  it('getFeeBalance rejects a G-address as asset', async () => {
+    await expect(sdk.getFeeBalance(MOCK_ADDRESS))
+      .rejects.toThrow(/Invalid contract address for "asset"/);
+  });
+
+  it('getAllBalances rejects a G-address in assets list', async () => {
+    await expect(sdk.getAllBalances([MOCK_ASSET, MOCK_ADDRESS]))
+      .rejects.toThrow(/Invalid contract address for "assets\[1\]"/);
   });
 });
