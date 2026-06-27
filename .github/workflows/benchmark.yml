@@ -1,0 +1,180 @@
+name: Gas Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  pull-requests: write
+
+jobs:
+  benchmark:
+    name: Contract Gas Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run benchmark tests
+        run: |
+          cargo test -p onboarding-bridge --features testutils \
+            --test gas_benchmark -- --nocapture 2>&1 | tee benchmark_output.txt
+
+      - name: Extract benchmark JSON
+        run: |
+          # Extract the JSON block from test output
+          python3 -c "
+          import re, sys
+          with open('benchmark_output.txt') as f:
+              content = f.read()
+          match = re.search(r'\{[\s\S]*benchmark_results[\s\S]*\}', content)
+          if match:
+              print(match.group())
+          else:
+              print('{\"benchmark_results\": []}')
+          " > benchmark_results.json
+          cat benchmark_results.json
+
+      - name: Download previous benchmark results
+        uses: actions/cache@v4
+        with:
+          path: previous_benchmark.json
+          key: benchmark-results-${{ github.ref_name }}
+          restore-keys: |
+            benchmark-results-main
+            benchmark-results-
+
+      - name: Compare with previous benchmarks
+        run: |
+          if [ -f previous_benchmark.json ]; then
+            bash scripts/compare_benchmarks.sh previous_benchmark.json benchmark_results.json 5
+          else
+            echo "No previous benchmark found — establishing baseline."
+          fi
+        continue-on-error: ${{ github.event_name == 'push' }}
+
+      - name: Alert on regression (PR only)
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = '## Gas Benchmark Regression Detected\n\n';
+            body += 'One or more contract functions exceeded the **5% gas increase threshold**.\n';
+            body += 'Please review the benchmark comparison output in the Actions log.\n\n';
+
+            try {
+              const output = fs.readFileSync('benchmark_results.json', 'utf8');
+              const results = JSON.parse(output);
+              body += '### Current Results\n\n';
+              body += '| Function | Variant | CPU Instructions | Memory Bytes |\n';
+              body += '|----------|---------|----------------:|-------------:|\n';
+              for (const r of results.benchmark_results || []) {
+                body += `| ${r.function} | ${r.variant} | ${r.cpu_insns.toLocaleString()} | ${r.mem_bytes.toLocaleString()} |\n`;
+              }
+            } catch (e) {
+              body += '_Could not parse benchmark results._\n';
+            }
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Save benchmark results as baseline
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: cp benchmark_results.json previous_benchmark.json
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark_results.json
+          retention-days: 90
+
+      - name: Generate benchmark dashboard
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          mkdir -p benchmark-dashboard
+
+          python3 -c "
+          import json, datetime
+
+          with open('benchmark_results.json') as f:
+              data = json.load(f)
+
+          results = data.get('benchmark_results', [])
+          now = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+
+          html = '''<!DOCTYPE html>
+          <html>
+          <head>
+            <title>C-Address Onboarding Bridge - Gas Benchmarks</title>
+            <style>
+              body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 2rem; background: #0d1117; color: #c9d1d9; }
+              h1 { color: #58a6ff; }
+              table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+              th, td { border: 1px solid #30363d; padding: 8px 12px; text-align: left; }
+              th { background: #161b22; color: #58a6ff; }
+              tr:nth-child(even) { background: #161b22; }
+              .timestamp { color: #8b949e; font-size: 0.9rem; }
+              .metric { font-family: monospace; text-align: right; }
+            </style>
+          </head>
+          <body>
+            <h1>Gas Benchmark Dashboard</h1>
+            <p class=\"timestamp\">Last updated: ''' + now + '''</p>
+            <table>
+              <thead>
+                <tr>
+                  <th>Function</th>
+                  <th>Variant</th>
+                  <th class=\"metric\">CPU Instructions</th>
+                  <th class=\"metric\">Memory (bytes)</th>
+                </tr>
+              </thead>
+              <tbody>'''
+
+          for r in results:
+              html += f'''
+                <tr>
+                  <td>{r[\"function\"]}</td>
+                  <td>{r[\"variant\"]}</td>
+                  <td class=\"metric\">{r[\"cpu_insns\"]:,}</td>
+                  <td class=\"metric\">{r[\"mem_bytes\"]:,}</td>
+                </tr>'''
+
+          html += '''
+              </tbody>
+            </table>
+          </body>
+          </html>'''
+
+          with open('benchmark-dashboard/index.html', 'w') as f:
+              f.write(html)
+          "
+
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./benchmark-dashboard
+          destination_dir: benchmarks
