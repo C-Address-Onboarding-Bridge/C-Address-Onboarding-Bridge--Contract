@@ -4,6 +4,18 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec,
 };
 
+#[cfg(target_family = "wasm")]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    core::arch::wasm32::unreachable()
+}
+
+#[cfg(target_family = "wasm")]
+#[alloc_error_handler]
+fn alloc_error(_: core::alloc::Layout) -> ! {
+    core::arch::wasm32::unreachable()
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BridgeError {
@@ -40,23 +52,36 @@ pub enum DataKey {
     SourceDailyLimit(Address, Address),
     AssetFeeCap(Address),
     Nonce(Address),
+    MaxInstanceTtl,
+    MaxPersistentTtl,
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
 const FEE_DENOMINATOR: i128 = 10_000;
+const DEFAULT_PAGE_LIMIT: u32 = 50;
+const MAX_PAGE_LIMIT: u32 = 200;
 
+const DEFAULT_INSTANCE_TTL: u32 = 518_400;
+const DEFAULT_PERSISTENT_TTL: u32 = 518_400;
+const MAX_ALLOWED_TTL: u32 = 3_110_400;
+const CRITICAL_ENTRY_TTL_THRESHOLD: u32 = 129_600;
+
+#[inline(never)]
 fn save_admin(env: &Env, admin: &Address) {
     env.storage().instance().set(&DataKey::Admin, admin);
 }
 
+#[inline(never)]
 fn read_admin(env: &Env) -> Address {
     env.storage().instance().get(&DataKey::Admin).unwrap()
 }
 
+#[inline(never)]
 fn save_fee_collector(env: &Env, addr: &Address) {
     env.storage().instance().set(&DataKey::FeeCollector, addr);
 }
 
+#[inline(never)]
 fn read_fee_collector(env: &Env) -> Address {
     env.storage()
         .instance()
@@ -64,6 +89,7 @@ fn read_fee_collector(env: &Env) -> Address {
         .unwrap()
 }
 
+#[inline(never)]
 fn save_fee_bps(env: &Env, fee_bps: &u32) {
     env.storage().instance().set(&DataKey::FeeBps, fee_bps);
 }
@@ -80,10 +106,12 @@ fn mark_initialized(env: &Env) {
     env.storage().instance().set(&DataKey::Initialized, &true);
 }
 
+#[inline(never)]
 fn save_minimum_amount(env: &Env, amount: &i128) {
     let _ = (env, amount); // Unused - planned for future  
 }
 
+#[inline(never)]
 fn read_minimum_amount(env: &Env) -> i128 {
     let _ = env; // Unused - planned for future
     0
@@ -145,6 +173,7 @@ fn check_access(env: &Env, target: &Address) -> Result<(), BridgeError> {
     Ok(())
 }
 
+#[inline(never)]
 fn read_whitelist(env: &Env) -> Map<Address, bool> {
     env.storage()
         .instance()
@@ -152,6 +181,7 @@ fn read_whitelist(env: &Env) -> Map<Address, bool> {
         .unwrap_or_else(|| Map::new(env))
 }
 
+#[inline(never)]
 fn save_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
     env.storage()
         .instance()
@@ -395,6 +425,42 @@ fn get_effective_fee_bps(env: &Env, asset: &Address, global_fee_bps: u32) -> u32
     global_fee_bps.min(cap)
 }
 
+#[inline(never)]
+fn read_max_instance_ttl(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxInstanceTtl)
+        .unwrap_or(DEFAULT_INSTANCE_TTL)
+}
+
+#[inline(never)]
+fn read_max_persistent_ttl(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxPersistentTtl)
+        .unwrap_or(DEFAULT_PERSISTENT_TTL)
+}
+
+#[inline(never)]
+fn auto_extend_instance_ttl(env: &Env) {
+    let max_ttl = read_max_instance_ttl(env);
+    let threshold = max_ttl / 4;
+    env.storage()
+        .instance()
+        .extend_ttl(threshold, max_ttl);
+}
+
+#[inline(never)]
+fn auto_extend_persistent_entry(env: &Env, key: &DataKey) {
+    let max_ttl = read_max_persistent_ttl(env);
+    let threshold = max_ttl / 4;
+    if env.storage().persistent().has(key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, threshold, max_ttl);
+    }
+}
+
 #[contract]
 pub struct OnboardingBridge;
 
@@ -464,6 +530,12 @@ impl OnboardingBridge {
         increment_accrued_fees(&env, &asset, fee);
         increment_total_bridged(&env, &asset, net_amount);
         increment_total_fees_collected(&env, &asset, fee);
+
+        auto_extend_instance_ttl(&env);
+        auto_extend_persistent_entry(&env, &DataKey::AccruedFees(asset.clone()));
+        auto_extend_persistent_entry(&env, &DataKey::TotalBridged(asset.clone()));
+        auto_extend_persistent_entry(&env, &DataKey::TotalFeesCollected(asset.clone()));
+
         env.events()
             .publish(("CAddressFunded", source, target), (amount, fee, asset));
         Ok(())
@@ -911,6 +983,106 @@ impl OnboardingBridge {
         Ok(read_whitelist(&env).keys())
     }
 
+    pub fn query_whitelisted_assets_paginated(
+        env: Env,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> Result<(Vec<Address>, Option<u32>), BridgeError> {
+        check_initialized(&env)?;
+        let effective_limit = if limit == 0 {
+            DEFAULT_PAGE_LIMIT
+        } else if limit > MAX_PAGE_LIMIT {
+            MAX_PAGE_LIMIT
+        } else {
+            limit
+        };
+        let all_keys = read_whitelist(&env).keys();
+        let total = all_keys.len();
+        let start = cursor.unwrap_or(0);
+        if start >= total {
+            return Ok((Vec::new(&env), None));
+        }
+        let end = if start + effective_limit > total {
+            total
+        } else {
+            start + effective_limit
+        };
+        let mut results = Vec::new(&env);
+        for i in start..end {
+            results.push_back(all_keys.get(i).unwrap());
+        }
+        let next_cursor = if end < total { Some(end) } else { None };
+        Ok((results, next_cursor))
+    }
+
+    pub fn query_accrued_fees_paginated(
+        env: Env,
+        assets: Vec<Address>,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> Result<(Vec<(Address, i128)>, Option<u32>), BridgeError> {
+        check_initialized(&env)?;
+        let effective_limit = if limit == 0 {
+            DEFAULT_PAGE_LIMIT
+        } else if limit > MAX_PAGE_LIMIT {
+            MAX_PAGE_LIMIT
+        } else {
+            limit
+        };
+        let total = assets.len();
+        let start = cursor.unwrap_or(0);
+        if start >= total {
+            return Ok((Vec::new(&env), None));
+        }
+        let end = if start + effective_limit > total {
+            total
+        } else {
+            start + effective_limit
+        };
+        let mut results: Vec<(Address, i128)> = Vec::new(&env);
+        for i in start..end {
+            let asset = assets.get(i).unwrap();
+            let fees = read_accrued_fees(&env, &asset);
+            results.push_back((asset, fees));
+        }
+        let next_cursor = if end < total { Some(end) } else { None };
+        Ok((results, next_cursor))
+    }
+
+    pub fn query_fee_tiers_paginated(
+        env: Env,
+        assets: Vec<Address>,
+        cursor: Option<u32>,
+        limit: u32,
+    ) -> Result<(Vec<(Address, u32)>, Option<u32>), BridgeError> {
+        check_initialized(&env)?;
+        let effective_limit = if limit == 0 {
+            DEFAULT_PAGE_LIMIT
+        } else if limit > MAX_PAGE_LIMIT {
+            MAX_PAGE_LIMIT
+        } else {
+            limit
+        };
+        let total = assets.len();
+        let start = cursor.unwrap_or(0);
+        if start >= total {
+            return Ok((Vec::new(&env), None));
+        }
+        let end = if start + effective_limit > total {
+            total
+        } else {
+            start + effective_limit
+        };
+        let mut results: Vec<(Address, u32)> = Vec::new(&env);
+        for i in start..end {
+            let asset = assets.get(i).unwrap();
+            let cap = read_asset_fee_cap(&env, &asset);
+            results.push_back((asset, cap));
+        }
+        let next_cursor = if end < total { Some(end) } else { None };
+        Ok((results, next_cursor))
+    }
+
     // --- Cross-chain Onboarding ---
 
     /// Fund a C-address from a cross-chain event.
@@ -1141,6 +1313,95 @@ impl OnboardingBridge {
 
     pub fn query_timelocked(env: Env, id: u64) -> Result<TimelockEntry, BridgeError> {
         read_timelock_entry(&env, id).ok_or(BridgeError::TimelockNotFound)
+    }
+
+    // --- TTL Management ---
+
+    pub fn extend_instance_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let max_ttl = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        let threshold = max_ttl / 4;
+        env.storage().instance().extend_ttl(threshold, max_ttl);
+        env.events()
+            .publish(("InstanceTtlExtended",), (admin, max_ttl));
+        Ok(())
+    }
+
+    pub fn extend_persistent_ttl(
+        env: Env,
+        key_asset: Address,
+        ttl: u32,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let max_ttl = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        let threshold = max_ttl / 4;
+        let keys = [
+            DataKey::AccruedFees(key_asset.clone()),
+            DataKey::TotalBridged(key_asset.clone()),
+            DataKey::TotalFeesCollected(key_asset.clone()),
+        ];
+        for key in keys.iter() {
+            if env.storage().persistent().has(key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(key, threshold, max_ttl);
+            }
+        }
+        env.events()
+            .publish(("PersistentTtlExtended",), (admin, key_asset, max_ttl));
+        Ok(())
+    }
+
+    pub fn set_max_instance_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let capped = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxInstanceTtl, &capped);
+        Ok(())
+    }
+
+    pub fn set_max_persistent_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let capped = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxPersistentTtl, &capped);
+        Ok(())
+    }
+
+    pub fn query_ttl_config(env: Env) -> Result<(u32, u32, u32, u32), BridgeError> {
+        check_initialized(&env)?;
+        Ok((
+            read_max_instance_ttl(&env),
+            read_max_persistent_ttl(&env),
+            MAX_ALLOWED_TTL,
+            CRITICAL_ENTRY_TTL_THRESHOLD,
+        ))
     }
 }
 

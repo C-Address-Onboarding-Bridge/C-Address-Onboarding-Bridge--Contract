@@ -13,3 +13,26 @@ debug = 0
 strip = "symbols"
 lto = true
 codegen-units = 1
+panic = "abort"
+
+[profile.release.package.onboarding-bridge]
+opt-level = "z"
+codegen-units = 1
+
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = 0
+
+[profile.release-debug]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+debug = 0
