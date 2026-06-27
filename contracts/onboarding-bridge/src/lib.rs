@@ -1,7 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Map,
+    Vec,
 };
 
 #[contracterror]
@@ -21,6 +22,15 @@ pub enum BridgeError {
 
     DuplicateNonce = 12,
     TransactionExpired = 13,
+    ReplayedNonce = 14,
+    NotRelayer = 15,
+    BelowThreshold = 16,
+    ThresholdExceedsRelayers = 17,
+    InvalidReleaseTime = 18,
+    TimelockNotFound = 19,
+    TimelockNotMatured = 20,
+    Unauthorized = 21,
+    BatchTooLarge = 22,
 }
 
 #[contracttype]
@@ -40,10 +50,37 @@ pub enum DataKey {
     SourceDailyLimit(Address, Address),
     AssetFeeCap(Address),
     Nonce(Address),
+    RelayerCount,
+    Relayer(BytesN<32>),
+    RelayerThreshold,
+    CrossChainNonce(BytesN<32>),
+    DailyUsage(Address, Address, u64),
+    TimelockId,
+    Timelock(u64),
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
 const FEE_DENOMINATOR: i128 = 10_000;
+const MAX_BATCH_SIZE: u32 = 100;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelayerSig {
+    pub pubkey: BytesN<32>,
+    pub signature: BytesN<64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockEntry {
+    pub source: Address,
+    pub target: Address,
+    pub asset: Address,
+    pub amount: i128,
+    pub release_time: u64,
+    pub cliff_time: u64,
+    pub claimed: bool,
+}
 
 fn save_admin(env: &Env, admin: &Address) {
     env.storage().instance().set(&DataKey::Admin, admin);
