@@ -1933,3 +1933,248 @@ mod crosschain_tests {
         );
     }
 }
+
+/********** Referral system tests **********/
+
+#[test]
+fn test_set_and_query_referral_rate() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+
+    // Default referral rate is 0
+    assert_eq!(bridge.query_referral_rate(), 0u32);
+
+    // Admin sets referral rate to 2000 (20% of fee)
+    bridge.set_referral_rate(&2000u32, &None);
+    assert_eq!(bridge.query_referral_rate(), 2000u32);
+}
+
+#[test]
+fn test_set_referral_rate_too_high() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+
+    assert_eq!(
+        bridge.try_set_referral_rate(&1001u32, &None),
+        Err(Ok(BridgeError::FeeTooHigh))
+    );
+}
+
+#[test]
+fn test_fund_with_referral_splits_fee() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    // fee_bps = 100 (1%), referral_rate = 2000 (20% of fee)
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_referral_rate(&2000u32, &None);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    let target = Address::generate(&env);
+    let referrer = Address::generate(&env);
+
+    bridge.fund_c_address_with_referral(
+        &user,
+        &target,
+        &token_id,
+        &1000i128,
+        &Some(referrer.clone()),
+    );
+
+    // gross = 1000, fee = 10 (1%), referral_fee = 2 (20% of 10), protocol_fee = 8
+    assert_eq!(check_balance(&env, &token_id, &user), 0i128);
+    assert_eq!(check_balance(&env, &token_id, &target), 990i128);
+    assert_eq!(check_balance(&env, &token_id, &referrer), 2i128);
+    // contract holds protocol fee (8)
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 8i128);
+}
+
+#[test]
+fn test_fund_with_no_referrer_accrues_full_fee() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_referral_rate(&2000u32, &None);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    let target = Address::generate(&env);
+
+    bridge.fund_c_address_with_referral(&user, &target, &token_id, &1000i128, &None);
+
+    // No referrer — full fee (10) stays in contract
+    assert_eq!(check_balance(&env, &token_id, &target), 990i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 10i128);
+}
+
+#[test]
+fn test_fund_with_referral_zero_referral_rate() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    // referral_rate defaults to 0
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    let target = Address::generate(&env);
+    let referrer = Address::generate(&env);
+
+    bridge.fund_c_address_with_referral(
+        &user,
+        &target,
+        &token_id,
+        &1000i128,
+        &Some(referrer.clone()),
+    );
+
+    // referral_rate = 0, so referrer gets nothing, full fee in contract
+    assert_eq!(check_balance(&env, &token_id, &referrer), 0i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 10i128);
+}
+
+/********** Zero-amount behavior tests **********/
+
+// fund_c_address with amount=0 — the contract guards `amount <= 0` before
+// require_auth, so it must return InvalidAmount immediately.
+#[test]
+fn test_fund_c_address_zero_amount_fails() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    let target = Address::generate(&env);
+    assert_eq!(
+        bridge.try_fund_c_address(&user, &target, &token_id, &0i128, &None, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+}
+
+// No CAddressFunded event must be emitted when the call is rejected due to zero amount.
+#[test]
+fn test_fund_c_address_zero_amount_no_event() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    // Snapshot event count after setup (Initialized + add_asset events already emitted).
+    let events_before = env.events().all().len();
+
+    let target = Address::generate(&env);
+    let _ = bridge.try_fund_c_address(&user, &target, &token_id, &0i128, &None, &None);
+
+    // No new events should have been emitted by the rejected call.
+    assert_eq!(env.events().all().len(), events_before);
+}
+
+// batch_fund_c_address where every amount is zero — fails at validation loop.
+#[test]
+fn test_batch_fund_all_zeros_fails() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    let targets = Vec::from_array(&env, [Address::generate(&env), Address::generate(&env)]);
+    let amounts = Vec::from_array(&env, [0i128, 0i128]);
+
+    assert_eq!(
+        bridge.try_batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+}
+
+// batch_fund_c_address with mixed zero and non-zero amounts — the validation
+// loop rejects on the first zero found, before any token transfer occurs.
+#[test]
+fn test_batch_fund_mixed_zero_nonzero_fails() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let user_balance_before = check_balance(&env, &token_id, &user);
+
+    let targets = Vec::from_array(&env, [Address::generate(&env), Address::generate(&env)]);
+    let amounts = Vec::from_array(&env, [500i128, 0i128]); // second entry is zero
+
+    assert_eq!(
+        bridge.try_batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+
+    // No tokens must have left the user's account — validation fails before transfer.
+    assert_eq!(check_balance(&env, &token_id, &user), user_balance_before);
+}
+
+// query_calculate_fee with zero gross amount — should return (fee=0, net=0).
+#[test]
+fn test_calculate_fee_zero_amount() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+
+    let (fee, net) = bridge.query_calculate_fee(&0i128);
+    assert_eq!(fee, 0i128);
+    assert_eq!(net, 0i128);
+}
+
+// Confirm zero amount is rejected even with a max fee rate configured.
+#[test]
+fn test_fund_c_address_zero_amount_max_fee_fails() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &1000u32, &None); // max fee
+    bridge.add_asset(&token_id, &None);
+
+    let target = Address::generate(&env);
+    assert_eq!(
+        bridge.try_fund_c_address(&user, &target, &token_id, &0i128, &None, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+}
