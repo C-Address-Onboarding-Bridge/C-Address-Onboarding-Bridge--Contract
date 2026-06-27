@@ -8,6 +8,8 @@ import {
   TransactionResult,
   CrossChainFundOptions,
   RelayerManagementOptions,
+  CreateCOptions,
+  CreateCAddressResult,
 } from './types';
 import { assertAccountAddress, assertContractAddress } from './validate';
 import {
@@ -650,6 +652,99 @@ export class OnboardingBridgeSDK {
     }
     const scVal = (result as any).results?.[0]?.retval;
     return scVal ? Number(scValToNative(scVal)) : 0;
+  }
+
+  /**
+   * Create a new C-address (smart contract account) using Soroban's create_contract.
+   * Optionally funds the C-address immediately after creation.
+   */
+  async createCAddress(
+    options: CreateCOptions,
+  ): Promise<CreateCAddressResult> {
+    const deployerKeypair = options.deployerKeypair;
+    const deployerAccount = await this.provider.getAccount(
+      deployerKeypair.publicKey(),
+    );
+
+    const saltBytes = options.salt
+      ? Buffer.from(options.salt, 'hex')
+      : Buffer.from(
+          Array.from({ length: 32 }, () =>
+            Math.floor(Math.random() * 256),
+          ),
+        );
+    const saltScVal = xdr.ScVal.scvBytes(saltBytes);
+
+    const deployerAddress = new Address(deployerKeypair.publicKey());
+
+    const txBuilder = new TransactionBuilder(deployerAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: this.networkPassphrase,
+    });
+
+    txBuilder.addOperation(
+      this.contract.call(
+        'create_contract',
+        deployerAddress.toScVal(),
+        saltScVal,
+      ),
+    );
+
+    const deployTx = txBuilder.setTimeout(30).build();
+    const preparedDeployTx = await this.provider.prepareTransaction(deployTx);
+    preparedDeployTx.sign(deployerKeypair);
+
+    const deployResponse = await this.provider.sendTransaction(preparedDeployTx);
+    if (deployResponse.status === 'ERROR') {
+      throw new Error(`Failed to create C-address: ${deployResponse.status}`);
+    }
+
+    let txResult = await this.provider.getTransaction(deployResponse.hash);
+    while (txResult.status === 'NOT_FOUND') {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      txResult = await this.provider.getTransaction(deployResponse.hash);
+    }
+
+    if (txResult.status !== 'SUCCESS') {
+      throw new Error(`C-address creation failed: ${txResult.status}`);
+    }
+
+    const returnVal = (txResult as any).returnValue;
+    const cAddress: string = returnVal
+      ? scValToNative(returnVal).toString()
+      : '';
+
+    if (options.initialFunds && cAddress) {
+      const fundAccount = await this.provider.getAccount(
+        deployerKeypair.publicKey(),
+      );
+      const fundTx = new TransactionBuilder(fundAccount, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call(
+            'fund_c_address',
+            ...this.toScVals([
+              deployerKeypair.publicKey(),
+              cAddress,
+              options.initialFunds.asset,
+              options.initialFunds.amount,
+            ]),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      const preparedFundTx = await this.provider.prepareTransaction(fundTx);
+      preparedFundTx.sign(deployerKeypair);
+      await this.provider.sendTransaction(preparedFundTx);
+    }
+
+    return {
+      cAddress,
+      txHash: deployResponse.hash,
+    };
   }
 
   /** Query whether a given Ed25519 pubkey (hex) is a registered relayer. */

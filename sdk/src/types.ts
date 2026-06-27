@@ -101,3 +101,26 @@ export interface RelayerManagementOptions {
   /** 32-byte Ed25519 public key as hex string */
   pubkey: string;
 }
+
+/** Options for creating a new C-address (smart contract account) */
+export interface CreateCOptions {
+  /** Keypair used to deploy the C-address contract */
+  deployerKeypair: any;
+  /** Optional salt for deterministic address derivation */
+  salt?: string;
+  /** Optional initial funds to transfer to the new C-address after creation */
+  initialFunds?: {
+    /** Asset contract address */
+    asset: string;
+    /** Amount in smallest unit */
+    amount: string;
+  };
+}
+
+/** Result of creating a C-address */
+export interface CreateCAddressResult {
+  /** The newly created C-address */
+  cAddress: string;
+  /** Transaction hash of the creation */
+  txHash: string;
+}
