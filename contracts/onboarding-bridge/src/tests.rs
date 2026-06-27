@@ -1933,3 +1933,121 @@ mod crosschain_tests {
         );
     }
 }
+
+/********** Referral system tests **********/
+
+#[test]
+fn test_set_and_query_referral_rate() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+
+    // Default referral rate is 0
+    assert_eq!(bridge.query_referral_rate(), 0u32);
+
+    // Admin sets referral rate to 2000 (20% of fee)
+    bridge.set_referral_rate(&2000u32, &None);
+    assert_eq!(bridge.query_referral_rate(), 2000u32);
+}
+
+#[test]
+fn test_set_referral_rate_too_high() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+
+    assert_eq!(
+        bridge.try_set_referral_rate(&1001u32, &None),
+        Err(Ok(BridgeError::FeeTooHigh))
+    );
+}
+
+#[test]
+fn test_fund_with_referral_splits_fee() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    // fee_bps = 100 (1%), referral_rate = 2000 (20% of fee)
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_referral_rate(&2000u32, &None);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    let target = Address::generate(&env);
+    let referrer = Address::generate(&env);
+
+    bridge.fund_c_address_with_referral(
+        &user,
+        &target,
+        &token_id,
+        &1000i128,
+        &Some(referrer.clone()),
+    );
+
+    // gross = 1000, fee = 10 (1%), referral_fee = 2 (20% of 10), protocol_fee = 8
+    assert_eq!(check_balance(&env, &token_id, &user), 0i128);
+    assert_eq!(check_balance(&env, &token_id, &target), 990i128);
+    assert_eq!(check_balance(&env, &token_id, &referrer), 2i128);
+    // contract holds protocol fee (8)
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 8i128);
+}
+
+#[test]
+fn test_fund_with_no_referrer_accrues_full_fee() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_referral_rate(&2000u32, &None);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    let target = Address::generate(&env);
+
+    bridge.fund_c_address_with_referral(&user, &target, &token_id, &1000i128, &None);
+
+    // No referrer — full fee (10) stays in contract
+    assert_eq!(check_balance(&env, &token_id, &target), 990i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 10i128);
+}
+
+#[test]
+fn test_fund_with_referral_zero_referral_rate() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    // referral_rate defaults to 0
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    let target = Address::generate(&env);
+    let referrer = Address::generate(&env);
+
+    bridge.fund_c_address_with_referral(
+        &user,
+        &target,
+        &token_id,
+        &1000i128,
+        &Some(referrer.clone()),
+    );
+
+    // referral_rate = 0, so referrer gets nothing, full fee in contract
+    assert_eq!(check_balance(&env, &token_id, &referrer), 0i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 10i128);
+}
