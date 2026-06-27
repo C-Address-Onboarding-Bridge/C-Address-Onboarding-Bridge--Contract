@@ -1,7 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Map,
+    Vec,
 };
 
 #[contracterror]
@@ -21,6 +22,9 @@ pub enum BridgeError {
 
     DuplicateNonce = 12,
     TransactionExpired = 13,
+    EmergencyWithdrawDisabled = 14,
+    ProofRequiredForLargeAmount = 15,
+    InsufficientUserDeposit = 16,
 }
 
 #[contracttype]
@@ -40,10 +44,46 @@ pub enum DataKey {
     SourceDailyLimit(Address, Address),
     AssetFeeCap(Address),
     Nonce(Address),
+    EmergencyMode,
+    UserDeposit(Address, Address),
+    EmergencyProofThreshold,
+    BridgeConfig,
 }
 
 const MAX_FEE_BPS: u32 = 1_000;
 const FEE_DENOMINATOR: i128 = 10_000;
+const INSTANCE_TTL_EXTEND: u32 = 518_400; // ~30 days in ledgers
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct BridgeConfigData {
+    pub admin: Address,
+    pub fee_collector: Address,
+    pub fee_bps: u32,
+}
+
+fn save_bridge_config(env: &Env, config: &BridgeConfigData) {
+    env.storage()
+        .instance()
+        .set(&DataKey::BridgeConfig, config);
+}
+
+fn read_bridge_config(env: &Env) -> BridgeConfigData {
+    env.storage()
+        .instance()
+        .get(&DataKey::BridgeConfig)
+        .unwrap_or_else(|| BridgeConfigData {
+            admin: read_admin(env),
+            fee_collector: read_fee_collector(env),
+            fee_bps: read_fee_bps(env),
+        })
+}
+
+fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_EXTEND, INSTANCE_TTL_EXTEND);
+}
 
 fn save_admin(env: &Env, admin: &Address) {
     env.storage().instance().set(&DataKey::Admin, admin);
@@ -110,8 +150,19 @@ fn check_not_paused(env: &Env) -> Result<(), BridgeError> {
     Ok(())
 }
 
+#[inline(always)]
 fn calculate_fee(amount: i128, fee_bps: u32) -> i128 {
-    (amount * fee_bps as i128) / FEE_DENOMINATOR
+    if fee_bps == 0 {
+        return 0;
+    }
+    let bps = fee_bps as i128;
+    // Use checked arithmetic to guard against overflow on very large amounts.
+    // If checked_mul overflows i128 (amount > ~1.7e38 / 1000), fall back to
+    // dividing first at the cost of minor precision loss.
+    match amount.checked_mul(bps) {
+        Some(product) => product / FEE_DENOMINATOR,
+        None => (amount / FEE_DENOMINATOR) * bps,
+    }
 }
 
 fn is_blocked(env: &Env, addr: &Address) -> bool {
@@ -248,7 +299,11 @@ fn read_asset_fee_cap(env: &Env, asset: &Address) -> u32 {
         .unwrap_or(MAX_FEE_BPS)
 }
 
-fn get_effective_fee_bps(env: &Env, asset: &Address, global_fee_bps: u32) -> u32 {
+#[inline(always)]
+fn get_effective_fee_bps_legacy(env: &Env, asset: &Address, global_fee_bps: u32) -> u32 {
+    if global_fee_bps == 0 {
+        return 0;
+    }
     let cap = read_asset_fee_cap(env, asset);
     if global_fee_bps < cap { global_fee_bps } else { cap }
 }
@@ -273,6 +328,43 @@ fn consume_nonce(env: &Env, caller: &Address, nonce: Option<u64>) -> Result<(), 
             .set(&DataKey::Nonce(caller.clone()), &(stored + 1));
     }
     Ok(())
+}
+
+// --- Emergency mode helpers ---
+
+fn read_emergency_mode(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::EmergencyMode)
+        .unwrap_or(false)
+}
+
+fn read_user_deposit(env: &Env, user: &Address, asset: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::UserDeposit(user.clone(), asset.clone()))
+        .unwrap_or(0)
+}
+
+fn increment_user_deposit(env: &Env, user: &Address, asset: &Address, amount: i128) {
+    let current = read_user_deposit(env, user, asset);
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserDeposit(user.clone(), asset.clone()), &(current + amount));
+}
+
+fn decrement_user_deposit(env: &Env, user: &Address, asset: &Address, amount: i128) {
+    let current = read_user_deposit(env, user, asset);
+    env.storage()
+        .persistent()
+        .set(&DataKey::UserDeposit(user.clone(), asset.clone()), &(current - amount));
+}
+
+fn read_emergency_proof_threshold(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::EmergencyProofThreshold)
+        .unwrap_or(1_000_000_0000000i128) // default 1M stroops
 }
 
 // --- Cross-chain relayer registry ---
@@ -389,8 +481,11 @@ fn read_asset_fee_cap(env: &Env, asset: &Address) -> u32 {
         .unwrap_or(MAX_FEE_BPS)
 }
 
-/// Returns the effective fee bps for an asset, capped by its per-asset fee cap.
+#[inline(always)]
 fn get_effective_fee_bps(env: &Env, asset: &Address, global_fee_bps: u32) -> u32 {
+    if global_fee_bps == 0 {
+        return 0;
+    }
     let cap = read_asset_fee_cap(env, asset);
     global_fee_bps.min(cap)
 }
@@ -418,7 +513,13 @@ impl OnboardingBridge {
         save_admin(&env, &admin);
         save_fee_collector(&env, &fee_collector);
         save_fee_bps(&env, &fee_bps);
+        save_bridge_config(&env, &BridgeConfigData {
+            admin: admin.clone(),
+            fee_collector: fee_collector.clone(),
+            fee_bps,
+        });
         mark_initialized(&env);
+        extend_instance_ttl(&env);
         env.events()
             .publish(("Initialized", admin.clone(), fee_collector.clone()), (fee_bps,));
         Ok(())
@@ -450,20 +551,23 @@ impl OnboardingBridge {
         consume_nonce(&env, &source, nonce)?;
 
         let token_client = token::Client::new(&env, &asset);
-        token_client.transfer(&source, &env.current_contract_address(), &amount);
+        let contract_addr = env.current_contract_address();
+        token_client.transfer(&source, &contract_addr, &amount);
 
-        let global_fee_bps = read_fee_bps(&env);
-        let effective_fee_bps = get_effective_fee_bps(&env, &asset, global_fee_bps);
+        let config = read_bridge_config(&env);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, config.fee_bps);
         let fee = calculate_fee(amount, effective_fee_bps);
         let net_amount = amount - fee;
 
         if net_amount > 0 {
-            token_client.transfer(&env.current_contract_address(), &target, &net_amount);
+            token_client.transfer(&contract_addr, &target, &net_amount);
         }
 
+        increment_user_deposit(&env, &source, &asset, amount);
         increment_accrued_fees(&env, &asset, fee);
         increment_total_bridged(&env, &asset, net_amount);
         increment_total_fees_collected(&env, &asset, fee);
+        extend_instance_ttl(&env);
         env.events()
             .publish(("CAddressFunded", source, target), (amount, fee, asset));
         Ok(())
@@ -505,10 +609,11 @@ impl OnboardingBridge {
         }
 
         let token_client = token::Client::new(&env, &asset);
-        token_client.transfer(&source, &env.current_contract_address(), &total);
-
-        let fee_bps = read_fee_bps(&env);
         let contract_addr = env.current_contract_address();
+        token_client.transfer(&source, &contract_addr, &total);
+
+        let config = read_bridge_config(&env);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, config.fee_bps);
         let mut num_success = 0u32;
         let mut num_failures = 0u32;
         let mut refund_amount = 0i128;
@@ -516,8 +621,7 @@ impl OnboardingBridge {
         for i in 0..targets.len() {
             let target = targets.get(i).unwrap();
             let amount = amounts.get(i).unwrap();
-            
-            let effective_fee_bps = get_effective_fee_bps(&env, &asset, fee_bps);
+
             let fee = calculate_fee(amount, effective_fee_bps);
             let net_amount = amount - fee;
 
@@ -561,13 +665,15 @@ impl OnboardingBridge {
         if new_fee_bps > MAX_FEE_BPS {
             return Err(BridgeError::FeeTooHigh);
         }
-        let admin = read_admin(&env);
-        admin.require_auth();
-        consume_nonce(&env, &admin, nonce)?;
-        let old_fee_bps = read_fee_bps(&env);
+        let mut config = read_bridge_config(&env);
+        config.admin.require_auth();
+        consume_nonce(&env, &config.admin, nonce)?;
+        let old_fee_bps = config.fee_bps;
+        config.fee_bps = new_fee_bps;
         save_fee_bps(&env, &new_fee_bps);
+        save_bridge_config(&env, &config);
         env.events()
-            .publish(("FeeBpsChanged", old_fee_bps, new_fee_bps), (admin,));
+            .publish(("FeeBpsChanged", old_fee_bps, new_fee_bps), (config.admin,));
         Ok(())
     }
 
@@ -623,25 +729,30 @@ impl OnboardingBridge {
     pub fn set_fee_collector(env: Env, new_fee_collector: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         check_not_paused(&env)?;
-        let admin = read_admin(&env);
-        admin.require_auth();
-        consume_nonce(&env, &admin, nonce)?;
-        let old_collector = read_fee_collector(&env);
+        let mut config = read_bridge_config(&env);
+        config.admin.require_auth();
+        consume_nonce(&env, &config.admin, nonce)?;
+        let old_collector = config.fee_collector.clone();
+        config.fee_collector = new_fee_collector.clone();
         save_fee_collector(&env, &new_fee_collector);
+        save_bridge_config(&env, &config);
         env.events()
-            .publish(("FeeCollectorChanged", old_collector, new_fee_collector), (admin,));
+            .publish(("FeeCollectorChanged", old_collector, new_fee_collector), (config.admin,));
         Ok(())
     }
 
     pub fn set_admin(env: Env, new_admin: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         check_not_paused(&env)?;
-        let admin = read_admin(&env);
-        admin.require_auth();
-        consume_nonce(&env, &admin, nonce)?;
+        let mut config = read_bridge_config(&env);
+        let old_admin = config.admin.clone();
+        config.admin.require_auth();
+        consume_nonce(&env, &config.admin, nonce)?;
+        config.admin = new_admin.clone();
         save_admin(&env, &new_admin);
+        save_bridge_config(&env, &config);
         env.events()
-            .publish(("AdminChanged", admin, new_admin.clone()), ());
+            .publish(("AdminChanged", old_admin, new_admin.clone()), ());
         Ok(())
     }
 
@@ -909,6 +1020,83 @@ impl OnboardingBridge {
     pub fn query_whitelisted_assets(env: Env) -> Result<Vec<Address>, BridgeError> {
         check_initialized(&env)?;
         Ok(read_whitelist(&env).keys())
+    }
+
+    // --- Emergency Withdraw ---
+
+    pub fn set_emergency_mode(env: Env, enabled: bool, nonce: Option<u64>) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyMode, &enabled);
+        env.events()
+            .publish(("EmergencyModeChanged",), (admin, enabled));
+        Ok(())
+    }
+
+    pub fn set_emergency_proof_threshold(
+        env: Env,
+        threshold: i128,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyProofThreshold, &threshold);
+        Ok(())
+    }
+
+    pub fn emergency_withdraw(
+        env: Env,
+        user: Address,
+        asset: Address,
+        amount: i128,
+        proof: Option<Bytes>,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let is_paused = read_paused(&env);
+        let is_emergency = read_emergency_mode(&env);
+        if !is_paused && !is_emergency {
+            return Err(BridgeError::EmergencyWithdrawDisabled);
+        }
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        user.require_auth();
+
+        let threshold = read_emergency_proof_threshold(&env);
+        if amount > threshold && proof.is_none() {
+            return Err(BridgeError::ProofRequiredForLargeAmount);
+        }
+
+        let user_deposit = read_user_deposit(&env, &user, &asset);
+        if user_deposit < amount {
+            return Err(BridgeError::InsufficientUserDeposit);
+        }
+
+        decrement_user_deposit(&env, &user, &asset, amount);
+
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&env.current_contract_address(), &user, &amount);
+
+        env.events()
+            .publish(("EmergencyWithdrawal", user, asset), (amount,));
+        Ok(())
+    }
+
+    pub fn query_user_deposit(env: Env, user: Address, asset: Address) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_user_deposit(&env, &user, &asset))
+    }
+
+    pub fn query_is_emergency_mode(env: Env) -> bool {
+        read_emergency_mode(&env)
     }
 
     // --- Cross-chain Onboarding ---
