@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Use a personal access token or configure permissions to allow pushing back to main
           token: ${{ secrets.GITHUB_TOKEN }}
