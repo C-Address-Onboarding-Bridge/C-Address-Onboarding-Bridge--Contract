@@ -12,6 +12,7 @@ import {
   BridgeConfig,
   FundCOptions,
   BatchFundCOptions,
+  BatchProgressCallback,
   WithdrawFeesOptions,
   UpgradeOptions,
   ReclaimTokensOptions,
@@ -25,6 +26,17 @@ import {
   PaginationOptions,
   CostEstimate,
 } from './types';
+
+/**
+ * Maximum number of `(target, amount)` pairs that can be included in a single
+ * `batch_fund_c_address` contract call.  Matches the `MAX_BATCH_SIZE` constant
+ * enforced on-chain (100).
+ *
+ * When {@link OnboardingBridgeSDK.batchFundCAddresses} is called with more
+ * entries than this limit, it automatically splits the list into chunks of this
+ * size and submits one transaction per chunk.
+ */
+export const BATCH_TX_LIMIT = 100;
 import { assertAccountAddress, assertContractAddress } from './validate';
 import { withRpcRetry } from './retry';
 import {
@@ -274,27 +286,42 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Fund multiple C-addresses from a single source account in one transaction.
+   * Fund multiple C-addresses from a single source account, automatically
+   * splitting large batches across multiple transactions.
    *
-   * The source is charged the sum of all `options.amounts` up front.  For each
-   * target that fails access control (blocked, not allowlisted), the
-   * corresponding amount is refunded to `source` and a `BatchTransferFailed`
-   * event is emitted.  A `BatchCompleted` event is emitted at the end with
-   * aggregate totals.
+   * When the number of `options.targets` exceeds {@link BATCH_TX_LIMIT}, the
+   * list is split into chunks of at most `BATCH_TX_LIMIT` entries and one
+   * on-chain `batch_fund_c_address` transaction is submitted per chunk.  This
+   * means a single call to `batchFundCAddresses` may submit **multiple**
+   * transactions and returns an array of {@link TransactionResult} — one entry
+   * per submitted transaction, in order.
+   *
+   * Within each chunk the contract pulls the sum of that chunk's amounts from
+   * `source` upfront.  For targets that fail access control the corresponding
+   * amount is refunded to `source` and a `BatchTransferFailed` event is emitted.
+   * A `BatchCompleted` event is emitted at the end of each on-chain transaction.
    *
    * `options.targets` and `options.amounts` must be the same length.
    *
    * @param options       - Batch transfer parameters: source, targets, amounts, asset.
-   * @param sourceKeypair - Keypair of the source account used to sign the transaction.
+   * @param sourceKeypair - Keypair of the source account used to sign every transaction.
+   * @param onProgress    - Optional callback invoked after each transaction is
+   *                        submitted.  Receives the cumulative count of recipients
+   *                        processed, the total recipient count, and the tx hash
+   *                        (or `undefined` if submission failed before a hash was
+   *                        returned).
    *
-   * @returns A {@link TransactionResult} with `status: 'pending'` on successful
-   *          submission, or `status: 'failed'` with an error message.
+   * @returns An array of {@link TransactionResult}, one per submitted transaction.
+   *          If the entire batch fits in a single transaction the array has one
+   *          element.  On a per-chunk submission error the corresponding element
+   *          has `status: 'failed'`; processing continues with the remaining chunks.
    *
-   * @throws Never — errors are returned as `status: 'failed'`.
+   * @throws Never — errors are returned as `status: 'failed'` in the results array.
    *
    * @example
    * ```ts
-   * const result = await sdk.batchFundCAddresses(
+   * // Small batch — fits in one tx
+   * const [result] = await sdk.batchFundCAddresses(
    *   {
    *     source:  keypair.publicKey(),
    *     targets: ['CC...1', 'CC...2', 'CC...3'],
@@ -303,52 +330,92 @@ export class OnboardingBridgeSDK {
    *   },
    *   keypair,
    * );
+   *
+   * // Large batch — auto-split with progress reporting
+   * const results = await sdk.batchFundCAddresses(
+   *   { source: keypair.publicKey(), targets: largeTargetList, amounts: largeAmountList, asset: 'CD...' },
+   *   keypair,
+   *   (completed, total, txHash) => {
+   *     console.log(`Processed ${completed}/${total} recipients — tx: ${txHash}`);
+   *   },
+   * );
    * ```
    */
   async batchFundCAddresses(
     options: BatchFundCOptions,
     sourceKeypair: Keypair,
-  ): Promise<TransactionResult> {
+    onProgress?: BatchProgressCallback,
+  ): Promise<TransactionResult[]> {
+    // Validate inputs before splitting so we fail fast on bad input.
     try {
       assertAccountAddress(options.source, 'source');
       options.targets.forEach((t, i) => assertContractAddress(t, `targets[${i}]`));
       assertContractAddress(options.asset, 'asset');
-      const sourceAccount = await this.provider.getAccount(options.source);
-
-      const tx = new TransactionBuilder(sourceAccount, {
-        fee: BASE_FEE,
-        networkPassphrase: this.networkPassphrase,
-      })
-        .addOperation(
-          this.contract.call(
-            'batch_fund_c_address',
-            ...this.toScVals([
-              options.source,
-              options.targets,
-              options.amounts,
-              options.asset,
-            ]),
-          ),
-        )
-        .setTimeout(30)
-        .build();
-
-      const preparedTx = await this.provider.prepareTransaction(tx);
-      preparedTx.sign(sourceKeypair);
-
-      const response = await this.provider.sendTransaction(preparedTx);
-
-      return {
-        hash: response.hash,
-        status: response.status === 'ERROR' ? 'failed' : 'pending',
-      };
     } catch (error: any) {
-      return {
-        hash: '',
-        status: 'failed',
-        error: error.message || 'Unknown error',
-      };
+      return [{ hash: '', status: 'failed', error: error.message || 'Unknown error' }];
     }
+
+    const total = options.targets.length;
+    const results: TransactionResult[] = [];
+    let completed = 0;
+
+    // Split targets/amounts into chunks of at most BATCH_TX_LIMIT.
+    for (let offset = 0; offset < total; offset += BATCH_TX_LIMIT) {
+      const chunkTargets = options.targets.slice(offset, offset + BATCH_TX_LIMIT);
+      const chunkAmounts = options.amounts.slice(offset, offset + BATCH_TX_LIMIT);
+
+      let result: TransactionResult;
+      try {
+        const sourceAccount = await this.provider.getAccount(options.source);
+
+        const tx = new TransactionBuilder(sourceAccount, {
+          fee: BASE_FEE,
+          networkPassphrase: this.networkPassphrase,
+        })
+          .addOperation(
+            this.contract.call(
+              'batch_fund_c_address',
+              ...this.toScVals([
+                options.source,
+                chunkTargets,
+                chunkAmounts,
+                options.asset,
+              ]),
+            ),
+          )
+          .setTimeout(30)
+          .build();
+
+        const preparedTx = await this.provider.prepareTransaction(tx);
+        preparedTx.sign(sourceKeypair);
+
+        const response = await this.provider.sendTransaction(preparedTx);
+
+        result = {
+          hash: response.hash,
+          status: response.status === 'ERROR' ? 'failed' : 'pending',
+        };
+      } catch (error: any) {
+        result = {
+          hash: '',
+          status: 'failed',
+          error: error.message || 'Unknown error',
+        };
+      }
+
+      results.push(result);
+      completed += chunkTargets.length;
+
+      if (onProgress) {
+        onProgress(
+          completed,
+          total,
+          result.hash || undefined,
+        );
+      }
+    }
+
+    return results;
   }
 
   /**
