@@ -193,6 +193,8 @@ pub enum DataKey {
     MaxWithdrawPerTx,
     // Issue #24: reentrancy guard flag
     Entered,
+    // Minimum transfer amount for funded transfers
+    MinimumAmount,
     // Issue #30: commit-reveal counter and entries
     CommitmentId,
     Commitment(u64),

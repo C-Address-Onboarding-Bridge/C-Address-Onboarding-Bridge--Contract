@@ -1143,6 +1143,46 @@ impl TestToken {
     }
 }
 
+mod swap_pool_contract {
+    use super::*;
+
+    #[contracttype]
+    pub enum SwapPoolDataKey {
+        InputToken,
+        OutputToken,
+        Rate,
+    }
+
+    #[contract]
+    pub struct SwapPool;
+
+    #[contractimpl]
+    impl SwapPool {
+        pub fn initialize(e: Env, input_token: Address, output_token: Address, rate: i128) {
+            e.storage().instance().set(&SwapPoolDataKey::InputToken, &input_token);
+            e.storage().instance().set(&SwapPoolDataKey::OutputToken, &output_token);
+            e.storage().instance().set(&SwapPoolDataKey::Rate, &rate);
+        }
+
+        pub fn swap(e: Env, min_amount_out: i128, to: Address) -> i128 {
+            let rate: i128 = e.storage().instance().get(&SwapPoolDataKey::Rate).unwrap();
+            let input_token: Address = e.storage().instance().get(&SwapPoolDataKey::InputToken).unwrap();
+            let input_token_client = soroban_sdk::token::Client::new(&e, &input_token);
+            let amount_in = input_token_client.balance(&e.current_contract_address());
+            let amount_out = amount_in.checked_mul(rate).unwrap_or(0);
+            if amount_out < min_amount_out {
+                return amount_out;
+            }
+            let output_token: Address = e.storage().instance().get(&SwapPoolDataKey::OutputToken).unwrap();
+            let output_token_client = soroban_sdk::token::Client::new(&e, &output_token);
+            output_token_client.transfer(&e.current_contract_address(), &to, &amount_out);
+            amount_out
+        }
+    }
+}
+
+use swap_pool_contract::{SwapPool, SwapPoolClient};
+
 /********** query_calculate_fee tests **********/
 
 #[test]
@@ -1856,7 +1896,7 @@ mod timelocked_tests {
         Address,
         Address,
     ) {
-        let (bridge_id, token_id) = register_all_contracts(env);
+        let (bridge_id, token_id) = register_all_contracts_mocked(env);
         let bridge = create_bridge_client(env, &bridge_id);
         let (admin, user, fee_collector) = create_test_users(env);
         init_token(env, &token_id, &admin);
@@ -2563,4 +2603,264 @@ fn test_pause_requires_admin_auth() {
     env.set_auths(&[] as &[SorobanAuthorizationEntry]);
 
     bridge.pause(&None);
+}
+
+#[test]
+fn test_schedule_upgrade_happy_path() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_hash = BytesN::from_array(&env, &[7u8; 32]);
+
+    let scheduled_at = bridge.schedule_upgrade(&new_hash, &None);
+    let pending = bridge.query_pending_upgrade().unwrap();
+
+    assert_eq!(scheduled_at, 17_280u32);
+    assert_eq!(pending.new_wasm_hash, new_hash);
+    assert_eq!(pending.executable_after_ledger, 17_280u32);
+}
+
+#[test]
+fn test_execute_upgrade_hash_mismatch_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let scheduled_hash = BytesN::from_array(&env, &[7u8; 32]);
+    let wrong_hash = BytesN::from_array(&env, &[8u8; 32]);
+    bridge.schedule_upgrade(&scheduled_hash, &None);
+
+    assert_eq!(
+        bridge.try_execute_upgrade(&wrong_hash, &None),
+        Err(Ok(BridgeError::UpgradeHashMismatch))
+    );
+}
+
+#[test]
+fn test_execute_upgrade_too_early_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_hash = BytesN::from_array(&env, &[9u8; 32]);
+    bridge.schedule_upgrade(&new_hash, &None);
+
+    assert_eq!(
+        bridge.try_execute_upgrade(&new_hash, &None),
+        Err(Ok(BridgeError::UpgradeTimelockActive))
+    );
+}
+
+#[test]
+fn test_cancel_upgrade_without_pending_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert_eq!(
+        bridge.try_cancel_upgrade(&None),
+        Err(Ok(BridgeError::UpgradeNotScheduled))
+    );
+}
+
+#[test]
+fn test_set_loyalty_token_and_query() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let loyalty_token = Address::generate(&env);
+
+    bridge.set_loyalty_token(&loyalty_token, &25i128);
+    let (token, amount) = bridge.query_loyalty_token();
+
+    assert_eq!(token, loyalty_token);
+    assert_eq!(amount, 25i128);
+}
+
+#[test]
+fn test_query_loyalty_token_unset_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert_eq!(
+        bridge.try_query_loyalty_token(),
+        Err(Ok(BridgeError::LoyaltyTokenNotSet))
+    );
+}
+
+#[test]
+fn test_set_fee_tiers_too_high_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let tier = crate::FeeTier {
+        min_volume: 0,
+        max_volume: 1_000i128,
+        fee_bps: 1_001u32,
+    };
+    let tiers = Vec::from_array(&env, [tier]);
+
+    assert_eq!(
+        bridge.try_set_fee_tiers(&tiers),
+        Err(Ok(BridgeError::FeeTooHigh))
+    );
+}
+
+#[test]
+fn test_query_fee_tiers_and_current_tier_default() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &125u32, &None);
+
+    let tiers = bridge.query_fee_tiers();
+    assert_eq!(tiers.len(), 1);
+    let default_tier = tiers.get(0).unwrap();
+    assert_eq!(default_tier.fee_bps, 125u32);
+    assert_eq!(default_tier.min_volume, 0i128);
+    assert_eq!(default_tier.max_volume, i128::MAX);
+
+    let source = Address::generate(&env);
+    let current_tier = bridge.query_current_tier(&source);
+    assert_eq!(current_tier.fee_bps, 125u32);
+    assert_eq!(current_tier.min_volume, 0i128);
+    assert_eq!(current_tier.max_volume, i128::MAX);
+}
+
+#[test]
+fn test_verify_auth_entry_consumes_nonce_and_replays_fail() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert_eq!(bridge.query_auth_nonce(&user), 0u64);
+    assert!(!bridge.query_auth_nonce_used(&user, &0u64));
+
+    bridge.verify_auth_entry(&user, &0u64, &0u32, &10u32);
+
+    assert_eq!(bridge.query_auth_nonce(&user), 1u64);
+    assert!(bridge.query_auth_nonce_used(&user, &0u64));
+
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &0u64, &0u32, &10u32),
+        Err(Ok(BridgeError::AuthNonceAlreadyUsed))
+    );
+}
+
+#[test]
+fn test_fund_c_address_with_swap_happy_path() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, source_token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &source_token_id, &admin);
+
+    let target_token_id = env.register(TestToken, ());
+    let pool_id = env.register(SwapPool, ());
+    let swap_pool = SwapPoolClient::new(&env, &pool_id);
+    init_token(&env, &target_token_id, &admin);
+    swap_pool.initialize(&source_token_id, &target_token_id, &2i128);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&target_token_id, &None);
+    mint_tokens(&env, &source_token_id, &user, 1_000i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 2_000i128);
+
+    let target = Address::generate(&env);
+    bridge.fund_c_address_with_swap(
+        &user,
+        &target,
+        &source_token_id,
+        &target_token_id,
+        &100i128,
+        &50i128,
+        &Vec::from_array(&env, [pool_id.clone()]),
+    );
+
+    assert_eq!(check_balance(&env, &source_token_id, &user), 900i128);
+    assert_eq!(check_balance(&env, &target_token_id, &target), 198i128);
+    assert_eq!(check_balance(&env, &target_token_id, &bridge_id), 2i128);
+}
+
+#[test]
+fn test_fund_c_address_with_swap_slippage_fails() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, source_token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &source_token_id, &admin);
+
+    let target_token_id = env.register(TestToken, ());
+    let pool_id = env.register(SwapPool, ());
+    let swap_pool = SwapPoolClient::new(&env, &pool_id);
+    init_token(&env, &target_token_id, &admin);
+    swap_pool.initialize(&source_token_id, &target_token_id, &1i128);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&target_token_id, &None);
+    mint_tokens(&env, &source_token_id, &user, 1_000i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 100i128);
+
+    let target = Address::generate(&env);
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target,
+            &source_token_id,
+            &target_token_id,
+            &100i128,
+            &200i128,
+            &Vec::from_array(&env, [pool_id.clone()]),
+        ),
+        Err(Ok(BridgeError::SlippageExceeded))
+    );
+}
+
+#[test]
+fn test_safe_add_happy_path_and_overflow() {
+    assert_eq!(crate::safe_math::safe_add(2i128, 3i128).unwrap(), 5i128);
+    assert_eq!(crate::safe_math::safe_add(i128::MAX, 1i128), Err(BridgeError::Overflow));
+}
+
+#[test]
+fn test_safe_sub_happy_path_and_underflow() {
+    assert_eq!(crate::safe_math::safe_sub(5i128, 2i128).unwrap(), 3i128);
+    assert_eq!(crate::safe_math::safe_sub(i128::MIN, 1i128), Err(BridgeError::Overflow));
+}
+
+#[test]
+fn test_safe_mul_happy_path_and_overflow() {
+    assert_eq!(crate::safe_math::safe_mul(6i128, 7i128).unwrap(), 42i128);
+    assert_eq!(crate::safe_math::safe_mul(i128::MAX, 2i128), Err(BridgeError::Overflow));
+}
+
+#[test]
+fn test_safe_div_happy_path_and_zero_divisor() {
+    assert_eq!(crate::safe_math::safe_div(8i128, 2i128).unwrap(), 4i128);
+    assert_eq!(crate::safe_math::safe_div(7i128, 0i128), Err(BridgeError::Overflow));
 }
