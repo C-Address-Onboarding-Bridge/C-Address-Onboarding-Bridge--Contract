@@ -131,12 +131,18 @@ export interface FundCOptions {
 }
 
 /**
- * Options for funding multiple C-addresses in a single transaction via
+ * Options for funding multiple C-addresses in one or more transactions via
  * {@link OnboardingBridgeSDK.batchFundCAddresses}.
  *
- * The source account is charged the sum of all `amounts` in one transfer.
- * For any target that fails (blocked, not allowlisted), the corresponding
- * amount is refunded to `source`.
+ * The source account is charged the sum of all `amounts` in one transfer per
+ * transaction chunk.  For any target that fails (blocked, not allowlisted), the
+ * corresponding amount is refunded to `source`.
+ *
+ * When the number of targets exceeds {@link BATCH_TX_LIMIT} the SDK automatically
+ * splits the list into chunks of at most `BATCH_TX_LIMIT` and submits one
+ * transaction per chunk.  The optional `onProgress` callback (passed as the
+ * third argument to `batchFundCAddresses`) is called after each transaction
+ * with the running total of recipients processed.
  *
  * @example
  * ```ts
@@ -148,6 +154,9 @@ export interface FundCOptions {
  *     asset:   'CD...',
  *   },
  *   keypair,
+ *   (completed, total, txHash) => {
+ *     console.log(`Progress: ${completed}/${total} — tx: ${txHash}`);
+ *   },
  * );
  * ```
  */
@@ -173,6 +182,23 @@ export interface BatchFundCOptions {
    */
   asset: string;
 }
+
+/**
+ * Progress callback invoked by {@link OnboardingBridgeSDK.batchFundCAddresses}
+ * after each on-chain transaction completes (or fails).
+ *
+ * @param completed - Number of individual recipients processed so far across
+ *                    all submitted transactions (whether each transfer succeeded
+ *                    inside the contract or was refunded due to access-control).
+ * @param total     - Total number of recipients in the original request.
+ * @param txHash    - Transaction hash of the just-submitted transaction.
+ *                    `undefined` when the transaction failed before submission.
+ */
+export type BatchProgressCallback = (
+  completed: number,
+  total: number,
+  txHash?: string,
+) => void;
 
 // ---------------------------------------------------------------------------
 // Admin operations

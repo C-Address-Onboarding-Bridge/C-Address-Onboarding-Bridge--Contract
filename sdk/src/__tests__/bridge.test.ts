@@ -117,8 +117,8 @@ describe('OnboardingBridgeSDK', () => {
   });
 
   describe('batchFundCAddresses', () => {
-    it('returns pending status on success', async () => {
-      const result = await sdk.batchFundCAddresses(
+    it('returns array with one pending result on success', async () => {
+      const results = await sdk.batchFundCAddresses(
         {
           source: MOCK_ADDRESS,
           targets: [MOCK_ASSET, MOCK_ASSET],
@@ -128,14 +128,32 @@ describe('OnboardingBridgeSDK', () => {
         mockKeypair,
       );
 
-      expect(result.status).toBe('pending');
-      expect(result.hash).toBe('mock_tx_hash');
+      expect(results).toHaveLength(1);
+      expect(results[0].status).toBe('pending');
+      expect(results[0].hash).toBe('mock_tx_hash');
     });
 
-    it('returns failed status when transaction errors (e.g. mismatched arrays on-chain)', async () => {
+    it('returns array with one failed result on ERROR response', async () => {
       mockProvider.sendTransaction.mockResolvedValue({ hash: 'err_hash', status: 'ERROR' });
 
-      const result = await sdk.batchFundCAddresses(
+      const results = await sdk.batchFundCAddresses(
+        {
+          source: MOCK_ADDRESS,
+          targets: [MOCK_ASSET],
+          amounts: ['500'],
+          asset: MOCK_ASSET,
+        },
+        mockKeypair,
+      );
+
+      expect(results).toHaveLength(1);
+      expect(results[0].status).toBe('failed');
+    });
+
+    it('returns array with one failed result on mismatched array lengths (on-chain error)', async () => {
+      mockProvider.sendTransaction.mockResolvedValue({ hash: 'err_hash', status: 'ERROR' });
+
+      const results = await sdk.batchFundCAddresses(
         {
           source: MOCK_ADDRESS,
           targets: [MOCK_ASSET],
@@ -145,7 +163,193 @@ describe('OnboardingBridgeSDK', () => {
         mockKeypair,
       );
 
-      expect(result.status).toBe('failed');
+      expect(results[0].status).toBe('failed');
+    });
+
+    // -----------------------------------------------------------------------
+    // Auto-splitting
+    // -----------------------------------------------------------------------
+
+    it('splits a batch exceeding BATCH_TX_LIMIT into multiple transactions', async () => {
+      const count = 250; // 3 chunks: 100, 100, 50
+      const targets = Array(count).fill(MOCK_ASSET);
+      const amounts = Array(count).fill('100');
+
+      let txCounter = 0;
+      mockProvider.sendTransaction.mockImplementation(() => {
+        txCounter++;
+        return Promise.resolve({ hash: `tx_hash_${txCounter}`, status: 'PENDING' });
+      });
+
+      const results = await sdk.batchFundCAddresses(
+        { source: MOCK_ADDRESS, targets, amounts, asset: MOCK_ASSET },
+        mockKeypair,
+      );
+
+      expect(results).toHaveLength(3);
+      expect(mockProvider.sendTransaction).toHaveBeenCalledTimes(3);
+      expect(results[0].hash).toBe('tx_hash_1');
+      expect(results[1].hash).toBe('tx_hash_2');
+      expect(results[2].hash).toBe('tx_hash_3');
+      results.forEach((r) => expect(r.status).toBe('pending'));
+    });
+
+    it('does not split when targets count equals BATCH_TX_LIMIT exactly', async () => {
+      const targets = Array(100).fill(MOCK_ASSET);
+      const amounts = Array(100).fill('100');
+
+      const results = await sdk.batchFundCAddresses(
+        { source: MOCK_ADDRESS, targets, amounts, asset: MOCK_ASSET },
+        mockKeypair,
+      );
+
+      expect(results).toHaveLength(1);
+      expect(mockProvider.sendTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not split when targets count is below BATCH_TX_LIMIT', async () => {
+      const targets = Array(50).fill(MOCK_ASSET);
+      const amounts = Array(50).fill('100');
+
+      const results = await sdk.batchFundCAddresses(
+        { source: MOCK_ADDRESS, targets, amounts, asset: MOCK_ASSET },
+        mockKeypair,
+      );
+
+      expect(results).toHaveLength(1);
+    });
+
+    // -----------------------------------------------------------------------
+    // Progress callback
+    // -----------------------------------------------------------------------
+
+    it('calls onProgress once per chunk with correct (completed, total, txHash)', async () => {
+      const count = 250;
+      const targets = Array(count).fill(MOCK_ASSET);
+      const amounts = Array(count).fill('100');
+
+      let callIdx = 0;
+      mockProvider.sendTransaction.mockImplementation(() => {
+        callIdx++;
+        return Promise.resolve({ hash: `h${callIdx}`, status: 'PENDING' });
+      });
+
+      const progressCalls: Array<[number, number, string | undefined]> = [];
+      const onProgress = jest.fn((completed: number, total: number, txHash?: string) => {
+        progressCalls.push([completed, total, txHash]);
+      });
+
+      await sdk.batchFundCAddresses(
+        { source: MOCK_ADDRESS, targets, amounts, asset: MOCK_ASSET },
+        mockKeypair,
+        onProgress,
+      );
+
+      expect(onProgress).toHaveBeenCalledTimes(3);
+      // After chunk 1: 100 of 250 processed
+      expect(progressCalls[0]).toEqual([100, 250, 'h1']);
+      // After chunk 2: 200 of 250 processed
+      expect(progressCalls[1]).toEqual([200, 250, 'h2']);
+      // After chunk 3: 250 of 250 processed
+      expect(progressCalls[2]).toEqual([250, 250, 'h3']);
+    });
+
+    it('calls onProgress even when total fits in one tx', async () => {
+      const targets = [MOCK_ASSET, MOCK_ASSET];
+      const amounts = ['500', '500'];
+
+      const onProgress = jest.fn();
+
+      await sdk.batchFundCAddresses(
+        { source: MOCK_ADDRESS, targets, amounts, asset: MOCK_ASSET },
+        mockKeypair,
+        onProgress,
+      );
+
+      expect(onProgress).toHaveBeenCalledTimes(1);
+      expect(onProgress).toHaveBeenCalledWith(2, 2, 'mock_tx_hash');
+    });
+
+    it('does not call onProgress when callback is omitted', async () => {
+      // Just verifies there is no crash when onProgress is undefined.
+      const results = await sdk.batchFundCAddresses(
+        { source: MOCK_ADDRESS, targets: [MOCK_ASSET], amounts: ['500'], asset: MOCK_ASSET },
+        mockKeypair,
+        // no callback
+      );
+      expect(results[0].status).toBe('pending');
+    });
+
+    it('passes undefined as txHash to onProgress when submission fails', async () => {
+      mockProvider.sendTransaction.mockRejectedValue(new Error('RPC error'));
+
+      const onProgress = jest.fn();
+
+      await sdk.batchFundCAddresses(
+        { source: MOCK_ADDRESS, targets: [MOCK_ASSET], amounts: ['100'], asset: MOCK_ASSET },
+        mockKeypair,
+        onProgress,
+      );
+
+      expect(onProgress).toHaveBeenCalledTimes(1);
+      // hash is '' which evaluates to undefined in the implementation
+      const [completed, total, txHash] = onProgress.mock.calls[0];
+      expect(completed).toBe(1);
+      expect(total).toBe(1);
+      expect(txHash).toBeUndefined();
+    });
+
+    it('continues remaining chunks even when one chunk fails', async () => {
+      const count = 250;
+      const targets = Array(count).fill(MOCK_ASSET);
+      const amounts = Array(count).fill('100');
+
+      let callIdx = 0;
+      mockProvider.sendTransaction.mockImplementation(() => {
+        callIdx++;
+        if (callIdx === 2) {
+          return Promise.resolve({ hash: 'fail_hash', status: 'ERROR' });
+        }
+        return Promise.resolve({ hash: `h${callIdx}`, status: 'PENDING' });
+      });
+
+      const results = await sdk.batchFundCAddresses(
+        { source: MOCK_ADDRESS, targets, amounts, asset: MOCK_ASSET },
+        mockKeypair,
+      );
+
+      expect(results).toHaveLength(3);
+      expect(results[0].status).toBe('pending');
+      expect(results[1].status).toBe('failed');
+      expect(results[2].status).toBe('pending');
+    });
+
+    it('calls onProgress for all chunks even when one fails mid-way', async () => {
+      const count = 250;
+      const targets = Array(count).fill(MOCK_ASSET);
+      const amounts = Array(count).fill('100');
+
+      let callIdx = 0;
+      mockProvider.sendTransaction.mockImplementation(() => {
+        callIdx++;
+        if (callIdx === 2) {
+          return Promise.resolve({ hash: 'fail_hash', status: 'ERROR' });
+        }
+        return Promise.resolve({ hash: `h${callIdx}`, status: 'PENDING' });
+      });
+
+      const onProgress = jest.fn();
+      await sdk.batchFundCAddresses(
+        { source: MOCK_ADDRESS, targets, amounts, asset: MOCK_ASSET },
+        mockKeypair,
+        onProgress,
+      );
+
+      // onProgress must be called for all 3 chunks regardless of failures
+      expect(onProgress).toHaveBeenCalledTimes(3);
+      expect(onProgress).toHaveBeenNthCalledWith(1, 100, 250, 'h1');
+      expect(onProgress).toHaveBeenNthCalledWith(2, 200, 250, 'fail_hash');
+      expect(onProgress).toHaveBeenNthCalledWith(3, 250, 250, 'h3');
     });
   });
 
@@ -531,21 +735,21 @@ describe('address validation', () => {
   });
 
   it('batchFundCAddresses rejects invalid source', async () => {
-    const result = await sdk.batchFundCAddresses(
+    const results = await sdk.batchFundCAddresses(
       { source: 'bad', targets: [MOCK_ASSET], amounts: ['100'], asset: MOCK_ASSET },
       mockKeypair,
     );
-    expect(result.status).toBe('failed');
-    expect(result.error).toMatch(/Invalid account address for "source"/);
+    expect(results[0].status).toBe('failed');
+    expect(results[0].error).toMatch(/Invalid account address for "source"/);
   });
 
   it('batchFundCAddresses rejects G-address in targets', async () => {
-    const result = await sdk.batchFundCAddresses(
+    const results = await sdk.batchFundCAddresses(
       { source: MOCK_ADDRESS, targets: [MOCK_ADDRESS], amounts: ['100'], asset: MOCK_ASSET },
       mockKeypair,
     );
-    expect(result.status).toBe('failed');
-    expect(result.error).toMatch(/Invalid contract address for "targets\[0\]"/);
+    expect(results[0].status).toBe('failed');
+    expect(results[0].error).toMatch(/Invalid contract address for "targets\[0\]"/);
   });
 
   it('withdrawFees rejects G-address as asset', async () => {
@@ -658,19 +862,20 @@ describe('Error handling - invalid inputs', () => {
   });
 
   it('batchFundCAddresses passes mismatched targets and amounts to contract (no client-side validation)', async () => {
-    const result = await sdk.batchFundCAddresses(
+    const results = await sdk.batchFundCAddresses(
       { source: MOCK_ADDRESS, targets: [MOCK_ASSET, MOCK_ASSET], amounts: ['100'], asset: MOCK_ASSET },
       mockKeypair,
     );
-    expect(result.status).toBe('pending');
+    expect(results[0].status).toBe('pending');
   });
 
   it('batchFundCAddresses passes empty targets array to contract (no client-side validation)', async () => {
-    const result = await sdk.batchFundCAddresses(
+    const results = await sdk.batchFundCAddresses(
       { source: MOCK_ADDRESS, targets: [], amounts: [], asset: MOCK_ASSET },
       mockKeypair,
     );
-    expect(result.status).toBe('pending');
+    // Empty targets: no chunks, no transactions submitted; returns empty array
+    expect(results).toHaveLength(0);
   });
 
   it('withdrawFees passes negative amount to contract (no client-side validation)', async () => {

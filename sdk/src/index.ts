@@ -49,7 +49,7 @@
  * @packageDocumentation
  */
 
-export { OnboardingBridgeSDK } from './bridge';
+export { OnboardingBridgeSDK, BATCH_TX_LIMIT } from './bridge';
 export { OffRampIntegration } from './offramp';
 export { assertAccountAddress, assertContractAddress } from './validate';
 export { CachedContractClient } from './cachedBridge';
