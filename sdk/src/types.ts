@@ -124,3 +124,69 @@ export interface CreateCAddressResult {
   /** Transaction hash of the creation */
   txHash: string;
 }
+
+// ---------------------------------------------------------------------------
+// Swap-and-bridge (#100)
+// ---------------------------------------------------------------------------
+
+/**
+ * Options for `fundCAddressWithSwap`.
+ *
+ * The bridge contract will:
+ * 1. Pull `sourceAmount` of `sourceAsset` from `source`.
+ * 2. Route it through `swapRoute` (ordered DEX pool addresses).
+ * 3. Deduct the protocol fee in `targetAsset`.
+ * 4. Credit the net amount to `target`.
+ */
+export interface FundCAddressWithSwapOptions {
+  /** Source account providing `sourceAsset` (G-address). Must sign. */
+  source: string;
+  /** Destination C-address to receive `targetAsset`. */
+  target: string;
+  /** Token contract the source holds (e.g. USDC contract address). */
+  sourceAsset: string;
+  /** Token contract the target should receive (e.g. XLM wrapper). */
+  targetAsset: string;
+  /** Gross amount of `sourceAsset` in its smallest unit. */
+  sourceAmount: string;
+  /**
+   * Minimum acceptable `targetAsset` amount after the swap.
+   * Reverts with `SlippageExceeded` if the DEX returns less.
+   */
+  minTargetAmount: string;
+  /**
+   * Ordered list of DEX pool contract addresses.
+   * Each pool must implement `swap(min_amount_out: i128, to: Address) -> i128`.
+   */
+  swapRoute: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Pagination
+// ---------------------------------------------------------------------------
+
+/**
+ * A page of results from a list-returning contract query.
+ *
+ * Because Soroban contracts return full vectors the pagination is handled
+ * client-side: cursor is an opaque base64-encoded offset token so callers
+ * don't need to track numeric indices.
+ */
+export interface PaginatedResult<T> {
+  /** Items in this page */
+  items: T[];
+  /**
+   * Opaque token to pass as `cursor` in the next call.
+   * `undefined` when there are no more pages.
+   */
+  cursor?: string;
+  /** Convenience flag — true when a next page exists */
+  hasMore: boolean;
+}
+
+export interface PaginationOptions {
+  /** Opaque cursor returned by a previous call */
+  cursor?: string;
+  /** Maximum items to return per page (default: 20) */
+  limit?: number;
+}

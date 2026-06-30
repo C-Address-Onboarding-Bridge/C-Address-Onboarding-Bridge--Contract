@@ -10,6 +10,9 @@ import {
   RelayerManagementOptions,
   CreateCOptions,
   CreateCAddressResult,
+  FundCAddressWithSwapOptions,
+  PaginatedResult,
+  PaginationOptions,
 } from './types';
 import { assertAccountAddress, assertContractAddress } from './validate';
 import {
@@ -64,6 +67,82 @@ export class OnboardingBridgeSDK {
               options.target,
               options.asset,
               options.amount,
+            ]),
+          ),
+        )
+        .setTimeout(30)
+        .build();
+
+      const preparedTx = await this.provider.prepareTransaction(tx);
+      preparedTx.sign(sourceKeypair);
+
+      const response = await this.provider.sendTransaction(preparedTx);
+
+      return {
+        hash: response.hash,
+        status: response.status === 'ERROR' ? 'failed' : 'pending',
+      };
+    } catch (error: any) {
+      return {
+        hash: '',
+        status: 'failed',
+        error: error.message || 'Unknown error',
+      };
+    }
+  }
+
+  /**
+   * Fund a C-address by swapping the source asset into a different target asset first.
+   *
+   * Calls `fund_c_address_with_swap` on the bridge contract which:
+   * 1. Pulls `sourceAmount` of `sourceAsset` from `source`.
+   * 2. Routes it through the DEX pools in `swapRoute`.
+   * 3. Deducts the fee in `targetAsset` and forwards the net to `target`.
+   *
+   * @example
+   * ```ts
+   * const result = await sdk.fundCAddressWithSwap(
+   *   {
+   *     source: keypair.publicKey(),
+   *     target: 'CC...',
+   *     sourceAsset: USDC_CONTRACT,
+   *     targetAsset: XLM_CONTRACT,
+   *     sourceAmount: '10000000', // 1 USDC
+   *     minTargetAmount: '9000000', // 0.9 XLM (10% max slippage)
+   *     swapRoute: [USDC_XLM_POOL],
+   *   },
+   *   keypair,
+   * );
+   * ```
+   */
+  async fundCAddressWithSwap(
+    options: FundCAddressWithSwapOptions,
+    sourceKeypair: any,
+  ): Promise<TransactionResult> {
+    try {
+      assertAccountAddress(options.source, 'source');
+      assertContractAddress(options.target, 'target');
+      assertContractAddress(options.sourceAsset, 'sourceAsset');
+      assertContractAddress(options.targetAsset, 'targetAsset');
+      options.swapRoute.forEach((p, i) => assertContractAddress(p, `swapRoute[${i}]`));
+
+      const sourceAccount = await this.provider.getAccount(options.source);
+
+      const tx = new TransactionBuilder(sourceAccount, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(
+          this.contract.call(
+            'fund_c_address_with_swap',
+            ...this.toScVals([
+              options.source,
+              options.target,
+              options.sourceAsset,
+              options.targetAsset,
+              options.sourceAmount,
+              options.minTargetAmount,
+              options.swapRoute,
             ]),
           ),
         )
@@ -757,6 +836,138 @@ export class OnboardingBridgeSDK {
     }
     const scVal = (result as any).results?.[0]?.retval;
     return scVal ? Boolean(scValToNative(scVal)) : false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pagination helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Encode a numeric offset as an opaque base64 cursor token.
+   * @internal
+   */
+  private encodeCursor(offset: number): string {
+    return Buffer.from(String(offset)).toString('base64');
+  }
+
+  /**
+   * Decode a base64 cursor back to a numeric offset.
+   * Returns 0 for an undefined/invalid cursor.
+   * @internal
+   */
+  private decodeCursor(cursor?: string): number {
+    if (!cursor) return 0;
+    const n = parseInt(Buffer.from(cursor, 'base64').toString('utf8'), 10);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  }
+
+  /**
+   * Slice a full list into a paginated page.
+   * @internal
+   */
+  private paginate<T>(items: T[], offset: number, limit: number): PaginatedResult<T> {
+    const page = items.slice(offset, offset + limit);
+    const nextOffset = offset + page.length;
+    const hasMore = nextOffset < items.length;
+    return {
+      items: page,
+      cursor: hasMore ? this.encodeCursor(nextOffset) : undefined,
+      hasMore,
+    };
+  }
+
+  /**
+   * Return a paginated list of whitelisted asset contract addresses.
+   *
+   * Soroban contracts return full vectors; pagination is applied client-side.
+   *
+   * @example
+   * ```ts
+   * let page = await sdk.getWhitelistedAssets();
+   * while (page.hasMore) {
+   *   page = await sdk.getWhitelistedAssets(page.cursor);
+   * }
+   * ```
+   */
+  async getWhitelistedAssets(
+    cursor?: string,
+    limit = 20,
+  ): Promise<PaginatedResult<string>> {
+    const result = await this.provider.simulateTransaction(
+      this.buildSimulationTx('query_whitelisted_assets', []),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query whitelisted assets: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    const all: string[] = scVal
+      ? (scValToNative(scVal) as Address[]).map((a) => a.toString())
+      : [];
+    return this.paginate(all, this.decodeCursor(cursor), limit);
+  }
+
+  /**
+   * Return a paginated list of fee-exempt addresses.
+   *
+   * Fee-exempt addresses are stored individually in contract storage under
+   * `DataKey::FeeExempt(address)`. The SDK queries the full list via
+   * `query_fee_exempt_addresses` and paginates client-side.
+   */
+  async getFeeExemptAddresses(
+    cursor?: string,
+    limit = 20,
+  ): Promise<PaginatedResult<string>> {
+    const result = await this.provider.simulateTransaction(
+      this.buildSimulationTx('query_fee_exempt_addresses', []),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query fee-exempt addresses: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    const all: string[] = scVal
+      ? (scValToNative(scVal) as Address[]).map((a) => a.toString())
+      : [];
+    return this.paginate(all, this.decodeCursor(cursor), limit);
+  }
+
+  /**
+   * Return a paginated list of addresses on the blocklist.
+   */
+  async getBlocklistedAddresses(
+    cursor?: string,
+    limit = 20,
+  ): Promise<PaginatedResult<string>> {
+    const result = await this.provider.simulateTransaction(
+      this.buildSimulationTx('query_blocklist', []),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query blocklist: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    const all: string[] = scVal
+      ? (scValToNative(scVal) as Address[]).map((a) => a.toString())
+      : [];
+    return this.paginate(all, this.decodeCursor(cursor), limit);
+  }
+
+  /**
+   * Return a paginated list of addresses on the allowlist.
+   */
+  async getAllowlistedAddresses(
+    cursor?: string,
+    limit = 20,
+  ): Promise<PaginatedResult<string>> {
+    const result = await this.provider.simulateTransaction(
+      this.buildSimulationTx('query_allowlist', []),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query allowlist: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    const all: string[] = scVal
+      ? (scValToNative(scVal) as Address[]).map((a) => a.toString())
+      : [];
+    return this.paginate(all, this.decodeCursor(cursor), limit);
   }
 
   /**

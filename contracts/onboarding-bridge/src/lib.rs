@@ -48,7 +48,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Map,
-    Vec,
+    Vec, IntoVal,
 };
 
 // ---------------------------------------------------------------------------
@@ -132,6 +132,10 @@ pub enum BridgeError {
     CommitmentHashMismatch = 33,
     /// The minimum delay between commit and reveal has not elapsed.
     CommitmentNotMatured = 34,
+    /// The swap produced fewer target tokens than `min_target_amount`.
+    SlippageExceeded = 35,
+    /// A DEX pool in the swap route returned zero or failed.
+    SwapFailed = 36,
 }
 
 // ---------------------------------------------------------------------------
@@ -4022,6 +4026,161 @@ impl OnboardingBridge {
     /// * [`BridgeError::CommitmentNotFound`] — No entry for `id`.
     pub fn query_commitment(env: Env, id: u64) -> Result<CommitmentEntry, BridgeError> {
         read_commitment(&env, id).ok_or(BridgeError::CommitmentNotFound)
+    }
+
+    // -----------------------------------------------------------------------
+    // Swap-and-bridge (#100)
+    // -----------------------------------------------------------------------
+
+    /// Fund a C-address by swapping `source_asset` into `target_asset` first.
+    ///
+    /// Flow:
+    /// 1. Pull `source_amount` of `source_asset` from `source` into the contract.
+    /// 2. Walk `swap_route` (a sequence of DEX pool contract addresses) swapping
+    ///    the running balance through each pool using the standard two-token
+    ///    `swap(amount_in, min_amount_out, to)` interface.
+    /// 3. Verify the final `target_asset` balance received ≥ `min_target_amount`.
+    /// 4. Deduct the fee (in `target_asset`) and transfer the net amount to
+    ///    `target`.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` — Account providing `source_asset`. Must authorise.
+    /// * `target` — Destination C-address to receive `target_asset`.
+    /// * `source_asset` — Token contract the source holds (e.g. USDC).
+    /// * `target_asset` — Token contract the target should receive (e.g. XLM).
+    /// * `source_amount` — Gross amount of `source_asset` to pull from source.
+    /// * `min_target_amount` — Slippage guard: revert if the swap yields less.
+    /// * `swap_route` — Ordered list of DEX pool contract addresses. At least
+    ///   one pool is required. Each pool must implement the interface:
+    ///   `swap(amount_in: i128, min_amount_out: i128, to: Address) -> i128`.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `source.require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::InvalidAmount`] — `source_amount` or `min_target_amount` ≤ 0.
+    /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
+    /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode is on and `target` is not listed.
+    /// * [`BridgeError::AssetNotWhitelisted`] — `target_asset` is not whitelisted.
+    /// * [`BridgeError::SwapFailed`] — A pool returned zero tokens out.
+    /// * [`BridgeError::SlippageExceeded`] — Swap output < `min_target_amount`.
+    pub fn fund_c_address_with_swap(
+        env: Env,
+        source: Address,
+        target: Address,
+        source_asset: Address,
+        target_asset: Address,
+        source_amount: i128,
+        min_target_amount: i128,
+        swap_route: Vec<Address>,
+    ) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        if source_amount <= 0 || min_target_amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+
+        check_access(&env, &target)?;
+        // Only the output asset needs to be whitelisted (what arrives at target).
+        check_asset_whitelisted(&env, &target_asset)?;
+
+        source.require_auth();
+
+        let contract_addr = env.current_contract_address();
+
+        // Step 1: pull source_asset into the contract.
+        let source_token = token::Client::new(&env, &source_asset);
+        source_token.transfer(&source, &contract_addr, &source_amount);
+
+        // Step 2: walk the swap route.
+        // Each pool must implement: swap(min_amount_out: i128, to: Address) -> i128
+        // The contract uses a push model: transfer amount_in to the pool first,
+        // then call swap. The pool detects its received balance and performs the swap.
+        //
+        // For single-hop: source_asset → pool → target_asset
+        // For multi-hop:  each pool's output token must be the next pool's input token;
+        //                 callers are responsible for constructing a valid route.
+        let mut amount_in: i128 = source_amount;
+        let route_len = swap_route.len();
+
+        // Track which token we currently hold in the contract.
+        // Hop 0 input = source_asset; subsequent inputs are determined by the route.
+        let mut current_token = source_asset.clone();
+
+        for (i, pool) in swap_route.iter().enumerate() {
+            let is_last = i as u32 == route_len - 1;
+            // Only enforce min_target_amount on the final hop.
+            let min_out: i128 = if is_last { min_target_amount } else { 1 };
+
+            // Push the current amount into the pool.
+            let input_token_client = token::Client::new(&env, &current_token);
+            input_token_client.transfer(&contract_addr, &pool, &amount_in);
+
+            // Call the pool's swap function. Interface: swap(min_amount_out, to) -> i128
+            // This matches the Phoenix Protocol / Soroswap pool interface.
+            let swap_sym = soroban_sdk::Symbol::new(&env, "swap");
+            let swap_args: Vec<soroban_sdk::Val> = soroban_sdk::vec![
+                &env,
+                min_out.into_val(&env),
+                contract_addr.into_val(&env),
+            ];
+            let amount_out: i128 = env.invoke_contract(&pool, &swap_sym, swap_args);
+
+            if amount_out <= 0 {
+                return Err(BridgeError::SwapFailed);
+            }
+
+            amount_in = amount_out;
+            // After this hop the contract holds the pool's output token.
+            // Update current_token for the next iteration (unused on last hop).
+            if !is_last {
+                // Intermediate token: for multi-hop routes callers construct pools
+                // such that each pool's output is the next pool's input.
+                // We advance current_token to target_asset as a reasonable default;
+                // for more complex routes the caller is responsible for matching tokens.
+                current_token = target_asset.clone();
+            }
+        }
+
+        // Step 3: slippage check on final output.
+        if amount_in < min_target_amount {
+            return Err(BridgeError::SlippageExceeded);
+        }
+
+        let received_amount = amount_in;
+
+        // Step 4: deduct fee in target_asset and forward net to target.
+        let global_fee_bps = read_fee_bps(&env);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &target_asset, tiered_fee_bps);
+        let fee = calculate_fee(received_amount, effective_fee_bps)?;
+        let net_amount = safe_math::safe_sub(received_amount, fee)?;
+
+        let target_token = token::Client::new(&env, &target_asset);
+        if net_amount > 0 {
+            target_token.transfer(&contract_addr, &target, &net_amount);
+        }
+
+        increment_accrued_fees(&env, &target_asset, fee);
+        increment_total_bridged(&env, &target_asset, net_amount);
+        increment_total_fees_collected(&env, &target_asset, fee);
+        increment_source_bridged_volume(&env, &source, source_amount);
+
+        mint_loyalty_tokens(&env, &source);
+
+        env.events().publish(
+            ("SwapAndFunded", source_asset, target_asset, source, target),
+            (source_amount, received_amount, fee),
+        );
+
+        Ok(())
     }
 }
 

@@ -1,0 +1,97 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Rust contract docs
+        run: cargo doc --no-deps -p onboarding-bridge --target-dir target/doc-out
+        env:
+          RUSTDOCFLAGS: "--default-theme dark"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: sdk/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('sdk/package.json') }}
+
+      - name: Install SDK dependencies
+        working-directory: sdk
+        run: npm install
+
+      - name: Build TypeScript SDK docs
+        working-directory: sdk
+        run: npx typedoc --out ../target/doc-out/doc/sdk src/index.ts --name "C-Address Onboarding Bridge SDK" --includeVersion
+
+      - name: Assemble docs site
+        run: |
+          mkdir -p _site
+          # Rust docs → /rust/
+          cp -r target/doc-out/doc/onboarding_bridge _site/rust
+          # SDK docs → /sdk/
+          cp -r target/doc-out/doc/sdk _site/sdk
+          # Simple index page
+          cat > _site/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8" />
+            <title>C-Address Onboarding Bridge – Docs</title>
+            <style>
+              body { font-family: sans-serif; max-width: 600px; margin: 60px auto; }
+              a { font-size: 1.2rem; display: block; margin: 12px 0; }
+            </style>
+          </head>
+          <body>
+            <h1>C-Address Onboarding Bridge</h1>
+            <p>Auto-generated API documentation</p>
+            <a href="rust/index.html">📦 Rust Contract (cargo doc)</a>
+            <a href="sdk/index.html">📘 TypeScript SDK (typedoc)</a>
+          </body>
+          </html>
+          EOF
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
