@@ -54,7 +54,7 @@ jobs:
                   parts = line.strip().split("\t")
                   if len(parts) == 3:
                       baseline[parts[0]] = (int(parts[1]), int(parts[2]))
-          
+
           results = {}
           with open("bench_results.txt") as f:
               next(f)  # skip header
@@ -62,7 +62,7 @@ jobs:
                   parts = line.strip().split("\t")
                   if len(parts) == 3:
                       results[parts[0]] = (int(parts[1]), int(parts[2]))
-          
+
           THRESHOLD = 0.20  # 20% regression threshold
           regressions = []
           for name, (cpu, mem) in results.items():
@@ -72,7 +72,7 @@ jobs:
                       regressions.append(f"{name}: CPU {base_cpu} -> {cpu} (+{(cpu-base_cpu)*100//base_cpu}%)")
                   if base_mem > 0 and (mem - base_mem) / base_mem > THRESHOLD:
                       regressions.append(f"{name}: MEM {base_mem} -> {mem} (+{(mem-base_mem)*100//base_mem}%)")
-          
+
           if regressions:
               print("GAS REGRESSIONS DETECTED (>20% increase):")
               for r in regressions:
@@ -97,6 +97,38 @@ jobs:
         with:
           name: onboarding-bridge-wasm
           path: target/wasm32-unknown-unknown/release/*.wasm
+
+  contract-compatibility:
+    name: Contract Compatibility (Soroban SDK ${{ matrix.soroban-sdk-version }}.x)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        soroban-sdk-version: ["20", "21", "22"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Pin Soroban SDK major version
+        run: |
+          sed -i -E "s/^soroban-sdk = \".*\"$/soroban-sdk = \"${{ matrix.soroban-sdk-version }}\"/" contracts/onboarding-bridge/Cargo.toml
+          sed -i -E "s/^soroban-sdk = \{ version = \".*\", features = \[\"testutils\"\] \}$/soroban-sdk = { version = \"${{ matrix.soroban-sdk-version }}\", features = [\"testutils\"] }/" contracts/onboarding-bridge/Cargo.toml
+
+      - name: Update lockfile for selected Soroban SDK
+        run: cargo update -p soroban-sdk --workspace
+
+      - name: Show resolved Soroban SDK version
+        run: cargo tree -p onboarding-bridge -e normal,dev | grep soroban-sdk | head -n 2
+
+      - name: Build contract
+        run: cargo build -p onboarding-bridge --release
+
+      - name: Run contract tests
+        run: cargo test -p onboarding-bridge --features testutils
 
   sdk:
     name: TypeScript SDK
