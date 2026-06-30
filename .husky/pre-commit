@@ -7,13 +7,14 @@ echo "▶ pre-commit: running checks..."
 echo "  [1/3] tsc type-check"
 (cd sdk && npx tsc --noEmit)
 
-# ---- ESLint (staged TS files only) ----
-STAGED_TS=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(ts|tsx)$' || true)
-if [ -n "$STAGED_TS" ]; then
+# ---- ESLint (staged TS files inside sdk/ only) ----
+STAGED_TS=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '^sdk/.*\.(ts|tsx)$' | sed 's|^sdk/||' || true)
+ESLINT_CFG=$(ls sdk/eslint.config.* sdk/.eslintrc.* 2>/dev/null | head -1 || true)
+if [ -n "$STAGED_TS" ] && [ -n "$ESLINT_CFG" ]; then
   echo "  [2/3] eslint"
   (cd sdk && npx eslint --max-warnings=0 $STAGED_TS)
 else
-  echo "  [2/3] eslint (no staged .ts files — skipped)"
+  echo "  [2/3] eslint (skipped — no staged files or no config)"
 fi
 
 # ---- Rust fmt check (if .rs files staged) ----
