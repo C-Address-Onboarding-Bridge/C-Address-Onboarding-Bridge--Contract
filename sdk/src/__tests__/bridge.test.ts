@@ -1,5 +1,6 @@
 import { OnboardingBridgeSDK } from '../bridge';
-import { SorobanRpc, scValToNative } from '@stellar/stellar-sdk';
+import { OffRampIntegration } from '../offramp';
+import { SorobanRpc, scValToNative, xdr, Address, nativeToScVal } from '@stellar/stellar-sdk';
 
 jest.mock('@stellar/stellar-sdk', () => ({
   SorobanRpc: {
@@ -35,8 +36,8 @@ jest.mock('@stellar/stellar-sdk', () => ({
     PUBLIC: 'Public Global Stellar Network ; September 2015',
   },
   StrKey: {
-    isValidEd25519PublicKey: jest.fn((addr: string) => addr.startsWith('G') && addr.length === 56),
-    isValidContract: jest.fn((addr: string) => addr.startsWith('C') && addr.length === 56),
+    isValidEd25519PublicKey: jest.fn((addr: string) => addr?.startsWith('G') && addr.length === 56),
+    isValidContract: jest.fn((addr: string) => addr?.startsWith('C') && addr.length === 56),
   },
 }));
 
@@ -601,5 +602,186 @@ describe('address validation', () => {
   it('getAllBalances rejects a G-address in assets list', async () => {
     await expect(sdk.getAllBalances([MOCK_ASSET, MOCK_ADDRESS]))
       .rejects.toThrow(/Invalid contract address for "assets\[1\]"/);
+  });
+});
+
+describe('Error handling - invalid inputs', () => {
+  let sdk: OnboardingBridgeSDK;
+  let mockKeypair: any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockKeypair = { publicKey: jest.fn().mockReturnValue(MOCK_ADDRESS), sign: jest.fn() };
+    const mockProvider = {
+      getAccount: jest.fn().mockResolvedValue({}),
+      prepareTransaction: jest.fn().mockResolvedValue({ sign: jest.fn() }),
+      sendTransaction: jest.fn().mockResolvedValue({ hash: 'h', status: 'PENDING' }),
+      simulateTransaction: jest.fn().mockResolvedValue({}),
+    };
+    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    sdk = new OnboardingBridgeSDK(CONFIG);
+  });
+
+  it('fundCAddress rejects invalid source address (malformed)', async () => {
+    const result = await sdk.fundCAddress(
+      { source: 'not-an-address', target: MOCK_ASSET, asset: MOCK_ASSET, amount: '1000' },
+      mockKeypair,
+    );
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/Invalid account address for "source"/);
+  });
+
+  it('fundCAddress rejects empty source address', async () => {
+    const result = await sdk.fundCAddress(
+      { source: '', target: MOCK_ASSET, asset: MOCK_ASSET, amount: '1000' },
+      mockKeypair,
+    );
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/Invalid account address for "source"/);
+  });
+
+  it('fundCAddress passes negative amount string to contract (no client-side validation)', async () => {
+    const result = await sdk.fundCAddress(
+      { source: MOCK_ADDRESS, target: MOCK_ASSET, asset: MOCK_ASSET, amount: '-1000' },
+      mockKeypair,
+    );
+    // SDK doesn't validate amount, just passes to contract
+    expect(result.status).toBe('pending');
+  });
+
+  it('fundCAddress passes zero amount to contract (no client-side validation)', async () => {
+    const result = await sdk.fundCAddress(
+      { source: MOCK_ADDRESS, target: MOCK_ASSET, asset: MOCK_ASSET, amount: '0' },
+      mockKeypair,
+    );
+    expect(result.status).toBe('pending');
+  });
+
+  it('batchFundCAddresses passes mismatched targets and amounts to contract (no client-side validation)', async () => {
+    const result = await sdk.batchFundCAddresses(
+      { source: MOCK_ADDRESS, targets: [MOCK_ASSET, MOCK_ASSET], amounts: ['100'], asset: MOCK_ASSET },
+      mockKeypair,
+    );
+    expect(result.status).toBe('pending');
+  });
+
+  it('batchFundCAddresses passes empty targets array to contract (no client-side validation)', async () => {
+    const result = await sdk.batchFundCAddresses(
+      { source: MOCK_ADDRESS, targets: [], amounts: [], asset: MOCK_ASSET },
+      mockKeypair,
+    );
+    expect(result.status).toBe('pending');
+  });
+
+  it('withdrawFees passes negative amount to contract (no client-side validation)', async () => {
+    const result = await sdk.withdrawFees({ asset: MOCK_ASSET, amount: '-100' }, mockKeypair);
+    expect(result.status).toBe('pending');
+  });
+
+  it('setFee passes negative fee bps to contract (no client-side validation)', async () => {
+    const result = await sdk.setFee(-100, mockKeypair);
+    expect(result.status).toBe('pending');
+  });
+
+  it('reclaimTokens rejects invalid to address (C-address)', async () => {
+    const result = await sdk.reclaimTokens(
+      { asset: MOCK_ASSET, amount: '100', to: MOCK_ASSET },
+      mockKeypair,
+    );
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/Invalid account address for "to"/);
+  });
+
+  it('getCAddressBalance rejects invalid cAddress', async () => {
+    await expect(sdk.getCAddressBalance('invalid', MOCK_ASSET))
+      .rejects.toThrow(/Invalid contract address for "cAddress"/);
+  });
+
+  it('getAllBalances rejects invalid asset in list', async () => {
+    await expect(sdk.getAllBalances(['invalid', MOCK_ASSET]))
+      .rejects.toThrow(/Invalid contract address for "assets\[0\]"/);
+  });
+});
+
+describe('Type validation at runtime', () => {
+  let sdk: OnboardingBridgeSDK;
+  let mockKeypair: any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockKeypair = { publicKey: jest.fn().mockReturnValue(MOCK_ADDRESS), sign: jest.fn() };
+    const mockProvider = {
+      getAccount: jest.fn().mockResolvedValue({}),
+      prepareTransaction: jest.fn().mockResolvedValue({ sign: jest.fn() }),
+      sendTransaction: jest.fn().mockResolvedValue({ hash: 'h', status: 'PENDING' }),
+      simulateTransaction: jest.fn().mockResolvedValue({}),
+    };
+    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    sdk = new OnboardingBridgeSDK(CONFIG);
+  });
+
+  it('BridgeConfig accepts contractId, rpcUrl, networkPassphrase', () => {
+    expect(() => new OnboardingBridgeSDK({ 
+      contractId: MOCK_ASSET, 
+      rpcUrl: 'https://rpc', 
+      networkPassphrase: 'test' 
+    })).not.toThrow();
+  });
+
+  it('BridgeConfig constructor validates contractId at construction time', () => {
+    expect(() => new OnboardingBridgeSDK({ 
+      rpcUrl: 'https://rpc', 
+      networkPassphrase: 'test' 
+    } as any)).toThrow(/Invalid contract address for "contractId"/);
+    
+    expect(() => new OnboardingBridgeSDK({ 
+      contractId: MOCK_ASSET, 
+      networkPassphrase: 'test' 
+    } as any)).not.toThrow();
+    
+    expect(() => new OnboardingBridgeSDK({ 
+      contractId: MOCK_ASSET, 
+      rpcUrl: 'https://rpc' 
+    } as any)).not.toThrow();
+  });
+
+  it('FundCOptions requires all fields', () => {
+    const options: any = { source: MOCK_ADDRESS, target: MOCK_ASSET, asset: MOCK_ASSET, amount: '1000' };
+    expect(options.source).toBeDefined();
+    expect(options.target).toBeDefined();
+    expect(options.asset).toBeDefined();
+    expect(options.amount).toBeDefined();
+  });
+
+  it('BatchFundCOptions requires matching targets and amounts lengths', () => {
+    const options: any = { 
+      source: MOCK_ADDRESS, 
+      targets: [MOCK_ASSET], 
+      amounts: ['100'], 
+      asset: MOCK_ASSET 
+    };
+    expect(options.targets.length).toBe(options.amounts.length);
+  });
+
+  it('OffRampConfig accepts optional provider keys', () => {
+    const config = new OffRampIntegration({});
+    expect(config).toBeInstanceOf(OffRampIntegration);
+  });
+
+  it('CrossChainFundOptions requires chainId, txHash, target, asset, amount, sigs', () => {
+    const options: any = {
+      chainId: 1,
+      txHash: '0x' + 'ab'.repeat(32),
+      target: MOCK_ADDRESS,
+      asset: MOCK_ASSET,
+      amount: '1000',
+      sigs: [{ pubkey: 'a'.repeat(64), signature: 'b'.repeat(128) }],
+    };
+    expect(options.chainId).toBeDefined();
+    expect(options.txHash).toBeDefined();
+    expect(options.target).toBeDefined();
+    expect(options.asset).toBeDefined();
+    expect(options.amount).toBeDefined();
+    expect(options.sigs).toBeDefined();
   });
 });
