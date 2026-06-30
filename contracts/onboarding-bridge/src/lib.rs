@@ -143,6 +143,8 @@ pub enum BridgeError {
     MetaTxExpired = 38,
     /// This meta-transaction nonce has already been used; replay prevented.
     MetaTxNonceAlreadyUsed = 39,
+    /// The contract is deactivated (permanently paused/migrated).
+    ContractDeactivated = 40,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,10 +207,9 @@ pub enum DataKey {
     // Issue #30: commit-reveal counter and entries
     CommitmentId,
     Commitment(u64),
-    // Minimum transfer amount
-    MinimumAmount,
     // Issue #35: EIP-712-style meta-transaction used nonces
     MetaTxNonce(Address, u64),
+    Deactivated,
 }
 
 // ---------------------------------------------------------------------------
@@ -568,7 +569,19 @@ fn set_paused(env: &Env, paused: bool) {
     env.storage().instance().set(&DataKey::Paused, &paused);
 }
 
+fn is_deactivated(env: &Env) -> bool {
+    env.storage().instance().has(&DataKey::Deactivated)
+}
+
+fn check_not_deactivated(env: &Env) -> Result<(), BridgeError> {
+    if is_deactivated(env) {
+        return Err(BridgeError::ContractDeactivated);
+    }
+    Ok(())
+}
+
 fn check_not_paused(env: &Env) -> Result<(), BridgeError> {
+    check_not_deactivated(env)?;
     if read_paused(env) {
         return Err(BridgeError::ContractPaused);
     }
@@ -1813,6 +1826,7 @@ impl OnboardingBridge {
     pub fn set_minimum_amount(env: Env, amount: i128, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if amount < 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -2295,6 +2309,7 @@ impl OnboardingBridge {
     pub fn pause(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -2324,6 +2339,7 @@ impl OnboardingBridge {
     pub fn unpause(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -2375,6 +2391,7 @@ impl OnboardingBridge {
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -2454,6 +2471,7 @@ impl OnboardingBridge {
     ) -> Result<u32, BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -2514,6 +2532,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -2573,6 +2592,7 @@ impl OnboardingBridge {
     pub fn cancel_upgrade(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -2595,6 +2615,115 @@ impl OnboardingBridge {
     /// upgrade has already been executed or cancelled.
     pub fn query_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
         read_pending_upgrade(&env)
+    }
+
+    /// Migrates the contract state to a new contract address in case of emergency.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_contract` (`Address`) — The address of the new contract.
+    /// * `migrate_data` (`bool`) — If true, emits all contract state as events.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    pub fn emergency_migrate(
+        env: Env,
+        new_contract: Address,
+        migrate_data: bool,
+    ) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        check_not_deactivated(&env)?;
+
+        let admin = read_admin(&env);
+        admin.require_auth();
+
+        // Emit the main migration event
+        env.events().publish(("EmergencyMigration",), new_contract.clone());
+
+        if migrate_data {
+            // 1. Admin
+            env.events().publish(("MigrateAdmin",), admin.clone());
+
+            // 2. Fee Collector
+            let fee_collector = read_fee_collector(&env);
+            env.events().publish(("MigrateFeeCollector",), fee_collector);
+
+            // 3. Config
+            let config = read_config(&env);
+            env.events().publish(("MigrateConfig",), config);
+
+            // 4. Fee Bps
+            let fee_bps = read_fee_bps(&env);
+            env.events().publish(("MigrateFeeBps",), fee_bps);
+
+            // 5. Relayer Threshold
+            let threshold = relayer_threshold(&env);
+            env.events().publish(("MigrateRelayerThreshold",), threshold);
+
+            // 6. Relayer Count
+            let count = relayer_count(&env);
+            env.events().publish(("MigrateRelayerCount",), count);
+
+            // 7. Referral Rate
+            if let Some(rate) = env.storage().instance().get::<_, u32>(&DataKey::ReferralRate) {
+                env.events().publish(("MigrateReferralRate",), rate);
+            }
+
+            // 8. Loyalty Token
+            if let Some(token) = env.storage().instance().get::<_, Address>(&DataKey::LoyaltyToken) {
+                env.events().publish(("MigrateLoyaltyToken",), token);
+            }
+
+            // 9. Loyalty Amount Per Fund
+            if let Some(amount) = env.storage().instance().get::<_, i128>(&DataKey::LoyaltyAmountPerFund) {
+                env.events().publish(("MigrateLoyaltyAmountPerFund",), amount);
+            }
+
+            // 10. Minimum Amount
+            if let Some(min_amount) = env.storage().instance().get::<_, i128>(&DataKey::MinimumAmount) {
+                env.events().publish(("MigrateMinimumAmount",), min_amount);
+            }
+
+            // 11. Max Withdraw Per Tx
+            if let Some(max_withdraw) = env.storage().instance().get::<_, i128>(&DataKey::MaxWithdrawPerTx) {
+                env.events().publish(("MigrateMaxWithdrawPerTx",), max_withdraw);
+            }
+
+            // 12. Fee Tiers
+            if let Some(tiers) = env.storage().instance().get::<_, Vec<FeeTier>>(&DataKey::FeeTiers) {
+                env.events().publish(("MigrateFeeTiers",), tiers);
+            }
+
+            // 13. Whitelist and asset-specific stats
+            let whitelist = read_whitelist(&env);
+            env.events().publish(("MigrateAssetWhitelist",), whitelist.clone());
+
+            for (asset, active) in whitelist.iter() {
+                if active {
+                    if let Some(cap) = env.storage().persistent().get::<_, u32>(&DataKey::AssetFeeCap(asset.clone())) {
+                        env.events().publish(("MigrateAssetFeeCap", asset.clone()), cap);
+                    }
+                    if let Some(stats) = env.storage().persistent().get::<_, AssetCounters>(&DataKey::AssetStats(asset.clone())) {
+                        env.events().publish(("MigrateAssetStats", asset.clone()), stats);
+                    }
+                    if let Some(fees) = env.storage().persistent().get::<_, i128>(&DataKey::AccruedFees(asset.clone())) {
+                        env.events().publish(("MigrateAccruedFees", asset.clone()), fees);
+                    }
+                }
+            }
+        }
+
+        // Set the deactivated flag in instance storage
+        env.storage().instance().set(&DataKey::Deactivated, &true);
+
+        // Also set paused in config to true for safety
+        let mut config = read_config(&env);
+        config.paused = true;
+        save_config(&env, &config);
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

@@ -3020,3 +3020,75 @@ mod concurrent_sequential_tests {
         assert_eq!(check_balance(&s.env, &s.token_id, &s.fee_collector), 500i128);
     }
 }
+
+#[test]
+fn test_emergency_migrate_basic() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let new_contract = Address::generate(&env);
+
+    // Call emergency_migrate as admin
+    env.mock_all_auths();
+    bridge.emergency_migrate(&new_contract, &true);
+
+    // Verify it is deactivated by trying to call pause/unpause/set_minimum_amount
+    assert_eq!(
+        bridge.try_pause(&None),
+        Err(Ok(BridgeError::ContractDeactivated))
+    );
+    assert_eq!(
+        bridge.try_unpause(&None),
+        Err(Ok(BridgeError::ContractDeactivated))
+    );
+    assert_eq!(
+        bridge.try_set_minimum_amount(&100i128, &None),
+        Err(Ok(BridgeError::ContractDeactivated))
+    );
+    assert_eq!(
+        bridge.try_upgrade(&soroban_sdk::BytesN::from_array(&env, &[0; 32]), &None),
+        Err(Ok(BridgeError::ContractDeactivated))
+    );
+    assert_eq!(
+        bridge.try_schedule_upgrade(&soroban_sdk::BytesN::from_array(&env, &[0; 32]), &None),
+        Err(Ok(BridgeError::ContractDeactivated))
+    );
+    assert_eq!(
+        bridge.try_execute_upgrade(&soroban_sdk::BytesN::from_array(&env, &[0; 32]), &None),
+        Err(Ok(BridgeError::ContractDeactivated))
+    );
+    assert_eq!(
+        bridge.try_cancel_upgrade(&None),
+        Err(Ok(BridgeError::ContractDeactivated))
+    );
+    assert_eq!(
+        bridge.try_emergency_migrate(&new_contract, &true),
+        Err(Ok(BridgeError::ContractDeactivated))
+    );
+
+    // Verify we can still query the final state
+    assert!(bridge.query_is_paused());
+}
+
+#[test]
+#[should_panic]
+fn test_emergency_migrate_non_admin_rejected() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let new_contract = Address::generate(&env);
+
+    // Clear all mocked auths so emergency_migrate is called without admin authorization.
+    use soroban_sdk::xdr::SorobanAuthorizationEntry;
+    env.set_auths(&[] as &[SorobanAuthorizationEntry]);
+    bridge.emergency_migrate(&new_contract, &true);
+}
+
