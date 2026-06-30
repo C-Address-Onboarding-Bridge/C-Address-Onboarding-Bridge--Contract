@@ -52,6 +52,8 @@
 export { OnboardingBridgeSDK } from './bridge';
 export { OffRampIntegration } from './offramp';
 export { assertAccountAddress, assertContractAddress } from './validate';
+export { CachedContractClient } from './cachedBridge';
+export type { ICacheProvider, CacheOptions, CacheKey } from './cachedBridge';
 export { OnboardingBridgeSDK } from "./bridge";
 export { OffRampIntegration } from "./offramp";
 export { BridgeEventEmitter } from "./events";
