@@ -1,0 +1,72 @@
+name: Release Verification Registry
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v1.0.0)'
+        required: true
+
+jobs:
+  publish-verification:
+    name: Build, Sign and Publish Hash
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Use a personal access token or configure permissions to allow pushing back to main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build WASM (release)
+        run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: sdk/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('sdk/package.json') }}
+
+      - name: Install SDK dependencies
+        run: |
+          cd sdk
+          npm install
+
+      - name: Sign and Publish Hash
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          VERSION: ${{ github.event.release.tag_name || github.event.inputs.version }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          NODE_PATH=sdk/node_modules node scripts/sign-release.js
+
+      - name: Commit and push registry update
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add registry/releases.json
+          git commit -m "chore: add release ${{ github.event.release.tag_name || github.event.inputs.version }} to verification registry [skip ci]" || echo "No changes to commit"
+          git push origin HEAD:main || echo "Failed to push to main. If main is protected, please merge registry changes via PR."
+
+      - name: Upload Verification Metadata to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: registry/onboarding_bridge-${{ github.event.release.tag_name }}-verification.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

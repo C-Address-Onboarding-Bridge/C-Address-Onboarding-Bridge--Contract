@@ -30,6 +30,22 @@ jobs:
       - name: Build WASM (release)
         run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
 
+      - name: Verify WASM Hash
+        run: |
+          COMPUTED_HASH=$(sha256sum target/wasm32-unknown-unknown/release/onboarding_bridge.wasm | cut -d' ' -f1)
+          if [ ! -f wasm_hash.txt ]; then
+            echo "::error::wasm_hash.txt not found!"
+            exit 1
+          fi
+          KNOWN_HASH=$(cat wasm_hash.txt | xargs)
+          echo "Computed WASM Hash: $COMPUTED_HASH"
+          echo "Known Good Hash:    $KNOWN_HASH"
+          if [ "$COMPUTED_HASH" != "$KNOWN_HASH" ]; then
+            echo "::error::Compiled WASM hash ($COMPUTED_HASH) does not match the known good hash ($KNOWN_HASH)!"
+            echo "If this change was intentional, please update the hash in wasm_hash.txt."
+            exit 1
+          fi
+
       - name: Run contract tests
         run: cargo test -p onboarding-bridge --features testutils
 
