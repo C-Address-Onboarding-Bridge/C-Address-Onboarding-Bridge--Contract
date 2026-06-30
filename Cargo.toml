@@ -5,6 +5,9 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+description = "C-Address Onboarding Bridge smart contract for Stellar/Soroban"
+license = "MIT"
+repository = "https://github.com/C-Address-Onboarding-Bridge/C-Address-Onboarding-Bridge--Contract"
 
 [profile.release]
 opt-level = "z"
