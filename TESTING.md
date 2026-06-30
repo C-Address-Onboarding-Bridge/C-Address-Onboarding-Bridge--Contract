@@ -423,6 +423,28 @@ cargo test -p onboarding-bridge --features testutils test_initialize --
 cargo test -p onboarding-bridge --features testutils bench_ --
 ```
 
+### Fuzz / Property-Based Testing
+
+The onboarding bridge includes `proptest` coverage for fee arithmetic and
+end-to-end funding amount behavior.
+
+```bash
+cd contracts/onboarding-bridge
+
+# Pure fee-function property tests
+cargo test --features testutils fee_fuzz_tests -- --nocapture
+
+# fund_c_address-level randomized funding amount tests
+cargo test --features testutils fund_amount_fuzz_tests -- --nocapture
+
+# Full contract suite
+cargo test --features testutils
+```
+
+If a property test fails, proptest may write a minimized counterexample under
+`contracts/onboarding-bridge/proptest-regressions/`. Commit that file with the
+fix so the failing case remains locked into the suite.
+
 ### SDK Tests
 
 ```bash
