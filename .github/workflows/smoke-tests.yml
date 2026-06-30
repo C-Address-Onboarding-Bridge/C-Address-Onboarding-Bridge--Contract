@@ -1,0 +1,48 @@
+name: Deployment Verification Smoke Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      contract_address:
+        description: 'Deployed contract address'
+        required: true
+        type: string
+      network:
+        description: 'Network (testnet or mainnet)'
+        required: true
+        type: choice
+        options:
+          - testnet
+          - mainnet
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke-tests:
+    name: Smoke Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build smoke tests
+        run: cargo build -p onboarding-bridge --release --features testutils
+
+      - name: Run smoke tests
+        run: |
+          cargo test -p onboarding-bridge --lib smoke_ --features testutils
+        env:
+          CONTRACT_ADDRESS: ${{ inputs.contract_address }}
+          NETWORK: ${{ inputs.network }}
+
+      - name: Report smoke test results
+        if: always()
+        run: |
+          echo "Smoke tests completed for contract: ${{ inputs.contract_address }}"
+          echo "Network: ${{ inputs.network }}"
