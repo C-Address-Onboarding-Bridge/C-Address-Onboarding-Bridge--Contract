@@ -1143,6 +1143,46 @@ impl TestToken {
     }
 }
 
+mod swap_pool_contract {
+    use super::*;
+
+    #[contracttype]
+    pub enum SwapPoolDataKey {
+        InputToken,
+        OutputToken,
+        Rate,
+    }
+
+    #[contract]
+    pub struct SwapPool;
+
+    #[contractimpl]
+    impl SwapPool {
+        pub fn initialize(e: Env, input_token: Address, output_token: Address, rate: i128) {
+            e.storage().instance().set(&SwapPoolDataKey::InputToken, &input_token);
+            e.storage().instance().set(&SwapPoolDataKey::OutputToken, &output_token);
+            e.storage().instance().set(&SwapPoolDataKey::Rate, &rate);
+        }
+
+        pub fn swap(e: Env, min_amount_out: i128, to: Address) -> i128 {
+            let rate: i128 = e.storage().instance().get(&SwapPoolDataKey::Rate).unwrap();
+            let input_token: Address = e.storage().instance().get(&SwapPoolDataKey::InputToken).unwrap();
+            let input_token_client = soroban_sdk::token::Client::new(&e, &input_token);
+            let amount_in = input_token_client.balance(&e.current_contract_address());
+            let amount_out = amount_in.checked_mul(rate).unwrap_or(0);
+            if amount_out < min_amount_out {
+                return amount_out;
+            }
+            let output_token: Address = e.storage().instance().get(&SwapPoolDataKey::OutputToken).unwrap();
+            let output_token_client = soroban_sdk::token::Client::new(&e, &output_token);
+            output_token_client.transfer(&e.current_contract_address(), &to, &amount_out);
+            amount_out
+        }
+    }
+}
+
+use swap_pool_contract::{SwapPool, SwapPoolClient};
+
 /********** query_calculate_fee tests **********/
 
 #[test]
@@ -1856,7 +1896,7 @@ mod timelocked_tests {
         Address,
         Address,
     ) {
-        let (bridge_id, token_id) = register_all_contracts(env);
+        let (bridge_id, token_id) = register_all_contracts_mocked(env);
         let bridge = create_bridge_client(env, &bridge_id);
         let (admin, user, fee_collector) = create_test_users(env);
         init_token(env, &token_id, &admin);
