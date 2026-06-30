@@ -51,7 +51,7 @@ jobs:
           cat benchmark_results.json
 
       - name: Download previous benchmark results
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: previous_benchmark.json
           key: benchmark-results-${{ github.ref_name }}

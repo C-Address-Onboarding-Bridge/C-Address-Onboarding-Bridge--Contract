@@ -113,7 +113,7 @@ jobs:
           node-version: 20
 
       - name: Cache npm dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: sdk/node_modules
           key: ${{ runner.os }}-node-${{ hashFiles('sdk/package.json') }}
@@ -155,7 +155,7 @@ jobs:
           npm --version
 
       - name: Cache npm dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: sdk/node_modules
           key: ${{ runner.os }}-node-${{ matrix.node-version }}-npm-${{ matrix.npm-version }}-${{ hashFiles('sdk/package.json') }}
