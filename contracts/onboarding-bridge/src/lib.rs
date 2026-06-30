@@ -47,7 +47,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Map,
+    Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -119,6 +120,18 @@ pub enum BridgeError {
     UpgradeTimelockActive = 27,
     // Issue #23: max withdraw per tx
     WithdrawExceedsLimit = 28,
+    /// An arithmetic operation overflowed i128 bounds.
+    Overflow = 29,
+    /// No commitment exists for the given ID.
+    CommitmentNotFound = 30,
+    /// The commitment has already been revealed.
+    CommitmentAlreadyRevealed = 31,
+    /// The reveal deadline has passed.
+    CommitmentExpired = 32,
+    /// The revealed amount+nonce does not match the stored hash.
+    CommitmentHashMismatch = 33,
+    /// The minimum delay between commit and reveal has not elapsed.
+    CommitmentNotMatured = 34,
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +189,9 @@ pub enum DataKey {
     MaxWithdrawPerTx,
     // Issue #24: reentrancy guard flag
     Entered,
+    // Issue #30: commit-reveal counter and entries
+    CommitmentId,
+    Commitment(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +206,8 @@ const MAX_ALLOWED_TTL: u32 = 3_110_400; // ~1 year in ledgers (5s/ledger)
 const CRITICAL_ENTRY_TTL_THRESHOLD: u32 = 100_000;
 /// Minimum ledgers that must pass before a scheduled upgrade becomes executable (~24 h at 5 s/ledger).
 const UPGRADE_TIMELOCK_LEDGERS: u32 = 17_280;
+/// Minimum ledgers between commit_fund and reveal_fund (~25 s at 5 s/ledger).
+const COMMIT_REVEAL_MIN_DELAY_LEDGERS: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -291,6 +309,30 @@ pub struct PendingUpgrade {
     pub new_wasm_hash: BytesN<32>,
     /// Ledger sequence at or after which `execute_upgrade` may be called.
     pub executable_after_ledger: u32,
+}
+
+/// A pending commit-reveal entry created by `commit_fund`.
+///
+/// The `amount_hash` is `sha256(amount_be16 || nonce_be8)`.  The `reveal_fund`
+/// function verifies this hash before executing the transfer so that the
+/// actual amount is never visible in the mempool.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommitmentEntry {
+    /// Address that will provide the tokens at reveal time.
+    pub source: Address,
+    /// Address that will receive the net amount at reveal time.
+    pub target: Address,
+    /// Whitelisted token contract address.
+    pub asset: Address,
+    /// sha256(amount_be16 || nonce_be8) — binds the reveal to a specific amount.
+    pub amount_hash: BytesN<32>,
+    /// Unix timestamp deadline; reveal must happen before this.
+    pub deadline: u64,
+    /// Ledger sequence when the commitment was created; used to enforce delay.
+    pub committed_at_ledger: u32,
+    /// Set to `true` once `reveal_fund` has been successfully called.
+    pub revealed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -518,18 +560,13 @@ fn check_not_paused(env: &Env) -> Result<(), BridgeError> {
 }
 
 #[inline(always)]
-fn calculate_fee(amount: i128, fee_bps: u32) -> i128 {
+fn calculate_fee(amount: i128, fee_bps: u32) -> Result<i128, BridgeError> {
     if fee_bps == 0 {
-        return 0;
+        return Ok(0);
     }
     let bps = fee_bps as i128;
-    // Use checked arithmetic to guard against overflow on very large amounts.
-    // If checked_mul overflows i128 (amount > ~1.7e38 / 1000), fall back to
-    // dividing first at the cost of minor precision loss.
-    match amount.checked_mul(bps) {
-        Some(product) => product / FEE_DENOMINATOR,
-        None => (amount / FEE_DENOMINATOR) * bps,
-    }
+    let product = safe_math::safe_mul(amount, bps)?;
+    safe_math::safe_div(product, FEE_DENOMINATOR)
 }
 
 fn is_blocked(env: &Env, addr: &Address) -> bool {
@@ -983,6 +1020,58 @@ fn mint_loyalty_tokens(env: &Env, recipient: &Address) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Commit-reveal helpers (issue #30)
+// ---------------------------------------------------------------------------
+
+fn next_commitment_id(env: &Env) -> u64 {
+    let id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::CommitmentId)
+        .unwrap_or(0u64);
+    env.storage().instance().set(&DataKey::CommitmentId, &(id + 1));
+    id
+}
+
+fn save_commitment(env: &Env, id: u64, entry: &CommitmentEntry) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::Commitment(id), entry);
+}
+
+fn read_commitment(env: &Env, id: u64) -> Option<CommitmentEntry> {
+    env.storage().persistent().get(&DataKey::Commitment(id))
+}
+
+// ---------------------------------------------------------------------------
+// Overflow-safe arithmetic (issue #26)
+// ---------------------------------------------------------------------------
+
+mod safe_math {
+    use super::BridgeError;
+
+    #[inline(always)]
+    pub fn safe_add(a: i128, b: i128) -> Result<i128, BridgeError> {
+        a.checked_add(b).ok_or(BridgeError::Overflow)
+    }
+
+    #[inline(always)]
+    pub fn safe_sub(a: i128, b: i128) -> Result<i128, BridgeError> {
+        a.checked_sub(b).ok_or(BridgeError::Overflow)
+    }
+
+    #[inline(always)]
+    pub fn safe_mul(a: i128, b: i128) -> Result<i128, BridgeError> {
+        a.checked_mul(b).ok_or(BridgeError::Overflow)
+    }
+
+    #[inline(always)]
+    pub fn safe_div(a: i128, b: i128) -> Result<i128, BridgeError> {
+        a.checked_div(b).ok_or(BridgeError::Overflow)
+    }
+}
+
 struct ReentrancyGuard {
     env: Env,
 }
@@ -1134,7 +1223,7 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
-    /// * `("CAddressFunded", source, target)` — data: `(amount, fee, asset)`
+    /// * `("CAddressFunded", asset, source, target)` — data: `(amount, fee)`
     ///
     /// # Security Considerations
     ///
@@ -1182,8 +1271,8 @@ impl OnboardingBridge {
         let global_fee_bps = read_fee_bps(&env);
         let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
         let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
-        let fee = calculate_fee(amount, effective_fee_bps);
-        let net_amount = amount - fee;
+        let fee = calculate_fee(amount, effective_fee_bps)?;
+        let net_amount = safe_math::safe_sub(amount, fee)?;
 
         if net_amount > 0 {
             token_client.transfer(&contract_addr, &target, &net_amount);
@@ -1198,7 +1287,7 @@ impl OnboardingBridge {
         mint_loyalty_tokens(&env, &source);
 
         env.events()
-            .publish(("CAddressFunded", source, target), (amount, fee, asset));
+            .publish(("CAddressFunded", asset, source, target), (amount, fee));
         Ok(())
     }
 
@@ -1239,8 +1328,8 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
-    /// * `("CAddressFunded", source, target)` — Emitted per successful entry;
-    ///   data: `(amount, fee, asset)`.
+    /// * `("CAddressFunded", asset, source, target)` — Emitted per successful entry;
+    ///   data: `(amount, fee)`.
     /// * `("BatchTransferFailed", source, target)` — Emitted per skipped entry;
     ///   data: `(amount, "access_denied")`.
     /// * `("BatchCompleted", source)` — Emitted once at the end;
@@ -1293,7 +1382,7 @@ impl OnboardingBridge {
             if amount <= 0 {
                 return Err(BridgeError::InvalidAmount);
             }
-            total += amount;
+            total = safe_math::safe_add(total, amount)?;
         }
 
         let token_client = token::Client::new(&env, &asset);
@@ -1315,8 +1404,8 @@ impl OnboardingBridge {
             let target = targets.get(i).unwrap();
             let amount = amounts.get(i).unwrap();
 
-            let fee = calculate_fee(amount, effective_fee_bps);
-            let net_amount = amount - fee;
+            let fee = calculate_fee(amount, effective_fee_bps)?;
+            let net_amount = safe_math::safe_sub(amount, fee)?;
 
             if check_access(&env, &target).is_err() {
                 num_failures += 1;
@@ -1338,8 +1427,8 @@ impl OnboardingBridge {
             }
 
             env.events().publish(
-                ("CAddressFunded", source.clone(), target),
-                (amount, fee, asset.clone()),
+                ("CAddressFunded", asset.clone(), source.clone(), target),
+                (amount, fee),
             );
         }
 
@@ -1895,7 +1984,7 @@ impl OnboardingBridge {
     ///
     /// * `("ReferralPaid", source, referrer)` — Emitted only when `referrer` is
     ///   `Some` and `referral_fee > 0`; data: `(rf, asset)`.
-    /// * `("CAddressFunded", source, target)` — data: `(amount, fee, asset)`.
+    /// * `("CAddressFunded", asset, source, target)` — data: `(amount, fee)`.
     ///
     /// # Security Considerations
     ///
@@ -1935,8 +2024,8 @@ impl OnboardingBridge {
 
         let global_fee_bps = read_fee_bps(&env);
         let effective_fee_bps = get_effective_fee_bps(&env, &asset, global_fee_bps);
-        let fee = calculate_fee(amount, effective_fee_bps);
-        let net_amount = amount - fee;
+        let fee = calculate_fee(amount, effective_fee_bps)?;
+        let net_amount = safe_math::safe_sub(amount, fee)?;
 
         if net_amount > 0 {
             token_client.transfer(&env.current_contract_address(), &target, &net_amount);
@@ -1945,7 +2034,7 @@ impl OnboardingBridge {
         // Split fee: referral portion goes directly to referrer
         let referral_fee = if let Some(ref referrer_addr) = referrer {
             let referral_rate = read_referral_rate(&env);
-            let rf = (fee * referral_rate as i128) / FEE_DENOMINATOR;
+            let rf = safe_math::safe_div(safe_math::safe_mul(fee, referral_rate as i128)?, FEE_DENOMINATOR)?;
             if rf > 0 {
                 token_client.transfer(&env.current_contract_address(), referrer_addr, &rf);
                 env.events().publish(
@@ -1964,8 +2053,8 @@ impl OnboardingBridge {
         increment_total_fees_collected(&env, &asset, fee);
 
         env.events().publish(
-            ("CAddressFunded", source, target),
-            (amount, fee, asset),
+            ("CAddressFunded", asset, source, target),
+            (amount, fee),
         );
         Ok(())
     }
@@ -2095,11 +2184,11 @@ impl OnboardingBridge {
     /// // assert_eq!(fee, 10i128);
     /// // assert_eq!(net, 990i128);
     /// ```
-    pub fn query_calculate_fee(env: Env, gross_amount: i128) -> (i128, i128) {
+    pub fn query_calculate_fee(env: Env, gross_amount: i128) -> Result<(i128, i128), BridgeError> {
         let fee_bps = read_fee_bps(&env);
-        let fee = calculate_fee(gross_amount, fee_bps);
-        let net = gross_amount - fee;
-        (fee, net)
+        let fee = calculate_fee(gross_amount, fee_bps)?;
+        let net = safe_math::safe_sub(gross_amount, fee)?;
+        Ok((fee, net))
     }
 
     /// Returns the cumulative net amount of `asset` that has been delivered to
@@ -3116,8 +3205,8 @@ impl OnboardingBridge {
 
         let fee_bps = read_fee_bps(&env);
         let effective_fee_bps = get_effective_fee_bps(&env, &asset, fee_bps);
-        let fee = calculate_fee(amount, effective_fee_bps);
-        let net_amount = amount - fee;
+        let fee = calculate_fee(amount, effective_fee_bps)?;
+        let net_amount = safe_math::safe_sub(amount, fee)?;
 
         let token_client = token::Client::new(&env, &asset);
         if net_amount > 0 {
@@ -3398,8 +3487,8 @@ impl OnboardingBridge {
 
         let fee_bps = read_fee_bps(&env);
         let effective_fee_bps = get_effective_fee_bps(&env, &entry.asset, fee_bps);
-        let fee = calculate_fee(entry.amount, effective_fee_bps);
-        let net_amount = entry.amount - fee;
+        let fee = calculate_fee(entry.amount, effective_fee_bps)?;
+        let net_amount = safe_math::safe_sub(entry.amount, fee)?;
 
         let token_client = token::Client::new(&env, &entry.asset);
         if net_amount > 0 {
@@ -3720,6 +3809,219 @@ impl OnboardingBridge {
     pub fn query_accrued_fees(env: Env, asset: Address) -> Result<i128, BridgeError> {
         check_initialized(&env)?;
         Ok(read_accrued_fees(&env, &asset))
+    }
+
+    // -----------------------------------------------------------------------
+    // Commit-reveal funding (issue #30)
+    // -----------------------------------------------------------------------
+
+    /// Stores a blinded funding commitment without revealing the amount.
+    ///
+    /// The caller commits to a specific `(source, target, asset, amount)` by
+    /// providing `amount_hash = sha256(amount_be16 || nonce_be8)`.  The actual
+    /// amount stays hidden until `reveal_fund` is called, preventing
+    /// front-runners from observing the value before the commitment is settled.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The account that will supply the tokens.
+    /// * `target` (`Address`) — The C-address that will receive the net amount.
+    /// * `asset` (`Address`) — Whitelisted token contract address.
+    /// * `amount_hash` (`BytesN<32>`) — `sha256(amount_be16 || nonce_be8)`.
+    /// * `deadline` (`u64`) — Unix timestamp; `reveal_fund` must be called
+    ///   before this time.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `source.require_auth()`.
+    ///
+    /// # Returns
+    ///
+    /// A numeric commitment ID used to reference this entry in `reveal_fund`
+    /// and `query_commitment`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::TransactionExpired`] — `deadline` is in the past.
+    /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
+    /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode on and `target`
+    ///   is not allowlisted.
+    /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
+    ///
+    /// # Events
+    ///
+    /// * `("CommitFund", source, target)` — data: `(id, amount_hash, asset, deadline)`
+    pub fn commit_fund(
+        env: Env,
+        source: Address,
+        target: Address,
+        asset: Address,
+        amount_hash: BytesN<32>,
+        deadline: u64,
+    ) -> Result<u64, BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        if env.ledger().timestamp() >= deadline {
+            return Err(BridgeError::TransactionExpired);
+        }
+        check_access(&env, &target)?;
+        check_asset_whitelisted(&env, &asset)?;
+        source.require_auth();
+        extend_instance_ttl(&env);
+
+        let id = next_commitment_id(&env);
+        let committed_at_ledger = env.ledger().sequence();
+
+        save_commitment(
+            &env,
+            id,
+            &CommitmentEntry {
+                source: source.clone(),
+                target: target.clone(),
+                asset: asset.clone(),
+                amount_hash: amount_hash.clone(),
+                deadline,
+                committed_at_ledger,
+                revealed: false,
+            },
+        );
+
+        env.events().publish(
+            ("CommitFund", source, target),
+            (id, amount_hash, asset, deadline),
+        );
+        Ok(id)
+    }
+
+    /// Executes a previously committed fund transfer after the minimum delay.
+    ///
+    /// Verifies `sha256(amount_be16 || nonce_be8) == stored_amount_hash` before
+    /// transferring tokens, ensuring the caller cannot substitute a different
+    /// amount from the one committed.
+    ///
+    /// # Arguments
+    ///
+    /// * `commitment_id` (`u64`) — ID returned by `commit_fund`.
+    /// * `source` (`Address`) — Must match the committed source.
+    /// * `target` (`Address`) — Must match the committed target.
+    /// * `asset` (`Address`) — Must match the committed asset.
+    /// * `amount` (`i128`) — Actual gross amount; must satisfy the hash.
+    /// * `nonce` (`u64`) — Blinding nonce used when computing `amount_hash`.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `source.require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::CommitmentNotFound`] — No entry for `commitment_id`.
+    /// * [`BridgeError::CommitmentAlreadyRevealed`] — Already revealed.
+    /// * [`BridgeError::CommitmentExpired`] — Past the reveal deadline.
+    /// * [`BridgeError::CommitmentNotMatured`] — Minimum delay not yet elapsed.
+    /// * [`BridgeError::Unauthorized`] — `source`, `target`, or `asset` do not
+    ///   match the commitment.
+    /// * [`BridgeError::CommitmentHashMismatch`] — Hash does not match.
+    /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
+    /// * [`BridgeError::Overflow`] — Fee arithmetic overflowed.
+    ///
+    /// # Events
+    ///
+    /// * `("CommitRevealFunded", asset, source, target)` — data:
+    ///   `(commitment_id, amount, fee)`
+    pub fn reveal_fund(
+        env: Env,
+        commitment_id: u64,
+        source: Address,
+        target: Address,
+        asset: Address,
+        amount: i128,
+        nonce: u64,
+    ) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        let mut entry = read_commitment(&env, commitment_id)
+            .ok_or(BridgeError::CommitmentNotFound)?;
+
+        if entry.revealed {
+            return Err(BridgeError::CommitmentAlreadyRevealed);
+        }
+
+        if env.ledger().timestamp() > entry.deadline {
+            return Err(BridgeError::CommitmentExpired);
+        }
+
+        if env.ledger().sequence()
+            < entry
+                .committed_at_ledger
+                .saturating_add(COMMIT_REVEAL_MIN_DELAY_LEDGERS)
+        {
+            return Err(BridgeError::CommitmentNotMatured);
+        }
+
+        if entry.source != source || entry.target != target || entry.asset != asset {
+            return Err(BridgeError::Unauthorized);
+        }
+
+        // Verify hash: sha256(amount_be16 || nonce_be8)
+        let mut preimage = Bytes::new(&env);
+        preimage.extend_from_array(&amount.to_be_bytes());
+        preimage.extend_from_array(&nonce.to_be_bytes());
+        let computed_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+        if computed_hash != entry.amount_hash {
+            return Err(BridgeError::CommitmentHashMismatch);
+        }
+
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+
+        source.require_auth();
+
+        // Mark revealed before the transfer to prevent re-entrancy replay.
+        entry.revealed = true;
+        save_commitment(&env, commitment_id, &entry);
+
+        let token_client = token::Client::new(&env, &asset);
+        let contract_addr = env.current_contract_address();
+        token_client.transfer(&source, &contract_addr, &amount);
+
+        let global_fee_bps = read_fee_bps(&env);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
+        let fee = calculate_fee(amount, effective_fee_bps)?;
+        let net_amount = safe_math::safe_sub(amount, fee)?;
+
+        if net_amount > 0 {
+            token_client.transfer(&contract_addr, &target, &net_amount);
+        }
+
+        increment_accrued_fees(&env, &asset, fee);
+        increment_total_bridged(&env, &asset, net_amount);
+        increment_total_fees_collected(&env, &asset, fee);
+        increment_source_bridged_volume(&env, &source, amount);
+        extend_instance_ttl(&env);
+
+        env.events().publish(
+            ("CommitRevealFunded", asset, source, target),
+            (commitment_id, amount, fee),
+        );
+        Ok(())
+    }
+
+    /// Returns a commitment entry by ID.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::CommitmentNotFound`] — No entry for `id`.
+    pub fn query_commitment(env: Env, id: u64) -> Result<CommitmentEntry, BridgeError> {
+        read_commitment(&env, id).ok_or(BridgeError::CommitmentNotFound)
     }
 }
 

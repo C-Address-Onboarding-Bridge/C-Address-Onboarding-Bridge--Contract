@@ -9,8 +9,12 @@ use soroban_sdk::{
 fn register_all_contracts(env: &Env) -> (Address, Address) {
     let bridge_id = env.register(OnboardingBridge, ());
     let token_id = env.register(TestToken, ());
-    env.mock_all_auths();
     (bridge_id, token_id)
+}
+
+fn register_all_contracts_mocked(env: &Env) -> (Address, Address) {
+    env.mock_all_auths();
+    register_all_contracts(env)
 }
 
 fn init_token(env: &Env, token_id: &Address, admin: &Address) {
@@ -46,7 +50,7 @@ fn check_balance(env: &Env, token_id: &Address, addr: &Address) -> i128 {
 fn test_initialize() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -61,7 +65,7 @@ fn test_initialize() {
 fn test_initialize_twice() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -75,7 +79,7 @@ fn test_initialize_twice() {
 fn test_initialize_fee_too_high() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     assert_eq!(
@@ -88,7 +92,7 @@ fn test_initialize_fee_too_high() {
 fn test_fund_c_address() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -109,7 +113,7 @@ fn test_fund_c_address() {
 fn test_fund_without_initialize() {
     let env = Env::default();
     let (_admin, user, _fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&Address::generate(&env), &Address::generate(&env), &50u32, &None);
@@ -127,7 +131,7 @@ fn test_fund_without_initialize() {
 fn test_batch_fund_c_addresses() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -153,7 +157,7 @@ fn test_batch_fund_c_addresses() {
 fn test_fund_with_zero_fee() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -174,7 +178,7 @@ fn test_fund_with_zero_fee() {
 fn test_set_fee_bps() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -188,7 +192,7 @@ fn test_set_fee_bps() {
 fn test_set_fee_bps_too_high() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -202,7 +206,7 @@ fn test_set_fee_bps_too_high() {
 fn test_set_fee_collector() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -215,7 +219,7 @@ fn test_set_fee_collector() {
 fn test_set_admin() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -228,7 +232,7 @@ fn test_set_admin() {
 fn test_withdraw_fees() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -252,7 +256,7 @@ fn test_withdraw_fees() {
 fn test_query_balance() {
     let env = Env::default();
     let (admin, user, _fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -267,7 +271,7 @@ fn test_query_balance() {
 fn test_batch_empty() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     let token_id = Address::generate(&env);
@@ -283,7 +287,7 @@ fn test_batch_empty() {
 fn test_fund_events() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -304,7 +308,7 @@ fn test_fund_events() {
 #[test]
 fn test_query_fee_bps_uninitialized() {
     let env = Env::default();
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     assert_eq!(
         bridge.try_query_fee_bps(),
@@ -318,7 +322,7 @@ fn test_query_fee_bps_uninitialized() {
 fn test_pause_and_unpause() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -336,7 +340,7 @@ fn test_pause_and_unpause() {
 fn test_fund_c_address_paused() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -355,7 +359,7 @@ fn test_fund_c_address_paused() {
 fn test_batch_fund_paused() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -376,7 +380,7 @@ fn test_batch_fund_paused() {
 fn test_withdraw_fees_paused() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -397,7 +401,7 @@ fn test_withdraw_fees_paused() {
 fn test_set_fee_bps_paused() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -412,7 +416,7 @@ fn test_set_fee_bps_paused() {
 fn test_set_fee_collector_paused() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -427,7 +431,7 @@ fn test_set_fee_collector_paused() {
 fn test_set_admin_paused() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -442,7 +446,7 @@ fn test_set_admin_paused() {
 fn test_view_functions_work_when_paused() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -462,7 +466,7 @@ fn test_view_functions_work_when_paused() {
 fn test_pause_emits_event() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -477,7 +481,7 @@ fn test_pause_emits_event() {
 fn test_unpause_emits_event() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -493,7 +497,7 @@ fn test_unpause_emits_event() {
 fn test_fund_works_after_unpause() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -521,7 +525,7 @@ const V2_WASM: &[u8] = include_bytes!(concat!(
 fn test_upgrade_admin_only_and_event() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     env.mock_all_auths();
 
@@ -561,7 +565,7 @@ fn test_upgrade_non_admin_rejected() {
 // --------- Blocklist / Allowlist Tests ---------
 
 fn setup_bridge(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, Address, Address) {
-    let (bridge_id, token_id) = register_all_contracts(env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(env);
     let bridge = create_bridge_client(env, &bridge_id);
     let (admin, user, fee_collector) = create_test_users(env);
     init_token(env, &token_id, &admin);
@@ -771,7 +775,7 @@ fn test_reclaim_emits_event() {
 fn test_add_asset_whitelists_it() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -785,7 +789,7 @@ fn test_add_asset_whitelists_it() {
 fn test_remove_asset() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -800,7 +804,7 @@ fn test_remove_asset() {
 fn test_query_whitelisted_assets() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -830,7 +834,7 @@ fn test_query_whitelisted_assets() {
 fn test_add_asset_is_idempotent() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -845,7 +849,7 @@ fn test_add_asset_is_idempotent() {
 fn test_add_asset_non_admin_rejected() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -859,7 +863,7 @@ fn test_add_asset_non_admin_rejected() {
 fn test_remove_asset_non_admin_rejected() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -872,7 +876,7 @@ fn test_remove_asset_non_admin_rejected() {
 #[test]
 fn test_whitelist_query_uninitialized() {
     let env = Env::default();
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     assert_eq!(
         bridge.try_query_is_asset_whitelisted(&token_id),
@@ -884,7 +888,7 @@ fn test_whitelist_query_uninitialized() {
 fn test_fund_rejects_non_whitelisted_asset() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -902,7 +906,7 @@ fn test_fund_rejects_non_whitelisted_asset() {
 fn test_batch_fund_rejects_non_whitelisted_asset() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -925,7 +929,7 @@ fn test_batch_fund_rejects_non_whitelisted_asset() {
 fn test_query_all_balances_returns_contract_balances() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
     bridge.initialize(&admin, &fee_collector, &0u32, &None);
@@ -943,7 +947,7 @@ fn test_query_all_balances_returns_contract_balances() {
 fn test_query_all_balances_empty_input() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _token_id) = register_all_contracts(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     bridge.initialize(&admin, &fee_collector, &0u32, &None);
 
@@ -956,7 +960,7 @@ fn test_query_all_balances_empty_input() {
 fn test_accrued_fees_single_deposit() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -975,7 +979,7 @@ fn test_accrued_fees_single_deposit() {
 fn test_accrued_fees_accumulate_across_deposits() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -994,7 +998,7 @@ fn test_accrued_fees_accumulate_across_deposits() {
 fn test_accrued_fees_batch_accumulate() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -1017,7 +1021,7 @@ fn test_accrued_fees_batch_accumulate() {
 fn test_withdraw_fees_decrements_accrued() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -1038,7 +1042,7 @@ fn test_withdraw_fees_decrements_accrued() {
 fn test_withdraw_fees_exceeds_accrued() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -1059,7 +1063,7 @@ fn test_withdraw_fees_exceeds_accrued() {
 fn test_zero_fee_no_accrued_entry() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -1145,7 +1149,7 @@ impl TestToken {
 fn test_query_calculate_fee() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
@@ -1159,7 +1163,7 @@ fn test_query_calculate_fee() {
 fn test_query_calculate_fee_zero_fee() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &0u32, &None);
@@ -1173,7 +1177,7 @@ fn test_query_calculate_fee_zero_fee() {
 fn test_query_calculate_fee_max_fee() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &1000u32, &None);
@@ -1189,7 +1193,7 @@ fn test_query_calculate_fee_max_fee() {
 fn test_query_total_bridged_and_fees_collected() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -1211,7 +1215,7 @@ fn test_query_total_bridged_and_fees_collected() {
 fn test_query_total_bridged_accumulates() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -1236,7 +1240,7 @@ fn test_query_total_bridged_accumulates() {
 fn test_query_total_bridged_batch() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -1262,7 +1266,7 @@ fn test_query_total_bridged_batch() {
 fn test_query_total_bridged_zero() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -1280,7 +1284,7 @@ fn test_query_total_bridged_zero() {
 fn test_initialize_emits_event() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -1294,7 +1298,7 @@ fn test_initialize_emits_event() {
 fn test_fee_bps_changed_emits_event() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -1309,7 +1313,7 @@ fn test_fee_bps_changed_emits_event() {
 fn test_fee_collector_changed_emits_event() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -1325,7 +1329,7 @@ fn test_fee_collector_changed_emits_event() {
 fn test_admin_changed_emits_event() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
@@ -1340,7 +1344,7 @@ fn test_admin_changed_emits_event() {
 // --------- batch_fund_c_address edge case tests ---------
 
 fn setup_batch(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, Address, Address) {
-    let (bridge_id, token_id) = register_all_contracts(env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(env);
     let bridge = create_bridge_client(env, &bridge_id);
     let (admin, user, fee_collector) = create_test_users(env);
     init_token(env, &token_id, &admin);
@@ -1634,7 +1638,7 @@ fn test_batch_100_targets() {
 #[test]
 fn test_nonce_starts_at_zero() {
     let env = Env::default();
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     let caller = Address::generate(&env);
     assert_eq!(bridge.query_nonce(&caller), 0u64);
@@ -2077,7 +2081,7 @@ mod crosschain_tests {
 fn test_set_and_query_referral_rate() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
@@ -2094,7 +2098,7 @@ fn test_set_and_query_referral_rate() {
 fn test_set_referral_rate_too_high() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
@@ -2109,7 +2113,7 @@ fn test_set_referral_rate_too_high() {
 fn test_fund_with_referral_splits_fee() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -2142,7 +2146,7 @@ fn test_fund_with_referral_splits_fee() {
 fn test_fund_with_no_referrer_accrues_full_fee() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -2164,7 +2168,7 @@ fn test_fund_with_no_referrer_accrues_full_fee() {
 fn test_fund_with_referral_zero_referral_rate() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -2197,7 +2201,7 @@ fn test_fund_with_referral_zero_referral_rate() {
 fn test_fund_c_address_zero_amount_fails() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -2216,7 +2220,7 @@ fn test_fund_c_address_zero_amount_fails() {
 fn test_fund_c_address_zero_amount_no_event() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -2238,7 +2242,7 @@ fn test_fund_c_address_zero_amount_no_event() {
 fn test_batch_fund_all_zeros_fails() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -2260,7 +2264,7 @@ fn test_batch_fund_all_zeros_fails() {
 fn test_batch_fund_mixed_zero_nonzero_fails() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -2287,7 +2291,7 @@ fn test_batch_fund_mixed_zero_nonzero_fails() {
 fn test_calculate_fee_zero_amount() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
@@ -2302,7 +2306,7 @@ fn test_calculate_fee_zero_amount() {
 fn test_fund_c_address_zero_amount_max_fee_fails() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
     init_token(&env, &token_id, &admin);
 
@@ -2314,4 +2318,82 @@ fn test_fund_c_address_zero_amount_max_fee_fails() {
         bridge.try_fund_c_address(&user, &target, &token_id, &0i128, &None, &None),
         Err(Ok(BridgeError::InvalidAmount))
     );
+}
+
+// --------- Authorization enforcement tests (issue #27) ---------
+// These tests verify that specific require_auth() calls are enforced.
+// Setup uses register_all_contracts_mocked; auths are cleared before the
+// operation under test so that auth enforcement is real, not bypassed.
+
+#[test]
+#[should_panic]
+fn test_fund_c_address_requires_source_auth() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    use soroban_sdk::xdr::SorobanAuthorizationEntry;
+    env.set_auths(&[] as &[SorobanAuthorizationEntry]);
+
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &500i128, &None, &None);
+}
+
+#[test]
+#[should_panic]
+fn test_set_fee_bps_requires_admin_auth() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    use soroban_sdk::xdr::SorobanAuthorizationEntry;
+    env.set_auths(&[] as &[SorobanAuthorizationEntry]);
+
+    bridge.set_fee_bps(&200u32, &None);
+}
+
+#[test]
+#[should_panic]
+fn test_withdraw_fees_requires_fee_collector_auth() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &500i128, &None, &None);
+
+    use soroban_sdk::xdr::SorobanAuthorizationEntry;
+    env.set_auths(&[] as &[SorobanAuthorizationEntry]);
+
+    bridge.withdraw_fees(&token_id, &5i128, &None);
+}
+
+#[test]
+#[should_panic]
+fn test_pause_requires_admin_auth() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    use soroban_sdk::xdr::SorobanAuthorizationEntry;
+    env.set_auths(&[] as &[SorobanAuthorizationEntry]);
+
+    bridge.pause(&None);
 }
