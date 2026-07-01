@@ -26,6 +26,12 @@ import {
   PaginationOptions,
   CostEstimate,
 } from './types';
+import {
+  type ObservabilityHooks,
+  withTransactionHooks,
+  withRpcHook,
+  fireRpcCall,
+} from './observability';
 
 /**
  * Maximum number of `(target, amount)` pairs that can be included in a single
@@ -88,6 +94,7 @@ export class OnboardingBridgeSDK {
   private contract: Contract;
   private provider: SorobanRpc.Server;
   private networkPassphrase: string;
+  private hooks: ObservabilityHooks | undefined;
 
   /**
    * Create a new SDK instance.
@@ -122,6 +129,7 @@ export class OnboardingBridgeSDK {
       config.retry,
     );
     this.networkPassphrase = config.networkPassphrase;
+    this.hooks = config.hooks;
   }
 
   /**
@@ -167,46 +175,68 @@ export class OnboardingBridgeSDK {
     options: FundCOptions,
     sourceKeypair: Keypair,
   ): Promise<TransactionResult> {
-    try {
-      assertAccountAddress(options.source, 'source');
-      assertContractAddress(options.target, 'target');
-      assertContractAddress(options.asset, 'asset');
-      const sourceAccount = await this.provider.getAccount(options.source);
+    return withTransactionHooks(
+      this.hooks,
+      'fundCAddress',
+      { source: options.source, target: options.target, asset: options.asset, amount: options.amount },
+      async () => {
+        try {
+          assertAccountAddress(options.source, 'source');
+          assertContractAddress(options.target, 'target');
+          assertContractAddress(options.asset, 'asset');
+          const sourceAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: options.source },
+            () => this.provider.getAccount(options.source),
+          );
 
-      const tx = new TransactionBuilder(sourceAccount, {
-        fee: BASE_FEE,
-        networkPassphrase: this.networkPassphrase,
-      })
-        .addOperation(
-          this.contract.call(
-            'fund_c_address',
-            ...this.toScVals([
-              options.source,
-              options.target,
-              options.asset,
-              options.amount,
-            ]),
-          ),
-        )
-        .setTimeout(30)
-        .build();
+          const tx = new TransactionBuilder(sourceAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'fund_c_address',
+                ...this.toScVals([
+                  options.source,
+                  options.target,
+                  options.asset,
+                  options.amount,
+                ]),
+              ),
+            )
+            .setTimeout(30)
+            .build();
 
-      const preparedTx = await this.provider.prepareTransaction(tx);
-      preparedTx.sign(sourceKeypair);
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'fund_c_address' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(sourceKeypair);
 
-      const response = await this.provider.sendTransaction(preparedTx);
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'fund_c_address' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
 
-      return {
-        hash: response.hash,
-        status: response.status === 'ERROR' ? 'failed' : 'pending',
-      };
-    } catch (error: any) {
-      return {
-        hash: '',
-        status: 'failed',
-        error: error.message || 'Unknown error',
-      };
-    }
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
   }
 
   /**
@@ -237,52 +267,81 @@ export class OnboardingBridgeSDK {
     options: FundCAddressWithSwapOptions,
     sourceKeypair: any,
   ): Promise<TransactionResult> {
-    try {
-      assertAccountAddress(options.source, 'source');
-      assertContractAddress(options.target, 'target');
-      assertContractAddress(options.sourceAsset, 'sourceAsset');
-      assertContractAddress(options.targetAsset, 'targetAsset');
-      options.swapRoute.forEach((p, i) => assertContractAddress(p, `swapRoute[${i}]`));
+    return withTransactionHooks(
+      this.hooks,
+      'fundCAddressWithSwap',
+      {
+        source: options.source,
+        target: options.target,
+        sourceAsset: options.sourceAsset,
+        targetAsset: options.targetAsset,
+        sourceAmount: options.sourceAmount,
+        minTargetAmount: options.minTargetAmount,
+      },
+      async () => {
+        try {
+          assertAccountAddress(options.source, 'source');
+          assertContractAddress(options.target, 'target');
+          assertContractAddress(options.sourceAsset, 'sourceAsset');
+          assertContractAddress(options.targetAsset, 'targetAsset');
+          options.swapRoute.forEach((p, i) => assertContractAddress(p, `swapRoute[${i}]`));
 
-      const sourceAccount = await this.provider.getAccount(options.source);
+          const sourceAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: options.source },
+            () => this.provider.getAccount(options.source),
+          );
 
-      const tx = new TransactionBuilder(sourceAccount, {
-        fee: BASE_FEE,
-        networkPassphrase: this.networkPassphrase,
-      })
-        .addOperation(
-          this.contract.call(
-            'fund_c_address_with_swap',
-            ...this.toScVals([
-              options.source,
-              options.target,
-              options.sourceAsset,
-              options.targetAsset,
-              options.sourceAmount,
-              options.minTargetAmount,
-              options.swapRoute,
-            ]),
-          ),
-        )
-        .setTimeout(30)
-        .build();
+          const tx = new TransactionBuilder(sourceAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'fund_c_address_with_swap',
+                ...this.toScVals([
+                  options.source,
+                  options.target,
+                  options.sourceAsset,
+                  options.targetAsset,
+                  options.sourceAmount,
+                  options.minTargetAmount,
+                  options.swapRoute,
+                ]),
+              ),
+            )
+            .setTimeout(30)
+            .build();
 
-      const preparedTx = await this.provider.prepareTransaction(tx);
-      preparedTx.sign(sourceKeypair);
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'fund_c_address_with_swap' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(sourceKeypair);
 
-      const response = await this.provider.sendTransaction(preparedTx);
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'fund_c_address_with_swap' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
 
-      return {
-        hash: response.hash,
-        status: response.status === 'ERROR' ? 'failed' : 'pending',
-      };
-    } catch (error: any) {
-      return {
-        hash: '',
-        status: 'failed',
-        error: error.message || 'Unknown error',
-      };
-    }
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
   }
 
   /**
@@ -346,76 +405,98 @@ export class OnboardingBridgeSDK {
     sourceKeypair: Keypair,
     onProgress?: BatchProgressCallback,
   ): Promise<TransactionResult[]> {
-    // Validate inputs before splitting so we fail fast on bad input.
-    try {
-      assertAccountAddress(options.source, 'source');
-      options.targets.forEach((t, i) => assertContractAddress(t, `targets[${i}]`));
-      assertContractAddress(options.asset, 'asset');
-    } catch (error: any) {
-      return [{ hash: '', status: 'failed', error: error.message || 'Unknown error' }];
-    }
+    return withTransactionHooks(
+      this.hooks,
+      'batchFundCAddresses',
+      { source: options.source, targetCount: options.targets.length, asset: options.asset },
+      async () => {
+        // Validate inputs before splitting so we fail fast on bad input.
+        try {
+          assertAccountAddress(options.source, 'source');
+          options.targets.forEach((t, i) => assertContractAddress(t, `targets[${i}]`));
+          assertContractAddress(options.asset, 'asset');
+        } catch (error: any) {
+          return [{ hash: '', status: 'failed', error: error.message || 'Unknown error' }];
+        }
 
-    const total = options.targets.length;
-    const results: TransactionResult[] = [];
-    let completed = 0;
+        const total = options.targets.length;
+        const results: TransactionResult[] = [];
+        let completed = 0;
 
-    // Split targets/amounts into chunks of at most BATCH_TX_LIMIT.
-    for (let offset = 0; offset < total; offset += BATCH_TX_LIMIT) {
-      const chunkTargets = options.targets.slice(offset, offset + BATCH_TX_LIMIT);
-      const chunkAmounts = options.amounts.slice(offset, offset + BATCH_TX_LIMIT);
+        // Split targets/amounts into chunks of at most BATCH_TX_LIMIT.
+        for (let offset = 0; offset < total; offset += BATCH_TX_LIMIT) {
+          const chunkTargets = options.targets.slice(offset, offset + BATCH_TX_LIMIT);
+          const chunkAmounts = options.amounts.slice(offset, offset + BATCH_TX_LIMIT);
 
-      let result: TransactionResult;
-      try {
-        const sourceAccount = await this.provider.getAccount(options.source);
+          let result: TransactionResult;
+          try {
+            const sourceAccount = await withRpcHook(
+              this.hooks,
+              'getAccount',
+              { address: options.source },
+              () => this.provider.getAccount(options.source),
+            );
 
-        const tx = new TransactionBuilder(sourceAccount, {
-          fee: BASE_FEE,
-          networkPassphrase: this.networkPassphrase,
-        })
-          .addOperation(
-            this.contract.call(
-              'batch_fund_c_address',
-              ...this.toScVals([
-                options.source,
-                chunkTargets,
-                chunkAmounts,
-                options.asset,
-              ]),
-            ),
-          )
-          .setTimeout(30)
-          .build();
+            const tx = new TransactionBuilder(sourceAccount, {
+              fee: BASE_FEE,
+              networkPassphrase: this.networkPassphrase,
+            })
+              .addOperation(
+                this.contract.call(
+                  'batch_fund_c_address',
+                  ...this.toScVals([
+                    options.source,
+                    chunkTargets,
+                    chunkAmounts,
+                    options.asset,
+                  ]),
+                ),
+              )
+              .setTimeout(30)
+              .build();
 
-        const preparedTx = await this.provider.prepareTransaction(tx);
-        preparedTx.sign(sourceKeypair);
+            const preparedTx = await withRpcHook(
+              this.hooks,
+              'prepareTransaction',
+              { contractMethod: 'batch_fund_c_address', chunkSize: chunkTargets.length },
+              () => this.provider.prepareTransaction(tx),
+            );
+            preparedTx.sign(sourceKeypair);
 
-        const response = await this.provider.sendTransaction(preparedTx);
+            const response = await withRpcHook(
+              this.hooks,
+              'sendTransaction',
+              { contractMethod: 'batch_fund_c_address', chunkSize: chunkTargets.length },
+              () => this.provider.sendTransaction(preparedTx),
+            );
 
-        result = {
-          hash: response.hash,
-          status: response.status === 'ERROR' ? 'failed' : 'pending',
-        };
-      } catch (error: any) {
-        result = {
-          hash: '',
-          status: 'failed',
-          error: error.message || 'Unknown error',
-        };
-      }
+            result = {
+              hash: response.hash,
+              status: response.status === 'ERROR' ? 'failed' : 'pending',
+            };
+          } catch (error: any) {
+            result = {
+              hash: '',
+              status: 'failed',
+              error: error.message || 'Unknown error',
+            };
+          }
 
-      results.push(result);
-      completed += chunkTargets.length;
+          results.push(result);
+          completed += chunkTargets.length;
 
-      if (onProgress) {
-        onProgress(
-          completed,
-          total,
-          result.hash || undefined,
-        );
-      }
-    }
+          if (onProgress) {
+            onProgress(
+              completed,
+              total,
+              result.hash || undefined,
+            );
+          }
+        }
 
-    return results;
+        return results;
+      },
+    );
   }
 
   /**
@@ -445,41 +526,61 @@ export class OnboardingBridgeSDK {
     options: WithdrawFeesOptions,
     feeCollectorKeypair: Keypair,
   ): Promise<TransactionResult> {
-    try {
-      assertContractAddress(options.asset, 'asset');
-      const feeCollectorAccount = await this.provider.getAccount(
-        feeCollectorKeypair.publicKey(),
-      );
+    return withTransactionHooks(
+      this.hooks,
+      'withdrawFees',
+      { asset: options.asset, amount: options.amount },
+      async () => {
+        try {
+          assertContractAddress(options.asset, 'asset');
+          const feeCollectorAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: feeCollectorKeypair.publicKey() },
+            () => this.provider.getAccount(feeCollectorKeypair.publicKey()),
+          );
 
-      const tx = new TransactionBuilder(feeCollectorAccount, {
-        fee: BASE_FEE,
-        networkPassphrase: this.networkPassphrase,
-      })
-        .addOperation(
-          this.contract.call(
-            'withdraw_fees',
-            ...this.toScVals([options.asset, options.amount]),
-          ),
-        )
-        .setTimeout(30)
-        .build();
+          const tx = new TransactionBuilder(feeCollectorAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'withdraw_fees',
+                ...this.toScVals([options.asset, options.amount]),
+              ),
+            )
+            .setTimeout(30)
+            .build();
 
-      const preparedTx = await this.provider.prepareTransaction(tx);
-      preparedTx.sign(feeCollectorKeypair);
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'withdraw_fees' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(feeCollectorKeypair);
 
-      const response = await this.provider.sendTransaction(preparedTx);
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'withdraw_fees' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
 
-      return {
-        hash: response.hash,
-        status: response.status === 'ERROR' ? 'failed' : 'pending',
-      };
-    } catch (error: any) {
-      return {
-        hash: '',
-        status: 'failed',
-        error: error.message || 'Unknown error',
-      };
-    }
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
   }
 
   /**
@@ -507,42 +608,62 @@ export class OnboardingBridgeSDK {
     options: ReclaimTokensOptions,
     adminKeypair: Keypair,
   ): Promise<TransactionResult> {
-    try {
-      assertContractAddress(options.asset, 'asset');
-      assertAccountAddress(options.to, 'to');
-      const adminAccount = await this.provider.getAccount(
-        adminKeypair.publicKey(),
-      );
+    return withTransactionHooks(
+      this.hooks,
+      'reclaimTokens',
+      { asset: options.asset, amount: options.amount, to: options.to },
+      async () => {
+        try {
+          assertContractAddress(options.asset, 'asset');
+          assertAccountAddress(options.to, 'to');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
 
-      const tx = new TransactionBuilder(adminAccount, {
-        fee: BASE_FEE,
-        networkPassphrase: this.networkPassphrase,
-      })
-        .addOperation(
-          this.contract.call(
-            'reclaim_tokens',
-            ...this.toScVals([options.asset, options.amount, options.to]),
-          ),
-        )
-        .setTimeout(30)
-        .build();
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'reclaim_tokens',
+                ...this.toScVals([options.asset, options.amount, options.to]),
+              ),
+            )
+            .setTimeout(30)
+            .build();
 
-      const preparedTx = await this.provider.prepareTransaction(tx);
-      preparedTx.sign(adminKeypair);
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'reclaim_tokens' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
 
-      const response = await this.provider.sendTransaction(preparedTx);
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'reclaim_tokens' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
 
-      return {
-        hash: response.hash,
-        status: response.status === 'ERROR' ? 'failed' : 'pending',
-      };
-    } catch (error: any) {
-      return {
-        hash: '',
-        status: 'failed',
-        error: error.message || 'Unknown error',
-      };
-    }
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
   }
 
   /**
@@ -562,10 +683,12 @@ export class OnboardingBridgeSDK {
    * ```
    */
   async getFee(): Promise<number> {
-    const result = await this.provider
-      .simulateTransaction(
-        this.buildSimulationTx('query_fee_bps', []),
-      );
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_fee_bps' },
+      () => this.provider.simulateTransaction(this.buildSimulationTx('query_fee_bps', [])),
+    );
 
     if ('error' in result && result.error) {
       throw new Error(`Failed to get fee: ${result.error}`);
@@ -591,10 +714,12 @@ export class OnboardingBridgeSDK {
    * ```
    */
   async getFeeCollector(): Promise<string> {
-    const result = await this.provider
-      .simulateTransaction(
-        this.buildSimulationTx('query_fee_collector', []),
-      );
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_fee_collector' },
+      () => this.provider.simulateTransaction(this.buildSimulationTx('query_fee_collector', [])),
+    );
 
     if ('error' in result && result.error) {
       throw new Error(`Failed to get fee collector: ${result.error}`);
@@ -621,10 +746,12 @@ export class OnboardingBridgeSDK {
    * ```
    */
   async getAdmin(): Promise<string> {
-    const result = await this.provider
-      .simulateTransaction(
-        this.buildSimulationTx('query_admin', []),
-      );
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_admin' },
+      () => this.provider.simulateTransaction(this.buildSimulationTx('query_admin', [])),
+    );
 
     if ('error' in result && result.error) {
       throw new Error(`Failed to get admin: ${result.error}`);
@@ -657,10 +784,12 @@ export class OnboardingBridgeSDK {
   ): Promise<string> {
     assertContractAddress(cAddress, 'cAddress');
     assertContractAddress(asset, 'asset');
-    const result = await this.provider
-      .simulateTransaction(
-        this.buildSimulationTx('query_balance', [cAddress, asset]),
-      );
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_balance' },
+      () => this.provider.simulateTransaction(this.buildSimulationTx('query_balance', [cAddress, asset])),
+    );
 
     if ('error' in result && result.error) {
       throw new Error(`Failed to get balance: ${result.error}`);
@@ -797,40 +926,60 @@ export class OnboardingBridgeSDK {
     newFeeBps: number,
     adminKeypair: Keypair,
   ): Promise<TransactionResult> {
-    try {
-      const adminAccount = await this.provider.getAccount(
-        adminKeypair.publicKey(),
-      );
+    return withTransactionHooks(
+      this.hooks,
+      'setFee',
+      { newFeeBps },
+      async () => {
+        try {
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
 
-      const tx = new TransactionBuilder(adminAccount, {
-        fee: BASE_FEE,
-        networkPassphrase: this.networkPassphrase,
-      })
-        .addOperation(
-          this.contract.call(
-            'set_fee_bps',
-            ...this.toScVals([newFeeBps]),
-          ),
-        )
-        .setTimeout(30)
-        .build();
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'set_fee_bps',
+                ...this.toScVals([newFeeBps]),
+              ),
+            )
+            .setTimeout(30)
+            .build();
 
-      const preparedTx = await this.provider.prepareTransaction(tx);
-      preparedTx.sign(adminKeypair);
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'set_fee_bps' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
 
-      const response = await this.provider.sendTransaction(preparedTx);
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'set_fee_bps' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
 
-      return {
-        hash: response.hash,
-        status: response.status === 'ERROR' ? 'failed' : 'pending',
-      };
-    } catch (error: any) {
-      return {
-        hash: '',
-        status: 'failed',
-        error: error.message || 'Unknown error',
-      };
-    }
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
   }
 
   /**
@@ -855,41 +1004,61 @@ export class OnboardingBridgeSDK {
     newFeeCollector: string,
     adminKeypair: Keypair,
   ): Promise<TransactionResult> {
-    try {
-      assertAccountAddress(newFeeCollector, 'newFeeCollector');
-      const adminAccount = await this.provider.getAccount(
-        adminKeypair.publicKey(),
-      );
+    return withTransactionHooks(
+      this.hooks,
+      'setFeeCollector',
+      { newFeeCollector },
+      async () => {
+        try {
+          assertAccountAddress(newFeeCollector, 'newFeeCollector');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
 
-      const tx = new TransactionBuilder(adminAccount, {
-        fee: BASE_FEE,
-        networkPassphrase: this.networkPassphrase,
-      })
-        .addOperation(
-          this.contract.call(
-            'set_fee_collector',
-            ...this.toScVals([newFeeCollector]),
-          ),
-        )
-        .setTimeout(30)
-        .build();
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'set_fee_collector',
+                ...this.toScVals([newFeeCollector]),
+              ),
+            )
+            .setTimeout(30)
+            .build();
 
-      const preparedTx = await this.provider.prepareTransaction(tx);
-      preparedTx.sign(adminKeypair);
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'set_fee_collector' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
 
-      const response = await this.provider.sendTransaction(preparedTx);
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'set_fee_collector' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
 
-      return {
-        hash: response.hash,
-        status: response.status === 'ERROR' ? 'failed' : 'pending',
-      };
-    } catch (error: any) {
-      return {
-        hash: '',
-        status: 'failed',
-        error: error.message || 'Unknown error',
-      };
-    }
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
   }
 
   /**
@@ -915,41 +1084,61 @@ export class OnboardingBridgeSDK {
     newAdmin: string,
     adminKeypair: Keypair,
   ): Promise<TransactionResult> {
-    try {
-      assertAccountAddress(newAdmin, 'newAdmin');
-      const adminAccount = await this.provider.getAccount(
-        adminKeypair.publicKey(),
-      );
+    return withTransactionHooks(
+      this.hooks,
+      'setAdmin',
+      { newAdmin },
+      async () => {
+        try {
+          assertAccountAddress(newAdmin, 'newAdmin');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
 
-      const tx = new TransactionBuilder(adminAccount, {
-        fee: BASE_FEE,
-        networkPassphrase: this.networkPassphrase,
-      })
-        .addOperation(
-          this.contract.call(
-            'set_admin',
-            ...this.toScVals([newAdmin]),
-          ),
-        )
-        .setTimeout(30)
-        .build();
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'set_admin',
+                ...this.toScVals([newAdmin]),
+              ),
+            )
+            .setTimeout(30)
+            .build();
 
-      const preparedTx = await this.provider.prepareTransaction(tx);
-      preparedTx.sign(adminKeypair);
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'set_admin' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
 
-      const response = await this.provider.sendTransaction(preparedTx);
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'set_admin' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
 
-      return {
-        hash: response.hash,
-        status: response.status === 'ERROR' ? 'failed' : 'pending',
-      };
-    } catch (error: any) {
-      return {
-        hash: '',
-        status: 'failed',
-        error: error.message || 'Unknown error',
-      };
-    }
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
   }
 
   /**
@@ -961,40 +1150,60 @@ export class OnboardingBridgeSDK {
     options: UpgradeOptions,
     adminKeypair: Keypair,
   ): Promise<TransactionResult> {
-    try {
-      const adminAccount = await this.provider.getAccount(
-        adminKeypair.publicKey(),
-      );
+    return withTransactionHooks(
+      this.hooks,
+      'upgrade',
+      { newWasmHash: options.newWasmHash },
+      async () => {
+        try {
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
 
-      const wasmHashBytes = Buffer.from(options.newWasmHash, 'hex');
-      const wasmHashScVal = xdr.ScVal.scvBytes(wasmHashBytes);
+          const wasmHashBytes = Buffer.from(options.newWasmHash, 'hex');
+          const wasmHashScVal = xdr.ScVal.scvBytes(wasmHashBytes);
 
-      const tx = new TransactionBuilder(adminAccount, {
-        fee: BASE_FEE,
-        networkPassphrase: this.networkPassphrase,
-      })
-        .addOperation(
-          this.contract.call('upgrade', wasmHashScVal),
-        )
-        .setTimeout(30)
-        .build();
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call('upgrade', wasmHashScVal),
+            )
+            .setTimeout(30)
+            .build();
 
-      const preparedTx = await this.provider.prepareTransaction(tx);
-      preparedTx.sign(adminKeypair);
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'upgrade' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
 
-      const response = await this.provider.sendTransaction(preparedTx);
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'upgrade' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
 
-      return {
-        hash: response.hash,
-        status: response.status === 'ERROR' ? 'failed' : 'pending',
-      };
-    } catch (error: any) {
-      return {
-        hash: '',
-        status: 'failed',
-        error: error.message || 'Unknown error',
-      };
-    }
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
   }
 
   // --- Cross-chain methods ---
@@ -1007,48 +1216,71 @@ export class OnboardingBridgeSDK {
     options: CrossChainFundOptions,
     relayerKeypair: Keypair,
   ): Promise<TransactionResult> {
-    try {
-      const relayerAccount = await this.provider.getAccount(relayerKeypair.publicKey());
+    return withTransactionHooks(
+      this.hooks,
+      'fundCrosschain',
+      { chainId: options.chainId, txHash: options.txHash, target: options.target, asset: options.asset, amount: options.amount },
+      async () => {
+        try {
+          const relayerAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: relayerKeypair.publicKey() },
+            () => this.provider.getAccount(relayerKeypair.publicKey()),
+          );
 
-      const sigsScVal = xdr.ScVal.scvVec(
-        options.sigs.map((s) => {
-          const pubkeyBytes = Buffer.from(s.pubkey, 'hex');
-          const sigBytes = Buffer.from(s.signature, 'hex');
-          return xdr.ScVal.scvMap([
-            new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol('pubkey'), val: xdr.ScVal.scvBytes(pubkeyBytes) }),
-            new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol('signature'), val: xdr.ScVal.scvBytes(sigBytes) }),
-          ]);
-        }),
-      );
+          const sigsScVal = xdr.ScVal.scvVec(
+            options.sigs.map((s) => {
+              const pubkeyBytes = Buffer.from(s.pubkey, 'hex');
+              const sigBytes = Buffer.from(s.signature, 'hex');
+              return xdr.ScVal.scvMap([
+                new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol('pubkey'), val: xdr.ScVal.scvBytes(pubkeyBytes) }),
+                new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol('signature'), val: xdr.ScVal.scvBytes(sigBytes) }),
+              ]);
+            }),
+          );
 
-      const txHashBytes = Buffer.from(options.txHash.replace('0x', ''), 'hex');
+          const txHashBytes = Buffer.from(options.txHash.replace('0x', ''), 'hex');
 
-      const tx = new TransactionBuilder(relayerAccount, {
-        fee: BASE_FEE,
-        networkPassphrase: this.networkPassphrase,
-      })
-        .addOperation(
-          this.contract.call(
-            'fund_c_address_crosschain',
-            nativeToScVal(options.chainId, { type: 'u32' }),
-            xdr.ScVal.scvBytes(txHashBytes),
-            new Address(options.target).toScVal(),
-            new Address(options.asset).toScVal(),
-            nativeToScVal(BigInt(options.amount), { type: 'i128' }),
-            sigsScVal,
-          ),
-        )
-        .setTimeout(30)
-        .build();
+          const tx = new TransactionBuilder(relayerAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'fund_c_address_crosschain',
+                nativeToScVal(options.chainId, { type: 'u32' }),
+                xdr.ScVal.scvBytes(txHashBytes),
+                new Address(options.target).toScVal(),
+                new Address(options.asset).toScVal(),
+                nativeToScVal(BigInt(options.amount), { type: 'i128' }),
+                sigsScVal,
+              ),
+            )
+            .setTimeout(30)
+            .build();
 
-      const preparedTx = await this.provider.prepareTransaction(tx);
-      preparedTx.sign(relayerKeypair);
-      const response = await this.provider.sendTransaction(preparedTx);
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'fund_c_address_crosschain' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(relayerKeypair);
 
-      return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
-    } catch (error: any) {
-      return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
-    }
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'fund_c_address_crosschain' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+        } catch (error: any) {
+          return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
+        }
+      },
+    );
   }
 
   /** 
@@ -1066,19 +1298,41 @@ export class OnboardingBridgeSDK {
    * @throws Never — errors are returned as `status: 'failed'`.
    */
   async addRelayer(options: RelayerManagementOptions, adminKeypair: Keypair): Promise<TransactionResult> {
-    try {
-      const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
-      const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
-        .addOperation(this.contract.call('add_relayer', xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex'))))
-        .setTimeout(30)
-        .build();
-      const preparedTx = await this.provider.prepareTransaction(tx);
-      preparedTx.sign(adminKeypair);
-      const response = await this.provider.sendTransaction(preparedTx);
-      return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
-    } catch (error: any) {
-      return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
-    }
+    return withTransactionHooks(
+      this.hooks,
+      'addRelayer',
+      { pubkey: options.pubkey },
+      async () => {
+        try {
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+          const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
+            .addOperation(this.contract.call('add_relayer', xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex'))))
+            .setTimeout(30)
+            .build();
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'add_relayer' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'add_relayer' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+          return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+        } catch (error: any) {
+          return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
+        }
+      },
+    );
   }
 
   /**
@@ -1096,19 +1350,41 @@ export class OnboardingBridgeSDK {
    * @throws Never — errors are returned as `status: 'failed'`.
    */
   async removeRelayer(options: RelayerManagementOptions, adminKeypair: Keypair): Promise<TransactionResult> {
-    try {
-      const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
-      const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
-        .addOperation(this.contract.call('remove_relayer', xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex'))))
-        .setTimeout(30)
-        .build();
-      const preparedTx = await this.provider.prepareTransaction(tx);
-      preparedTx.sign(adminKeypair);
-      const response = await this.provider.sendTransaction(preparedTx);
-      return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
-    } catch (error: any) {
-      return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
-    }
+    return withTransactionHooks(
+      this.hooks,
+      'removeRelayer',
+      { pubkey: options.pubkey },
+      async () => {
+        try {
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+          const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
+            .addOperation(this.contract.call('remove_relayer', xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex'))))
+            .setTimeout(30)
+            .build();
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'remove_relayer' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'remove_relayer' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+          return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+        } catch (error: any) {
+          return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
+        }
+      },
+    );
   }
 
   /**
@@ -1131,19 +1407,41 @@ export class OnboardingBridgeSDK {
    * ```
    */
   async setRelayerThreshold(threshold: number, adminKeypair: Keypair): Promise<TransactionResult> {
-    try {
-      const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
-      const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
-        .addOperation(this.contract.call('set_relayer_threshold', nativeToScVal(threshold, { type: 'u32' })))
-        .setTimeout(30)
-        .build();
-      const preparedTx = await this.provider.prepareTransaction(tx);
-      preparedTx.sign(adminKeypair);
-      const response = await this.provider.sendTransaction(preparedTx);
-      return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
-    } catch (error: any) {
-      return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
-    }
+    return withTransactionHooks(
+      this.hooks,
+      'setRelayerThreshold',
+      { threshold },
+      async () => {
+        try {
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+          const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
+            .addOperation(this.contract.call('set_relayer_threshold', nativeToScVal(threshold, { type: 'u32' })))
+            .setTimeout(30)
+            .build();
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'set_relayer_threshold' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'set_relayer_threshold' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+          return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+        } catch (error: any) {
+          return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
+        }
+      },
+    );
   }
 
   /**
@@ -1192,90 +1490,133 @@ export class OnboardingBridgeSDK {
   async createCAddress(
     options: CreateCOptions,
   ): Promise<CreateCAddressResult> {
-    const deployerKeypair = options.deployerKeypair;
-    const deployerAccount = await this.provider.getAccount(
-      deployerKeypair.publicKey(),
-    );
+    return withTransactionHooks(
+      this.hooks,
+      'createCAddress',
+      { salt: options.salt, hasInitialFunds: !!options.initialFunds },
+      async () => {
+        const deployerKeypair = options.deployerKeypair;
+        const deployerAccount = await withRpcHook(
+          this.hooks,
+          'getAccount',
+          { address: deployerKeypair.publicKey() },
+          () => this.provider.getAccount(deployerKeypair.publicKey()),
+        );
 
-    const saltBytes = options.salt
-      ? Buffer.from(options.salt, 'hex')
-      : Buffer.from(
-          Array.from({ length: 32 }, () =>
-            Math.floor(Math.random() * 256),
+        const saltBytes = options.salt
+          ? Buffer.from(options.salt, 'hex')
+          : Buffer.from(
+              Array.from({ length: 32 }, () =>
+                Math.floor(Math.random() * 256),
+              ),
+            );
+        const saltScVal = xdr.ScVal.scvBytes(saltBytes);
+
+        const deployerAddress = new Address(deployerKeypair.publicKey());
+
+        const txBuilder = new TransactionBuilder(deployerAccount, {
+          fee: BASE_FEE,
+          networkPassphrase: this.networkPassphrase,
+        });
+
+        txBuilder.addOperation(
+          this.contract.call(
+            'create_contract',
+            deployerAddress.toScVal(),
+            saltScVal,
           ),
         );
-    const saltScVal = xdr.ScVal.scvBytes(saltBytes);
 
-    const deployerAddress = new Address(deployerKeypair.publicKey());
+        const deployTx = txBuilder.setTimeout(30).build();
+        const preparedDeployTx = await withRpcHook(
+          this.hooks,
+          'prepareTransaction',
+          { contractMethod: 'create_contract' },
+          () => this.provider.prepareTransaction(deployTx),
+        );
+        preparedDeployTx.sign(deployerKeypair);
 
-    const txBuilder = new TransactionBuilder(deployerAccount, {
-      fee: BASE_FEE,
-      networkPassphrase: this.networkPassphrase,
-    });
+        const deployResponse = await withRpcHook(
+          this.hooks,
+          'sendTransaction',
+          { contractMethod: 'create_contract' },
+          () => this.provider.sendTransaction(preparedDeployTx),
+        );
+        if (deployResponse.status === 'ERROR') {
+          throw new Error(`Failed to create C-address: ${deployResponse.status}`);
+        }
 
-    txBuilder.addOperation(
-      this.contract.call(
-        'create_contract',
-        deployerAddress.toScVal(),
-        saltScVal,
-      ),
+        let txResult = await withRpcHook(
+          this.hooks,
+          'getTransaction',
+          { hash: deployResponse.hash },
+          () => this.provider.getTransaction(deployResponse.hash),
+        );
+        while (txResult.status === 'NOT_FOUND') {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          txResult = await withRpcHook(
+            this.hooks,
+            'getTransaction',
+            { hash: deployResponse.hash },
+            () => this.provider.getTransaction(deployResponse.hash),
+          );
+        }
+
+        if (txResult.status !== 'SUCCESS') {
+          throw new Error(`C-address creation failed: ${txResult.status}`);
+        }
+
+        const returnVal = (txResult as any).returnValue;
+        const cAddress: string = returnVal
+          ? scValToNative(returnVal).toString()
+          : '';
+
+        if (options.initialFunds && cAddress) {
+          const fundAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: deployerKeypair.publicKey() },
+            () => this.provider.getAccount(deployerKeypair.publicKey()),
+          );
+          const fundTx = new TransactionBuilder(fundAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'fund_c_address',
+                ...this.toScVals([
+                  deployerKeypair.publicKey(),
+                  cAddress,
+                  options.initialFunds.asset,
+                  options.initialFunds.amount,
+                ]),
+              ),
+            )
+            .setTimeout(30)
+            .build();
+
+          const preparedFundTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'fund_c_address' },
+            () => this.provider.prepareTransaction(fundTx),
+          );
+          preparedFundTx.sign(deployerKeypair);
+          await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'fund_c_address' },
+            () => this.provider.sendTransaction(preparedFundTx),
+          );
+        }
+
+        return {
+          cAddress,
+          txHash: deployResponse.hash,
+        };
+      },
     );
-
-    const deployTx = txBuilder.setTimeout(30).build();
-    const preparedDeployTx = await this.provider.prepareTransaction(deployTx);
-    preparedDeployTx.sign(deployerKeypair);
-
-    const deployResponse = await this.provider.sendTransaction(preparedDeployTx);
-    if (deployResponse.status === 'ERROR') {
-      throw new Error(`Failed to create C-address: ${deployResponse.status}`);
-    }
-
-    let txResult = await this.provider.getTransaction(deployResponse.hash);
-    while (txResult.status === 'NOT_FOUND') {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      txResult = await this.provider.getTransaction(deployResponse.hash);
-    }
-
-    if (txResult.status !== 'SUCCESS') {
-      throw new Error(`C-address creation failed: ${txResult.status}`);
-    }
-
-    const returnVal = (txResult as any).returnValue;
-    const cAddress: string = returnVal
-      ? scValToNative(returnVal).toString()
-      : '';
-
-    if (options.initialFunds && cAddress) {
-      const fundAccount = await this.provider.getAccount(
-        deployerKeypair.publicKey(),
-      );
-      const fundTx = new TransactionBuilder(fundAccount, {
-        fee: BASE_FEE,
-        networkPassphrase: this.networkPassphrase,
-      })
-        .addOperation(
-          this.contract.call(
-            'fund_c_address',
-            ...this.toScVals([
-              deployerKeypair.publicKey(),
-              cAddress,
-              options.initialFunds.asset,
-              options.initialFunds.amount,
-            ]),
-          ),
-        )
-        .setTimeout(30)
-        .build();
-
-      const preparedFundTx = await this.provider.prepareTransaction(fundTx);
-      preparedFundTx.sign(deployerKeypair);
-      await this.provider.sendTransaction(preparedFundTx);
-    }
-
-    return {
-      cAddress,
-      txHash: deployResponse.hash,
-    };
   }
 
   /**

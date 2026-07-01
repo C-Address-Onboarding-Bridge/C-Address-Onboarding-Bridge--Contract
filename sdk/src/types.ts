@@ -9,6 +9,7 @@
  */
 
 import type { RpcRetryOptions } from './retry';
+import type { ObservabilityHooks } from './observability';
 
 // ---------------------------------------------------------------------------
 // SDK configuration
@@ -81,6 +82,40 @@ export interface BridgeConfig {
    * ```
    */
   retry?: RpcRetryOptions;
+
+  /**
+   * Optional observability hooks for instrumenting SDK method calls and RPC
+   * round-trips.  Supply any subset of the four callbacks to integrate with
+   * your metrics, logging, or tracing infrastructure.
+   *
+   * Two ready-made implementations are provided:
+   * - {@link ConsoleLogger} — structured JSON lines to the console (debug mode).
+   * - {@link createOpenTelemetryHooks} — OpenTelemetry span tracing.
+   *
+   * @example
+   * ```ts
+   * import { ConsoleLogger } from '@stellar/c-address-onboarding-bridge-sdk';
+   *
+   * const sdk = new OnboardingBridgeSDK({
+   *   contractId: 'CA...',
+   *   rpcUrl: 'https://soroban-testnet.stellar.org',
+   *   networkPassphrase: Networks.TESTNET,
+   *   hooks: ConsoleLogger,
+   * });
+   * ```
+   *
+   * @example
+   * ```ts
+   * import { trace } from '@opentelemetry/api';
+   * import { createOpenTelemetryHooks } from '@stellar/c-address-onboarding-bridge-sdk';
+   *
+   * const sdk = new OnboardingBridgeSDK({
+   *   // ...
+   *   hooks: createOpenTelemetryHooks(trace.getTracer('bridge-sdk')),
+   * });
+   * ```
+   */
+  hooks?: ObservabilityHooks;
 }
 
 // ---------------------------------------------------------------------------
