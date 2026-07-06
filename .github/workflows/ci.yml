@@ -120,7 +120,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        soroban-sdk-version: ["20", "21", "22"]
+        # The contract uses SDK 22 APIs (Env::register, cost_estimate);
+        # majors 20/21 cannot compile it and were removed from the matrix.
+        soroban-sdk-version: ["22"]
     steps:
       - uses: actions/checkout@v4
 
@@ -142,6 +144,10 @@ jobs:
 
       - name: Build contract
         run: cargo build -p onboarding-bridge --release
+
+      # The upgrade tests include_bytes! the compiled wasm; build it first.
+      - name: Build WASM fixture for tests
+        run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
 
       - name: Run contract tests
         run: cargo test -p onboarding-bridge --features testutils
