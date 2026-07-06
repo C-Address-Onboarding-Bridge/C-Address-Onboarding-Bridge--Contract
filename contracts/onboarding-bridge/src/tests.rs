@@ -531,6 +531,9 @@ fn test_upgrade_admin_only_and_event() {
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
 
+    // Uploading a real compiled wasm costs far more than the default test
+    // budget allows; lift the limit so the test exercises logic, not gas.
+    env.cost_estimate().budget().reset_unlimited();
     let wasm_bytes = Bytes::from_slice(&env, V2_WASM);
     let wasm_hash: BytesN<32> = env.deployer().upload_contract_wasm(wasm_bytes);
 
@@ -553,6 +556,8 @@ fn test_upgrade_non_admin_rejected() {
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
 
+    // Lift the budget so the failure below is the auth rejection, not gas.
+    env.cost_estimate().budget().reset_unlimited();
     let wasm_bytes = Bytes::from_slice(&env, V2_WASM);
     let wasm_hash: BytesN<32> = env.deployer().upload_contract_wasm(wasm_bytes);
 
