@@ -53,36 +53,9 @@ export { OnboardingBridgeSDK, BATCH_TX_LIMIT } from './bridge';
 export { OffRampIntegration } from './offramp';
 export { assertAccountAddress, assertContractAddress } from './validate';
 export { CachedContractClient } from './cachedBridge';
-export type { ICacheProvider, CacheOptions, CacheKey } from './cachedBridge';
-export { OnboardingBridgeSDK } from "./bridge";
-export { OffRampIntegration } from "./offramp";
-export { BridgeEventEmitter } from "./events";
-export type {
-  BridgeEvent,
-  BridgeEventType,
-  BridgeEventListener,
-  BridgeEventEmitterConfig,
-  CAddressFundedEvent,
-  BatchTransferFailedEvent,
-  BatchCompletedEvent,
-  CrossChainFundedEvent,
-  FeesWithdrawnEvent,
-  AdminChangedEvent,
-  FeeBpsChangedEvent,
-  FeeCollectorChangedEvent,
-  ContractPausedEvent,
-  ContractUnpausedEvent,
-  ContractUpgradedEvent,
-  UpgradeScheduledEvent,
-  UpgradeCancelledEvent,
-  TimelockCreatedEvent,
-  TimelockClaimedEvent,
-  CommitFundEvent,
-  CommitRevealFundedEvent,
-  SwapAndFundedEvent,
-  ReferralPaidEvent,
-} from "./events";
-export { assertAccountAddress, assertContractAddress } from "./validate";
+export type { CacheOptions, CacheKey } from './cachedBridge';
+export { InMemoryCache } from './cache';
+export type { ICacheProvider } from './cache';
 export {
   withRetry,
   withRpcRetry,
@@ -90,7 +63,7 @@ export {
   computeBackoffDelay,
   VIEW_RETRY_POLICY,
   STATE_CHANGING_RETRY_POLICY,
-} from "./retry";
+} from './retry';
 export type {
   RetryOptions,
   RpcRetryOptions,
@@ -98,6 +71,10 @@ export type {
   RetryLogger,
   RetryableClassifier,
 } from './retry';
+
+// Issue #214: Observability hooks + OpenTelemetry integration
+export { ConsoleLogger, createOpenTelemetryHooks, composeHooks } from './observability';
+export type { ObservabilityHooks, OpenTelemetryHooksOptions } from './observability';
 
 // Issue #57: Event subscription
 export { EventSubscriber } from './events';
