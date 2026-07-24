@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Release profile now declares `lto = "fat"` explicitly (previously the equivalent `lto = true`)
-- Removed the last panic-message string from the contract binary, reducing WASM size
+- Removed the last panic-message string from the contract binary in favor of a typed error code
 
 ## [0.1.0] - 2024-01-01
 
