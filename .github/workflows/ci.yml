@@ -13,6 +13,10 @@ jobs:
   contract:
     name: Soroban Contract
     runs-on: ubuntu-latest
+    permissions:
+      # contents: write is needed by the "Publish WASM size badge" step, which
+      # pushes the shields.io endpoint JSON to the `badges` branch on main.
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -45,6 +49,73 @@ jobs:
             echo "If this change was intentional, please update the hash in wasm_hash.txt."
             exit 1
           fi
+
+      - name: Install stellar-cli
+        run: |
+          STELLAR_CLI_VERSION=27.0.0
+          TOOL_DIR=$(mktemp -d)
+          curl -fsSL --retry 3 \
+            "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$TOOL_DIR"
+          BIN=$(find "$TOOL_DIR" -maxdepth 3 -type f -name stellar | head -n 1)
+          if [ -z "$BIN" ]; then
+            echo "::error::stellar binary not found in release tarball"
+            exit 1
+          fi
+          sudo install "$BIN" /usr/local/bin/stellar
+          stellar --version
+
+      - name: Optimize WASM (wasm-opt -Oz)
+        run: |
+          WASM_DIR=target/wasm32-unknown-unknown/release
+          stellar contract optimize \
+            --wasm "$WASM_DIR/onboarding_bridge.wasm" \
+            --wasm-out "$WASM_DIR/onboarding_bridge.optimized.wasm"
+
+      - name: Report WASM size
+        run: |
+          WASM_DIR=target/wasm32-unknown-unknown/release
+          RAW_SIZE=$(stat -c%s "$WASM_DIR/onboarding_bridge.wasm")
+          OPT_SIZE=$(stat -c%s "$WASM_DIR/onboarding_bridge.optimized.wasm")
+          REDUCTION=$(awk -v raw="$RAW_SIZE" -v opt="$OPT_SIZE" 'BEGIN { printf "%.1f", (raw - opt) * 100 / raw }')
+          RAW_KB=$(awk -v s="$RAW_SIZE" 'BEGIN { printf "%.1f", s / 1024 }')
+          OPT_KB=$(awk -v s="$OPT_SIZE" 'BEGIN { printf "%.1f", s / 1024 }')
+          printf "raw_bytes\t%s\noptimized_bytes\t%s\nreduction_pct\t%s\n" \
+            "$RAW_SIZE" "$OPT_SIZE" "$REDUCTION" > wasm_size.txt
+          {
+            echo "## WASM Size Report"
+            echo ""
+            echo "| Artifact | Size |"
+            echo "|---|---|"
+            echo "| cargo release build | ${RAW_KB} KB (${RAW_SIZE} bytes) |"
+            echo "| after wasm-opt -Oz | ${OPT_KB} KB (${OPT_SIZE} bytes) |"
+            echo "| reduction | ${REDUCTION}% |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat wasm_size.txt
+
+      - name: Upload WASM size report
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-size-report
+          path: wasm_size.txt
+
+      - name: Publish WASM size badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OPT_SIZE=$(stat -c%s target/wasm32-unknown-unknown/release/onboarding_bridge.optimized.wasm)
+          OPT_KB=$(awk -v s="$OPT_SIZE" 'BEGIN { printf "%.1f", s / 1024 }')
+          BADGE_DIR=$(mktemp -d)
+          printf '{"schemaVersion": 1, "label": "wasm size", "message": "%s KB", "color": "blue"}\n' "$OPT_KB" \
+            > "$BADGE_DIR/wasm-size.json"
+          cd "$BADGE_DIR"
+          git init -q -b badges
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add wasm-size.json
+          git commit -qm "chore: update WASM size badge (${OPT_KB} KB)"
+          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
 
       - name: Run contract tests
         run: cargo test -p onboarding-bridge --features testutils

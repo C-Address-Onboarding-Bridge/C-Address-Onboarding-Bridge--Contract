@@ -47,8 +47,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Map,
-    Vec, IntoVal,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
+    BytesN, Env, Map, Vec, IntoVal,
 };
 
 // ---------------------------------------------------------------------------
@@ -145,6 +145,8 @@ pub enum BridgeError {
     MetaTxNonceAlreadyUsed = 39,
     /// The contract is deactivated (permanently paused/migrated).
     ContractDeactivated = 40,
+    /// A nested (reentrant) call was detected by the reentrancy guard.
+    ReentrantCall = 41,
 }
 
 // ---------------------------------------------------------------------------
@@ -1127,7 +1129,9 @@ impl ReentrancyGuard {
             .get(&DataKey::Entered)
             .unwrap_or(false);
         if entered {
-            panic!("reentrant call");
+            // panic_with_error traps with a typed error code instead of
+            // embedding a panic-message string in the WASM binary.
+            panic_with_error!(env, BridgeError::ReentrantCall);
         }
         env.storage().instance().set(&DataKey::Entered, &true);
         Self { env: env.clone() }

@@ -37,6 +37,12 @@ test "$COMPUTED_HASH" = "$KNOWN_HASH"
 
 If you intentionally modify the contract, you must update the hash in `wasm_hash.txt` to match the new build output.
 
+### Optimized Deployment Artifact
+
+After verifying the hash, CI additionally runs the compiled WASM through `stellar contract optimize` (`wasm-opt -Oz`, preserving the Soroban custom sections) and uploads `onboarding_bridge.optimized.wasm` alongside the raw build. The optimized artifact is functionally identical but smaller, which lowers deployment (ledger rent and upload) costs — prefer it when deploying.
+
+Note that `wasm_hash.txt` always refers to the **unoptimized** `cargo` build output, which is the reproducible-build anchor; the optimized artifact's size is tracked per-run in the CI job summary, the `wasm-size-report` artifact, and the WASM size badge in the README (published to the `badges` branch on every push to `main`).
+
 ---
 
 ## 2. Release Registry
