@@ -145,6 +145,22 @@ pub enum BridgeError {
     MetaTxNonceAlreadyUsed = 39,
     /// The contract is deactivated (permanently paused/migrated).
     ContractDeactivated = 40,
+    /// Multisig system has not been initialized.
+    MultisigNotInitialized = 41,
+    /// Multisig configuration has already been initialized.
+    MultisigAlreadyInitialized = 42,
+    /// Threshold must be greater than 0 and less than or equal to total signers.
+    InvalidMultisigThreshold = 43,
+    /// Caller is not an authorized multisig signer.
+    NotMultisigSigner = 44,
+    /// Multisig signer has already approved this operation.
+    DuplicateMultisigApproval = 45,
+    /// Multisig operation was not found.
+    OperationNotFound = 46,
+    /// Multisig operation has already been executed.
+    OperationAlreadyExecuted = 47,
+    /// Multisig operation has not reached the required approval threshold.
+    InsufficientMultisigApprovals = 48,
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +226,9 @@ pub enum DataKey {
     // Issue #35: EIP-712-style meta-transaction used nonces
     MetaTxNonce(Address, u64),
     Deactivated,
+    MultisigConfigKey,
+    MultisigOpId,
+    MultisigOp(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +369,30 @@ pub struct CommitmentEntry {
     pub committed_at_ledger: u32,
     /// Set to `true` once `reveal_fund` has been successfully called.
     pub revealed: bool,
+}
+
+/// Multisignature configuration for sensitive admin operations.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigConfig {
+    /// Vector of authorized signer addresses.
+    pub signers: Vec<Address>,
+    /// Minimum required number of approvals to execute an operation.
+    pub threshold: u32,
+}
+
+/// Pending or completed multisignature operation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigOperation {
+    /// Unique identifier for this operation.
+    pub id: u64,
+    /// Hash of the operation payload/parameters.
+    pub op_hash: BytesN<32>,
+    /// List of signers who have approved this operation.
+    pub approvals: Vec<Address>,
+    /// Whether this operation has been executed.
+    pub executed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -578,6 +621,35 @@ fn check_not_deactivated(env: &Env) -> Result<(), BridgeError> {
         return Err(BridgeError::ContractDeactivated);
     }
     Ok(())
+}
+
+fn read_multisig_config(env: &Env) -> Option<MultisigConfig> {
+    env.storage().instance().get(&DataKey::MultisigConfigKey)
+}
+
+fn save_multisig_config(env: &Env, config: &MultisigConfig) {
+    env.storage().instance().set(&DataKey::MultisigConfigKey, config);
+}
+
+fn next_multisig_op_id(env: &Env) -> u64 {
+    let id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::MultisigOpId)
+        .unwrap_or(0u64);
+    let next_id = id + 1;
+    env.storage()
+        .instance()
+        .set(&DataKey::MultisigOpId, &next_id);
+    next_id
+}
+
+fn read_multisig_operation(env: &Env, id: u64) -> Option<MultisigOperation> {
+    env.storage().persistent().get(&DataKey::MultisigOp(id))
+}
+
+fn save_multisig_operation(env: &Env, id: u64, op: &MultisigOperation) {
+    env.storage().persistent().set(&DataKey::MultisigOp(id), op);
 }
 
 fn check_not_paused(env: &Env) -> Result<(), BridgeError> {
@@ -4534,6 +4606,223 @@ impl OnboardingBridge {
             .persistent()
             .get(&DataKey::MetaTxNonce(source, nonce))
             .unwrap_or(false)
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin Multisig Lifecycle
+    // -----------------------------------------------------------------------
+
+    /// Initialises the one-time multisignature authorization configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `signers` (`Vec<Address>`) — Vector of authorized multisig signers.
+    /// * `threshold` (`u32`) — Required approval threshold. Must be > 0 and <= signers.len().
+    ///
+    /// # Authorization
+    ///
+    /// Requires current contract `admin.require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not initialized.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::MultisigAlreadyInitialized`] — Multisig is already configured.
+    /// * [`BridgeError::InvalidMultisigThreshold`] — Threshold is zero or greater than total signers.
+    pub fn set_multisig(
+        env: Env,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        let admin = read_admin(&env);
+        admin.require_auth();
+
+        if env.storage().instance().has(&DataKey::MultisigConfigKey) {
+            return Err(BridgeError::MultisigAlreadyInitialized);
+        }
+
+        let len = signers.len();
+        if threshold == 0 || threshold > len {
+            return Err(BridgeError::InvalidMultisigThreshold);
+        }
+
+        let config = MultisigConfig {
+            signers: signers.clone(),
+            threshold,
+        };
+        save_multisig_config(&env, &config);
+
+        env.events().publish(
+            ("MultisigConfigured", admin),
+            (threshold, len),
+        );
+
+        Ok(())
+    }
+
+    /// Submits a new pending multisig operation with the hash of the payload/action.
+    ///
+    /// The submitter must be an authorized signer and automatically approves the operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `caller` (`Address`) — Authorized signer submitting the operation.
+    /// * `op_hash` (`BytesN<32>`) — SHA-256 hash of the operation.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not initialized.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::MultisigNotInitialized`] — Multisig not configured.
+    /// * [`BridgeError::NotMultisigSigner`] — Caller is not in configured signers.
+    pub fn submit_operation(
+        env: Env,
+        caller: Address,
+        op_hash: BytesN<32>,
+    ) -> Result<u64, BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        caller.require_auth();
+
+        let config = read_multisig_config(&env).ok_or(BridgeError::MultisigNotInitialized)?;
+        if !config.signers.contains(&caller) {
+            return Err(BridgeError::NotMultisigSigner);
+        }
+
+        let op_id = next_multisig_op_id(&env);
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(caller.clone());
+
+        let op = MultisigOperation {
+            id: op_id,
+            op_hash: op_hash.clone(),
+            approvals,
+            executed: false,
+        };
+        save_multisig_operation(&env, op_id, &op);
+
+        env.events().publish(
+            ("MultisigOperationSubmitted", caller),
+            (op_id, op_hash),
+        );
+
+        Ok(op_id)
+    }
+
+    /// Approves a pending multisig operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `caller` (`Address`) — Authorized signer approving the operation.
+    /// * `op_id` (`u64`) — ID of the pending operation.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not initialized.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::MultisigNotInitialized`] — Multisig not configured.
+    /// * [`BridgeError::NotMultisigSigner`] — Caller is not in configured signers.
+    /// * [`BridgeError::OperationNotFound`] — No operation exists for `op_id`.
+    /// * [`BridgeError::OperationAlreadyExecuted`] — Operation was already executed.
+    /// * [`BridgeError::DuplicateMultisigApproval`] — Signer has already approved.
+    pub fn approve_operation(
+        env: Env,
+        caller: Address,
+        op_id: u64,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        caller.require_auth();
+
+        let config = read_multisig_config(&env).ok_or(BridgeError::MultisigNotInitialized)?;
+        if !config.signers.contains(&caller) {
+            return Err(BridgeError::NotMultisigSigner);
+        }
+
+        let mut op = read_multisig_operation(&env, op_id).ok_or(BridgeError::OperationNotFound)?;
+        if op.executed {
+            return Err(BridgeError::OperationAlreadyExecuted);
+        }
+
+        if op.approvals.contains(&caller) {
+            return Err(BridgeError::DuplicateMultisigApproval);
+        }
+
+        op.approvals.push_back(caller.clone());
+        save_multisig_operation(&env, op_id, &op);
+
+        env.events().publish(
+            ("MultisigOperationApproved", caller),
+            (op_id, op.approvals.len()),
+        );
+
+        Ok(())
+    }
+
+    /// Executes a pending multisig operation after required approval threshold is reached.
+    ///
+    /// # Arguments
+    ///
+    /// * `caller` (`Address`) — Authorized signer executing the operation.
+    /// * `op_id` (`u64`) — ID of the operation to execute.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not initialized.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::MultisigNotInitialized`] — Multisig not configured.
+    /// * [`BridgeError::NotMultisigSigner`] — Caller is not in configured signers.
+    /// * [`BridgeError::OperationNotFound`] — No operation exists for `op_id`.
+    /// * [`BridgeError::OperationAlreadyExecuted`] — Operation already executed.
+    /// * [`BridgeError::InsufficientMultisigApprovals`] — Approvals count is below threshold.
+    pub fn execute_operation(
+        env: Env,
+        caller: Address,
+        op_id: u64,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        caller.require_auth();
+
+        let config = read_multisig_config(&env).ok_or(BridgeError::MultisigNotInitialized)?;
+        if !config.signers.contains(&caller) {
+            return Err(BridgeError::NotMultisigSigner);
+        }
+
+        let mut op = read_multisig_operation(&env, op_id).ok_or(BridgeError::OperationNotFound)?;
+        if op.executed {
+            return Err(BridgeError::OperationAlreadyExecuted);
+        }
+
+        if op.approvals.len() < config.threshold {
+            return Err(BridgeError::InsufficientMultisigApprovals);
+        }
+
+        op.executed = true;
+        save_multisig_operation(&env, op_id, &op);
+
+        env.events().publish(
+            ("MultisigOperationExecuted", caller),
+            (op_id, op.op_hash.clone()),
+        );
+
+        Ok(())
+    }
+
+    /// Queries the multisig configuration if set.
+    pub fn query_multisig_config(env: Env) -> Option<MultisigConfig> {
+        read_multisig_config(&env)
+    }
+
+    /// Queries the details of a multisig operation by ID.
+    pub fn query_multisig_operation(env: Env, op_id: u64) -> Option<MultisigOperation> {
+        read_multisig_operation(&env, op_id)
     }
 }
 
