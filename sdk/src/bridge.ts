@@ -265,7 +265,7 @@ export class OnboardingBridgeSDK {
    */
   async fundCAddressWithSwap(
     options: FundCAddressWithSwapOptions,
-    sourceKeypair: any,
+    sourceKeypair: Keypair,
   ): Promise<TransactionResult> {
     return withTransactionHooks(
       this.hooks,

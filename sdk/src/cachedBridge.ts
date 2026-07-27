@@ -6,6 +6,7 @@
  */
 import {
   BridgeConfig,
+  FundCAddressWithSwapOptions,
   TransactionResult,
 } from './types';
 import { assertAccountAddress, assertContractAddress } from './validate';
@@ -264,7 +265,7 @@ class ContractClient {
     return this.submitMutation('fundCAddress', tx, sourceKeypair);
   }
 
-  async fundCAddressWithSwap(options: any, sourceKeypair: Keypair): Promise<TransactionResult> {
+  async fundCAddressWithSwap(options: FundCAddressWithSwapOptions, sourceKeypair: Keypair): Promise<TransactionResult> {
     assertAccountAddress(options.source, 'source');
     assertContractAddress(options.target, 'target');
     assertContractAddress(options.sourceAsset, 'sourceAsset');
