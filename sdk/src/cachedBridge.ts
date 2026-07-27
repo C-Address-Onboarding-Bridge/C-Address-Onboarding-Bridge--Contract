@@ -6,6 +6,9 @@
  */
 import {
   BridgeConfig,
+  FundCOptions,
+  UpgradeOptions,
+  WithdrawFeesOptions,
   TransactionResult,
 } from './types';
 import { assertAccountAddress, assertContractAddress } from './validate';
@@ -244,7 +247,7 @@ class ContractClient {
     };
   }
 
-  async fundCAddress(options: any, sourceKeypair: Keypair): Promise<TransactionResult> {
+  async fundCAddress(options: FundCOptions, sourceKeypair: Keypair): Promise<TransactionResult> {
     assertAccountAddress(options.source, 'source');
     assertContractAddress(options.target, 'target');
     assertContractAddress(options.asset, 'asset');
@@ -294,7 +297,7 @@ class ContractClient {
     return this.submitMutation('fundCAddressWithSwap', tx, sourceKeypair);
   }
 
-  async withdrawFees(options: any, sourceKeypair: Keypair): Promise<TransactionResult> {
+  async withdrawFees(options: WithdrawFeesOptions, sourceKeypair: Keypair): Promise<TransactionResult> {
     assertContractAddress(options.asset, 'asset');
     const sourceAccount = await this.provider.getAccount(sourceKeypair.publicKey());
 
@@ -350,7 +353,7 @@ class ContractClient {
     return this.submitMutation('setAdmin', tx, adminKeypair);
   }
 
-  async upgrade(options: any, adminKeypair: Keypair): Promise<TransactionResult> {
+  async upgrade(options: UpgradeOptions, adminKeypair: Keypair): Promise<TransactionResult> {
     const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
     const wasmHashBytes = Buffer.from(options.newWasmHash, 'hex');
     const wasmHashScVal = xdr.ScVal.scvBytes(wasmHashBytes);
