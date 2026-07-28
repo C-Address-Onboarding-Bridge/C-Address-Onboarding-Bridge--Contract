@@ -335,25 +335,35 @@ export class EthChainListener implements ChainListener {
    */
   private decode(log: any): BridgeEvent | null {
     try {
-      const txHash = (log.topics[1] as string).slice(2); // strip 0x
+      if (!Array.isArray(log.topics) || typeof log.topics[1] !== 'string') return null;
+      const txHashTopic = log.topics[1] as string;
+      if (!txHashTopic.startsWith('0x') || txHashTopic.length !== 66) return null;
+      const txHash = txHashTopic.slice(2); // strip 0x
 
       // ABI-decode non-indexed data: (string target, string asset, uint256 amount)
+      if (typeof log.data !== 'string' || !log.data.startsWith('0x')) return null;
       const data = (log.data as string).slice(2); // strip 0x
+      if (data.length < 64 * 3) return null;
       // Each ABI word is 32 bytes = 64 hex chars
       const word = (n: number) => data.slice(n * 64, (n + 1) * 64);
 
       const targetOffset = parseInt(word(0), 16) * 2; // byte offset → hex offset
       const assetOffset = parseInt(word(1), 16) * 2;
       const amountHex = word(2);
+      if (!Number.isFinite(targetOffset) || !Number.isFinite(assetOffset) || amountHex.length !== 64) return null;
 
       const decodeString = (byteOffset: number) => {
+        if (byteOffset < 0 || byteOffset + 64 > data.length) return null;
         const len = parseInt(data.slice(byteOffset, byteOffset + 64), 16);
+        if (!Number.isFinite(len)) return null;
         const strHex = data.slice(byteOffset + 64, byteOffset + 64 + len * 2);
+        if (strHex.length !== len * 2) return null;
         return Buffer.from(strHex, 'hex').toString('utf8');
       };
 
       const target = decodeString(targetOffset);
       const asset = decodeString(assetOffset);
+      if (target === null || asset === null) return null;
       const amount = BigInt('0x' + amountHex).toString();
 
       return { chainId: this.config.chainId, txHash, target, asset, amount };
@@ -432,13 +442,193 @@ export class SolanaChainListener implements ChainListener {
   private decodeLine(line: string): BridgeEvent | null {
     try {
       const payload = line.replace('Program log: bridge_fund:', '');
-      const [txHash, target, asset, amount] = payload.split(':');
-      if (!txHash || !target || !asset || !amount) return null;
+      const parts = payload.split(':');
+      if (parts.length !== 4) return this.rejectLine(line, 'expected 4 fields');
+      const [txHash, target, asset, amount] = parts;
+      if (!txHash || !target || !asset || !amount) return this.rejectLine(line, 'missing field');
+      if (!/^\d+$/.test(amount)) return this.rejectLine(line, 'amount is not numeric');
       return { chainId: this.config.chainId, txHash, target, asset, amount };
     } catch {
-      return null;
+      return this.rejectLine(line, 'malformed line');
     }
   }
+
+  private rejectLine(line: string, reason: string): null {
+    console.warn(`[solana-listener] rejected bridge_fund log: ${reason}; line=${line}`);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Lightweight self-tests (run with: npx ts-node relayer/index.ts --self-test)
+// ---------------------------------------------------------------------------
+
+function assert(condition: unknown, message: string): void {
+  if (!condition) throw new Error(message);
+}
+
+function assertEqual<T>(actual: T, expected: T, message: string): void {
+  if (actual !== expected) {
+    throw new Error(`${message}: expected ${String(expected)}, got ${String(actual)}`);
+  }
+}
+
+function makeTestEvent(overrides: Partial<BridgeEvent> = {}): BridgeEvent {
+  return {
+    chainId: 1,
+    txHash: 'ab'.repeat(32),
+    target: 'GDESTINATION',
+    asset: 'CASSET',
+    amount: '1000',
+    ...overrides,
+  };
+}
+
+function makeTestService(params: {
+  threshold?: number;
+  nodes?: RelayerNodeConfig[];
+  fundCrosschain?: (options: CrossChainFundOptions, submitter: any) => Promise<any>;
+} = {}): RelayerService {
+  const service = Object.create(RelayerService.prototype) as RelayerService;
+  (service as any).config = {
+    contractId: 'C',
+    rpcUrl: 'http://localhost',
+    networkPassphrase: 'test',
+    submitterSecretKey: 'S',
+    threshold: params.threshold ?? 1,
+    nodes: params.nodes ?? [{ privateKey: '01'.repeat(32) }],
+    listeners: [],
+  };
+  (service as any).sdk = {
+    fundCrosschain: params.fundCrosschain ?? (async () => ({ status: 'pending', hash: 'hash' })),
+  };
+  (service as any).submitterKeypair = {};
+  (service as any).nonces = new NonceStore();
+  return service;
+}
+
+export async function test_duplicate_event_ignored_via_nonce_store(): Promise<void> {
+  let calls = 0;
+  const service = makeTestService({
+    fundCrosschain: async () => {
+      calls += 1;
+      return { status: 'pending', hash: 'hash' };
+    },
+  });
+  const event = makeTestEvent();
+
+  await (service as any).handleEvent(event);
+  await (service as any).handleEvent(event);
+
+  assertEqual(calls, 1, 'duplicate event should not call SDK twice');
+}
+
+export async function test_nonce_marked_only_after_successful_submission(): Promise<void> {
+  let calls = 0;
+  const service = makeTestService({
+    fundCrosschain: async () => {
+      calls += 1;
+      return calls === 1
+        ? { status: 'failed', hash: '', error: 'submission failed' }
+        : { status: 'pending', hash: 'hash' };
+    },
+  });
+  const event = makeTestEvent();
+
+  await (service as any).handleEvent(event);
+  await (service as any).handleEvent(event);
+  await (service as any).handleEvent(event);
+
+  assertEqual(calls, 2, 'failed submission should be retried and successful nonce should dedupe later events');
+}
+
+export async function test_below_threshold_short_circuits_before_sdk_call(): Promise<void> {
+  let calls = 0;
+  const service = makeTestService({
+    threshold: 2,
+    nodes: [{ privateKey: '01'.repeat(32) }],
+    fundCrosschain: async () => {
+      calls += 1;
+      return { status: 'pending', hash: 'hash' };
+    },
+  });
+
+  await (service as any).handleEvent(makeTestEvent());
+
+  assertEqual(calls, 0, 'below-threshold event should not call SDK');
+}
+
+function word(hex: string): string {
+  return hex.padStart(64, '0');
+}
+
+function encodedString(value: string): string {
+  const hex = Buffer.from(value, 'utf8').toString('hex');
+  const paddedLength = Math.ceil(hex.length / 64) * 64;
+  return word((hex.length / 2).toString(16)) + hex.padEnd(paddedLength, '0');
+}
+
+function makeAbiLog(target: string, asset: string, amount: bigint): any {
+  const targetTail = encodedString(target);
+  const assetTail = encodedString(asset);
+  const targetOffset = 32 * 3;
+  const assetOffset = targetOffset + targetTail.length / 2;
+  return {
+    topics: ['0x' + '00'.repeat(32), '0x' + 'cd'.repeat(32)],
+    data: '0x' + word(targetOffset.toString(16)) + word(assetOffset.toString(16)) + word(amount.toString(16)) + targetTail + assetTail,
+  };
+}
+
+export function test_eth_listener_decodes_realistic_abi_log_fixture(): void {
+  const listener = new EthChainListener({
+    rpcUrl: 'http://localhost',
+    bridgeContractAddress: '0xbridge',
+    eventTopic: '0xtopic',
+    chainId: 1,
+  });
+
+  const event = (listener as any).decode(makeAbiLog('GDESTINATION', 'CASSET', 123456789n));
+
+  assert(event !== null, 'valid ABI log should decode');
+  assertEqual(event.target, 'GDESTINATION', 'target should decode');
+  assertEqual(event.asset, 'CASSET', 'asset should decode');
+  assertEqual(event.amount, '123456789', 'amount should decode');
+}
+
+export function test_eth_listener_rejects_malformed_truncated_log_payload(): void {
+  const listener = new EthChainListener({
+    rpcUrl: 'http://localhost',
+    bridgeContractAddress: '0xbridge',
+    eventTopic: '0xtopic',
+    chainId: 1,
+  });
+
+  const event = (listener as any).decode({ topics: ['0x' + '00'.repeat(32), '0x' + 'cd'.repeat(32)], data: '0x1234' });
+
+  assertEqual(event, null, 'truncated ABI log should be rejected');
+}
+
+export function test_solana_listener_rejects_bad_log_lines(): void {
+  const listener = new SolanaChainListener({
+    wsUrl: 'ws://localhost',
+    programId: 'program',
+    chainId: 101,
+  });
+
+  const decodeLine = (line: string) => (listener as any).decodeLine(line);
+  assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset'), null, 'missing amount should be rejected');
+  assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset:100:extra'), null, 'extra colon should be rejected');
+  assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset:not-a-number'), null, 'non-numeric amount should be rejected');
+}
+
+async function runRelayerSelfTests(): Promise<void> {
+  await test_duplicate_event_ignored_via_nonce_store();
+  await test_nonce_marked_only_after_successful_submission();
+  await test_below_threshold_short_circuits_before_sdk_call();
+  test_eth_listener_decodes_realistic_abi_log_fixture();
+  test_eth_listener_rejects_malformed_truncated_log_payload();
+  test_solana_listener_rejects_bad_log_lines();
+  console.log('[relayer] self-tests passed');
 }
 
 // ---------------------------------------------------------------------------
@@ -446,30 +636,37 @@ export class SolanaChainListener implements ChainListener {
 // ---------------------------------------------------------------------------
 
 if (require.main === module) {
-  const service = new RelayerService({
-    contractId: process.env.CONTRACT_ID!,
-    rpcUrl: process.env.STELLAR_RPC_URL!,
-    networkPassphrase: process.env.NETWORK_PASSPHRASE!,
-    submitterSecretKey: process.env.RELAYER_SECRET_KEY!,
-    threshold: parseInt(process.env.THRESHOLD ?? '1', 10),
-    nodes: (process.env.RELAYER_PRIVATE_KEYS ?? '').split(',').map((pk) => ({ privateKey: pk.trim() })),
-    listeners: [
-      ...(process.env.ETH_RPC_URL ? [new EthChainListener({
-        rpcUrl: process.env.ETH_RPC_URL,
-        bridgeContractAddress: process.env.ETH_BRIDGE_CONTRACT!,
-        eventTopic: process.env.ETH_EVENT_TOPIC!,
-        chainId: 1,
-      })] : []),
-      ...(process.env.SOLANA_WS_URL ? [new SolanaChainListener({
-        wsUrl: process.env.SOLANA_WS_URL,
-        programId: process.env.SOLANA_PROGRAM_ID!,
-        chainId: 101,
-      })] : []),
-    ],
-  });
+  if (process.argv.includes('--self-test')) {
+    runRelayerSelfTests().catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
+  } else {
+    const service = new RelayerService({
+      contractId: process.env.CONTRACT_ID!,
+      rpcUrl: process.env.STELLAR_RPC_URL!,
+      networkPassphrase: process.env.NETWORK_PASSPHRASE!,
+      submitterSecretKey: process.env.RELAYER_SECRET_KEY!,
+      threshold: parseInt(process.env.THRESHOLD ?? '1', 10),
+      nodes: (process.env.RELAYER_PRIVATE_KEYS ?? '').split(',').map((pk) => ({ privateKey: pk.trim() })),
+      listeners: [
+        ...(process.env.ETH_RPC_URL ? [new EthChainListener({
+          rpcUrl: process.env.ETH_RPC_URL,
+          bridgeContractAddress: process.env.ETH_BRIDGE_CONTRACT!,
+          eventTopic: process.env.ETH_EVENT_TOPIC!,
+          chainId: 1,
+        })] : []),
+        ...(process.env.SOLANA_WS_URL ? [new SolanaChainListener({
+          wsUrl: process.env.SOLANA_WS_URL,
+          programId: process.env.SOLANA_PROGRAM_ID!,
+          chainId: 101,
+        })] : []),
+      ],
+    });
 
-  service.start();
+    service.start();
 
-  process.on('SIGINT', () => { service.stop(); process.exit(0); });
-  process.on('SIGTERM', () => { service.stop(); process.exit(0); });
+    process.on('SIGINT', () => { service.stop(); process.exit(0); });
+    process.on('SIGTERM', () => { service.stop(); process.exit(0); });
+  }
 }
