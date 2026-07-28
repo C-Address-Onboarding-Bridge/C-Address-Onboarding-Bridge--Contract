@@ -331,6 +331,13 @@ export interface WithdrawFeesOptions {
 
   /** Amount to withdraw, in the token's smallest unit. Must not exceed accrued fees. */
   amount: string;
+
+  /**
+   * Optional nonce for replay protection.
+   * When provided, the contract verifies that this call has not been made
+   * before with the same nonce.
+   */
+  nonce?: string | number | bigint;
 }
 
 /**
@@ -352,6 +359,13 @@ export interface UpgradeOptions {
    * Obtained from `stellar contract install --network <net> ...`.
    */
   newWasmHash: string;
+
+  /**
+   * Optional nonce for replay protection.
+   * When provided, the contract verifies that this call has not been made
+   * before with the same nonce.
+   */
+  nonce?: string | number | bigint;
 }
 
 /**
@@ -378,6 +392,13 @@ export interface ReclaimTokensOptions {
 
   /** Destination G-address that will receive the reclaimed tokens. */
   to: string;
+
+  /**
+   * Optional nonce for replay protection.
+   * When provided, the contract verifies that this call has not been made
+   * before with the same nonce.
+   */
+  nonce?: string | number | bigint;
 }
 
 // ---------------------------------------------------------------------------
@@ -719,58 +740,7 @@ export interface RelayerManagementOptions {
 // C-address creation
 // ---------------------------------------------------------------------------
 
-/**
- * Options for {@link OnboardingBridgeSDK.createCAddress}.
- *
- * Creates a new Soroban smart-contract account (C-address) and optionally
- * funds it immediately in the same flow.
- *
- * @example
- * ```ts
- * const { cAddress } = await sdk.createCAddress({
- *   deployerKeypair: keypair,
- *   initialFunds: { asset: 'CD...usdc', amount: '10000000' },
- * });
- * console.log('New C-address:', cAddress);
- * ```
- */
-export interface CreateCOptions {
-  /**
-   * Keypair used to sign the contract-creation transaction.
-   * This account pays the deployment fees.
-   */
-  deployerKeypair: any;
 
-  /**
-   * Optional 32-byte salt for deterministic address derivation, as a hex string.
-   * If omitted, a random salt is generated so the address is non-deterministic.
-   */
-  salt?: string;
-
-  /**
-   * Optional initial funds to transfer to the newly created C-address immediately
-   * after its creation, using the bridge contract's `fund_c_address` function.
-   */
-  initialFunds?: {
-    /** Token contract address of the asset to send. */
-    asset: string;
-    /** Amount to send, in the token's smallest unit. */
-    amount: string;
-  };
-}
-
-/**
- * Result returned by {@link OnboardingBridgeSDK.createCAddress}.
- */
-export interface CreateCAddressResult {
-  /**
-   * The newly created C-address (Soroban contract address starting with `C`).
-   */
-  cAddress: string;
-
-  /** Transaction hash of the contract-creation transaction. */
-  txHash: string;
-}
 
 // ---------------------------------------------------------------------------
 // Swap-and-bridge

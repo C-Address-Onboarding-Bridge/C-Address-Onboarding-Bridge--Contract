@@ -439,6 +439,22 @@ describe('OnboardingBridgeSDK', () => {
       expect(result.hash).toBe('mock_tx_hash');
       expect(mockProvider.getAccount).toHaveBeenCalledWith(MOCK_ADDRESS);
     });
+
+    it('passes nonce argument when provided', async () => {
+      const result = await sdk.withdrawFees(
+        { asset: MOCK_ASSET, amount: '100', nonce: 42 },
+        mockKeypair,
+      );
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'withdraw_fees',
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
   });
 
   describe('setFee', () => {
@@ -514,6 +530,75 @@ describe('OnboardingBridgeSDK', () => {
       const result = await sdk.setAdmin(MOCK_ADDRESS, mockKeypair);
 
       expect(result.status).toBe('pending');
+    });
+  });
+
+  describe('upgrade', () => {
+    it('submits upgrade with wasm hash and optional nonce', async () => {
+      const result = await sdk.upgrade(
+        { newWasmHash: 'a'.repeat(64) },
+        mockKeypair,
+      );
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'upgrade',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('passes nonce argument when provided', async () => {
+      const result = await sdk.upgrade(
+        { newWasmHash: 'a'.repeat(64), nonce: 99 },
+        mockKeypair,
+      );
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'upgrade',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
+  describe('reclaimTokens', () => {
+    it('returns pending status on success', async () => {
+      const result = await sdk.reclaimTokens(
+        { asset: MOCK_ASSET, amount: '100', to: MOCK_ADDRESS },
+        mockKeypair,
+      );
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(result.hash).toBe('mock_tx_hash');
+      expect(contract.call).toHaveBeenCalledWith(
+        'reclaim_tokens',
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('passes nonce argument when provided', async () => {
+      const result = await sdk.reclaimTokens(
+        { asset: MOCK_ASSET, amount: '100', to: MOCK_ADDRESS, nonce: 7 },
+        mockKeypair,
+      );
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'reclaim_tokens',
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
     });
   });
 
