@@ -109,20 +109,6 @@ export class CachedContractClient {
   }
 }
 
-const MUTATION_METHODS = new Set([
-  'fundCAddress',
-  'fundCAddressWithSwap',
-  'withdrawFees',
-  'setFee',
-  'setFeeCollector',
-  'setAdmin',
-  'upgrade',
-  'fundCrosschain',
-  'addRelayer',
-  'removeRelayer',
-  'setRelayerThreshold',
-]);
-
 class ContractClient {
   private config: BridgeConfig;
   private cache: ICacheProvider;
