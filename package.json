@@ -12,6 +12,7 @@
   },
   "scripts": {
     "prepare": "husky install || true",
+    "lint:docs:migration-sdk": "node scripts/check-migration-sdk-docs.js",
     "estimate-deploy-cost": "ts-node scripts/estimate-deploy-cost.ts",
     "estimate:mainnet": "npm run estimate-deploy-cost -- --network mainnet",
     "estimate:testnet": "npm run estimate-deploy-cost -- --network testnet",

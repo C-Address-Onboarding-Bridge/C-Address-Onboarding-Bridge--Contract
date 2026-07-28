@@ -32,6 +32,30 @@ services:
     command: npx ts-node-dev --respawn --transpile-only relayer/index.ts
 
   # -------------------------------------------------------------------
+  # Indexer API — Rust event indexer and webhook delivery worker
+  # -------------------------------------------------------------------
+  indexer:
+    image: rust:1-bookworm
+    working_dir: /app
+    ports:
+      - '3001:3001'
+    volumes:
+      - .:/app
+      - cargo_cache:/usr/local/cargo/registry
+      - indexer_target:/app/indexer/target
+    environment:
+      STELLAR_RPC_URL: http://soroban:8000/soroban/rpc
+      CONTRACT_ID: ${CONTRACT_ID}
+      DATABASE_URL: sqlite:indexer.db
+      LISTEN_ADDR: 0.0.0.0:3001
+    env_file:
+      - .env
+    depends_on:
+      soroban:
+        condition: service_healthy
+    command: cargo run --manifest-path indexer/Cargo.toml
+
+  # -------------------------------------------------------------------
   # PostgreSQL — event store and reconciliation DB
   # -------------------------------------------------------------------
   postgres:
@@ -86,3 +110,5 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  cargo_cache:
+  indexer_target:
