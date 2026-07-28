@@ -149,6 +149,12 @@ pub enum BridgeError {
     BatchTooLarge = 41,
     /// An address's strkey representation exceeds `MAX_STRKEY_LEN` (64) bytes.
     InvalidAddress = 42,
+    /// The same relayer pubkey appeared more than once in `sigs`.
+    DuplicateRelayerSignature = 41,
+    /// A pool address in `swap_route` is not on the swap-pool whitelist.
+    PoolNotWhitelisted = 42,
+    /// `swap_route` contained more than one hop; multi-hop swaps are not supported.
+    MultiHopNotSupported = 43,
 }
 
 // ---------------------------------------------------------------------------
@@ -214,6 +220,8 @@ pub enum DataKey {
     // Issue #35: EIP-712-style meta-transaction used nonces
     MetaTxNonce(Address, u64),
     Deactivated,
+    // Admin-managed whitelist of DEX pool addresses usable in `swap_route`.
+    PoolWhitelist,
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +282,10 @@ pub struct AssetCounters {
     pub total_bridged: i128,
     /// Cumulative gross fees collected since deployment.
     pub total_fees_collected: i128,
+    /// Sum of `TimelockEntry.amount` for entries not yet claimed. Sits in the
+    /// contract's token balance but is not owned by the fee collector or
+    /// available for `reclaim_tokens`.
+    pub locked_timelock: i128,
 }
 
 /// A volume-based fee tier.
@@ -664,6 +676,30 @@ fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError
     Ok(())
 }
 
+// fund_c_address_with_swap must not invoke arbitrary caller-supplied pool
+// addresses. Mirrors the asset whitelist pattern above.
+#[inline(never)]
+fn read_pool_whitelist(env: &Env) -> Map<Address, bool> {
+    env.storage()
+        .instance()
+        .get(&DataKey::PoolWhitelist)
+        .unwrap_or_else(|| Map::new(env))
+}
+
+#[inline(never)]
+fn save_pool_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PoolWhitelist, whitelist);
+}
+
+fn check_pool_whitelisted(env: &Env, pool: &Address) -> Result<(), BridgeError> {
+    if !read_pool_whitelist(env).get(pool.clone()).unwrap_or(false) {
+        return Err(BridgeError::PoolNotWhitelisted);
+    }
+    Ok(())
+}
+
 // Issue #96: SAC native token (XLM) support
 //
 // Native SAC tokens (e.g., XLM) use the same token interface but may have
@@ -687,7 +723,20 @@ fn read_asset_counters(env: &Env, asset: &Address) -> AssetCounters {
             accrued_fees: 0,
             total_bridged: 0,
             total_fees_collected: 0,
+            locked_timelock: 0,
         })
+}
+
+fn increment_locked_timelock(env: &Env, asset: &Address, amount: i128) {
+    let mut c = read_asset_counters(env, asset);
+    c.locked_timelock += amount;
+    save_asset_counters(env, asset, &c);
+}
+
+fn decrement_locked_timelock(env: &Env, asset: &Address, amount: i128) {
+    let mut c = read_asset_counters(env, asset);
+    c.locked_timelock -= amount;
+    save_asset_counters(env, asset, &c);
 }
 
 fn save_asset_counters(env: &Env, asset: &Address, counters: &AssetCounters) {
@@ -902,6 +951,26 @@ fn remove_relayer(env: &Env, pubkey: &BytesN<32>) {
             .instance()
             .set(&DataKey::RelayerCount, &(count.saturating_sub(1)));
     }
+}
+
+// --- Meta-transaction signer registry ---
+//
+// `execute_meta_fund` authenticates purely via Ed25519 signature (no
+// `require_auth`), so nothing inherently ties the supplied `pubkey` to
+// `params.source`. This registry lets `source` bind the one pubkey it will
+// accept meta-tx signatures from, via `register_meta_signer` (which itself
+// requires `source.require_auth()` once, on-chain).
+
+fn save_meta_signer(env: &Env, source: &Address, pubkey: &BytesN<32>) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::MetaSigner(source.clone()), pubkey);
+}
+
+fn read_meta_signer(env: &Env, source: &Address) -> Option<BytesN<32>> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::MetaSigner(source.clone()))
 }
 
 fn relayer_threshold(env: &Env) -> u32 {
@@ -1379,7 +1448,10 @@ impl OnboardingBridge {
     /// * [`BridgeError::TransactionExpired`] — `deadline` is in the past.
     /// * [`BridgeError::MismatchedArrays`] — `targets.len() != amounts.len()`.
     /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
-    /// * [`BridgeError::InvalidAmount`] — Any element of `amounts` is ≤ 0.
+    /// * [`BridgeError::InvalidAmount`] — Any element of `amounts` is ≤ 0 or below
+    ///   the configured minimum transfer amount.
+    /// * [`BridgeError::DailyLimitExceeded`] — The aggregate batch amount would
+    ///   exceed `source`'s daily limit for this asset.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     ///
     /// # Events
@@ -1439,18 +1511,28 @@ impl OnboardingBridge {
         let mut total: i128 = 0;
         for i in 0..targets.len() {
             let amount = amounts.get(i).unwrap();
-            if amount <= 0 {
+            // Enforce the same per-transfer minimum as `fund_c_address` — otherwise
+            // a source could evade it entirely by routing through the batch path.
+            if amount <= 0 || amount < minimum_amount {
                 return Err(BridgeError::InvalidAmount);
             }
             total = safe_math::safe_add(total, amount)?;
         }
+
+        // Enforce the source's daily limit against the aggregate batch amount,
+        // same as `fund_c_address` / `fund_c_address_with_referral` / `execute_meta_fund` —
+        // otherwise a source could evade a configured limit via the batch path.
+        check_daily_limit(&env, &source, &asset, total)?;
 
         let token_client = token::Client::new(&env, &asset);
         let contract_addr = env.current_contract_address();
         token_client.transfer(&source, &contract_addr, &total);
 
         let config = read_bridge_config(&env);
-        let effective_fee_bps = get_effective_fee_bps(&env, &asset, config.fee_bps);
+        // Route through the same volume-tiered fee lookup as the other funding
+        // entry points, instead of the flat global rate.
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, config.fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
         let mut num_success = 0u32;
         let mut num_failures = 0u32;
         let mut refund_amount = 0i128;
@@ -1503,6 +1585,13 @@ impl OnboardingBridge {
         // Batch-update all counters in a single storage read+write
         if total_fees > 0 || total_bridged > 0 {
             update_asset_counters(&env, &asset, total_fees, total_bridged);
+        }
+
+        // Track bridged volume for the tiered-fee lookup, mirroring the other
+        // funding entry points. Only the amount that actually succeeded counts.
+        let successful_amount = total - refund_amount;
+        if successful_amount > 0 {
+            increment_source_bridged_volume(&env, &source, successful_amount);
         }
 
         if refund_amount > 0 {
@@ -2086,7 +2175,11 @@ impl OnboardingBridge {
         token_client.transfer(&source, &env.current_contract_address(), &amount);
 
         let global_fee_bps = read_fee_bps(&env);
-        let effective_fee_bps = get_effective_fee_bps(&env, &asset, global_fee_bps);
+        // Route through the volume-tiered fee lookup, same as fund_c_address /
+        // reveal_fund / fund_c_address_with_swap / execute_meta_fund — otherwise
+        // a source could bypass their tier by using the referral path instead.
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
         let fee = calculate_fee(amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(amount, fee)?;
 
@@ -2114,6 +2207,7 @@ impl OnboardingBridge {
         increment_accrued_fees(&env, &asset, protocol_fee);
         increment_total_bridged(&env, &asset, net_amount);
         increment_total_fees_collected(&env, &asset, fee);
+        increment_source_bridged_volume(&env, &source, amount);
 
         env.events().publish(
             ("CAddressFunded", asset, source, target),
@@ -2943,10 +3037,16 @@ impl OnboardingBridge {
     ///
     /// # Security Considerations
     ///
-    /// The check `reclaimable = balance − accrued_fees` ensures that fee
-    /// reserves are ring-fenced. However, timelocked funds also sit in the
-    /// contract balance and are not tracked separately. Do not reclaim tokens
-    /// if there are active timelocks denominated in the same asset.
+    /// The check `reclaimable = balance − accrued_fees − locked_timelock`
+    /// ensures that both fee reserves and unclaimed `TimelockEntry` deposits
+    /// are ring-fenced: `locked_timelock` is a running per-asset total
+    /// incremented in `fund_c_address_timelocked` and decremented in
+    /// `claim_timelocked`, so admins cannot drain tokens that are owed to a
+    /// pending timelock claim. Unrevealed `CommitmentEntry` records created
+    /// by `commit_fund` never hold contract balance in the first place —
+    /// `reveal_fund` pulls the tokens from `source` and forwards them to
+    /// `target` atomically within a single call — so no separate accounting
+    /// is required for them.
     pub fn reclaim_tokens(
         env: Env,
         asset: Address,
@@ -2965,8 +3065,8 @@ impl OnboardingBridge {
 
         let token_client = token::Client::new(&env, &asset);
         let contract_balance = token_client.balance(&env.current_contract_address());
-        let accrued = read_accrued_fees(&env, &asset);
-        let reclaimable = contract_balance - accrued;
+        let counters = read_asset_counters(&env, &asset);
+        let reclaimable = contract_balance - counters.accrued_fees - counters.locked_timelock;
 
         if reclaimable < amount {
             return Err(BridgeError::InsufficientReclaimable);
@@ -3062,6 +3162,81 @@ impl OnboardingBridge {
     pub fn query_whitelisted_assets(env: Env) -> Result<Vec<Address>, BridgeError> {
         check_initialized(&env)?;
         Ok(read_whitelist(&env).keys())
+    }
+
+    // -----------------------------------------------------------------------
+    // Swap pool whitelist
+    // -----------------------------------------------------------------------
+
+    /// Adds `pool` to the DEX swap-pool whitelist.
+    ///
+    /// Only whitelisted pool addresses may appear in the `swap_route` passed
+    /// to `fund_c_address_with_swap`. Adding a pool that is already
+    /// whitelisted is idempotent.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` (`Address`) — The DEX pool contract address to whitelist.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    pub fn add_swap_pool(env: Env, pool: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        let mut whitelist = read_pool_whitelist(&env);
+        whitelist.set(pool, true);
+        save_pool_whitelist(&env, &whitelist);
+        Ok(())
+    }
+
+    /// Removes `pool` from the DEX swap-pool whitelist.
+    ///
+    /// After removal, any `fund_c_address_with_swap` call whose `swap_route`
+    /// references this pool returns [`BridgeError::PoolNotWhitelisted`].
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` (`Address`) — The DEX pool contract address to remove.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    pub fn remove_swap_pool(env: Env, pool: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        let mut whitelist = read_pool_whitelist(&env);
+        whitelist.remove(pool);
+        save_pool_whitelist(&env, &whitelist);
+        Ok(())
+    }
+
+    /// Returns `true` if `pool` is currently on the swap-pool whitelist.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    pub fn query_is_pool_whitelisted(env: Env, pool: Address) -> Result<bool, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_pool_whitelist(&env).get(pool).unwrap_or(false))
     }
 
     // -----------------------------------------------------------------------
@@ -3284,6 +3459,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::ReplayedNonce`] — This `(chain_id, tx_hash)` combination
     ///   has already been processed.
     /// * [`BridgeError::NotRelayer`] — A signature's pubkey is not a registered relayer.
+    /// * [`BridgeError::DuplicateRelayerSignature`] — The same relayer pubkey
+    ///   appears more than once in `sigs`.
     /// * [`BridgeError::BelowThreshold`] — Fewer than `threshold` valid signatures.
     /// * [`BridgeError::InvalidAddress`] — A strkey exceeds `MAX_STRKEY_LEN` (64) bytes.
     ///
@@ -3297,10 +3474,10 @@ impl OnboardingBridge {
     /// marked used before the token transfer, preventing replay attacks. An
     /// invalid Ed25519 signature causes a host-level trap (panic) rather than
     /// returning an error code, so callers should pre-validate signatures
-    /// off-chain. The contract does not verify that `sigs` contains distinct
-    /// pubkeys — a single relayer submitting the same signature twice counts
-    /// as two signatures and could satisfy a threshold of 2. Callers and
-    /// relayer infrastructure should deduplicate signatures before submission.
+    /// off-chain. The contract verifies that `sigs` contains distinct
+    /// pubkeys — a relayer submitting the same signature twice only counts
+    /// once toward the threshold; duplicates are rejected with
+    /// [`BridgeError::DuplicateRelayerSignature`].
     pub fn fund_c_address_crosschain(
         env: Env,
         chain_id: u32,
@@ -3368,17 +3545,25 @@ impl OnboardingBridge {
 
         let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
 
-        // Verify M-of-N relayer signatures
+        // Verify M-of-N relayer signatures. Each relayer pubkey may only be
+        // counted once — track pubkeys already seen and reject duplicates so
+        // a single relayer's signature submitted twice cannot satisfy a
+        // threshold of 2 (or more).
         let threshold = relayer_threshold(&env);
         let mut valid: u32 = 0;
+        let mut seen_pubkeys: Vec<BytesN<32>> = Vec::new(&env);
         for i in 0..sigs.len() {
             let sig = sigs.get(i).unwrap();
             if !is_relayer(&env, &sig.pubkey) {
                 return Err(BridgeError::NotRelayer);
             }
+            if seen_pubkeys.contains(&sig.pubkey) {
+                return Err(BridgeError::DuplicateRelayerSignature);
+            }
             // Panics (traps) on invalid sig — convert to error via try pattern
             env.crypto()
                 .ed25519_verify(&sig.pubkey, &payload_hash.clone().into(), &sig.signature);
+            seen_pubkeys.push_back(sig.pubkey.clone());
             valid += 1;
         }
         if valid < threshold {
@@ -3610,6 +3795,8 @@ impl OnboardingBridge {
                 claimed: false,
             },
         );
+        // Ring-fence this deposit so reclaim_tokens cannot drain it before claim.
+        increment_locked_timelock(&env, &asset, amount);
 
         env.events().publish(
             ("TimelockCreated", source, target),
@@ -3669,6 +3856,10 @@ impl OnboardingBridge {
 
         entry.claimed = true;
         save_timelock_entry(&env, id, &entry);
+        // This entry's full deposit is leaving the "locked" pool: the fee
+        // portion is now tracked in accrued_fees and net_amount leaves the
+        // contract balance entirely.
+        decrement_locked_timelock(&env, &entry.asset, entry.amount);
 
         let fee_bps = read_fee_bps(&env);
         let effective_fee_bps = get_effective_fee_bps(&env, &entry.asset, fee_bps);
@@ -4217,9 +4408,8 @@ impl OnboardingBridge {
     ///
     /// Flow:
     /// 1. Pull `source_amount` of `source_asset` from `source` into the contract.
-    /// 2. Walk `swap_route` (a sequence of DEX pool contract addresses) swapping
-    ///    the running balance through each pool using the standard two-token
-    ///    `swap(amount_in, min_amount_out, to)` interface.
+    /// 2. Invoke the single whitelisted pool in `swap_route` using the standard
+    ///    two-token `swap(min_amount_out, to)` interface.
     /// 3. Verify the final `target_asset` balance received ≥ `min_target_amount`.
     /// 4. Deduct the fee (in `target_asset`) and transfer the net amount to
     ///    `target`.
@@ -4232,9 +4422,10 @@ impl OnboardingBridge {
     /// * `target_asset` — Token contract the target should receive (e.g. XLM).
     /// * `source_amount` — Gross amount of `source_asset` to pull from source.
     /// * `min_target_amount` — Slippage guard: revert if the swap yields less.
-    /// * `swap_route` — Ordered list of DEX pool contract addresses. At least
-    ///   one pool is required. Each pool must implement the interface:
-    ///   `swap(amount_in: i128, min_amount_out: i128, to: Address) -> i128`.
+    /// * `swap_route` — Must contain exactly one DEX pool contract address,
+    ///   and that address must be on the swap-pool whitelist (see
+    ///   `add_swap_pool`). The pool must implement:
+    ///   `swap(min_amount_out: i128, to: Address) -> i128`.
     ///
     /// # Authorization
     ///
@@ -4248,8 +4439,32 @@ impl OnboardingBridge {
     /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode is on and `target` is not listed.
     /// * [`BridgeError::AssetNotWhitelisted`] — `target_asset` is not whitelisted.
-    /// * [`BridgeError::SwapFailed`] — A pool returned zero tokens out.
+    /// * [`BridgeError::MultiHopNotSupported`] — `swap_route` does not contain
+    ///   exactly one pool.
+    /// * [`BridgeError::PoolNotWhitelisted`] — The pool in `swap_route` is not
+    ///   on the swap-pool whitelist.
+    /// * [`BridgeError::SwapFailed`] — The pool returned zero tokens out.
     /// * [`BridgeError::SlippageExceeded`] — Swap output < `min_target_amount`.
+    ///
+    /// # Security Considerations
+    ///
+    /// `swap_route` addresses are invoked with `env.invoke_contract` after
+    /// the contract has already transferred tokens to them. Without a
+    /// whitelist, a malicious or unvetted pool could keep the transferred
+    /// tokens and return a fabricated `amount_out`, effectively stealing
+    /// from the source. Every address in `swap_route` is therefore required
+    /// to be present in the admin-managed pool whitelist (`add_swap_pool` /
+    /// `remove_swap_pool`), which mirrors the existing asset whitelist
+    /// pattern. Only the admin should whitelist pools, and only after
+    /// auditing their `swap` implementation and token-return behavior.
+    ///
+    /// Multi-hop routes are intentionally out of scope: the contract cannot
+    /// generally know which token an intermediate pool actually returns, and
+    /// assuming it equals `target_asset` mid-route can cause the contract to
+    /// transfer the wrong token into the next pool. `swap_route` is therefore
+    /// restricted to exactly one hop; longer routes return
+    /// [`BridgeError::MultiHopNotSupported`] rather than silently
+    /// miscomputing the swap.
     pub fn fund_c_address_with_swap(
         env: Env,
         source: Address,
@@ -4272,6 +4487,15 @@ impl OnboardingBridge {
         // Only the output asset needs to be whitelisted (what arrives at target).
         check_asset_whitelisted(&env, &target_asset)?;
 
+        // Multi-hop routes are out of scope: the contract cannot verify which
+        // token an intermediate pool returns, so only a single, whitelisted
+        // pool is permitted. See "Security Considerations" above.
+        if swap_route.len() != 1 {
+            return Err(BridgeError::MultiHopNotSupported);
+        }
+        let pool = swap_route.get(0).unwrap();
+        check_pool_whitelisted(&env, &pool)?;
+
         source.require_auth();
 
         let contract_addr = env.current_contract_address();
@@ -4280,55 +4504,26 @@ impl OnboardingBridge {
         let source_token = token::Client::new(&env, &source_asset);
         source_token.transfer(&source, &contract_addr, &source_amount);
 
-        // Step 2: walk the swap route.
+        // Step 2: invoke the single whitelisted pool.
         // Each pool must implement: swap(min_amount_out: i128, to: Address) -> i128
-        // The contract uses a push model: transfer amount_in to the pool first,
-        // then call swap. The pool detects its received balance and performs the swap.
-        //
-        // For single-hop: source_asset → pool → target_asset
-        // For multi-hop:  each pool's output token must be the next pool's input token;
-        //                 callers are responsible for constructing a valid route.
-        let mut amount_in: i128 = source_amount;
-        let route_len = swap_route.len();
+        // The contract uses a push model: transfer source_amount to the pool
+        // first, then call swap. The pool detects its received balance and
+        // performs the swap, transferring target_asset back to `to`.
+        source_token.transfer(&contract_addr, &pool, &source_amount);
 
-        // Track which token we currently hold in the contract.
-        // Hop 0 input = source_asset; subsequent inputs are determined by the route.
-        let mut current_token = source_asset.clone();
+        let swap_sym = soroban_sdk::Symbol::new(&env, "swap");
+        let swap_args: Vec<soroban_sdk::Val> = soroban_sdk::vec![
+            &env,
+            min_target_amount.into_val(&env),
+            contract_addr.into_val(&env),
+        ];
+        let amount_out: i128 = env.invoke_contract(&pool, &swap_sym, swap_args);
 
-        for (i, pool) in swap_route.iter().enumerate() {
-            let is_last = i as u32 == route_len - 1;
-            // Only enforce min_target_amount on the final hop.
-            let min_out: i128 = if is_last { min_target_amount } else { 1 };
-
-            // Push the current amount into the pool.
-            let input_token_client = token::Client::new(&env, &current_token);
-            input_token_client.transfer(&contract_addr, &pool, &amount_in);
-
-            // Call the pool's swap function. Interface: swap(min_amount_out, to) -> i128
-            // This matches the Phoenix Protocol / Soroswap pool interface.
-            let swap_sym = soroban_sdk::Symbol::new(&env, "swap");
-            let swap_args: Vec<soroban_sdk::Val> = soroban_sdk::vec![
-                &env,
-                min_out.into_val(&env),
-                contract_addr.into_val(&env),
-            ];
-            let amount_out: i128 = env.invoke_contract(&pool, &swap_sym, swap_args);
-
-            if amount_out <= 0 {
-                return Err(BridgeError::SwapFailed);
-            }
-
-            amount_in = amount_out;
-            // After this hop the contract holds the pool's output token.
-            // Update current_token for the next iteration (unused on last hop).
-            if !is_last {
-                // Intermediate token: for multi-hop routes callers construct pools
-                // such that each pool's output is the next pool's input.
-                // We advance current_token to target_asset as a reasonable default;
-                // for more complex routes the caller is responsible for matching tokens.
-                current_token = target_asset.clone();
-            }
+        if amount_out <= 0 {
+            return Err(BridgeError::SwapFailed);
         }
+
+        let amount_in = amount_out;
 
         // Step 3: slippage check on final output.
         if amount_in < min_target_amount {
@@ -4368,6 +4563,57 @@ impl OnboardingBridge {
     // Issue #35: EIP-712-style meta-transaction (gasless / relayer-submitted)
     // -----------------------------------------------------------------------
 
+    /// Binds an Ed25519 public key to `source` for use with `execute_meta_fund`.
+    ///
+    /// `execute_meta_fund` authenticates purely via an Ed25519 signature check —
+    /// it never calls `require_auth`. Without this registry, verifying that
+    /// *some* keypair signed the payload proves nothing about whose funds are
+    /// being moved: any keypair holder could submit a validly-signed meta-tx
+    /// naming an arbitrary `params.source`. Calling this once (authorised by
+    /// `source` itself) establishes the binding that `execute_meta_fund` then
+    /// enforces on every subsequent call.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The account this pubkey is allowed to sign for.
+    /// * `pubkey` (`BytesN<32>`) — The Ed25519 public key to bind to `source`.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `source.require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    ///
+    /// # Events
+    ///
+    /// * `("MetaSignerRegistered", source)` — data: `(pubkey,)`
+    pub fn register_meta_signer(
+        env: Env,
+        source: Address,
+        pubkey: BytesN<32>,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        source.require_auth();
+        save_meta_signer(&env, &source, &pubkey);
+        env.events()
+            .publish(("MetaSignerRegistered", source), (pubkey,));
+        Ok(())
+    }
+
+    /// Returns the Ed25519 public key currently bound to `source` via
+    /// `register_meta_signer`, or `None` if no key has been registered.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The address to query.
+    pub fn query_meta_signer(env: Env, source: Address) -> Option<BytesN<32>> {
+        read_meta_signer(&env, &source)
+    }
+
     /// Execute a fund_c_address on behalf of a user who signed the parameters
     /// off-chain.
     ///
@@ -4397,7 +4643,8 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `params` — Funding parameters signed by the user.
-    /// * `pubkey` — The user's Ed25519 public key (`BytesN<32>`).
+    /// * `pubkey` — The user's Ed25519 public key (`BytesN<32>`). Must already be
+    ///   bound to `params.source` via `register_meta_signer`.
     /// * `signature` — Ed25519 signature over the canonical payload hash.
     ///
     /// # Authorization
@@ -4420,6 +4667,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::AssetNotWhitelisted`] — Asset not whitelisted.
     /// * [`BridgeError::DailyLimitExceeded`] — Daily limit exceeded.
     /// * [`BridgeError::InvalidAddress`] — A strkey exceeds `MAX_STRKEY_LEN` (64) bytes.
+    /// * [`BridgeError::MetaTxPubkeySourceMismatch`] — `pubkey` is not the key
+    ///   `params.source` registered via `register_meta_signer`.
     ///
     /// # Events
     ///
@@ -4462,6 +4711,15 @@ impl OnboardingBridge {
         check_access(&env, &params.target)?;
         check_asset_whitelisted(&env, &params.asset)?;
         check_daily_limit(&env, &params.source, &params.asset, params.amount)?;
+
+        // 4b. Bind the signature to `params.source`: verifying the Ed25519
+        //     signature alone only proves *some* keypair signed the payload,
+        //     not that it belongs to `params.source`. Require `pubkey` to be
+        //     the one `params.source` registered via `register_meta_signer`.
+        match read_meta_signer(&env, &params.source) {
+            Some(registered) if registered == pubkey => {}
+            _ => return Err(BridgeError::MetaTxPubkeySourceMismatch),
+        }
 
         // 5. Build canonical payload hash and verify signature
         //    payload = sha256(domain || source_hash || target_hash || asset_hash
@@ -4572,7 +4830,9 @@ impl OnboardingBridge {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetaFundParams {
-    /// The user's Stellar address (source of funds). Must match `pubkey`.
+    /// The user's Stellar address (source of funds). `pubkey` must be the key
+    /// registered for this address via `register_meta_signer` — enforced by
+    /// `execute_meta_fund`, not merely documented here.
     pub source: Address,
     /// Destination C-address.
     pub target: Address,
