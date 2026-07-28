@@ -145,6 +145,9 @@ pub enum BridgeError {
     MetaTxNonceAlreadyUsed = 39,
     /// The contract is deactivated (permanently paused/migrated).
     ContractDeactivated = 40,
+    /// `execute_meta_fund`'s `pubkey` is not the one `params.source` registered
+    /// via `register_meta_signer` — the signature is valid but not for this source.
+    MetaTxPubkeySourceMismatch = 41,
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +213,8 @@ pub enum DataKey {
     // Issue #35: EIP-712-style meta-transaction used nonces
     MetaTxNonce(Address, u64),
     Deactivated,
+    // The Ed25519 pubkey registered by a given source address for meta-tx auth
+    MetaSigner(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -895,6 +900,26 @@ fn remove_relayer(env: &Env, pubkey: &BytesN<32>) {
             .instance()
             .set(&DataKey::RelayerCount, &(count.saturating_sub(1)));
     }
+}
+
+// --- Meta-transaction signer registry ---
+//
+// `execute_meta_fund` authenticates purely via Ed25519 signature (no
+// `require_auth`), so nothing inherently ties the supplied `pubkey` to
+// `params.source`. This registry lets `source` bind the one pubkey it will
+// accept meta-tx signatures from, via `register_meta_signer` (which itself
+// requires `source.require_auth()` once, on-chain).
+
+fn save_meta_signer(env: &Env, source: &Address, pubkey: &BytesN<32>) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::MetaSigner(source.clone()), pubkey);
+}
+
+fn read_meta_signer(env: &Env, source: &Address) -> Option<BytesN<32>> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::MetaSigner(source.clone()))
 }
 
 fn relayer_threshold(env: &Env) -> u32 {
@@ -4351,6 +4376,57 @@ impl OnboardingBridge {
     // Issue #35: EIP-712-style meta-transaction (gasless / relayer-submitted)
     // -----------------------------------------------------------------------
 
+    /// Binds an Ed25519 public key to `source` for use with `execute_meta_fund`.
+    ///
+    /// `execute_meta_fund` authenticates purely via an Ed25519 signature check —
+    /// it never calls `require_auth`. Without this registry, verifying that
+    /// *some* keypair signed the payload proves nothing about whose funds are
+    /// being moved: any keypair holder could submit a validly-signed meta-tx
+    /// naming an arbitrary `params.source`. Calling this once (authorised by
+    /// `source` itself) establishes the binding that `execute_meta_fund` then
+    /// enforces on every subsequent call.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The account this pubkey is allowed to sign for.
+    /// * `pubkey` (`BytesN<32>`) — The Ed25519 public key to bind to `source`.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `source.require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    ///
+    /// # Events
+    ///
+    /// * `("MetaSignerRegistered", source)` — data: `(pubkey,)`
+    pub fn register_meta_signer(
+        env: Env,
+        source: Address,
+        pubkey: BytesN<32>,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        source.require_auth();
+        save_meta_signer(&env, &source, &pubkey);
+        env.events()
+            .publish(("MetaSignerRegistered", source), (pubkey,));
+        Ok(())
+    }
+
+    /// Returns the Ed25519 public key currently bound to `source` via
+    /// `register_meta_signer`, or `None` if no key has been registered.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The address to query.
+    pub fn query_meta_signer(env: Env, source: Address) -> Option<BytesN<32>> {
+        read_meta_signer(&env, &source)
+    }
+
     /// Execute a fund_c_address on behalf of a user who signed the parameters
     /// off-chain.
     ///
@@ -4380,7 +4456,8 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `params` — Funding parameters signed by the user.
-    /// * `pubkey` — The user's Ed25519 public key (`BytesN<32>`).
+    /// * `pubkey` — The user's Ed25519 public key (`BytesN<32>`). Must already be
+    ///   bound to `params.source` via `register_meta_signer`.
     /// * `signature` — Ed25519 signature over the canonical payload hash.
     ///
     /// # Authorization
@@ -4402,6 +4479,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode and target not listed.
     /// * [`BridgeError::AssetNotWhitelisted`] — Asset not whitelisted.
     /// * [`BridgeError::DailyLimitExceeded`] — Daily limit exceeded.
+    /// * [`BridgeError::MetaTxPubkeySourceMismatch`] — `pubkey` is not the key
+    ///   `params.source` registered via `register_meta_signer`.
     ///
     /// # Events
     ///
@@ -4444,6 +4523,15 @@ impl OnboardingBridge {
         check_access(&env, &params.target)?;
         check_asset_whitelisted(&env, &params.asset)?;
         check_daily_limit(&env, &params.source, &params.asset, params.amount)?;
+
+        // 4b. Bind the signature to `params.source`: verifying the Ed25519
+        //     signature alone only proves *some* keypair signed the payload,
+        //     not that it belongs to `params.source`. Require `pubkey` to be
+        //     the one `params.source` registered via `register_meta_signer`.
+        match read_meta_signer(&env, &params.source) {
+            Some(registered) if registered == pubkey => {}
+            _ => return Err(BridgeError::MetaTxPubkeySourceMismatch),
+        }
 
         // 5. Build canonical payload hash and verify signature
         //    payload = sha256(domain || source_hash || target_hash || asset_hash
@@ -4545,7 +4633,9 @@ impl OnboardingBridge {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetaFundParams {
-    /// The user's Stellar address (source of funds). Must match `pubkey`.
+    /// The user's Stellar address (source of funds). `pubkey` must be the key
+    /// registered for this address via `register_meta_signer` — enforced by
+    /// `execute_meta_fund`, not merely documented here.
     pub source: Address,
     /// Destination C-address.
     pub target: Address,

@@ -1,4 +1,4 @@
-use crate::{BridgeError, OnboardingBridge};
+use crate::{BridgeError, MetaFundParams, OnboardingBridge};
 
 use soroban_sdk::{
     contract, contractimpl, contracttype,
@@ -3095,5 +3095,88 @@ fn test_emergency_migrate_non_admin_rejected() {
     use soroban_sdk::xdr::SorobanAuthorizationEntry;
     env.set_auths(&[] as &[SorobanAuthorizationEntry]);
     bridge.emergency_migrate(&new_contract, &true);
+}
+
+/********** Meta-fund pubkey/source binding **********/
+
+// execute_meta_fund verified the Ed25519 signature but never checked that the
+// supplied `pubkey` actually corresponds to `params.source` — any keypair holder
+// could submit a validly-signed meta-tx naming an arbitrary source. The check
+// against the `register_meta_signer` registry happens before signature
+// verification, so a bogus/zeroed signature is enough to exercise this path.
+#[test]
+fn test_meta_fund_rejects_pubkey_source_mismatch() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+
+    // `user` registers pubkey_a as their meta-tx signer.
+    let pubkey_a = BytesN::from_array(&env, &[0xAAu8; 32]);
+    bridge.register_meta_signer(&user, &pubkey_a);
+
+    // A relayer attempts to submit a meta-tx for `user` using an unrelated
+    // pubkey_b. The signature is bogus, but the source/pubkey binding check
+    // runs first, so the call never reaches Ed25519 verification.
+    let pubkey_b = BytesN::from_array(&env, &[0xBBu8; 32]);
+    let bogus_signature = BytesN::from_array(&env, &[0u8; 64]);
+
+    let params = MetaFundParams {
+        source: user.clone(),
+        target,
+        asset: token_id.clone(),
+        amount: 500i128,
+        nonce: 0u64,
+        deadline: 1_000_000u64,
+    };
+
+    assert_eq!(
+        bridge.try_execute_meta_fund(&params, &pubkey_b, &bogus_signature),
+        Err(Ok(BridgeError::MetaTxPubkeySourceMismatch))
+    );
+
+    // No tokens should have moved.
+    assert_eq!(check_balance(&env, &token_id, &user), 1000i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 0i128);
+}
+
+// Same scenario, but no pubkey was ever registered for `source` — must also
+// be rejected rather than silently accepting any signer.
+#[test]
+fn test_meta_fund_rejects_unregistered_source() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+    let pubkey = BytesN::from_array(&env, &[0xCCu8; 32]);
+    let bogus_signature = BytesN::from_array(&env, &[0u8; 64]);
+
+    let params = MetaFundParams {
+        source: user.clone(),
+        target,
+        asset: token_id.clone(),
+        amount: 500i128,
+        nonce: 0u64,
+        deadline: 1_000_000u64,
+    };
+
+    assert_eq!(
+        bridge.try_execute_meta_fund(&params, &pubkey, &bogus_signature),
+        Err(Ok(BridgeError::MetaTxPubkeySourceMismatch))
+    );
 }
 
