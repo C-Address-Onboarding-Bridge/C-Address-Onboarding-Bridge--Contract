@@ -32,6 +32,7 @@ import {
   PaginationOptions,
   CostEstimate,
   TimelockEntry,
+  FundCTimelockedOptions,
 } from './types';
 import {
   type ObservabilityHooks,
@@ -52,6 +53,7 @@ import {
 export const BATCH_TX_LIMIT = 100;
 import { assertAccountAddress, assertContractAddress } from './validate';
 import { withRpcRetry } from './retry';
+import { toScVals, buildSimulationTx as buildSharedSimTx } from './encoding';
 import {
   SorobanRpc,
   Contract,
@@ -205,7 +207,7 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'fund_c_address',
-                ...this.toScVals([
+                ...toScVals([
                   options.source,
                   options.target,
                   options.asset,
@@ -277,7 +279,7 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'fund_c_address_with_referral',
-                ...this.toScVals([
+                ...toScVals([
                   options.source,
                   options.target,
                   options.asset,
@@ -704,7 +706,7 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'fund_c_address_with_swap',
-                ...this.toScVals([
+                ...toScVals([
                   options.source,
                   options.target,
                   options.sourceAsset,
@@ -848,7 +850,7 @@ export class OnboardingBridgeSDK {
               .addOperation(
                 this.contract.call(
                   'batch_fund_c_address',
-                  ...this.toScVals([
+                  ...toScVals([
                     options.source,
                     chunkTargets,
                     chunkAmounts,
@@ -951,7 +953,7 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'withdraw_fees',
-                ...this.toScVals([options.asset, options.amount]),
+                ...toScVals([options.asset, options.amount]),
               ),
             )
             .setTimeout(30)
@@ -1034,7 +1036,7 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'reclaim_tokens',
-                ...this.toScVals([options.asset, options.amount, options.to]),
+                ...toScVals([options.asset, options.amount, options.to]),
               ),
             )
             .setTimeout(30)
@@ -1440,7 +1442,7 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'set_fee_bps',
-                ...this.toScVals([newFeeBps]),
+                ...toScVals([newFeeBps]),
               ),
             )
             .setTimeout(30)
@@ -1704,7 +1706,7 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'set_fee_collector',
-                ...this.toScVals([newFeeCollector]),
+                ...toScVals([newFeeCollector]),
               ),
             )
             .setTimeout(30)
@@ -1784,7 +1786,7 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'set_admin',
-                ...this.toScVals([newAdmin]),
+                ...toScVals([newAdmin]),
               ),
             )
             .setTimeout(30)
@@ -2264,7 +2266,7 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'fund_c_address',
-                ...this.toScVals([
+                ...toScVals([
                   deployerKeypair.publicKey(),
                   cAddress,
                   options.initialFunds.asset,
@@ -2533,7 +2535,7 @@ export class OnboardingBridgeSDK {
       .addOperation(
         this.contract.call(
           'fund_c_address',
-          ...this.toScVals([
+          ...toScVals([
             options.source,
             options.target,
             options.asset,
@@ -2588,54 +2590,8 @@ export class OnboardingBridgeSDK {
   /**
    * Convert JavaScript values to Soroban SCVals.
    */
-  private toScVals(args: any[]): xdr.ScVal[] {
-    return args.map((arg) => {
-      if (arg === null || arg === undefined) {
-        return xdr.ScVal.scvVoid();
-      }
-
-      if (Array.isArray(arg)) {
-        return xdr.ScVal.scvVec(
-          arg.map((item) => this.toSingleScVal(item)),
-        );
-      }
-
-      return this.toSingleScVal(arg);
-    });
-  }
-
-  private toSingleScVal(arg: any): xdr.ScVal {
-    if (typeof arg === 'string') {
-      if (arg.startsWith('C') || arg.startsWith('G')) {
-        return new Address(arg).toScVal();
-      }
-      if (/^\d+$/.test(arg)) {
-        return nativeToScVal(BigInt(arg), { type: 'i128' });
-      }
-      return nativeToScVal(arg, { type: 'string' });
-    }
-    if (typeof arg === 'number') {
-      return nativeToScVal(arg, { type: 'i128' });
-    }
-    if (typeof arg === 'bigint') {
-      return nativeToScVal(arg, { type: 'i128' });
-    }
-    if (arg instanceof Address) {
-      return arg.toScVal();
-    }
-    return nativeToScVal(arg);
-  }
-
   private buildSimulationTx(method: string, args: any[]) {
-    const source = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
-    const account = new Account(source, '0');
-    return new TransactionBuilder(account, {
-      fee: '100',
-      networkPassphrase: this.networkPassphrase,
-    })
-      .addOperation(this.contract.call(method, ...this.toScVals(args)))
-      .setTimeout(30)
-      .build();
+    return buildSharedSimTx(this.contract, method, args, this.networkPassphrase, this.config.timeout ?? 30);
   }
 
   private buildSimulationTxWithScVals(method: string, args: xdr.ScVal[]) {

@@ -1,45 +1,8 @@
-import { SorobanRpc, xdr, Address, nativeToScVal, scValToNative } from '@stellar/stellar-sdk';
+import { xdr, Address, scValToNative } from '@stellar/stellar-sdk';
+import { toSingleScVal, toScVals } from '../encoding';
 
 const MOCK_ADDRESS = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 const MOCK_ASSET = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4';
-
-function toSingleScVal(arg: any): xdr.ScVal {
-  if (typeof arg === 'string') {
-    if (arg.startsWith('C') || arg.startsWith('G')) {
-      return new Address(arg).toScVal();
-    }
-    if (/^\d+$/.test(arg)) {
-      return nativeToScVal(BigInt(arg), { type: 'i128' });
-    }
-    return nativeToScVal(arg, { type: 'string' });
-  }
-  if (typeof arg === 'number') {
-    return nativeToScVal(arg, { type: 'i128' });
-  }
-  if (typeof arg === 'bigint') {
-    return nativeToScVal(arg, { type: 'i128' });
-  }
-  if (arg instanceof Address) {
-    return arg.toScVal();
-  }
-  return nativeToScVal(arg);
-}
-
-function toScVals(args: any[]): xdr.ScVal[] {
-  return args.map((arg) => {
-    if (arg === null || arg === undefined) {
-      return xdr.ScVal.scvVoid();
-    }
-
-    if (Array.isArray(arg)) {
-      return xdr.ScVal.scvVec(
-        arg.map((item) => toSingleScVal(item)),
-      );
-    }
-
-    return toSingleScVal(arg);
-  });
-}
 
 describe('toScVals / toSingleScVal encoding', () => {
   it('encodes G-address (account) to ScVal Address', () => {
