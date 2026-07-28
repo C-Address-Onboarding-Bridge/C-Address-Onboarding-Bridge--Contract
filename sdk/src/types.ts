@@ -163,6 +163,20 @@ export interface FundCOptions {
    * The protocol fee is deducted from this before crediting the target.
    */
   amount: string;
+
+  /**
+   * Optional sequential nonce for replay protection.
+   * Pass `undefined` to skip nonce enforcement (standard Stellar tx
+   * replay protection via sequence number applies).
+   */
+  nonce?: string | number | bigint;
+
+  /**
+   * Optional Unix timestamp (seconds) deadline.
+   * If provided and the ledger timestamp exceeds this value, the
+   * contract will reject the transaction.
+   */
+  deadline?: string | number | bigint;
 }
 
 export interface FundCAddressWithReferralOptions extends FundCOptions {
@@ -290,6 +304,19 @@ export interface BatchFundCOptions {
    * The asset must be whitelisted on the bridge contract.
    */
   asset: string;
+
+  /**
+   * Optional sequential nonce for replay protection.
+   * Pass `undefined` to skip nonce enforcement.
+   */
+  nonce?: string | number | bigint;
+
+  /**
+   * Optional Unix timestamp (seconds) deadline.
+   * If provided and the ledger timestamp exceeds this value, the
+   * contract will reject the entire batch.
+   */
+  deadline?: string | number | bigint;
 }
 
 /**
