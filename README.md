@@ -42,16 +42,103 @@ graph TD
 
 ### Contract (`contracts/onboarding-bridge/`)
 
-| Function | Description |
-|---|---|
-| `initialize` | Set admin, fee collector, and fee rate |
-| `fund_c_address` | Route tokens from source to a C-address |
-| `batch_fund_c_address` | Fund multiple C-addresses in one tx |
-| `set_fee_bps` / `set_fee_collector` / `set_admin` | Admin management |
-| `withdraw_fees` | Fee collector drains accumulated fees |
-| `query_fee_bps` / `query_fee_collector` / `query_admin` | Read config |
-| `query_balance` | Check any address's token balance |
-| `query_is_initialized` | Check if contract is initialized |
+| Area | Function | Description |
+|---|---|---|
+| Lifecycle | `initialize` | Set the initial admin, fee collector, and fee rate |
+| Core funding | `fund_c_address` | Route tokens from a source address to one C-address |
+| Core funding | `batch_fund_c_address` | Route tokens from one source to multiple C-addresses |
+| Fees and limits | `set_fee_bps` | Update the global fee rate |
+| Fees and limits | `set_source_daily_limit` | Configure a source address's per-asset daily funding limit |
+| Fees and limits | `query_source_daily_limit` | Read a source address's daily limit state for an asset |
+| Fees and limits | `set_asset_fee_cap` | Configure a per-asset maximum effective fee |
+| Fees and limits | `query_asset_fee_cap` | Read the fee cap for an asset |
+| Fees and limits | `set_minimum_amount` | Configure the minimum allowed funding amount |
+| Fees and limits | `query_minimum_amount` | Read the minimum allowed funding amount |
+| Fees and limits | `withdraw_fees` | Withdraw accrued fees to the fee collector |
+| Fees and limits | `set_max_withdraw_per_tx` | Configure the maximum fee withdrawal per transaction |
+| Fees and limits | `query_max_withdraw_per_tx` | Read the maximum fee withdrawal per transaction |
+| Fees and limits | `query_fee_bps` | Read the global fee rate |
+| Fees and limits | `query_calculate_fee` | Calculate net amount and fee for a gross amount |
+| Fees and limits | `query_accrued_fees` | Read accrued fees for an asset |
+| Roles | `set_fee_collector` | Replace the fee collector immediately |
+| Roles | `propose_new_fee_collector` | Start a two-step fee collector transfer |
+| Roles | `accept_fee_collector` | Accept a pending fee collector role |
+| Roles | `query_pending_fee_collector` | Read the pending fee collector, if any |
+| Roles | `set_admin` | Replace the admin immediately |
+| Roles | `propose_new_admin` | Start a two-step admin transfer |
+| Roles | `accept_admin` | Accept a pending admin role |
+| Roles | `query_pending_admin` | Read the pending admin, if any |
+| Referrals and loyalty | `set_referral_rate` | Configure the referral fee share |
+| Referrals and loyalty | `query_referral_rate` | Read the referral fee share |
+| Referrals and loyalty | `fund_c_address_with_referral` | Fund a C-address and credit a referrer |
+| Referrals and loyalty | `set_loyalty_token` | Configure loyalty token rewards |
+| Referrals and loyalty | `query_loyalty_token` | Read loyalty token reward configuration |
+| Queries | `query_fee_collector` | Read the active fee collector |
+| Queries | `query_admin` | Read the active admin |
+| Queries | `query_balance` | Read an address's token balance |
+| Queries | `query_all_balances` | Read this contract's balances for multiple assets |
+| Queries | `query_fee_balance` | Read accrued fee balance for an asset |
+| Queries | `query_is_initialized` | Check whether the contract is initialized |
+| Queries | `query_nonce` | Read the next sequential nonce for a caller |
+| Queries | `query_total_bridged` | Read total net bridged amount for an asset |
+| Queries | `query_total_fees_collected` | Read total fees collected for an asset |
+| Pause and recovery | `pause` | Pause mutating bridge operations |
+| Pause and recovery | `unpause` | Resume mutating bridge operations |
+| Pause and recovery | `query_is_paused` | Check whether the contract is paused |
+| Pause and recovery | `reclaim_tokens` | Recover tokens that are not reserved for fees or timelocks |
+| Upgrades and migration | `upgrade` | Upgrade immediately to a new WASM hash |
+| Upgrades and migration | `schedule_upgrade` | Schedule a timelocked upgrade |
+| Upgrades and migration | `execute_upgrade` | Execute a scheduled upgrade after its timelock |
+| Upgrades and migration | `cancel_upgrade` | Cancel a pending upgrade |
+| Upgrades and migration | `query_pending_upgrade` | Read pending upgrade details |
+| Upgrades and migration | `emergency_migrate` | Emit migration data and deactivate the old contract |
+| Access control | `add_to_blocklist` | Block an address from receiving funds |
+| Access control | `remove_from_blocklist` | Remove an address from the blocklist |
+| Access control | `add_to_allowlist` | Add an address to the allowlist |
+| Access control | `remove_from_allowlist` | Remove an address from the allowlist |
+| Access control | `set_allowlist_mode` | Enable or disable allowlist enforcement |
+| Access control | `query_is_blocked` | Check whether an address is blocked |
+| Access control | `query_is_allowlisted` | Check whether an address is allowlisted |
+| Access control | `query_allowlist_mode` | Check whether allowlist mode is enabled |
+| Asset and pool lists | `add_asset` | Whitelist a token asset |
+| Asset and pool lists | `remove_asset` | Remove a token asset from the whitelist |
+| Asset and pool lists | `query_is_asset_whitelisted` | Check whether an asset is whitelisted |
+| Asset and pool lists | `query_whitelisted_assets` | List whitelisted assets |
+| Asset and pool lists | `add_swap_pool` | Whitelist a swap pool |
+| Asset and pool lists | `remove_swap_pool` | Remove a swap pool from the whitelist |
+| Asset and pool lists | `query_is_pool_whitelisted` | Check whether a swap pool is whitelisted |
+| Tiered fees | `set_fee_tiers` | Configure volume-based fee tiers |
+| Tiered fees | `query_fee_tiers` | Read configured fee tiers |
+| Tiered fees | `query_current_tier` | Read the current fee tier for a source |
+| Cross-chain relay | `fund_c_address_crosschain` | Fund a C-address from an external chain event with relayer signatures |
+| Cross-chain relay | `add_relayer` | Add an authorized relayer public key |
+| Cross-chain relay | `remove_relayer` | Remove an authorized relayer public key |
+| Cross-chain relay | `set_relayer_threshold` | Configure the required relayer signature threshold |
+| Cross-chain relay | `query_relayer_threshold` | Read the relayer signature threshold |
+| Cross-chain relay | `query_is_relayer` | Check whether a public key is an authorized relayer |
+| Timelocked funding | `fund_c_address_timelocked` | Lock a funding transfer until a claim time |
+| Timelocked funding | `claim_timelocked` | Claim a matured timelocked transfer |
+| Timelocked funding | `query_timelocked` | Read timelocked transfer details |
+| TTL management | `extend_instance_ttl` | Extend instance storage TTL |
+| TTL management | `extend_persistent_ttl` | Extend persistent storage TTL for an arbitrary key |
+| TTL management | `extend_timelock_ttl` | Extend a timelock entry's TTL |
+| TTL management | `extend_commitment_ttl` | Extend a commitment entry's TTL |
+| TTL management | `extend_relayer_ttl` | Extend a relayer entry's TTL |
+| TTL management | `extend_source_persistent_ttl` | Extend a source-scoped persistent entry's TTL |
+| TTL management | `set_max_instance_ttl` | Configure maximum instance TTL extension |
+| TTL management | `set_max_persistent_ttl` | Configure maximum persistent TTL extension |
+| TTL management | `query_ttl_config` | Read TTL configuration |
+| Auth replay protection | `verify_auth_entry` | Verify and consume an auth nonce in a ledger window |
+| Auth replay protection | `query_auth_nonce` | Read the next auth nonce for a source |
+| Auth replay protection | `query_auth_nonce_used` | Check whether an auth nonce has been used |
+| Commit-reveal funding | `commit_fund` | Store a funding commitment hash |
+| Commit-reveal funding | `reveal_fund` | Reveal and execute a committed funding transfer |
+| Commit-reveal funding | `query_commitment` | Read a commitment entry |
+| Swap funding | `fund_c_address_with_swap` | Swap a source asset through a whitelisted pool and fund the target asset |
+| Meta-transactions | `register_meta_signer` | Bind an Ed25519 public key to a source address |
+| Meta-transactions | `query_meta_signer` | Read the meta-transaction signer for a source |
+| Meta-transactions | `execute_meta_fund` | Execute a signed funding request submitted by a relayer |
+| Meta-transactions | `query_meta_tx_nonce_used` | Check whether a meta-transaction nonce has been used |
 
 ### Transaction Flow
 
@@ -266,10 +353,12 @@ const result = await bridge.fundCAddress(
 
 // Credit card on-ramp
 const offramp = new OffRampIntegration({ testMode: true });
-const moonpayUrl = offramp.getMoonpayUrl({
-  targetCAddress: 'C...',
+const onRampUrl = offramp.getOnRampUrl({
+  provider: 'moonpay',
   amount: '100',
-  currency: 'XLM',
+  fiatCurrency: 'USD',
+  asset: 'XLM',
+  cAddress: 'C...',
 });
 
 // CEX deposit routing
@@ -678,20 +767,22 @@ const offramp = new OffRampIntegration({
 });
 
 // Moonpay: user pays with credit card, funds arrive at C-address
-const moonpayUrl = offramp.getMoonpayUrl({
-  targetCAddress: 'CC...',
+const moonpayUrl = offramp.getOnRampUrl({
+  provider: 'moonpay',
   amount: '100',       // fiat amount
-  currency: 'XLM',    // crypto currency code
-  assetCode: 'USD',   // optional fiat currency
+  fiatCurrency: 'USD',
+  asset: 'XLM',        // crypto asset code
+  cAddress: 'CC...',
 });
 // Redirect or open moonpayUrl in a browser/webview
 
 // Transak
-const transakUrl = offramp.getTransakUrl({
-  targetCAddress: 'CC...',
+const transakUrl = offramp.getOnRampUrl({
+  provider: 'transak',
   amount: '100',
-  currency: 'XLM',
-  fiatCurrency: 'USD', // optional
+  fiatCurrency: 'USD',
+  asset: 'XLM',
+  cAddress: 'CC...',
 });
 ```
 

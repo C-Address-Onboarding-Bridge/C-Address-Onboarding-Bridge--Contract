@@ -25,7 +25,7 @@ rustup target add wasm32-unknown-unknown
 ## 1. Clone and Configure
 
 ```bash
-git clone https://github.com/chiboy948/C-Address-Onboarding-Bridge--Contract.git
+git clone https://github.com/C-Address-Onboarding-Bridge/C-Address-Onboarding-Bridge--Contract.git
 cd C-Address-Onboarding-Bridge--Contract
 cp .env.example .env
 ```

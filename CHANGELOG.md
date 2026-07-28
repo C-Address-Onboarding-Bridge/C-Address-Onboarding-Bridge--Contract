@@ -16,5 +16,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TypeScript SDK with basic functions
 - Off-ramp integration (Moonpay, Transak)
 
-[Unreleased]: https://github.com/BestBisong/C-Address-Onboarding-Bridge--Contract/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/BestBisong/C-Address-Onboarding-Bridge--Contract/releases/tag/v0.1.0
+[Unreleased]: https://github.com/C-Address-Onboarding-Bridge/C-Address-Onboarding-Bridge--Contract/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/C-Address-Onboarding-Bridge/C-Address-Onboarding-Bridge--Contract/releases/tag/v0.1.0
