@@ -1063,12 +1063,15 @@ describe('Error handling - invalid inputs', () => {
     expect(result.status).toBe('pending');
   });
 
-  it('batchFundCAddresses passes mismatched targets and amounts to contract (no client-side validation)', async () => {
+  it('batchFundCAddresses rejects mismatched targets and amounts before RPC', async () => {
     const results = await sdk.batchFundCAddresses(
       { source: MOCK_ADDRESS, targets: [MOCK_ASSET, MOCK_ASSET], amounts: ['100'], asset: MOCK_ASSET },
       mockKeypair,
     );
-    expect(results[0].status).toBe('pending');
+    expect(results).toHaveLength(1);
+    expect(results[0].status).toBe('failed');
+    expect(results[0].error).toMatch(/targets and amounts must have the same length/);
+    expect(mockProvider.getAccount).not.toHaveBeenCalled();
   });
 
   it('batchFundCAddresses passes empty targets array to contract (no client-side validation)', async () => {

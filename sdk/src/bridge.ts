@@ -817,6 +817,11 @@ export class OnboardingBridgeSDK {
         // Validate inputs before splitting so we fail fast on bad input.
         try {
           assertAccountAddress(options.source, 'source');
+          if (options.targets.length !== options.amounts.length) {
+            throw new Error(
+              `targets and amounts must have the same length (got ${options.targets.length} targets vs ${options.amounts.length} amounts)`,
+            );
+          }
           options.targets.forEach((t, i) => assertContractAddress(t, `targets[${i}]`));
           assertContractAddress(options.asset, 'asset');
         } catch (error: any) {
