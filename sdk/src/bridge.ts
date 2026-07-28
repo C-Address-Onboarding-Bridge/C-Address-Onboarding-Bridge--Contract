@@ -817,6 +817,11 @@ export class OnboardingBridgeSDK {
         // Validate inputs before splitting so we fail fast on bad input.
         try {
           assertAccountAddress(options.source, 'source');
+          if (options.targets.length !== options.amounts.length) {
+            throw new Error(
+              `targets and amounts must have the same length (got ${options.targets.length} targets vs ${options.amounts.length} amounts)`,
+            );
+          }
           options.targets.forEach((t, i) => assertContractAddress(t, `targets[${i}]`));
           assertContractAddress(options.asset, 'asset');
         } catch (error: any) {
@@ -1835,6 +1840,10 @@ export class OnboardingBridgeSDK {
       { newWasmHash: options.newWasmHash },
       async () => {
         try {
+          if (!/^[0-9a-f]{64}$/i.test(options.newWasmHash)) {
+            throw new Error('newWasmHash must be a 64-character hex string (32 bytes)');
+          }
+
           const adminAccount = await withRpcHook(
             this.hooks,
             'getAccount',
@@ -1901,6 +1910,15 @@ export class OnboardingBridgeSDK {
       { chainId: options.chainId, txHash: options.txHash, target: options.target, asset: options.asset, amount: options.amount },
       async () => {
         try {
+          options.sigs.forEach((s, i) => {
+            if (!/^[0-9a-f]{64}$/i.test(s.pubkey)) {
+              throw new Error(`sigs[${i}].pubkey must be a 64-character hex string (32 bytes), got "${s.pubkey}"`);
+            }
+            if (!/^[0-9a-f]{128}$/i.test(s.signature)) {
+              throw new Error(`sigs[${i}].signature must be a 128-character hex string (64 bytes), got "${s.signature}"`);
+            }
+          });
+
           const relayerAccount = await withRpcHook(
             this.hooks,
             'getAccount',

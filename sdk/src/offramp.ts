@@ -17,6 +17,7 @@ import {
   ProviderConfig,
   ProviderComparison,
 } from './types';
+import { assertAccountAddress, assertContractAddress } from './validate';
 
 /**
  * Builds on-ramp and off-ramp widget URLs for multiple fiat-to-crypto
@@ -87,6 +88,7 @@ export class OffRampIntegration {
    * ```
    */
   getOnRampUrl(params: OnRampUrlParams): string {
+    assertContractAddress(params.cAddress, 'cAddress');
     switch (params.provider) {
       case 'moonpay':
         return this.getMoonpayOnRampUrl(params);
@@ -126,6 +128,7 @@ export class OffRampIntegration {
    * ```
    */
   getOffRampUrl(params: OffRampUrlParams): string {
+    assertAccountAddress(params.gAddress, 'gAddress');
     switch (params.provider) {
       case 'moonpay':
         return this.getMoonpayOffRampUrl(params);

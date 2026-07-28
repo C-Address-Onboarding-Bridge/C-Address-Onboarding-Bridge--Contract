@@ -460,6 +460,54 @@ describe('OffRampIntegration', () => {
       expect(url).toContain('apiKey=');
     });
 
+    it('getOnRampUrl rejects invalid cAddress format', () => {
+      const offramp = new OffRampIntegration({ moonpayApiKey: 'test', testMode: false });
+
+      expect(() => offramp.getOnRampUrl({
+        provider: 'moonpay',
+        amount: '100',
+        fiatCurrency: 'USD',
+        asset: 'XLM',
+        cAddress: 'not-a-c-address',
+      })).toThrow(/Invalid contract address for "cAddress"/);
+    });
+
+    it('getOnRampUrl rejects G-address as cAddress', () => {
+      const offramp = new OffRampIntegration({ moonpayApiKey: 'test', testMode: false });
+
+      expect(() => offramp.getOnRampUrl({
+        provider: 'moonpay',
+        amount: '100',
+        fiatCurrency: 'USD',
+        asset: 'XLM',
+        cAddress: SOURCE_G_ADDRESS,
+      })).toThrow(/Invalid contract address for "cAddress"/);
+    });
+
+    it('getOffRampUrl rejects invalid gAddress format', () => {
+      const offramp = new OffRampIntegration({ moonpayApiKey: 'test', testMode: false });
+
+      expect(() => offramp.getOffRampUrl({
+        provider: 'moonpay',
+        amount: '100',
+        asset: 'XLM',
+        fiatCurrency: 'USD',
+        gAddress: 'not-a-g-address',
+      })).toThrow(/Invalid account address for "gAddress"/);
+    });
+
+    it('getOffRampUrl rejects C-address as gAddress', () => {
+      const offramp = new OffRampIntegration({ moonpayApiKey: 'test', testMode: false });
+
+      expect(() => offramp.getOffRampUrl({
+        provider: 'moonpay',
+        amount: '100',
+        asset: 'XLM',
+        fiatCurrency: 'USD',
+        gAddress: TARGET_C_ADDRESS,
+      })).toThrow(/Invalid account address for "gAddress"/);
+    });
+
     it('getOffRampUrl works without api keys', () => {
       const offramp = new OffRampIntegration({ testMode: false });
       

@@ -366,6 +366,9 @@ class ContractClient {
   }
 
   async upgrade(options: any, adminKeypair: Keypair): Promise<TransactionResult> {
+    if (!/^[0-9a-f]{64}$/i.test(options.newWasmHash)) {
+      throw new Error('newWasmHash must be a 64-character hex string (32 bytes)');
+    }
     const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
     const wasmHashBytes = Buffer.from(options.newWasmHash, 'hex');
     const wasmHashScVal = xdr.ScVal.scvBytes(wasmHashBytes);
