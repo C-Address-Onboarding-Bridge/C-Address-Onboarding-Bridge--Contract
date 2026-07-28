@@ -1242,6 +1242,61 @@ fn test_swap_rejects_non_whitelisted_pool() {
     assert_eq!(check_balance(&env, &source_token_id, &user), 1_000i128);
 }
 
+#[test]
+fn test_swap_multi_hop_route_rejected() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+
+    let pool1_id = env.register(SwapPool, ());
+    let pool2_id = env.register(SwapPool, ());
+    bridge.add_swap_pool(&pool1_id, &None);
+    bridge.add_swap_pool(&pool2_id, &None);
+
+    let target = Address::generate(&env);
+    // Even though both pools are whitelisted, multi-hop routes must be rejected
+    // rather than silently miscomputing which token the intermediate hop holds.
+    let swap_route = Vec::from_array(&env, [pool1_id, pool2_id]);
+
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target,
+            &source_token_id,
+            &target_token_id,
+            &500i128,
+            &400i128,
+            &swap_route,
+        ),
+        Err(Ok(BridgeError::MultiHopNotSupported))
+    );
+}
+
+#[test]
+fn test_swap_happy_path_single_hop() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &target_token_id, &1i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+
+    bridge.fund_c_address_with_swap(
+        &user,
+        &target,
+        &source_token_id,
+        &target_token_id,
+        &500i128,
+        &400i128,
+        &swap_route,
+    );
+
+    assert_eq!(check_balance(&env, &target_token_id, &target), 500i128);
+}
+
 /********** query_calculate_fee tests **********/
 
 #[test]

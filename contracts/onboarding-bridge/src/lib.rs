@@ -149,6 +149,8 @@ pub enum BridgeError {
     DuplicateRelayerSignature = 41,
     /// A pool address in `swap_route` is not on the swap-pool whitelist.
     PoolNotWhitelisted = 42,
+    /// `swap_route` contained more than one hop; multi-hop swaps are not supported.
+    MultiHopNotSupported = 43,
 }
 
 // ---------------------------------------------------------------------------
@@ -4315,9 +4317,8 @@ impl OnboardingBridge {
     ///
     /// Flow:
     /// 1. Pull `source_amount` of `source_asset` from `source` into the contract.
-    /// 2. Walk `swap_route` (a sequence of DEX pool contract addresses) swapping
-    ///    the running balance through each pool using the standard two-token
-    ///    `swap(amount_in, min_amount_out, to)` interface.
+    /// 2. Invoke the single whitelisted pool in `swap_route` using the standard
+    ///    two-token `swap(min_amount_out, to)` interface.
     /// 3. Verify the final `target_asset` balance received ≥ `min_target_amount`.
     /// 4. Deduct the fee (in `target_asset`) and transfer the net amount to
     ///    `target`.
@@ -4330,10 +4331,10 @@ impl OnboardingBridge {
     /// * `target_asset` — Token contract the target should receive (e.g. XLM).
     /// * `source_amount` — Gross amount of `source_asset` to pull from source.
     /// * `min_target_amount` — Slippage guard: revert if the swap yields less.
-    /// * `swap_route` — Ordered list of DEX pool contract addresses. At least
-    ///   one pool is required, and every pool must be on the swap-pool
-    ///   whitelist (see `add_swap_pool`). Each pool must implement the
-    ///   interface: `swap(amount_in: i128, min_amount_out: i128, to: Address) -> i128`.
+    /// * `swap_route` — Must contain exactly one DEX pool contract address,
+    ///   and that address must be on the swap-pool whitelist (see
+    ///   `add_swap_pool`). The pool must implement:
+    ///   `swap(min_amount_out: i128, to: Address) -> i128`.
     ///
     /// # Authorization
     ///
@@ -4347,9 +4348,11 @@ impl OnboardingBridge {
     /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode is on and `target` is not listed.
     /// * [`BridgeError::AssetNotWhitelisted`] — `target_asset` is not whitelisted.
-    /// * [`BridgeError::PoolNotWhitelisted`] — A pool in `swap_route` is not
+    /// * [`BridgeError::MultiHopNotSupported`] — `swap_route` does not contain
+    ///   exactly one pool.
+    /// * [`BridgeError::PoolNotWhitelisted`] — The pool in `swap_route` is not
     ///   on the swap-pool whitelist.
-    /// * [`BridgeError::SwapFailed`] — A pool returned zero tokens out.
+    /// * [`BridgeError::SwapFailed`] — The pool returned zero tokens out.
     /// * [`BridgeError::SlippageExceeded`] — Swap output < `min_target_amount`.
     ///
     /// # Security Considerations
@@ -4363,6 +4366,14 @@ impl OnboardingBridge {
     /// `remove_swap_pool`), which mirrors the existing asset whitelist
     /// pattern. Only the admin should whitelist pools, and only after
     /// auditing their `swap` implementation and token-return behavior.
+    ///
+    /// Multi-hop routes are intentionally out of scope: the contract cannot
+    /// generally know which token an intermediate pool actually returns, and
+    /// assuming it equals `target_asset` mid-route can cause the contract to
+    /// transfer the wrong token into the next pool. `swap_route` is therefore
+    /// restricted to exactly one hop; longer routes return
+    /// [`BridgeError::MultiHopNotSupported`] rather than silently
+    /// miscomputing the swap.
     pub fn fund_c_address_with_swap(
         env: Env,
         source: Address,
@@ -4385,12 +4396,14 @@ impl OnboardingBridge {
         // Only the output asset needs to be whitelisted (what arrives at target).
         check_asset_whitelisted(&env, &target_asset)?;
 
-        // Every pool address in the route must be admin-whitelisted; otherwise
-        // a malicious/unvetted pool could keep the transferred tokens and
-        // return a fabricated amount_out. See "Security Considerations" above.
-        for pool in swap_route.iter() {
-            check_pool_whitelisted(&env, &pool)?;
+        // Multi-hop routes are out of scope: the contract cannot verify which
+        // token an intermediate pool returns, so only a single, whitelisted
+        // pool is permitted. See "Security Considerations" above.
+        if swap_route.len() != 1 {
+            return Err(BridgeError::MultiHopNotSupported);
         }
+        let pool = swap_route.get(0).unwrap();
+        check_pool_whitelisted(&env, &pool)?;
 
         source.require_auth();
 
@@ -4400,55 +4413,26 @@ impl OnboardingBridge {
         let source_token = token::Client::new(&env, &source_asset);
         source_token.transfer(&source, &contract_addr, &source_amount);
 
-        // Step 2: walk the swap route.
+        // Step 2: invoke the single whitelisted pool.
         // Each pool must implement: swap(min_amount_out: i128, to: Address) -> i128
-        // The contract uses a push model: transfer amount_in to the pool first,
-        // then call swap. The pool detects its received balance and performs the swap.
-        //
-        // For single-hop: source_asset → pool → target_asset
-        // For multi-hop:  each pool's output token must be the next pool's input token;
-        //                 callers are responsible for constructing a valid route.
-        let mut amount_in: i128 = source_amount;
-        let route_len = swap_route.len();
+        // The contract uses a push model: transfer source_amount to the pool
+        // first, then call swap. The pool detects its received balance and
+        // performs the swap, transferring target_asset back to `to`.
+        source_token.transfer(&contract_addr, &pool, &source_amount);
 
-        // Track which token we currently hold in the contract.
-        // Hop 0 input = source_asset; subsequent inputs are determined by the route.
-        let mut current_token = source_asset.clone();
+        let swap_sym = soroban_sdk::Symbol::new(&env, "swap");
+        let swap_args: Vec<soroban_sdk::Val> = soroban_sdk::vec![
+            &env,
+            min_target_amount.into_val(&env),
+            contract_addr.into_val(&env),
+        ];
+        let amount_out: i128 = env.invoke_contract(&pool, &swap_sym, swap_args);
 
-        for (i, pool) in swap_route.iter().enumerate() {
-            let is_last = i as u32 == route_len - 1;
-            // Only enforce min_target_amount on the final hop.
-            let min_out: i128 = if is_last { min_target_amount } else { 1 };
-
-            // Push the current amount into the pool.
-            let input_token_client = token::Client::new(&env, &current_token);
-            input_token_client.transfer(&contract_addr, &pool, &amount_in);
-
-            // Call the pool's swap function. Interface: swap(min_amount_out, to) -> i128
-            // This matches the Phoenix Protocol / Soroswap pool interface.
-            let swap_sym = soroban_sdk::Symbol::new(&env, "swap");
-            let swap_args: Vec<soroban_sdk::Val> = soroban_sdk::vec![
-                &env,
-                min_out.into_val(&env),
-                contract_addr.into_val(&env),
-            ];
-            let amount_out: i128 = env.invoke_contract(&pool, &swap_sym, swap_args);
-
-            if amount_out <= 0 {
-                return Err(BridgeError::SwapFailed);
-            }
-
-            amount_in = amount_out;
-            // After this hop the contract holds the pool's output token.
-            // Update current_token for the next iteration (unused on last hop).
-            if !is_last {
-                // Intermediate token: for multi-hop routes callers construct pools
-                // such that each pool's output is the next pool's input.
-                // We advance current_token to target_asset as a reasonable default;
-                // for more complex routes the caller is responsible for matching tokens.
-                current_token = target_asset.clone();
-            }
+        if amount_out <= 0 {
+            return Err(BridgeError::SwapFailed);
         }
+
+        let amount_in = amount_out;
 
         // Step 3: slippage check on final output.
         if amount_in < min_target_amount {
