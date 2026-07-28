@@ -3097,3 +3097,51 @@ fn test_emergency_migrate_non_admin_rejected() {
     bridge.emergency_migrate(&new_contract, &true);
 }
 
+// --------- Loyalty reserve depletion tests ---------
+
+#[test]
+fn test_fund_succeeds_when_loyalty_reserve_depleted() {
+    let env = Env::default();
+    let (bridge, user, token_id, admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+
+    // Configure a loyalty token and reward, but never fund the bridge's
+    // loyalty-token reserve — it should be zero.
+    let loyalty_token_id = env.register(TestToken, ());
+    init_token(&env, &loyalty_token_id, &admin);
+    bridge.set_loyalty_token(&loyalty_token_id, &100i128);
+    assert_eq!(check_balance(&env, &loyalty_token_id, &bridge.address), 0i128);
+
+    // fund_c_address must still succeed end-to-end even though the loyalty
+    // transfer inside it cannot be satisfied.
+    bridge.fund_c_address(&user, &target, &token_id, &500i128, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &target), 500i128);
+    // No loyalty tokens were (or could be) minted.
+    assert_eq!(check_balance(&env, &loyalty_token_id, &user), 0i128);
+
+    // A LoyaltyMintSkipped event was emitted instead of a trap.
+    assert_eq!(
+        count_events_with_topic(&env, &bridge.address, "LoyaltyMintSkipped"),
+        1
+    );
+    assert_eq!(count_events_with_topic(&env, &bridge.address, "CAddressFunded"), 1);
+}
+
+#[test]
+fn test_fund_mints_loyalty_when_reserve_sufficient() {
+    let env = Env::default();
+    let (bridge, user, token_id, admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+
+    let loyalty_token_id = env.register(TestToken, ());
+    init_token(&env, &loyalty_token_id, &admin);
+    bridge.set_loyalty_token(&loyalty_token_id, &100i128);
+    mint_tokens(&env, &loyalty_token_id, &bridge.address, 1000i128);
+
+    bridge.fund_c_address(&user, &target, &token_id, &500i128, &None, &None);
+
+    assert_eq!(check_balance(&env, &loyalty_token_id, &user), 100i128);
+    assert_eq!(check_balance(&env, &loyalty_token_id, &bridge.address), 900i128);
+}
+
