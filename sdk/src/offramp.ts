@@ -252,6 +252,10 @@ export class OffRampIntegration {
     asset: string,
     fiatCurrency: string = 'USD',
   ): Partial<Record<OffRampProvider, ProviderComparison>> {
+    // Validate amount is a well-formed positive numeric string
+    if (typeof amount !== 'string' || !/^\d+(\.\d+)?$/.test(amount) || parseFloat(amount) <= 0) {
+      throw new Error('amount must be a well-formed positive numeric string, got: ' + JSON.stringify(amount));
+    }
     const amountNum = parseFloat(amount);
     const result: Partial<Record<OffRampProvider, ProviderComparison>> = {};
 
