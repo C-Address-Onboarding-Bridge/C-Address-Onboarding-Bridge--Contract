@@ -1,4 +1,4 @@
-use crate::{BridgeError, OnboardingBridge};
+use crate::{BridgeError, FeeTier, MetaFundParams, OnboardingBridge};
 
 use soroban_sdk::{
     contract, contractimpl, contracttype,
@@ -1917,7 +1917,7 @@ fn test_batch_exceeds_max_size() {
 
     assert_eq!(
         bridge.try_batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None),
-        Err(Ok(BridgeError::InvalidAmount))
+        Err(Ok(BridgeError::BatchTooLarge))
     );
     assert_eq!(check_balance(&env, &token_id, &user), 1_000_000i128);
 }
@@ -2283,6 +2283,145 @@ mod timelocked_tests {
         );
 
         assert_eq!(check_balance(&env, &loyalty_token_id, &user), 4i128);
+    }
+}
+
+/********** Commit-reveal funding tests **********/
+
+#[cfg(test)]
+mod commit_reveal_tests {
+    use super::*;
+
+    /// Minimum ledgers that must elapse between commit_fund and reveal_fund.
+    const MIN_DELAY_LEDGERS: u32 = 5;
+
+    fn setup_commit_reveal(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, Address) {
+        let (bridge_id, token_id) = register_all_contracts_mocked(env);
+        let bridge = create_bridge_client(env, &bridge_id);
+        let (admin, user, fee_collector) = create_test_users(env);
+        init_token(env, &token_id, &admin);
+        bridge.initialize(&admin, &fee_collector, &100u32, &None); // 1% fee
+        bridge.add_asset(&token_id, &None);
+        mint_tokens(env, &token_id, &user, 10_000i128);
+        (bridge, user, token_id)
+    }
+
+    /// Mirrors the contract's `sha256(amount_be16 || nonce_be8)` commitment hash.
+    fn amount_hash(env: &Env, amount: i128, nonce: u64) -> BytesN<32> {
+        let mut preimage = Bytes::new(env);
+        preimage.extend_from_array(&amount.to_be_bytes());
+        preimage.extend_from_array(&nonce.to_be_bytes());
+        env.crypto().sha256(&preimage).into()
+    }
+
+    /// Advances the ledger past the commit-reveal minimum delay.
+    fn advance_past_min_delay(env: &Env) {
+        let seq = env.ledger().sequence();
+        env.ledger().set_sequence_number(seq + MIN_DELAY_LEDGERS);
+    }
+
+    #[test]
+    fn test_commit_reveal_happy_path() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(&env, 500i128, 42u64);
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
+
+        let entry = bridge.query_commitment(&id);
+        assert_eq!(entry.source, user);
+        assert_eq!(entry.target, target);
+        assert!(!entry.revealed);
+
+        advance_past_min_delay(&env);
+        bridge.reveal_fund(&id, &user, &target, &token_id, &500i128, &42u64);
+
+        assert_eq!(check_balance(&env, &token_id, &target), 495i128);
+        assert_eq!(check_balance(&env, &token_id, &user), 9_500i128);
+        assert_eq!(bridge.query_accrued_fees(&token_id), 5i128);
+        assert!(bridge.query_commitment(&id).revealed);
+    }
+
+    #[test]
+    fn test_reveal_before_min_delay_fails() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(&env, 500i128, 7u64);
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
+
+        // Revealed in the same ledger the commitment was created in.
+        assert_eq!(
+            bridge.try_reveal_fund(&id, &user, &target, &token_id, &500i128, &7u64),
+            Err(Ok(BridgeError::CommitmentNotMatured))
+        );
+        assert_eq!(check_balance(&env, &token_id, &target), 0i128);
+    }
+
+    #[test]
+    fn test_reveal_after_deadline_fails() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(&env, 500i128, 9u64);
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &1_500u64);
+
+        advance_past_min_delay(&env);
+        env.ledger().set_timestamp(1_501);
+
+        assert_eq!(
+            bridge.try_reveal_fund(&id, &user, &target, &token_id, &500i128, &9u64),
+            Err(Ok(BridgeError::CommitmentExpired))
+        );
+        assert_eq!(check_balance(&env, &token_id, &target), 0i128);
+    }
+
+    #[test]
+    fn test_reveal_twice_fails() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(&env, 500i128, 11u64);
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
+
+        advance_past_min_delay(&env);
+        bridge.reveal_fund(&id, &user, &target, &token_id, &500i128, &11u64);
+
+        assert_eq!(
+            bridge.try_reveal_fund(&id, &user, &target, &token_id, &500i128, &11u64),
+            Err(Ok(BridgeError::CommitmentAlreadyRevealed))
+        );
+        // Only the first reveal moved funds.
+        assert_eq!(check_balance(&env, &token_id, &target), 495i128);
+    }
+
+    #[test]
+    fn test_reveal_hash_mismatch_fails() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(&env, 500i128, 13u64);
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
+
+        advance_past_min_delay(&env);
+
+        // Committed to 500, revealing 900 with the same nonce.
+        assert_eq!(
+            bridge.try_reveal_fund(&id, &user, &target, &token_id, &900i128, &13u64),
+            Err(Ok(BridgeError::CommitmentHashMismatch))
+        );
+        assert_eq!(check_balance(&env, &token_id, &target), 0i128);
+        assert!(!bridge.query_commitment(&id).revealed);
     }
 }
 
@@ -3524,5 +3663,257 @@ fn test_emergency_migrate_non_admin_rejected() {
     use soroban_sdk::xdr::SorobanAuthorizationEntry;
     env.set_auths(&[] as &[SorobanAuthorizationEntry]);
     bridge.emergency_migrate(&new_contract, &true);
+}
+
+/********** Meta-fund pubkey/source binding **********/
+
+// execute_meta_fund verified the Ed25519 signature but never checked that the
+// supplied `pubkey` actually corresponds to `params.source` — any keypair holder
+// could submit a validly-signed meta-tx naming an arbitrary source. The check
+// against the `register_meta_signer` registry happens before signature
+// verification, so a bogus/zeroed signature is enough to exercise this path.
+#[test]
+fn test_meta_fund_rejects_pubkey_source_mismatch() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+
+    // `user` registers pubkey_a as their meta-tx signer.
+    let pubkey_a = BytesN::from_array(&env, &[0xAAu8; 32]);
+    bridge.register_meta_signer(&user, &pubkey_a);
+
+    // A relayer attempts to submit a meta-tx for `user` using an unrelated
+    // pubkey_b. The signature is bogus, but the source/pubkey binding check
+    // runs first, so the call never reaches Ed25519 verification.
+    let pubkey_b = BytesN::from_array(&env, &[0xBBu8; 32]);
+    let bogus_signature = BytesN::from_array(&env, &[0u8; 64]);
+
+    let params = MetaFundParams {
+        source: user.clone(),
+        target,
+        asset: token_id.clone(),
+        amount: 500i128,
+        nonce: 0u64,
+        deadline: 1_000_000u64,
+    };
+
+    assert_eq!(
+        bridge.try_execute_meta_fund(&params, &pubkey_b, &bogus_signature),
+        Err(Ok(BridgeError::MetaTxPubkeySourceMismatch))
+    );
+
+    // No tokens should have moved.
+    assert_eq!(check_balance(&env, &token_id, &user), 1000i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 0i128);
+}
+
+// Same scenario, but no pubkey was ever registered for `source` — must also
+// be rejected rather than silently accepting any signer.
+#[test]
+fn test_meta_fund_rejects_unregistered_source() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+    let pubkey = BytesN::from_array(&env, &[0xCCu8; 32]);
+    let bogus_signature = BytesN::from_array(&env, &[0u8; 64]);
+
+    let params = MetaFundParams {
+        source: user.clone(),
+        target,
+        asset: token_id.clone(),
+        amount: 500i128,
+        nonce: 0u64,
+        deadline: 1_000_000u64,
+    };
+
+    assert_eq!(
+        bridge.try_execute_meta_fund(&params, &pubkey, &bogus_signature),
+        Err(Ok(BridgeError::MetaTxPubkeySourceMismatch))
+    );
+}
+
+/********** Batch fund minimum-amount enforcement **********/
+
+// batch_fund_c_address computed `minimum_amount` but never checked it against
+// each target's amount — a per-target amount below the configured minimum
+// silently succeeded in a batch even though `fund_c_address` would reject it.
+#[test]
+fn test_batch_fund_rejects_amount_below_minimum() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_minimum_amount(&50i128, &None);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let targets = Vec::from_array(&env, [Address::generate(&env), Address::generate(&env)]);
+    // Second amount (10) is below the configured minimum of 50.
+    let amounts = Vec::from_array(&env, [100i128, 10i128]);
+
+    assert_eq!(
+        bridge.try_batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+
+    // The whole batch is rejected before any token pull, so nothing moved.
+    assert_eq!(check_balance(&env, &token_id, &user), 1000i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 0i128);
+}
+
+/********** Batch fund daily-limit enforcement **********/
+
+// check_daily_limit was only wired into fund_c_address, fund_c_address_with_referral,
+// and execute_meta_fund — never batch_fund_c_address, so a source could evade a
+// configured SourceDailyLimit entirely by using the batch path.
+#[test]
+fn test_batch_fund_respects_daily_limit() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_source_daily_limit(&user, &token_id, &500i128, &None);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let targets = Vec::from_array(&env, [Address::generate(&env), Address::generate(&env)]);
+    // 300 + 300 = 600 exceeds the configured daily limit of 500, even though
+    // no single amount would trip a per-transfer check.
+    let amounts = Vec::from_array(&env, [300i128, 300i128]);
+
+    assert_eq!(
+        bridge.try_batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None),
+        Err(Ok(BridgeError::DailyLimitExceeded))
+    );
+
+    assert_eq!(check_balance(&env, &token_id, &user), 1000i128);
+}
+
+// A batch within the daily limit should still succeed and consume the usage,
+// so a subsequent batch that would push cumulative usage over the limit fails.
+#[test]
+fn test_batch_fund_within_daily_limit_succeeds() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_source_daily_limit(&user, &token_id, &500i128, &None);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target1 = Address::generate(&env);
+    let target2 = Address::generate(&env);
+    let targets = Vec::from_array(&env, [target1.clone(), target2.clone()]);
+    let amounts = Vec::from_array(&env, [200i128, 200i128]);
+
+    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &user), 600i128);
+
+    let more_targets = Vec::from_array(&env, [Address::generate(&env)]);
+    let more_amounts = Vec::from_array(&env, [200i128]);
+    assert_eq!(
+        bridge.try_batch_fund_c_address(&user, &more_targets, &more_amounts, &token_id, &None, &None),
+        Err(Ok(BridgeError::DailyLimitExceeded))
+    );
+}
+
+/********** Tiered fee applied to batch/referral funding paths **********/
+
+// get_tiered_fee_bps was only consulted by fund_c_address, reveal_fund,
+// fund_c_address_with_swap, and execute_meta_fund — batch_fund_c_address computed
+// its fee from the flat global rate, silently bypassing the volume-tier discount.
+#[test]
+fn test_batch_fund_applies_tiered_fee() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    // Global fee is 100 bps (1%), but a volume tier discounts it to 10 bps (0.1%)
+    // for cumulative volume in [0, 1_000_000] — i.e. every source by default.
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier {
+            min_volume: 0,
+            max_volume: 1_000_000i128,
+            fee_bps: 10u32,
+        }],
+    );
+    bridge.set_fee_tiers(&tiers);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    let target = Address::generate(&env);
+    let targets = Vec::from_array(&env, [target.clone()]);
+    let amounts = Vec::from_array(&env, [1000i128]);
+
+    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None);
+
+    // Tiered fee (10 bps) on 1000 = 1, not the flat global rate (100 bps = 10).
+    assert_eq!(check_balance(&env, &token_id, &target), 999i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 1i128);
+}
+
+// fund_c_address_with_referral computed its fee straight from the global rate via
+// get_effective_fee_bps, never consulting the caller's volume tier.
+#[test]
+fn test_referral_fund_applies_tiered_fee() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier {
+            min_volume: 0,
+            max_volume: 1_000_000i128,
+            fee_bps: 10u32,
+        }],
+    );
+    bridge.set_fee_tiers(&tiers);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    let target = Address::generate(&env);
+
+    bridge.fund_c_address_with_referral(&user, &target, &token_id, &1000i128, &None);
+
+    // Tiered fee (10 bps) on 1000 = 1, not the flat global rate (100 bps = 10).
+    assert_eq!(check_balance(&env, &token_id, &target), 999i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 1i128);
 }
 
