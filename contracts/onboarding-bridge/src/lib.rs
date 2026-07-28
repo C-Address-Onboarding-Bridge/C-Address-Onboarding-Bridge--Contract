@@ -2135,6 +2135,10 @@ impl OnboardingBridge {
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
+        let minimum_amount = read_minimum_amount(&env);
+        if amount < minimum_amount {
+            return Err(BridgeError::InvalidAmount);
+        }
         check_access(&env, &target)?;
         check_asset_whitelisted(&env, &asset)?;
         check_daily_limit(&env, &source, &asset, amount)?;
@@ -4324,6 +4328,10 @@ impl OnboardingBridge {
         }
 
         if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        let minimum_amount = read_minimum_amount(&env);
+        if amount < minimum_amount {
             return Err(BridgeError::InvalidAmount);
         }
 

@@ -867,6 +867,28 @@ fn test_reveal_fund_mints_loyalty() {
     assert_eq!(check_balance(&env, &loyalty_token_id, &user), 8i128);
 }
 
+#[test]
+fn test_reveal_fund_rejects_below_minimum() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+
+    bridge.set_minimum_amount(&100i128, &None);
+
+    let amount: i128 = 50; // below the configured minimum of 100
+    let nonce: u64 = 1;
+    let amount_hash = commit_reveal_amount_hash(&env, amount, nonce);
+
+    let id = bridge.commit_fund(&user, &target, &token_id, &amount_hash, &10_000u64);
+    env.ledger().set_sequence_number(10);
+
+    assert_eq!(
+        bridge.try_reveal_fund(&id, &user, &target, &token_id, &amount, &nonce),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+}
+
 /********** Asset whitelist tests **********/
 
 #[test]
@@ -2766,6 +2788,26 @@ fn test_referral_fund_mints_loyalty() {
     bridge.fund_c_address_with_referral(&user, &target, &token_id, &1000i128, &None);
 
     assert_eq!(check_balance(&env, &loyalty_token_id, &user), 6i128);
+}
+
+#[test]
+fn test_referral_fund_rejects_below_minimum() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_minimum_amount(&100i128, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+    assert_eq!(
+        bridge.try_fund_c_address_with_referral(&user, &target, &token_id, &50i128, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
 }
 
 /********** Zero-amount behavior tests **********/
