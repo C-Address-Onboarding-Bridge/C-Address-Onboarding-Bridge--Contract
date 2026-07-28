@@ -3180,3 +3180,36 @@ fn test_meta_fund_rejects_unregistered_source() {
     );
 }
 
+/********** Batch fund minimum-amount enforcement **********/
+
+// batch_fund_c_address computed `minimum_amount` but never checked it against
+// each target's amount — a per-target amount below the configured minimum
+// silently succeeded in a batch even though `fund_c_address` would reject it.
+#[test]
+fn test_batch_fund_rejects_amount_below_minimum() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_minimum_amount(&50i128, &None);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let targets = Vec::from_array(&env, [Address::generate(&env), Address::generate(&env)]);
+    // Second amount (10) is below the configured minimum of 50.
+    let amounts = Vec::from_array(&env, [100i128, 10i128]);
+
+    assert_eq!(
+        bridge.try_batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+
+    // The whole batch is rejected before any token pull, so nothing moved.
+    assert_eq!(check_balance(&env, &token_id, &user), 1000i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 0i128);
+}
+

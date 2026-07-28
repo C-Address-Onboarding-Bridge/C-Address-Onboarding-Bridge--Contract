@@ -1396,7 +1396,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::TransactionExpired`] — `deadline` is in the past.
     /// * [`BridgeError::MismatchedArrays`] — `targets.len() != amounts.len()`.
     /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
-    /// * [`BridgeError::InvalidAmount`] — Any element of `amounts` is ≤ 0.
+    /// * [`BridgeError::InvalidAmount`] — Any element of `amounts` is ≤ 0 or below
+    ///   the configured minimum transfer amount.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     ///
     /// # Events
@@ -1456,7 +1457,9 @@ impl OnboardingBridge {
         let mut total: i128 = 0;
         for i in 0..targets.len() {
             let amount = amounts.get(i).unwrap();
-            if amount <= 0 {
+            // Enforce the same per-transfer minimum as `fund_c_address` — otherwise
+            // a source could evade it entirely by routing through the batch path.
+            if amount <= 0 || amount < minimum_amount {
                 return Err(BridgeError::InvalidAmount);
             }
             total = safe_math::safe_add(total, amount)?;
