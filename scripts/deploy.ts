@@ -225,6 +225,7 @@ async function initialize(
         Address.fromString(admin.publicKey()).toScVal(),
         Address.fromString(cfg.feeCollectorPublicKey).toScVal(),
         nativeToScVal(cfg.feeBps, { type: 'u32' }),
+        nativeToScVal(null),
       ),
     )
     .setTimeout(30)

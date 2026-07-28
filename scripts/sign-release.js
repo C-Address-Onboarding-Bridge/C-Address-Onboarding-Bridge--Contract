@@ -25,21 +25,24 @@ async function main() {
   console.log(`WASM Path: ${wasmPath}`);
   console.log(`Computed WASM SHA-256 Hash: ${wasmHashHex}`);
 
-  // Load or generate signing key
-  let keypair;
-  let isTransient = false;
+  // Load the signing key. A real release must be signed with the
+  // configured RELEASE_SIGNING_KEY -- if it's missing or misconfigured,
+  // fail loudly rather than silently publishing a permanent registry entry
+  // signed by a throwaway key nobody can verify against.
+  if (!process.env.RELEASE_SIGNING_KEY) {
+    console.error(
+      'Error: RELEASE_SIGNING_KEY is not set. Refusing to sign a release with a random ' +
+        'throwaway key -- set RELEASE_SIGNING_KEY (see .github/workflows/release.yml) before running this script.'
+    );
+    process.exit(1);
+  }
 
-  if (process.env.RELEASE_SIGNING_KEY) {
-    try {
-      keypair = Keypair.fromSecret(process.env.RELEASE_SIGNING_KEY);
-    } catch (err) {
-      console.error(`Error parsing RELEASE_SIGNING_KEY: ${err.message}`);
-      process.exit(1);
-    }
-  } else {
-    console.warn('WARNING: RELEASE_SIGNING_KEY is not set. Generating a transient keypair for testing/development.');
-    keypair = Keypair.random();
-    isTransient = true;
+  let keypair;
+  try {
+    keypair = Keypair.fromSecret(process.env.RELEASE_SIGNING_KEY);
+  } catch (err) {
+    console.error(`Error parsing RELEASE_SIGNING_KEY: ${err.message}`);
+    process.exit(1);
   }
 
   // Sign the raw 32-byte hash
@@ -72,7 +75,6 @@ async function main() {
     signature: signatureHex,
     signer_public_key: publicKey,
     timestamp: new Date().toISOString(),
-    is_transient: isTransient ? true : undefined,
   };
 
   if (entryIndex >= 0) {

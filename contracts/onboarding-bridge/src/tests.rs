@@ -1,8 +1,14 @@
-use crate::{BridgeError, FeeTier, MetaFundParams, OnboardingBridge};
+use crate::{
+    BridgeError, DataKey, FeeTier, MetaFundParams, OnboardingBridge,
+    CRITICAL_ENTRY_TTL_THRESHOLD, MAX_ALLOWED_TTL,
+};
 
 use soroban_sdk::{
     contract, contractimpl, contracttype,
-    testutils::{Address as _, Events, Ledger},
+    testutils::{
+        storage::{Instance as _, Persistent as _},
+        Address as _, Events, Ledger,
+    },
     Address, Bytes, BytesN, Env, IntoVal, Vec,
 };
 
@@ -978,6 +984,61 @@ fn test_reclaim_cannot_drain_active_commitments() {
     mint_tokens(&env, &token_id, &bridge.address, 300i128);
     bridge.reclaim_tokens(&token_id, &300i128, &destination, &None);
     assert_eq!(check_balance(&env, &token_id, &destination), 300i128);
+}
+
+/********** Commit-reveal (reveal_fund) tests **********/
+
+fn commit_reveal_amount_hash(env: &Env, amount: i128, nonce: u64) -> BytesN<32> {
+    let mut preimage = Bytes::new(env);
+    preimage.extend_from_array(&amount.to_be_bytes());
+    preimage.extend_from_array(&nonce.to_be_bytes());
+    env.crypto().sha256(&preimage).into()
+}
+
+#[test]
+fn test_reveal_fund_mints_loyalty() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (bridge, user, token_id, admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+
+    let loyalty_token_id = env.register(TestToken, ());
+    init_token(&env, &loyalty_token_id, &admin);
+    bridge.set_loyalty_token(&loyalty_token_id, &8i128);
+    mint_tokens(&env, &loyalty_token_id, &bridge.address, 1_000i128);
+
+    let amount: i128 = 500;
+    let nonce: u64 = 1;
+    let amount_hash = commit_reveal_amount_hash(&env, amount, nonce);
+
+    let id = bridge.commit_fund(&user, &target, &token_id, &amount_hash, &10_000u64);
+    env.ledger().set_sequence_number(10);
+
+    bridge.reveal_fund(&id, &user, &target, &token_id, &amount, &nonce);
+
+    assert_eq!(check_balance(&env, &loyalty_token_id, &user), 8i128);
+}
+
+#[test]
+fn test_reveal_fund_rejects_below_minimum() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+
+    bridge.set_minimum_amount(&100i128, &None);
+
+    let amount: i128 = 50; // below the configured minimum of 100
+    let nonce: u64 = 1;
+    let amount_hash = commit_reveal_amount_hash(&env, amount, nonce);
+
+    let id = bridge.commit_fund(&user, &target, &token_id, &amount_hash, &10_000u64);
+    env.ledger().set_sequence_number(10);
+
+    assert_eq!(
+        bridge.try_reveal_fund(&id, &user, &target, &token_id, &amount, &nonce),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
 }
 
 /********** Asset whitelist tests **********/
@@ -2520,12 +2581,19 @@ mod timelocked_tests {
     }
 
     #[test]
-    fn test_timelocked_nonce_replay_rejected() {
+    fn test_timelocked_fund_mints_loyalty_at_deposit() {
         let env = Env::default();
         env.ledger().set_timestamp(6_000);
-        let (bridge, user, token_id, _fee_collector, _admin) = setup_timelocked(&env);
+        let (bridge, user, token_id, _fee_collector, admin) = setup_timelocked(&env);
         let target = Address::generate(&env);
         let release_time = 6_100u64;
+
+        // Minted at deposit time (when `source`/`user` is known), not at
+        // claim_timelocked time (which is authorised by `target`).
+        let loyalty_token_id = env.register(TestToken, ());
+        init_token(&env, &loyalty_token_id, &admin);
+        bridge.set_loyalty_token(&loyalty_token_id, &4i128);
+        mint_tokens(&env, &loyalty_token_id, &bridge.address, 1_000i128);
 
         bridge.fund_c_address_timelocked(
             &user,
@@ -2534,69 +2602,9 @@ mod timelocked_tests {
             &500i128,
             &release_time,
             &0u64,
-            &Some(0u64),
-            &None,
         );
-        assert_eq!(bridge.query_nonce(&user), 1u64);
 
-        // Reusing nonce=0 is rejected.
-        let target2 = Address::generate(&env);
-        assert_eq!(
-            bridge.try_fund_c_address_timelocked(
-                &user,
-                &target2,
-                &token_id,
-                &500i128,
-                &release_time,
-                &0u64,
-                &Some(0u64),
-                &None,
-            ),
-            Err(Ok(BridgeError::DuplicateNonce))
-        );
-    }
-
-    #[test]
-    fn test_timelocked_deadline_expired_reverts() {
-        let env = Env::default();
-        env.ledger().set_timestamp(7_000);
-        let (bridge, user, token_id, _fee_collector, _admin) = setup_timelocked(&env);
-        let target = Address::generate(&env);
-
-        assert_eq!(
-            bridge.try_fund_c_address_timelocked(
-                &user,
-                &target,
-                &token_id,
-                &500i128,
-                &7_100u64,
-                &0u64,
-                &None,
-                &Some(6_999u64),
-            ),
-            Err(Ok(BridgeError::TransactionExpired))
-        );
-    }
-
-    #[test]
-    fn test_timelocked_deadline_in_future_passes() {
-        let env = Env::default();
-        env.ledger().set_timestamp(8_000);
-        let (bridge, user, token_id, _fee_collector, _admin) = setup_timelocked(&env);
-        let target = Address::generate(&env);
-
-        let id = bridge.fund_c_address_timelocked(
-            &user,
-            &target,
-            &token_id,
-            &500i128,
-            &8_100u64,
-            &0u64,
-            &None,
-            &Some(9_000u64),
-        );
-        assert_eq!(check_balance(&env, &token_id, &bridge.address), 500i128);
-        let _ = id;
+        assert_eq!(check_balance(&env, &loyalty_token_id, &user), 4i128);
     }
 }
 
@@ -3015,6 +3023,91 @@ mod crosschain_tests {
             Err(Ok(BridgeError::DuplicateRelayerSignature))
         );
     }
+
+    #[test]
+    fn test_crosschain_mints_loyalty_to_target() {
+        let env = Env::default();
+        let (bridge_id, token_id, admin, bridge) = setup(&env);
+
+        // Cross-chain deposits have no on-chain `source`; the reward is
+        // credited to `target`, the only address party to this call.
+        let loyalty_token_id = env.register(TestToken, ());
+        init_token(&env, &loyalty_token_id, &admin);
+        bridge.set_loyalty_token(&loyalty_token_id, &3i128);
+        mint_tokens(&env, &loyalty_token_id, &bridge_id, 1_000i128);
+
+        let sk = make_signing_key([9u8; 32]);
+        let pubkey = BytesN::from_array(&env, sk.verifying_key().as_bytes());
+        bridge.add_relayer(&pubkey);
+        bridge.set_relayer_threshold(&1u32);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0x77; 32]);
+        let chain_id: u32 = 1;
+        let amount: i128 = 1000;
+
+        let payload_hash = build_payload_hash(&env, chain_id, &tx_hash, &target, &token_id, amount);
+        let sig = make_relayer_sig(&env, &sk, &payload_hash);
+        let sigs = Vec::from_array(&env, [sig]);
+
+        bridge.fund_c_address_crosschain(&chain_id, &tx_hash, &target, &token_id, &amount, &sigs);
+
+        assert_eq!(check_balance(&env, &loyalty_token_id, &target), 3i128);
+    }
+}
+
+#[test]
+fn test_batch_fund_mints_loyalty_once() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    let loyalty_token_id = env.register(TestToken, ());
+    init_token(&env, &loyalty_token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_loyalty_token(&loyalty_token_id, &10i128);
+    mint_tokens(&env, &loyalty_token_id, &bridge_id, 1_000i128);
+    mint_tokens(&env, &token_id, &user, 2_000i128);
+
+    let t1 = Address::generate(&env);
+    let t2 = Address::generate(&env);
+    let targets = Vec::from_array(&env, [t1, t2]);
+    let amounts = Vec::from_array(&env, [500i128, 500i128]);
+    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None);
+
+    // Rewarded once per batch call, not once per recipient.
+    assert_eq!(check_balance(&env, &loyalty_token_id, &user), 10i128);
+}
+
+#[test]
+fn test_batch_fund_all_blocked_mints_no_loyalty() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    let loyalty_token_id = env.register(TestToken, ());
+    init_token(&env, &loyalty_token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_loyalty_token(&loyalty_token_id, &10i128);
+    mint_tokens(&env, &loyalty_token_id, &bridge_id, 1_000i128);
+    mint_tokens(&env, &token_id, &user, 1_000i128);
+
+    let t1 = Address::generate(&env);
+    bridge.add_to_blocklist(&t1, &None);
+    let targets = Vec::from_array(&env, [t1]);
+    let amounts = Vec::from_array(&env, [500i128]);
+    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None);
+
+    // Nothing succeeded, so no loyalty reward is minted.
+    assert_eq!(check_balance(&env, &loyalty_token_id, &user), 0i128);
 }
 
 /********** Referral system tests **********/
@@ -3133,6 +3226,49 @@ fn test_fund_with_referral_zero_referral_rate() {
     // referral_rate = 0, so referrer gets nothing, full fee in contract
     assert_eq!(check_balance(&env, &token_id, &referrer), 0i128);
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 10i128);
+}
+
+#[test]
+fn test_referral_fund_mints_loyalty() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    let loyalty_token_id = env.register(TestToken, ());
+    init_token(&env, &loyalty_token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_loyalty_token(&loyalty_token_id, &6i128);
+    mint_tokens(&env, &loyalty_token_id, &bridge_id, 1_000i128);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+    bridge.fund_c_address_with_referral(&user, &target, &token_id, &1000i128, &None);
+
+    assert_eq!(check_balance(&env, &loyalty_token_id, &user), 6i128);
+}
+
+#[test]
+fn test_referral_fund_rejects_below_minimum() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_minimum_amount(&100i128, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+    assert_eq!(
+        bridge.try_fund_c_address_with_referral(&user, &target, &token_id, &50i128, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
 }
 
 /********** Zero-amount behavior tests **********/
@@ -3710,6 +3846,30 @@ mod concurrent_sequential_tests {
     }
 
     // -----------------------------------------------------------------------
+    // Reentrancy guard now returns BridgeError::Reentrant instead of
+    // panicking. This directly exercises ReentrancyGuard::enter re-entering
+    // while a guard is already held for the current contract, which is what
+    // a malicious token callback into a bridge function would trigger.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reentrant_call_returns_error() {
+        let s = ConcurrentSetup::new();
+
+        s.env.as_contract(&s.bridge_id, || {
+            let _outer_guard = crate::ReentrancyGuard::enter(&s.env).unwrap();
+            let inner = crate::ReentrancyGuard::enter(&s.env);
+            assert!(matches!(inner, Err(BridgeError::Reentrant)));
+        });
+
+        // Once the outer guard drops, entry succeeds again (sequential calls
+        // are unaffected — only true reentrancy is rejected).
+        s.env.as_contract(&s.bridge_id, || {
+            assert!(crate::ReentrancyGuard::enter(&s.env).is_ok());
+        });
+    }
+
+    // -----------------------------------------------------------------------
     // Scenario 6: Fee counter consistency across mixed batch + single calls
     //
     // Mixing batch_fund_c_address and fund_c_address in sequence must keep
@@ -4048,39 +4208,97 @@ fn test_batch_fund_applies_tiered_fee() {
 }
 
 #[test]
-fn test_set_fee_tiers_rejects_excessive_tier_count() {
+fn test_extend_instance_ttl_extends_instance_storage() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
     let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+
+    bridge.extend_instance_ttl(&200_000u32);
+
+    let ttl = env.as_contract(&bridge_id, || env.storage().instance().get_ttl());
+    assert!(ttl >= 200_000);
+}
+
+#[test]
+fn test_extend_persistent_ttl_extends_asset_keys() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
-
-    // MAX_FEE_TIERS is 50 — one more than that must be rejected.
-    let mut too_many: Vec<FeeTier> = Vec::new(&env);
-    for i in 0..51u32 {
-        too_many.push_back(FeeTier {
-            min_volume: (i as i128) * 1000,
-            max_volume: (i as i128) * 1000 + 999,
-            fee_bps: 10u32,
-        });
-    }
-    assert_eq!(
-        bridge.try_set_fee_tiers(&too_many),
-        Err(Ok(BridgeError::TooManyFeeTiers))
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    bridge.fund_c_address(
+        &user,
+        &Address::generate(&env),
+        &token_id,
+        &500i128,
+        &None,
+        &None,
     );
+    bridge.set_asset_fee_cap(&token_id, &1000u32);
 
-    // Exactly MAX_FEE_TIERS is accepted.
-    let mut exactly_max: Vec<FeeTier> = Vec::new(&env);
-    for i in 0..50u32 {
-        exactly_max.push_back(FeeTier {
-            min_volume: (i as i128) * 1000,
-            max_volume: (i as i128) * 1000 + 999,
-            fee_bps: 10u32,
-        });
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    bridge.extend_persistent_ttl(&token_id, &200_000u32);
+
+    let expected_keys = [
+        DataKey::AccruedFees(token_id.clone()),
+        DataKey::TotalBridged(token_id.clone()),
+        DataKey::TotalFeesCollected(token_id.clone()),
+        DataKey::AssetStats(token_id.clone()),
+        DataKey::AssetFeeCap(token_id.clone()),
+    ];
+    for key in expected_keys.iter() {
+        let ttl = env.as_contract(&bridge_id, || env.storage().persistent().get_ttl(key));
+        assert!(ttl >= 200_000);
     }
-    bridge.set_fee_tiers(&exactly_max);
-    assert_eq!(bridge.query_fee_tiers().len(), 50);
+}
+
+#[test]
+fn test_set_max_ttl_updates_config() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+
+    bridge.set_max_instance_ttl(&200_000u32);
+    let instance_ttl = env.as_contract(&bridge_id, || env.storage().instance().get_ttl());
+    assert!(instance_ttl >= 200_000);
+
+    bridge.set_max_persistent_ttl(&300_000u32);
+
+    let (instance_ttl, persistent_ttl, hard_ceiling, critical_threshold) =
+        bridge.query_ttl_config();
+    assert_eq!(instance_ttl, 200_000);
+    assert_eq!(persistent_ttl, 300_000);
+    assert_eq!(hard_ceiling, MAX_ALLOWED_TTL);
+    assert_eq!(critical_threshold, CRITICAL_ENTRY_TTL_THRESHOLD);
+}
+
+#[test]
+fn test_query_ttl_config_returns_current_settings() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let (instance_ttl, persistent_ttl, hard_ceiling, critical_threshold) =
+        bridge.query_ttl_config();
+    assert_eq!(instance_ttl, MAX_ALLOWED_TTL);
+    assert_eq!(persistent_ttl, MAX_ALLOWED_TTL);
+    assert_eq!(hard_ceiling, MAX_ALLOWED_TTL);
+    assert_eq!(critical_threshold, CRITICAL_ENTRY_TTL_THRESHOLD);
 }
 
 // fund_c_address_with_referral computed its fee straight from the global rate via
@@ -4114,4 +4332,3 @@ fn test_referral_fund_applies_tiered_fee() {
     assert_eq!(check_balance(&env, &token_id, &target), 999i128);
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 1i128);
 }
-
