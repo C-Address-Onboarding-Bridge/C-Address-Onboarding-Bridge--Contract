@@ -3145,3 +3145,31 @@ fn test_fund_mints_loyalty_when_reserve_sufficient() {
     assert_eq!(check_balance(&env, &loyalty_token_id, &bridge.address), 900i128);
 }
 
+// --------- Instance TTL extension tests ---------
+
+/// `initialize` sets the instance TTL to `MAX_ALLOWED_TTL` (3_110_400 ledgers)
+/// from sequence 0, so the original live-until ledger is ~3_110_400. This test
+/// advances close to (but before) that boundary, calls only
+/// `fund_c_address` (never `extend_instance_ttl` directly), then advances
+/// well past the *original* boundary. If `fund_c_address` did not refresh
+/// the instance TTL, any instance-storage access below would panic on an
+/// expired contract instance, permanently bricking the contract.
+#[test]
+fn test_fund_c_address_extends_instance_ttl_past_original_threshold() {
+    let env = Env::default();
+    let (bridge, user, token_id, admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+
+    // Close to, but still before, the TTL boundary set by `initialize` alone.
+    env.ledger().set_sequence_number(3_000_000);
+    bridge.fund_c_address(&user, &target, &token_id, &500i128, &None, &None);
+
+    // Well past the *original* boundary (3_110_400). Only reachable without a
+    // panic if fund_c_address refreshed the instance TTL above.
+    env.ledger().set_sequence_number(6_000_000);
+
+    assert_eq!(bridge.query_admin(), admin);
+    assert!(bridge.query_is_initialized());
+    assert_eq!(check_balance(&env, &token_id, &target), 500i128);
+}
+
