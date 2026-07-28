@@ -145,6 +145,10 @@ pub enum BridgeError {
     MetaTxNonceAlreadyUsed = 39,
     /// The contract is deactivated (permanently paused/migrated).
     ContractDeactivated = 40,
+    /// The `targets` array passed to `batch_fund_c_address` exceeds `MAX_BATCH_SIZE` (100).
+    BatchTooLarge = 41,
+    /// An address's strkey representation exceeds `MAX_STRKEY_LEN` (64) bytes.
+    InvalidAddress = 42,
     /// The same relayer pubkey appeared more than once in `sigs`.
     DuplicateRelayerSignature = 41,
     /// A pool address in `swap_route` is not on the swap-pool whitelist.
@@ -233,6 +237,9 @@ const CRITICAL_ENTRY_TTL_THRESHOLD: u32 = 100_000;
 const UPGRADE_TIMELOCK_LEDGERS: u32 = 17_280;
 /// Minimum ledgers between commit_fund and reveal_fund (~25 s at 5 s/ledger).
 const COMMIT_REVEAL_MIN_DELAY_LEDGERS: u32 = 5;
+/// Size of the stack buffer used to hold an address's strkey while hashing it.
+/// Soroban strkeys are 56 bytes; anything longer is rejected rather than copied.
+const MAX_STRKEY_LEN: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -1437,6 +1444,7 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::BatchTooLarge`] — `targets.len()` exceeds `MAX_BATCH_SIZE` (100).
     /// * [`BridgeError::TransactionExpired`] — `deadline` is in the past.
     /// * [`BridgeError::MismatchedArrays`] — `targets.len() != amounts.len()`.
     /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
@@ -1482,7 +1490,7 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         check_not_paused(&env)?;
         if targets.len() > MAX_BATCH_SIZE {
-            return Err(BridgeError::InvalidAmount);
+            return Err(BridgeError::BatchTooLarge);
         }
         if let Some(d) = deadline {
             if env.ledger().timestamp() > d {
@@ -1928,8 +1936,10 @@ impl OnboardingBridge {
 
     /// Returns the configured minimum transfer amount.
     ///
-    /// > **Note:** Currently always returns `0` because the persistence layer
-    /// > is a stub. See `set_minimum_amount` for details.
+    /// Returns the value last stored by `set_minimum_amount`, or `0` (no
+    /// minimum) if it has never been called. The minimum is enforced by
+    /// `fund_c_address`, which rejects amounts below it with
+    /// [`BridgeError::InvalidAmount`].
     ///
     /// # Errors
     ///
@@ -3452,6 +3462,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::DuplicateRelayerSignature`] — The same relayer pubkey
     ///   appears more than once in `sigs`.
     /// * [`BridgeError::BelowThreshold`] — Fewer than `threshold` valid signatures.
+    /// * [`BridgeError::InvalidAddress`] — A strkey exceeds `MAX_STRKEY_LEN` (64) bytes.
     ///
     /// # Events
     ///
@@ -3503,15 +3514,21 @@ impl OnboardingBridge {
         // payload is still domain-separated and collision-resistant.
         let target_strkey = target.clone().to_string();
         let asset_strkey = asset.clone().to_string();
-        let mut addr_buf = [0u8; 64];
+        let mut addr_buf = [0u8; MAX_STRKEY_LEN];
 
         let tlen = target_strkey.len() as usize;
+        if tlen > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
         target_strkey.copy_into_slice(&mut addr_buf[..tlen]);
         let target_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..tlen]);
         let target_hash: BytesN<32> = env.crypto().sha256(&target_raw).into();
         let target_bytes: soroban_sdk::Bytes = target_hash.into();
 
         let alen = asset_strkey.len() as usize;
+        if alen > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
         asset_strkey.copy_into_slice(&mut addr_buf[..alen]);
         let asset_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..alen]);
         let asset_hash: BytesN<32> = env.crypto().sha256(&asset_raw).into();
@@ -4649,6 +4666,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode and target not listed.
     /// * [`BridgeError::AssetNotWhitelisted`] — Asset not whitelisted.
     /// * [`BridgeError::DailyLimitExceeded`] — Daily limit exceeded.
+    /// * [`BridgeError::InvalidAddress`] — A strkey exceeds `MAX_STRKEY_LEN` (64) bytes.
     /// * [`BridgeError::MetaTxPubkeySourceMismatch`] — `pubkey` is not the key
     ///   `params.source` registered via `register_meta_signer`.
     ///
@@ -4708,22 +4726,31 @@ impl OnboardingBridge {
         //                     || amount_be16 || nonce_be8 || deadline_be8)
         let domain: soroban_sdk::Bytes = soroban_sdk::Bytes::from_slice(&env, b"meta_fund");
 
-        let mut addr_buf = [0u8; 64];
+        let mut addr_buf = [0u8; MAX_STRKEY_LEN];
 
         let src_str = params.source.clone().to_string();
         let slen = src_str.len() as usize;
+        if slen > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
         src_str.copy_into_slice(&mut addr_buf[..slen]);
         let src_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..slen]);
         let src_hash: BytesN<32> = env.crypto().sha256(&src_raw).into();
 
         let tgt_str = params.target.clone().to_string();
         let tlen = tgt_str.len() as usize;
+        if tlen > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
         tgt_str.copy_into_slice(&mut addr_buf[..tlen]);
         let tgt_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..tlen]);
         let tgt_hash: BytesN<32> = env.crypto().sha256(&tgt_raw).into();
 
         let ast_str = params.asset.clone().to_string();
         let alen = ast_str.len() as usize;
+        if alen > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
         ast_str.copy_into_slice(&mut addr_buf[..alen]);
         let ast_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..alen]);
         let ast_hash: BytesN<32> = env.crypto().sha256(&ast_raw).into();
