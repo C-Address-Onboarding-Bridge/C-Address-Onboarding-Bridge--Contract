@@ -1084,6 +1084,33 @@ describe('Error handling - invalid inputs', () => {
     await expect(sdk.getAllBalances(['invalid', MOCK_ASSET]))
       .rejects.toThrow(/Invalid contract address for "assets\[0\]"/);
   });
+
+  it('upgrade rejects newWasmHash shorter than 64 hex chars', async () => {
+    await expect(sdk.upgrade({ newWasmHash: 'ab12' }, mockKeypair)).rejects.toThrow(
+      /newWasmHash must be a 64-character hex string/,
+    );
+    expect(mockProvider.getAccount).not.toHaveBeenCalled();
+  });
+
+  it('upgrade rejects newWasmHash longer than 64 hex chars', async () => {
+    await expect(sdk.upgrade({ newWasmHash: 'a'.repeat(128) }, mockKeypair)).rejects.toThrow(
+      /newWasmHash must be a 64-character hex string/,
+    );
+    expect(mockProvider.getAccount).not.toHaveBeenCalled();
+  });
+
+  it('upgrade rejects newWasmHash with non-hex characters', async () => {
+    await expect(sdk.upgrade({ newWasmHash: 'g'.repeat(64) }, mockKeypair)).rejects.toThrow(
+      /newWasmHash must be a 64-character hex string/,
+    );
+    expect(mockProvider.getAccount).not.toHaveBeenCalled();
+  });
+
+  it('upgrade accepts a valid 64-char hex hash', async () => {
+    const result = await sdk.upgrade({ newWasmHash: 'ab'.repeat(32) }, mockKeypair);
+    expect(result.status).toBe('pending');
+    expect(result.hash).toBe('h');
+  });
 });
 
 describe('Type validation at runtime', () => {
