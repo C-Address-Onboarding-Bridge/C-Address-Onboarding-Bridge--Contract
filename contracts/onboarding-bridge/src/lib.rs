@@ -147,6 +147,8 @@ pub enum BridgeError {
     ContractDeactivated = 40,
     /// The `targets` array passed to `batch_fund_c_address` exceeds `MAX_BATCH_SIZE` (100).
     BatchTooLarge = 41,
+    /// An address's strkey representation exceeds `MAX_STRKEY_LEN` (64) bytes.
+    InvalidAddress = 42,
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +229,9 @@ const CRITICAL_ENTRY_TTL_THRESHOLD: u32 = 100_000;
 const UPGRADE_TIMELOCK_LEDGERS: u32 = 17_280;
 /// Minimum ledgers between commit_fund and reveal_fund (~25 s at 5 s/ledger).
 const COMMIT_REVEAL_MIN_DELAY_LEDGERS: u32 = 5;
+/// Size of the stack buffer used to hold an address's strkey while hashing it.
+/// Soroban strkeys are 56 bytes; anything longer is rejected rather than copied.
+const MAX_STRKEY_LEN: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -3280,6 +3285,7 @@ impl OnboardingBridge {
     ///   has already been processed.
     /// * [`BridgeError::NotRelayer`] — A signature's pubkey is not a registered relayer.
     /// * [`BridgeError::BelowThreshold`] — Fewer than `threshold` valid signatures.
+    /// * [`BridgeError::InvalidAddress`] — A strkey exceeds `MAX_STRKEY_LEN` (64) bytes.
     ///
     /// # Events
     ///
@@ -3331,15 +3337,21 @@ impl OnboardingBridge {
         // payload is still domain-separated and collision-resistant.
         let target_strkey = target.clone().to_string();
         let asset_strkey = asset.clone().to_string();
-        let mut addr_buf = [0u8; 64];
+        let mut addr_buf = [0u8; MAX_STRKEY_LEN];
 
         let tlen = target_strkey.len() as usize;
+        if tlen > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
         target_strkey.copy_into_slice(&mut addr_buf[..tlen]);
         let target_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..tlen]);
         let target_hash: BytesN<32> = env.crypto().sha256(&target_raw).into();
         let target_bytes: soroban_sdk::Bytes = target_hash.into();
 
         let alen = asset_strkey.len() as usize;
+        if alen > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
         asset_strkey.copy_into_slice(&mut addr_buf[..alen]);
         let asset_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..alen]);
         let asset_hash: BytesN<32> = env.crypto().sha256(&asset_raw).into();
@@ -4407,6 +4419,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode and target not listed.
     /// * [`BridgeError::AssetNotWhitelisted`] — Asset not whitelisted.
     /// * [`BridgeError::DailyLimitExceeded`] — Daily limit exceeded.
+    /// * [`BridgeError::InvalidAddress`] — A strkey exceeds `MAX_STRKEY_LEN` (64) bytes.
     ///
     /// # Events
     ///
@@ -4455,22 +4468,31 @@ impl OnboardingBridge {
         //                     || amount_be16 || nonce_be8 || deadline_be8)
         let domain: soroban_sdk::Bytes = soroban_sdk::Bytes::from_slice(&env, b"meta_fund");
 
-        let mut addr_buf = [0u8; 64];
+        let mut addr_buf = [0u8; MAX_STRKEY_LEN];
 
         let src_str = params.source.clone().to_string();
         let slen = src_str.len() as usize;
+        if slen > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
         src_str.copy_into_slice(&mut addr_buf[..slen]);
         let src_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..slen]);
         let src_hash: BytesN<32> = env.crypto().sha256(&src_raw).into();
 
         let tgt_str = params.target.clone().to_string();
         let tlen = tgt_str.len() as usize;
+        if tlen > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
         tgt_str.copy_into_slice(&mut addr_buf[..tlen]);
         let tgt_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..tlen]);
         let tgt_hash: BytesN<32> = env.crypto().sha256(&tgt_raw).into();
 
         let ast_str = params.asset.clone().to_string();
         let alen = ast_str.len() as usize;
+        if alen > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
         ast_str.copy_into_slice(&mut addr_buf[..alen]);
         let ast_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..alen]);
         let ast_hash: BytesN<32> = env.crypto().sha256(&ast_raw).into();
