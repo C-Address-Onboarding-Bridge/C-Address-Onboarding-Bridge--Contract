@@ -759,6 +759,32 @@ describe('OnboardingBridgeSDK', () => {
       expect(result.status).toBe('failed');
       expect(result.error).toBe('RPC down');
     });
+
+    it('rejects malformed pubkey before any RPC call', async () => {
+      const badSig = { pubkey: 'tooshort', signature: 'b'.repeat(128) };
+
+      const result = await sdk.fundCrosschain(
+        { chainId: 1, txHash: 'ab'.repeat(32), target: MOCK_ADDRESS, asset: MOCK_ASSET, amount: '500', sigs: [badSig] },
+        mockKeypair,
+      );
+
+      expect(result.status).toBe('failed');
+      expect(result.error).toMatch(/pubkey must be a 64-character hex string/);
+      expect(mockProvider.getAccount).not.toHaveBeenCalled();
+    });
+
+    it('rejects malformed signature before any RPC call', async () => {
+      const badSig = { pubkey: 'a'.repeat(64), signature: 'tooshort' };
+
+      const result = await sdk.fundCrosschain(
+        { chainId: 1, txHash: 'ab'.repeat(32), target: MOCK_ADDRESS, asset: MOCK_ASSET, amount: '500', sigs: [badSig] },
+        mockKeypair,
+      );
+
+      expect(result.status).toBe('failed');
+      expect(result.error).toMatch(/signature must be a 128-character hex string/);
+      expect(mockProvider.getAccount).not.toHaveBeenCalled();
+    });
   });
 
   describe('addRelayer', () => {
