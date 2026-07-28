@@ -1103,6 +1103,19 @@ fn read_loyalty_amount_per_fund(env: &Env) -> i128 {
         .unwrap_or(0)
 }
 
+// Loyalty minting policy: every funding path that pulls tokens from a
+// caller-controlled `source` and delivers them to a `target` mints loyalty
+// tokens to the funder (`source`), matching the advertised "general funding
+// incentive". This covers: `fund_c_address`, `batch_fund_c_address` (once per
+// call, not per recipient), `fund_c_address_with_referral`,
+// `fund_c_address_with_swap`, `reveal_fund`, and `execute_meta_fund`.
+// `fund_c_address_timelocked` mints at deposit time (when `source` is known
+// and authorises the call) rather than at `claim_timelocked` time, since the
+// claim is authorised by `target`, not `source`, and minting once at deposit
+// avoids ambiguity about which ledger a delayed claim should credit.
+// `fund_c_address_crosschain` has no on-chain `source` (funds originate on a
+// different chain and are attested by relayers), so the reward is minted to
+// `target`, the only address party to that call.
 fn mint_loyalty_tokens(env: &Env, recipient: &Address) {
     if let Some(loyalty_token) = read_loyalty_token(env) {
         let amount = read_loyalty_amount_per_fund(env);
@@ -1548,6 +1561,12 @@ impl OnboardingBridge {
 
         if refund_amount > 0 {
             token_client.transfer(&contract_addr, &source, &refund_amount);
+        }
+
+        // Reward the funder once per batch call (not per recipient), consistent
+        // with the single-transfer semantics of the rest of this function.
+        if num_success > 0 {
+            mint_loyalty_tokens(&env, &source);
         }
 
         env.events().publish(
@@ -2153,6 +2172,8 @@ impl OnboardingBridge {
         increment_accrued_fees(&env, &asset, protocol_fee);
         increment_total_bridged(&env, &asset, net_amount);
         increment_total_fees_collected(&env, &asset, fee);
+
+        mint_loyalty_tokens(&env, &source);
 
         env.events().publish(
             ("CAddressFunded", asset, source, target),
@@ -3522,6 +3543,11 @@ impl OnboardingBridge {
         }
         update_asset_counters(&env, &asset, fee, net_amount);
 
+        // No on-chain `source` exists for cross-chain deposits (the funds
+        // originate on another chain), so `target` is the only address party
+        // to this call and receives the loyalty reward.
+        mint_loyalty_tokens(&env, &target);
+
         env.events().publish(
             ("CrossChainFunded", target),
             (chain_id, tx_hash, amount, fee, asset),
@@ -3735,6 +3761,11 @@ impl OnboardingBridge {
         );
         // Ring-fence this deposit so reclaim_tokens cannot drain it before claim.
         increment_locked_timelock(&env, &asset, amount);
+
+        // Minted at deposit time, not at claim_timelocked, since `source`
+        // (the funder) authorises this call, while claim_timelocked is
+        // authorised by `target`. See policy note on `mint_loyalty_tokens`.
+        mint_loyalty_tokens(&env, &source);
 
         env.events().publish(
             ("TimelockCreated", source, target),
@@ -4322,6 +4353,8 @@ impl OnboardingBridge {
         increment_source_bridged_volume(&env, &source, amount);
         extend_instance_ttl(&env);
 
+        mint_loyalty_tokens(&env, &source);
+
         env.events().publish(
             ("CommitRevealFunded", asset, source, target),
             (commitment_id, amount, fee),
@@ -4661,6 +4694,10 @@ impl OnboardingBridge {
         increment_source_bridged_volume(&env, &params.source, params.amount);
 
         extend_instance_ttl(&env);
+
+        // execute_meta_fund replays the same transfer flow as fund_c_address on
+        // the user's behalf, so it earns the same loyalty reward.
+        mint_loyalty_tokens(&env, &params.source);
 
         env.events().publish(
             ("MetaFundExecuted", params.asset, params.source, params.target),
