@@ -239,6 +239,10 @@ pub enum DataKey {
 const MAX_FEE_BPS: u32 = 1_000;
 const FEE_DENOMINATOR: i128 = 10_000;
 const MAX_BATCH_SIZE: u32 = 100;
+/// Maximum number of tiers accepted by `set_fee_tiers`. `get_tiered_fee_bps`
+/// / `find_current_tier` scan the full tier list linearly on every funding
+/// call, so this bounds the per-call cost of that scan.
+const MAX_FEE_TIERS: u32 = 50;
 const MAX_ALLOWED_TTL: u32 = 3_110_400; // ~1 year in ledgers (5s/ledger)
 /// Minimum configurable value for `MaxInstanceTtl` / `MaxPersistentTtl`.
 ///
@@ -1762,6 +1766,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -1828,6 +1833,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         if max_fee_bps > MAX_FEE_BPS {
             return Err(BridgeError::FeeTooHigh);
         }
@@ -2145,6 +2151,7 @@ impl OnboardingBridge {
     pub fn set_referral_rate(env: Env, bps: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         if bps > 10_000 {
             return Err(BridgeError::FeeTooHigh);
         }
@@ -2348,11 +2355,16 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `assets` (`Vec<Address>`) — List of token contract addresses to query.
+    ///   Must contain at most `MAX_BATCH_SIZE` (100) entries.
     ///
     /// # Returns
     ///
     /// A `Map<Address, i128>` mapping each asset address to the contract's balance.
     /// Assets with a zero balance are included.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::BatchTooLarge`] — `assets.len()` exceeds `MAX_BATCH_SIZE` (100).
     ///
     /// # Examples
     ///
@@ -2360,7 +2372,13 @@ impl OnboardingBridge {
     /// // let assets = Vec::from_array(&env, [usdc, xlm]);
     /// // let balances = bridge.query_all_balances(&assets);
     /// ```
-    pub fn query_all_balances(env: Env, assets: Vec<Address>) -> Map<Address, i128> {
+    pub fn query_all_balances(
+        env: Env,
+        assets: Vec<Address>,
+    ) -> Result<Map<Address, i128>, BridgeError> {
+        if assets.len() > MAX_BATCH_SIZE {
+            return Err(BridgeError::BatchTooLarge);
+        }
         let contract = env.current_contract_address();
         let mut result: Map<Address, i128> = Map::new(&env);
         for i in 0..assets.len() {
@@ -2368,7 +2386,7 @@ impl OnboardingBridge {
             let balance = token::Client::new(&env, &asset).balance(&contract);
             result.set(asset, balance);
         }
-        result
+        Ok(result)
     }
 
     /// Returns the contract's total token balance for `asset`.
@@ -3255,14 +3273,40 @@ impl OnboardingBridge {
         Ok(read_whitelist(&env).get(asset).unwrap_or(false))
     }
 
-    /// Returns the list of all currently whitelisted asset addresses.
+    /// Returns a page of currently whitelisted asset addresses.
+    ///
+    /// The whitelist can grow without bound over the contract's lifetime, so
+    /// results are paginated rather than returned in a single unbounded call.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` (`u32`) — Number of whitelist entries to skip.
+    /// * `limit` (`u32`) — Maximum number of entries to return. Capped at
+    ///   `MAX_BATCH_SIZE` (100); values above that are silently clamped.
     ///
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_whitelisted_assets(env: Env) -> Result<Vec<Address>, BridgeError> {
+    pub fn query_whitelisted_assets(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<Address>, BridgeError> {
         check_initialized(&env)?;
-        Ok(read_whitelist(&env).keys())
+        let all = read_whitelist(&env).keys();
+        let page_size = if limit > MAX_BATCH_SIZE {
+            MAX_BATCH_SIZE
+        } else {
+            limit
+        };
+        let mut page: Vec<Address> = Vec::new(&env);
+        let total = all.len();
+        let mut i = offset;
+        while i < total && (i - offset) < page_size {
+            page.push_back(all.get(i).unwrap());
+            i += 1;
+        }
+        Ok(page)
     }
 
     // -----------------------------------------------------------------------
@@ -3377,6 +3421,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         if amount_per_fund < 0 {
@@ -3429,8 +3474,8 @@ impl OnboardingBridge {
     ///
     /// # Arguments
     ///
-    /// * `tiers` (`Vec<FeeTier>`) — Ordered list of fee tiers. Each tier's
-    ///   `fee_bps` must be ≤ 1 000.
+    /// * `tiers` (`Vec<FeeTier>`) — Ordered list of fee tiers. Must contain at
+    ///   most `MAX_FEE_TIERS` (50) entries. Each tier's `fee_bps` must be ≤ 1 000.
     ///
     /// # Authorization
     ///
@@ -3439,6 +3484,8 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::TooManyFeeTiers`] — `tiers.len()` exceeds `MAX_FEE_TIERS` (50).
     /// * [`BridgeError::FeeTooHigh`] — Any tier's `fee_bps` exceeds 1 000.
     ///
     /// # Events
@@ -3447,8 +3494,12 @@ impl OnboardingBridge {
     pub fn set_fee_tiers(env: Env, tiers: Vec<FeeTier>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        if tiers.len() > MAX_FEE_TIERS {
+            return Err(BridgeError::TooManyFeeTiers);
+        }
         for i in 0..tiers.len() {
             let tier = tiers.get(i).unwrap();
             if tier.fee_bps > MAX_FEE_BPS {
@@ -3719,6 +3770,7 @@ impl OnboardingBridge {
     pub fn add_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         read_admin(&env).require_auth();
         extend_instance_ttl(&env);
         add_relayer(&env, &pubkey);
@@ -3747,6 +3799,7 @@ impl OnboardingBridge {
     pub fn remove_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         read_admin(&env).require_auth();
         // Prevent removing below threshold
         let new_count = relayer_count(&env).saturating_sub(1);
@@ -3777,6 +3830,7 @@ impl OnboardingBridge {
     pub fn set_relayer_threshold(env: Env, threshold: u32) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         read_admin(&env).require_auth();
         if threshold > relayer_count(&env) {
             return Err(BridgeError::ThresholdExceedsRelayers);
@@ -3832,6 +3886,9 @@ impl OnboardingBridge {
     /// * `cliff_time` (`u64`) — Optional cliff timestamp. If > 0 it must be
     ///   ≤ `release_time`. Currently informational only; not enforced by
     ///   `claim_timelocked`.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for `source`.
+    /// * `deadline` (`Option<u64>`) — Optional Unix timestamp (seconds) after
+    ///   which the call is rejected. Pass `None` for no expiry.
     ///
     /// # Authorization
     ///
@@ -3846,6 +3903,7 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::TransactionExpired`] — `deadline` is in the past.
     /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
     /// * [`BridgeError::InvalidReleaseTime`] — `release_time` ≤ current timestamp,
     ///   or `cliff_time > release_time`.
@@ -3853,6 +3911,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode on and `target`
     ///   is not allowlisted.
     /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     ///
     /// # Events
     ///
@@ -3872,10 +3931,17 @@ impl OnboardingBridge {
         amount: i128,
         release_time: u64,
         cliff_time: u64,
+        nonce: Option<u64>,
+        deadline: Option<u64>,
     ) -> Result<u64, BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
+        if let Some(d) = deadline {
+            if env.ledger().timestamp() > d {
+                return Err(BridgeError::TransactionExpired);
+            }
+        }
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -3889,6 +3955,7 @@ impl OnboardingBridge {
         check_access(&env, &target)?;
         check_asset_whitelisted(&env, &asset)?;
         source.require_auth();
+        consume_nonce(&env, &source, nonce)?;
         extend_instance_ttl(&env);
 
         token::Client::new(&env, &asset)
@@ -4816,10 +4883,17 @@ impl OnboardingBridge {
         source_amount: i128,
         min_target_amount: i128,
         swap_route: Vec<Address>,
+        nonce: Option<u64>,
+        deadline: Option<u64>,
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
+        if let Some(d) = deadline {
+            if env.ledger().timestamp() > d {
+                return Err(BridgeError::TransactionExpired);
+            }
+        }
 
         if source_amount <= 0 || min_target_amount <= 0 {
             return Err(BridgeError::InvalidAmount);
@@ -4839,6 +4913,7 @@ impl OnboardingBridge {
         check_pool_whitelisted(&env, &pool)?;
 
         source.require_auth();
+        consume_nonce(&env, &source, nonce)?;
         extend_instance_ttl(&env);
 
         let contract_addr = env.current_contract_address();

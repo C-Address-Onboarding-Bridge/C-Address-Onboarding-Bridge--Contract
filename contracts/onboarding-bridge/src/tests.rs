@@ -448,6 +448,144 @@ fn test_set_admin_paused() {
     );
 }
 
+/********** Issue: check_not_paused consistency across admin setters **********/
+
+#[test]
+fn test_set_referral_rate_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+    assert_eq!(
+        bridge.try_set_referral_rate(&1000u32, &None),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_set_asset_fee_cap_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+    assert_eq!(
+        bridge.try_set_asset_fee_cap(&token_id, &50u32, &None),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_set_source_daily_limit_paused() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+    assert_eq!(
+        bridge.try_set_source_daily_limit(&user, &token_id, &10_000i128, &None),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_set_loyalty_token_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+    assert_eq!(
+        bridge.try_set_loyalty_token(&token_id, &10i128),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_set_fee_tiers_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier {
+            min_volume: 0,
+            max_volume: 1000i128,
+            fee_bps: 50u32,
+        }],
+    );
+    assert_eq!(
+        bridge.try_set_fee_tiers(&tiers),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_add_relayer_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+    let pubkey = BytesN::from_array(&env, &[7u8; 32]);
+    assert_eq!(
+        bridge.try_add_relayer(&pubkey),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_remove_relayer_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let pubkey = BytesN::from_array(&env, &[7u8; 32]);
+    bridge.add_relayer(&pubkey);
+    bridge.pause(&None);
+    assert_eq!(
+        bridge.try_remove_relayer(&pubkey),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_set_relayer_threshold_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let pubkey = BytesN::from_array(&env, &[7u8; 32]);
+    bridge.add_relayer(&pubkey);
+    bridge.pause(&None);
+    assert_eq!(
+        bridge.try_set_relayer_threshold(&1u32),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
 #[test]
 fn test_view_functions_work_when_paused() {
     let env = Env::default();
@@ -790,8 +928,16 @@ fn test_reclaim_cannot_drain_active_timelocks() {
 
     // 500 tokens locked in an unclaimed timelock; nothing else in the balance.
     let release_time = 1_100u64;
-    let id =
-        bridge.fund_c_address_timelocked(&user, &target, &token_id, &500i128, &release_time, &0u64);
+    let id = bridge.fund_c_address_timelocked(
+        &user,
+        &target,
+        &token_id,
+        &500i128,
+        &release_time,
+        &0u64,
+        &None,
+        &None,
+    );
     assert_eq!(check_balance(&env, &token_id, &bridge.address), 500i128);
 
     // Locked funds cannot be reclaimed at all before the timelock is claimed.
@@ -940,7 +1086,7 @@ fn test_query_whitelisted_assets() {
     bridge.add_asset(&asset1, &None);
     bridge.add_asset(&asset2, &None);
 
-    let assets = bridge.query_whitelisted_assets();
+    let assets = bridge.query_whitelisted_assets(&0u32, &100u32);
     assert_eq!(assets.len(), 2);
 
     let mut found1 = false;
@@ -967,7 +1113,7 @@ fn test_add_asset_is_idempotent() {
     bridge.add_asset(&token_id, &None);
     bridge.add_asset(&token_id, &None);
 
-    assert_eq!(bridge.query_whitelisted_assets().len(), 1);
+    assert_eq!(bridge.query_whitelisted_assets(&0u32, &100u32).len(), 1);
 }
 
 #[test]
@@ -1080,6 +1226,56 @@ fn test_query_all_balances_empty_input() {
     let assets: Vec<Address> = Vec::new(&env);
     let balances = bridge.query_all_balances(&assets);
     assert_eq!(balances.len(), 0);
+}
+
+#[test]
+fn test_query_all_balances_rejects_oversized_input() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+
+    // MAX_BATCH_SIZE is 100 — one more than that must be rejected.
+    let mut assets: Vec<Address> = Vec::new(&env);
+    for _ in 0..101 {
+        assets.push_back(Address::generate(&env));
+    }
+    assert_eq!(
+        bridge.try_query_all_balances(&assets),
+        Err(Ok(BridgeError::BatchTooLarge))
+    );
+
+    // Exactly MAX_BATCH_SIZE is accepted.
+    assets.pop_back();
+    assert_eq!(bridge.query_all_balances(&assets).len(), 100);
+}
+
+#[test]
+fn test_query_whitelisted_assets_pagination() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    for _ in 0..5 {
+        bridge.add_asset(&Address::generate(&env), &None);
+    }
+
+    let page1 = bridge.query_whitelisted_assets(&0u32, &2u32);
+    assert_eq!(page1.len(), 2);
+    let page2 = bridge.query_whitelisted_assets(&2u32, &2u32);
+    assert_eq!(page2.len(), 2);
+    let page3 = bridge.query_whitelisted_assets(&4u32, &2u32);
+    assert_eq!(page3.len(), 1);
+    // Offset past the end returns an empty page rather than erroring.
+    let page4 = bridge.query_whitelisted_assets(&5u32, &2u32);
+    assert_eq!(page4.len(), 0);
+
+    // A limit above MAX_BATCH_SIZE is silently clamped, not rejected.
+    let clamped = bridge.query_whitelisted_assets(&0u32, &1000u32);
+    assert_eq!(clamped.len(), 5);
 }
 
 #[test]
@@ -1356,6 +1552,8 @@ fn test_swap_rejects_non_whitelisted_pool() {
             &500i128,
             &400i128,
             &swap_route,
+            &None,
+            &None,
         ),
         Err(Ok(BridgeError::PoolNotWhitelisted))
     );
@@ -1387,6 +1585,8 @@ fn test_swap_multi_hop_route_rejected() {
             &500i128,
             &400i128,
             &swap_route,
+            &None,
+            &None,
         ),
         Err(Ok(BridgeError::MultiHopNotSupported))
     );
@@ -1413,8 +1613,114 @@ fn test_swap_happy_path_single_hop() {
         &500i128,
         &400i128,
         &swap_route,
+        &None,
+        &None,
     );
 
+    assert_eq!(check_balance(&env, &target_token_id, &target), 500i128);
+}
+
+#[test]
+fn test_swap_nonce_replay_rejected() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &target_token_id, &1i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+
+    bridge.fund_c_address_with_swap(
+        &user,
+        &target,
+        &source_token_id,
+        &target_token_id,
+        &500i128,
+        &400i128,
+        &swap_route,
+        &Some(0u64),
+        &None,
+    );
+    assert_eq!(bridge.query_nonce(&user), 1u64);
+
+    // Reusing nonce=0 is rejected.
+    let target2 = Address::generate(&env);
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target2,
+            &source_token_id,
+            &target_token_id,
+            &500i128,
+            &400i128,
+            &swap_route,
+            &Some(0u64),
+            &None,
+        ),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+}
+
+#[test]
+fn test_swap_deadline_expired_reverts() {
+    let env = Env::default();
+    env.ledger().set_timestamp(2_000);
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &target_token_id, &1i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target,
+            &source_token_id,
+            &target_token_id,
+            &500i128,
+            &400i128,
+            &swap_route,
+            &None,
+            &Some(1_999u64),
+        ),
+        Err(Ok(BridgeError::TransactionExpired))
+    );
+    // Nothing was pulled from the user since the deadline check runs first.
+    assert_eq!(check_balance(&env, &source_token_id, &user), 1_000i128);
+}
+
+#[test]
+fn test_swap_deadline_in_future_passes() {
+    let env = Env::default();
+    env.ledger().set_timestamp(2_000);
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &target_token_id, &1i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+
+    bridge.fund_c_address_with_swap(
+        &user,
+        &target,
+        &source_token_id,
+        &target_token_id,
+        &500i128,
+        &400i128,
+        &swap_route,
+        &None,
+        &Some(3_000u64),
+    );
     assert_eq!(check_balance(&env, &target_token_id, &target), 500i128);
 }
 
@@ -2156,6 +2462,8 @@ mod timelocked_tests {
             &500i128,
             &release_time,
             &0u64,
+            &None,
+            &None,
         );
 
         env.ledger().set_timestamp(release_time + 1);
@@ -2179,6 +2487,8 @@ mod timelocked_tests {
             &500i128,
             &(2_100u64),
             &0u64,
+            &None,
+            &None,
         );
 
         assert_eq!(
@@ -2202,6 +2512,8 @@ mod timelocked_tests {
                 &500i128,
                 &3_100u64,
                 &3_101u64,
+                &None,
+                &None,
             ),
             Err(Ok(BridgeError::InvalidReleaseTime))
         );
@@ -2222,6 +2534,8 @@ mod timelocked_tests {
                 &500i128,
                 &4_000u64,
                 &0u64,
+                &None,
+                &None,
             ),
             Err(Ok(BridgeError::InvalidReleaseTime))
         );
@@ -2242,6 +2556,8 @@ mod timelocked_tests {
             &500i128,
             &release_time,
             &0u64,
+            &None,
+            &None,
         );
 
         env.ledger().set_timestamp(release_time + 1);
