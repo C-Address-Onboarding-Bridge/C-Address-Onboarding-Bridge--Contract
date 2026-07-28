@@ -116,6 +116,63 @@ describe('OnboardingBridgeSDK', () => {
     });
   });
 
+  describe('timelocked funding', () => {
+    it('fundCAddressTimelocked returns pending status on success', async () => {
+      const result = await sdk.fundCAddressTimelocked(
+        {
+          source: MOCK_ADDRESS,
+          target: MOCK_ASSET,
+          asset: MOCK_ASSET,
+          amount: '1000',
+          releaseTime: 1893456000,
+          cliffTime: 1893455000,
+        },
+        mockKeypair,
+      );
+
+      expect(result.status).toBe('pending');
+      expect(result.hash).toBe('mock_tx_hash');
+      expect(mockProvider.getAccount).toHaveBeenCalledWith(MOCK_ADDRESS);
+      expect(mockProvider.prepareTransaction).toHaveBeenCalled();
+      expect(mockProvider.sendTransaction).toHaveBeenCalled();
+    });
+
+    it('claimTimelocked returns pending status on success', async () => {
+      const result = await sdk.claimTimelocked(1, mockKeypair);
+
+      expect(result.status).toBe('pending');
+      expect(result.hash).toBe('mock_tx_hash');
+      expect(mockProvider.getAccount).toHaveBeenCalledWith(MOCK_ADDRESS);
+      expect(mockProvider.prepareTransaction).toHaveBeenCalled();
+      expect(mockProvider.sendTransaction).toHaveBeenCalled();
+    });
+
+    it('queryTimelocked returns a timelock entry', async () => {
+      (scValToNative as jest.Mock).mockReturnValue({
+        source: MOCK_ADDRESS,
+        target: MOCK_ASSET,
+        asset: MOCK_ASSET,
+        amount: 1000n,
+        release_time: 1893456000n,
+        cliff_time: 1893455000n,
+        claimed: false,
+      });
+      mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+      const entry = await sdk.queryTimelocked(1);
+
+      expect(entry).toEqual({
+        source: MOCK_ADDRESS,
+        target: MOCK_ASSET,
+        asset: MOCK_ASSET,
+        amount: '1000',
+        releaseTime: 1893456000,
+        cliffTime: 1893455000,
+        claimed: false,
+      });
+    });
+  });
+
   describe('batchFundCAddresses', () => {
     it('returns array with one pending result on success', async () => {
       const results = await sdk.batchFundCAddresses(

@@ -15,7 +15,7 @@ Three upgrade strategies were considered:
 
 ## Decision
 
-Use a **timelock upgrade** pattern:
+Use a **timelock upgrade** pattern for production deployments:
 
 - `schedule_upgrade(new_wasm_hash, delay_seconds)` (admin only): stores the pending hash and `release_time = now + delay` under `DataKey::PendingUpgrade`.
 - `execute_upgrade(expected_hash)` (admin only): callable only after `release_time`; verifies the hash matches to prevent bait-and-switch; calls `update_current_contract_wasm`.
@@ -24,7 +24,9 @@ Use a **timelock upgrade** pattern:
 - The `expected_hash` parameter in `execute_upgrade` is a safety check: if the admin's key was compromised and the attacker scheduled a different WASM, the legitimate admin (who stored the expected hash off-chain at schedule time) can detect the mismatch.
 
 Deploy-new-instance was rejected because it changes the contract ID, breaking all integrations.
-Immediate upgrade was rejected because it gives no window for users to exit if the new code is malicious.
+Immediate upgrade was rejected as the default production governance path because it gives no window for users to exit if the new code is malicious.
+
+The contract still retains `upgrade(new_wasm_hash, nonce)` as an explicit **untimelocked** admin-only path for development, testnet deployments, emergency recovery drills, and controlled environments where waiting 24 hours is counterproductive. Production runbooks should treat this as a break-glass or non-mainnet convenience path and prefer `schedule_upgrade` plus `execute_upgrade` for user-facing deployments.
 
 ## Consequences
 
@@ -33,8 +35,10 @@ Immediate upgrade was rejected because it gives no window for users to exit if t
 - Hash verification prevents bait-and-switch attacks.
 - Instance storage (admin config, fees, accrued balances) is fully preserved across upgrades.
 - No change to the contract address — integrations continue working.
+- Testnet and development deployments can still use the immediate path when a timelock would slow iteration without improving user safety.
 
 **Negative:**
 - Security patches cannot be applied instantly; a 24-hour window must elapse. For critical bugs, the admin should pause the contract immediately while the upgrade is pending.
 - Adds operational complexity: two transactions (schedule + execute) instead of one.
 - If the admin key is lost after scheduling an upgrade, there is no way to execute it. Mitigated by maintaining a secure backup of the admin key.
+- Retaining an immediate path means operational policy and monitoring must distinguish production timelocked upgrades from non-production or break-glass immediate upgrades.
