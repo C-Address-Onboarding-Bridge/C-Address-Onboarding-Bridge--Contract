@@ -609,10 +609,9 @@ export interface TransactionResult {
   /**
    * Current status of the transaction:
    * - `'pending'`  — submitted and waiting for ledger inclusion.
-   * - `'success'`  — included and successful (rare, usually stays `'pending'`).
    * - `'failed'`   — rejected before submission or returned an error.
    */
-  status: 'success' | 'pending' | 'failed';
+  status: 'pending' | 'failed';
 
   /**
    * Human-readable error description when `status === 'failed'`.

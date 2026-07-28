@@ -380,7 +380,7 @@ export interface OpenTelemetryHooksOptions {
  * Each mutating SDK method becomes a span with:
  * - `bridge.method` — the SDK method name.
  * - `bridge.tx.hash` — the transaction hash on success.
- * - `bridge.tx.status` — `'pending'`, `'success'`, or `'failed'`.
+ * - `bridge.tx.status` — `'pending'` or `'failed'`.
  * - `bridge.duration_ms` — wall-clock duration.
  *
  * RPC calls (when `traceRpcCalls` is true, the default) produce spans with:
