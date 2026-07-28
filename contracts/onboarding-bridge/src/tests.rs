@@ -1,4 +1,4 @@
-use crate::{BridgeError, MetaFundParams, OnboardingBridge};
+use crate::{BridgeError, FeeTier, MetaFundParams, OnboardingBridge};
 
 use soroban_sdk::{
     contract, contractimpl, contracttype,
@@ -3276,5 +3276,76 @@ fn test_batch_fund_within_daily_limit_succeeds() {
         bridge.try_batch_fund_c_address(&user, &more_targets, &more_amounts, &token_id, &None, &None),
         Err(Ok(BridgeError::DailyLimitExceeded))
     );
+}
+
+/********** Tiered fee applied to batch/referral funding paths **********/
+
+// get_tiered_fee_bps was only consulted by fund_c_address, reveal_fund,
+// fund_c_address_with_swap, and execute_meta_fund — batch_fund_c_address computed
+// its fee from the flat global rate, silently bypassing the volume-tier discount.
+#[test]
+fn test_batch_fund_applies_tiered_fee() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    // Global fee is 100 bps (1%), but a volume tier discounts it to 10 bps (0.1%)
+    // for cumulative volume in [0, 1_000_000] — i.e. every source by default.
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier {
+            min_volume: 0,
+            max_volume: 1_000_000i128,
+            fee_bps: 10u32,
+        }],
+    );
+    bridge.set_fee_tiers(&tiers);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    let target = Address::generate(&env);
+    let targets = Vec::from_array(&env, [target.clone()]);
+    let amounts = Vec::from_array(&env, [1000i128]);
+
+    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None);
+
+    // Tiered fee (10 bps) on 1000 = 1, not the flat global rate (100 bps = 10).
+    assert_eq!(check_balance(&env, &token_id, &target), 999i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 1i128);
+}
+
+// fund_c_address_with_referral computed its fee straight from the global rate via
+// get_effective_fee_bps, never consulting the caller's volume tier.
+#[test]
+fn test_referral_fund_applies_tiered_fee() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier {
+            min_volume: 0,
+            max_volume: 1_000_000i128,
+            fee_bps: 10u32,
+        }],
+    );
+    bridge.set_fee_tiers(&tiers);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    let target = Address::generate(&env);
+
+    bridge.fund_c_address_with_referral(&user, &target, &token_id, &1000i128, &None);
+
+    // Tiered fee (10 bps) on 1000 = 1, not the flat global rate (100 bps = 10).
+    assert_eq!(check_balance(&env, &token_id, &target), 999i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 1i128);
 }
 

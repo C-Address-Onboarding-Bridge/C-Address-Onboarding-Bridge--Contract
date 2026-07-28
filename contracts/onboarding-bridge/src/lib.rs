@@ -1477,7 +1477,10 @@ impl OnboardingBridge {
         token_client.transfer(&source, &contract_addr, &total);
 
         let config = read_bridge_config(&env);
-        let effective_fee_bps = get_effective_fee_bps(&env, &asset, config.fee_bps);
+        // Route through the same volume-tiered fee lookup as the other funding
+        // entry points, instead of the flat global rate.
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, config.fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
         let mut num_success = 0u32;
         let mut num_failures = 0u32;
         let mut refund_amount = 0i128;
@@ -1530,6 +1533,13 @@ impl OnboardingBridge {
         // Batch-update all counters in a single storage read+write
         if total_fees > 0 || total_bridged > 0 {
             update_asset_counters(&env, &asset, total_fees, total_bridged);
+        }
+
+        // Track bridged volume for the tiered-fee lookup, mirroring the other
+        // funding entry points. Only the amount that actually succeeded counts.
+        let successful_amount = total - refund_amount;
+        if successful_amount > 0 {
+            increment_source_bridged_volume(&env, &source, successful_amount);
         }
 
         if refund_amount > 0 {
@@ -2111,7 +2121,11 @@ impl OnboardingBridge {
         token_client.transfer(&source, &env.current_contract_address(), &amount);
 
         let global_fee_bps = read_fee_bps(&env);
-        let effective_fee_bps = get_effective_fee_bps(&env, &asset, global_fee_bps);
+        // Route through the volume-tiered fee lookup, same as fund_c_address /
+        // reveal_fund / fund_c_address_with_swap / execute_meta_fund — otherwise
+        // a source could bypass their tier by using the referral path instead.
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
         let fee = calculate_fee(amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(amount, fee)?;
 
@@ -2139,6 +2153,7 @@ impl OnboardingBridge {
         increment_accrued_fees(&env, &asset, protocol_fee);
         increment_total_bridged(&env, &asset, net_amount);
         increment_total_fees_collected(&env, &asset, fee);
+        increment_source_bridged_volume(&env, &source, amount);
 
         env.events().publish(
             ("CAddressFunded", asset, source, target),
