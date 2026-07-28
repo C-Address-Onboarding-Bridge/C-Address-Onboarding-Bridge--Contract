@@ -5301,3 +5301,6 @@ mod integration_tests;
 
 #[cfg(test)]
 mod explicit_auth_tests;
+
+#[cfg(test)]
+mod smoke_tests;

@@ -41,11 +41,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: sdk/node_modules
-          key: ${{ runner.os }}-node-${{ hashFiles('sdk/package.json') }}
+          key: ${{ runner.os }}-node-${{ hashFiles('sdk/package-lock.json') }}
 
       - name: Install SDK dependencies
         working-directory: sdk
-        run: npm install
+        run: npm ci
 
       - name: Build TypeScript SDK docs
         working-directory: sdk

@@ -161,6 +161,12 @@ cd ..
   cargo clippy --all-targets --all-features
   ```
 
+> **Both are enforced in CI** by the `Format & Lint` job, which runs
+> `cargo fmt --all -- --check` and `cargo clippy --all-targets --all-features -- -D warnings`.
+> The pre-commit hook only covers formatting and can be skipped with
+> `--no-verify`, so clippy warnings will still fail your PR. Run both locally
+> to avoid a round trip.
+
 ### TypeScript/JavaScript (SDK)
 
 - Use TypeScript for type safety
@@ -283,14 +289,20 @@ git checkout -b feat/add-batch-funding
    cd sdk && npm test && cd ..
    ```
 
-3. **Check formatting and linting:**
+3. **Check formatting and linting:** (CI runs the `--check`/`-D warnings` forms)
    ```bash
-   cargo fmt --all
-   cargo clippy --all-targets
+   cargo fmt --all -- --check
+   cargo clippy --all-targets --all-features -- -D warnings
    cd sdk && npm run lint && cd ..
    ```
 
-4. **Verify Conventional Commits:**
+4. **Check for vulnerable dependencies:** (CI runs these in the `Dependency Audit` job)
+   ```bash
+   cargo audit
+   cd sdk && npm audit --audit-level=high && cd ..
+   ```
+
+5. **Verify Conventional Commits:**
    All commits must follow the format above.
 
 ### Creating a Pull Request

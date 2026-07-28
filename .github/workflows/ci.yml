@@ -10,6 +10,57 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lint:
+    name: Format & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # CONTRIBUTING.md asks contributors to run both before committing, but the
+      # pre-commit hook only covers fmt and `--no-verify` skips it entirely.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # Covers the contract, indexer, and relayer crates via the workspace lockfile.
+      - name: Audit Rust dependencies
+        run: cargo audit --deny warnings
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Audit SDK dependencies
+        working-directory: sdk
+        run: npm audit --audit-level=high
+
   contract:
     name: Soroban Contract
     runs-on: ubuntu-latest
@@ -170,10 +221,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: sdk/node_modules
-          key: ${{ runner.os }}-node-${{ hashFiles('sdk/package.json') }}
+          key: ${{ runner.os }}-node-${{ hashFiles('sdk/package-lock.json') }}
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: TypeScript type-check
         run: npx tsc --noEmit
@@ -212,13 +263,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: sdk/node_modules
-          key: ${{ runner.os }}-node-${{ matrix.node-version }}-npm-${{ matrix.npm-version }}-${{ hashFiles('sdk/package.json') }}
+          key: ${{ runner.os }}-node-${{ matrix.node-version }}-npm-${{ matrix.npm-version }}-${{ hashFiles('sdk/package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-node-${{ matrix.node-version }}-npm-
             ${{ runner.os }}-node-
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: TypeScript type-check
         run: npx tsc --noEmit

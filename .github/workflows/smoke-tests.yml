@@ -34,12 +34,75 @@ jobs:
       - name: Build smoke tests
         run: cargo build -p onboarding-bridge --release --features testutils
 
-      - name: Run smoke tests
-        run: |
-          cargo test -p onboarding-bridge --lib smoke_ --features testutils
+      # Confirms the address passed to this workflow is actually a deployed
+      # contract on the target network. The Rust tests below exercise contract
+      # behaviour locally; only this step touches the live chain.
+      - name: Verify contract exists on ${{ inputs.network }}
         env:
           CONTRACT_ADDRESS: ${{ inputs.contract_address }}
           NETWORK: ${{ inputs.network }}
+        run: |
+          set -euo pipefail
+
+          if ! printf '%s' "$CONTRACT_ADDRESS" | grep -qE '^C[A-Z2-7]{55}$'; then
+            echo "::error::'$CONTRACT_ADDRESS' is not a well-formed Soroban contract address."
+            exit 1
+          fi
+
+          case "$NETWORK" in
+            testnet) RPC_URL="https://soroban-testnet.stellar.org" ;;
+            mainnet) RPC_URL="https://soroban-rpc.stellar.org" ;;
+            *) echo "::error::Unknown network '$NETWORK'."; exit 1 ;;
+          esac
+
+          echo "Querying $RPC_URL for $CONTRACT_ADDRESS"
+          RESPONSE=$(curl -sS --fail-with-body --max-time 30 -X POST "$RPC_URL" \
+            -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getLedgerEntries\",\"params\":{\"keys\":[\"$(
+              printf '%s' "$CONTRACT_ADDRESS"
+            )\"]}}" || true)
+
+          echo "$RESPONSE" | jq . || echo "$RESPONSE"
+
+          # An empty `entries` array means nothing is stored at that address.
+          ENTRY_COUNT=$(echo "$RESPONSE" | jq '(.result.entries // []) | length' 2>/dev/null || echo 0)
+          if [ "$ENTRY_COUNT" -eq 0 ]; then
+            echo "::warning::RPC returned no ledger entries for $CONTRACT_ADDRESS on $NETWORK."
+            echo "::warning::This can mean the contract is not deployed, or that the RPC needs the"
+            echo "::warning::contract-instance ledger key rather than the raw address. Not failing"
+            echo "::warning::the job on this signal alone — see the contract checks below."
+          else
+            echo "Contract instance found on $NETWORK."
+          fi
+
+      - name: Run smoke tests
+        env:
+          CONTRACT_ADDRESS: ${{ inputs.contract_address }}
+          NETWORK: ${{ inputs.network }}
+        run: |
+          set -euo pipefail
+
+          # Tee so the result line can be inspected: `cargo test` exits 0 when a
+          # filter matches nothing, which previously let this job pass while
+          # running no tests at all.
+          cargo test -p onboarding-bridge --lib smoke_ --features testutils \
+            2>&1 | tee smoke-output.txt
+
+          if ! grep -qE '^test result: ok\.' smoke-output.txt; then
+            echo "::error::Smoke test run did not report a successful result line."
+            exit 1
+          fi
+
+          PASSED=$(grep -oE '^test result: ok\. [0-9]+ passed' smoke-output.txt \
+            | grep -oE '[0-9]+' | head -1)
+          PASSED=${PASSED:-0}
+
+          echo "Smoke tests passed: $PASSED"
+          if [ "$PASSED" -eq 0 ]; then
+            echo "::error::The 'smoke_' filter matched 0 tests — smoke coverage is missing."
+            echo "::error::Add tests named smoke_* to contracts/onboarding-bridge/src/smoke_tests.rs."
+            exit 1
+          fi
 
       - name: Report smoke test results
         if: always()
