@@ -208,6 +208,38 @@ export interface FeeTier {
 }
 
 /**
+ * Options for creating a timelocked C-address funding entry via
+ * {@link OnboardingBridgeSDK.fundCAddressTimelocked}.
+ */
+export interface FundCTimelockedOptions extends FundCOptions {
+  /**
+   * Unix timestamp in seconds after which the target can claim the locked funds.
+   * Must be strictly in the future when submitted to the contract.
+   */
+  releaseTime: number;
+
+  /**
+   * Optional informational cliff timestamp in seconds. Use `0` when no cliff is
+   * needed. If set, it must be less than or equal to `releaseTime`.
+   */
+  cliffTime?: number;
+}
+
+/**
+ * Timelocked funding record returned by
+ * {@link OnboardingBridgeSDK.queryTimelocked}.
+ */
+export interface TimelockEntry {
+  source: string;
+  target: string;
+  asset: string;
+  amount: string;
+  releaseTime: number;
+  cliffTime: number;
+  claimed: boolean;
+}
+
+/**
  * Options for funding multiple C-addresses in one or more transactions via
  * {@link OnboardingBridgeSDK.batchFundCAddresses}.
  *

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Cross-chain funding with relayer signature verification, replay protection, and relayer threshold management.
+- Referral fee splitting and fee-tier/loyalty-token support.
+- Timelocked C-address funding with delayed claim and query support.
+- Commit-reveal funding flow for privacy-preserving deposits.
+- Meta-transaction support with signer registration and nonce tracking.
+- Admin controls for pausing, asset allowlisting, blocklist/allowlist access control, daily limits, fee caps, and emergency token reclaim.
+- Timelocked contract upgrade scheduling, execution, cancellation, and pending-upgrade query support.
+- Two-step admin and fee-collector handoff using propose/accept flows.
+- SDK wrappers for timelocked funding, claiming, and querying.
+
 ## [0.1.0] - 2024-01-01
 
 ### Added

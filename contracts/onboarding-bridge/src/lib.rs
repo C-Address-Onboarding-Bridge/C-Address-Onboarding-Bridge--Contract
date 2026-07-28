@@ -1909,6 +1909,11 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Proposes a fee-collector handoff that must be accepted by `new_collector`.
+    ///
+    /// This two-step path is preferred over `set_fee_collector` for normal
+    /// operations because it proves the proposed collector controls the key
+    /// before the role is moved.
     pub fn propose_new_fee_collector(env: Env, new_collector: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
@@ -1923,6 +1928,7 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Accepts a pending fee-collector handoff.
     pub fn accept_fee_collector(env: Env) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
@@ -1962,6 +1968,10 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Proposes an admin handoff that must be accepted by `new_admin`.
+    ///
+    /// This two-step path is preferred over `set_admin` for normal operations
+    /// because it prevents accidentally transferring control to an unusable key.
     pub fn propose_new_admin(env: Env, new_admin: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
@@ -1976,6 +1986,7 @@ impl OnboardingBridge {
         Ok(())
     }
 
+    /// Accepts a pending admin handoff.
     pub fn accept_admin(env: Env) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
@@ -2569,9 +2580,10 @@ impl OnboardingBridge {
 
     /// Immediately upgrades the contract WASM to `new_wasm_hash`.
     ///
-    /// This is the **untimelocked** upgrade path. For production deployments,
-    /// prefer `schedule_upgrade` + `execute_upgrade` which enforces a ~24-hour
-    /// delay, giving users time to react.
+    /// This is the **untimelocked** upgrade path retained for development,
+    /// testnet, and controlled break-glass operations. For production
+    /// deployments, prefer `schedule_upgrade` + `execute_upgrade` which
+    /// enforces a ~24-hour delay, giving users time to react.
     ///
     /// # Arguments
     ///

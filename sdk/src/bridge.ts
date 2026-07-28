@@ -31,6 +31,7 @@ import {
   PaginatedResult,
   PaginationOptions,
   CostEstimate,
+  TimelockEntry,
 } from './types';
 import {
   type ObservabilityHooks,
@@ -453,6 +454,193 @@ export class OnboardingBridgeSDK {
         }
       },
     );
+  }
+
+  /**
+   * Create a timelocked funding entry for a C-address.
+   *
+   * Transfers `options.amount` of `options.asset` from `source` into the bridge
+   * contract immediately. The `target` can later call {@link claimTimelocked}
+   * once `releaseTime` has passed.
+   */
+  async fundCAddressTimelocked(
+    options: FundCTimelockedOptions,
+    sourceKeypair: Keypair,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'fundCAddressTimelocked',
+      {
+        source: options.source,
+        target: options.target,
+        asset: options.asset,
+        amount: options.amount,
+        releaseTime: options.releaseTime,
+        cliffTime: options.cliffTime ?? 0,
+      },
+      async () => {
+        try {
+          assertAccountAddress(options.source, 'source');
+          assertContractAddress(options.target, 'target');
+          assertContractAddress(options.asset, 'asset');
+
+          const sourceAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: options.source },
+            () => this.provider.getAccount(options.source),
+          );
+
+          const tx = new TransactionBuilder(sourceAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'fund_c_address_timelocked',
+                new Address(options.source).toScVal(),
+                new Address(options.target).toScVal(),
+                new Address(options.asset).toScVal(),
+                nativeToScVal(BigInt(options.amount), { type: 'i128' }),
+                nativeToScVal(BigInt(options.releaseTime), { type: 'u64' }),
+                nativeToScVal(BigInt(options.cliffTime ?? 0), { type: 'u64' }),
+              ),
+            )
+            .setTimeout(30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'fund_c_address_timelocked' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(sourceKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'fund_c_address_timelocked' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Claim a matured timelocked funding entry.
+   */
+  async claimTimelocked(
+    id: number,
+    targetKeypair: Keypair,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'claimTimelocked',
+      { id },
+      async () => {
+        try {
+          const targetAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: targetKeypair.publicKey() },
+            () => this.provider.getAccount(targetKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(targetAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'claim_timelocked',
+                nativeToScVal(BigInt(id), { type: 'u64' }),
+              ),
+            )
+            .setTimeout(30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'claim_timelocked' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(targetKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'claim_timelocked' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Query a timelocked funding entry by ID.
+   */
+  async queryTimelocked(id: number): Promise<TimelockEntry | null> {
+    const account = new Account('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF', '0');
+    const tx = new TransactionBuilder(account, {
+      fee: '100',
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(
+        this.contract.call(
+          'query_timelocked',
+          nativeToScVal(BigInt(id), { type: 'u64' }),
+        ),
+      )
+      .setTimeout(30)
+      .build();
+
+    const result = await this.provider.simulateTransaction(
+      tx,
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query timelocked entry: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    if (!scVal) return null;
+
+    const native = scValToNative(scVal) as any;
+    return {
+      source: native.source?.toString?.() ?? String(native.source),
+      target: native.target?.toString?.() ?? String(native.target),
+      asset: native.asset?.toString?.() ?? String(native.asset),
+      amount: native.amount?.toString?.() ?? String(native.amount),
+      releaseTime: Number(native.release_time ?? native.releaseTime),
+      cliffTime: Number(native.cliff_time ?? native.cliffTime),
+      claimed: Boolean(native.claimed),
+    };
   }
 
   /**
