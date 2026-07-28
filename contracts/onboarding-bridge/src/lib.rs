@@ -487,12 +487,14 @@ fn read_timelock_entry(env: &Env, id: u64) -> Option<TimelockEntry> {
     env.storage().persistent().get(&DataKey::Timelock(id))
 }
 
-fn increment_user_deposit(env: &Env, source: &Address, asset: &Address, amount: i128) {
+fn increment_user_deposit(env: &Env, source: &Address, asset: &Address, amount: i128) -> Result<(), BridgeError> {
     let key = DataKey::UserDeposit(source.clone(), asset.clone());
     let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+    let updated = safe_math::safe_add(current, amount)?;
     env.storage()
         .persistent()
-        .set(&key, &(current + amount));
+        .set(&key, &updated);
+    Ok(())
 }
 
 #[inline(never)]
@@ -756,10 +758,11 @@ fn read_accrued_fees(env: &Env, asset: &Address) -> i128 {
     read_asset_counters(env, asset).accrued_fees
 }
 
-fn increment_accrued_fees(env: &Env, asset: &Address, amount: i128) {
+fn increment_accrued_fees(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
     let mut c = read_asset_counters(env, asset);
-    c.accrued_fees += amount;
+    c.accrued_fees = safe_math::safe_add(c.accrued_fees, amount)?;
     save_asset_counters(env, asset, &c);
+    Ok(())
 }
 
 fn decrement_accrued_fees(env: &Env, asset: &Address, amount: i128) {
@@ -772,29 +775,32 @@ fn read_total_bridged(env: &Env, asset: &Address) -> i128 {
     read_asset_counters(env, asset).total_bridged
 }
 
-fn increment_total_bridged(env: &Env, asset: &Address, amount: i128) {
+fn increment_total_bridged(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
     let mut c = read_asset_counters(env, asset);
-    c.total_bridged += amount;
+    c.total_bridged = safe_math::safe_add(c.total_bridged, amount)?;
     save_asset_counters(env, asset, &c);
+    Ok(())
 }
 
 fn read_total_fees_collected(env: &Env, asset: &Address) -> i128 {
     read_asset_counters(env, asset).total_fees_collected
 }
 
-fn increment_total_fees_collected(env: &Env, asset: &Address, amount: i128) {
+fn increment_total_fees_collected(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
     let mut c = read_asset_counters(env, asset);
-    c.total_fees_collected += amount;
+    c.total_fees_collected = safe_math::safe_add(c.total_fees_collected, amount)?;
     save_asset_counters(env, asset, &c);
+    Ok(())
 }
 
 /// Atomically update all three counters in a single storage read+write
-fn update_asset_counters(env: &Env, asset: &Address, fees: i128, bridged: i128) {
+fn update_asset_counters(env: &Env, asset: &Address, fees: i128, bridged: i128) -> Result<(), BridgeError> {
     let mut c = read_asset_counters(env, asset);
-    c.accrued_fees += fees;
-    c.total_bridged += bridged;
-    c.total_fees_collected += fees;
+    c.accrued_fees = safe_math::safe_add(c.accrued_fees, fees)?;
+    c.total_bridged = safe_math::safe_add(c.total_bridged, bridged)?;
+    c.total_fees_collected = safe_math::safe_add(c.total_fees_collected, fees)?;
     save_asset_counters(env, asset, &c);
+    Ok(())
 }
 
 fn read_nonce(env: &Env, caller: &Address) -> u64 {
@@ -1001,10 +1007,11 @@ fn check_daily_limit(env: &Env, source: &Address, asset: &Address, amount: i128)
     let day = current_day(env);
     let key = DataKey::DailyUsage(source.clone(), asset.clone(), day);
     let used: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-    if used + amount > limit {
+    let updated = safe_math::safe_add(used, amount)?;
+    if updated > limit {
         return Err(BridgeError::DailyLimitExceeded);
     }
-    env.storage().persistent().set(&key, &(used + amount));
+    env.storage().persistent().set(&key, &updated);
     Ok(())
 }
 
@@ -1049,11 +1056,13 @@ fn read_source_bridged_volume(env: &Env, source: &Address) -> i128 {
         .unwrap_or(0)
 }
 
-fn increment_source_bridged_volume(env: &Env, source: &Address, amount: i128) {
+fn increment_source_bridged_volume(env: &Env, source: &Address, amount: i128) -> Result<(), BridgeError> {
     let current = read_source_bridged_volume(env, source);
+    let updated = safe_math::safe_add(current, amount)?;
     env.storage()
         .persistent()
-        .set(&DataKey::SourceBridgedVolume(source.clone()), &(current + amount));
+        .set(&DataKey::SourceBridgedVolume(source.clone()), &updated);
+    Ok(())
 }
 
 fn get_tiered_fee_bps(env: &Env, source: &Address, fallback_bps: u32) -> u32 {
@@ -1390,11 +1399,11 @@ impl OnboardingBridge {
             token_client.transfer(&contract_addr, &target, &net_amount);
         }
 
-        increment_user_deposit(&env, &source, &asset, amount);
-        increment_accrued_fees(&env, &asset, fee);
-        increment_total_bridged(&env, &asset, net_amount);
-        increment_total_fees_collected(&env, &asset, fee);
-        increment_source_bridged_volume(&env, &source, amount);
+        increment_user_deposit(&env, &source, &asset, amount)?;
+        increment_accrued_fees(&env, &asset, fee)?;
+        increment_total_bridged(&env, &asset, net_amount)?;
+        increment_total_fees_collected(&env, &asset, fee)?;
+        increment_source_bridged_volume(&env, &source, amount)?;
 
         mint_loyalty_tokens(&env, &source);
 
@@ -1525,7 +1534,7 @@ impl OnboardingBridge {
 
             if check_access(&env, &target).is_err() {
                 num_failures += 1;
-                refund_amount += amount;
+                refund_amount = safe_math::safe_add(refund_amount, amount)?;
                 env.events().publish(
                     ("BatchTransferFailed", source.clone(), target.clone()),
                     (amount, "access_denied"),
@@ -1534,8 +1543,8 @@ impl OnboardingBridge {
             }
 
             num_success += 1;
-            total_fees += fee;
-            total_bridged += net_amount;
+            total_fees = safe_math::safe_add(total_fees, fee)?;
+            total_bridged = safe_math::safe_add(total_bridged, net_amount)?;
 
             if net_amount > 0 {
                 let existing = aggregated.get(target.clone()).unwrap_or(0);
@@ -1558,7 +1567,7 @@ impl OnboardingBridge {
 
         // Batch-update all counters in a single storage read+write
         if total_fees > 0 || total_bridged > 0 {
-            update_asset_counters(&env, &asset, total_fees, total_bridged);
+            update_asset_counters(&env, &asset, total_fees, total_bridged)?;
         }
 
         if refund_amount > 0 {
@@ -2175,9 +2184,9 @@ impl OnboardingBridge {
         };
 
         let protocol_fee = fee - referral_fee;
-        increment_accrued_fees(&env, &asset, protocol_fee);
-        increment_total_bridged(&env, &asset, net_amount);
-        increment_total_fees_collected(&env, &asset, fee);
+        increment_accrued_fees(&env, &asset, protocol_fee)?;
+        increment_total_bridged(&env, &asset, net_amount)?;
+        increment_total_fees_collected(&env, &asset, fee)?;
 
         mint_loyalty_tokens(&env, &source);
 
@@ -3547,7 +3556,7 @@ impl OnboardingBridge {
         if net_amount > 0 {
             token_client.transfer(&env.current_contract_address(), &target, &net_amount);
         }
-        update_asset_counters(&env, &asset, fee, net_amount);
+        update_asset_counters(&env, &asset, fee, net_amount)?;
 
         // No on-chain `source` exists for cross-chain deposits (the funds
         // originate on another chain), so `target` is the only address party
@@ -3845,7 +3854,7 @@ impl OnboardingBridge {
         if net_amount > 0 {
             token_client.transfer(&env.current_contract_address(), &entry.target, &net_amount);
         }
-        update_asset_counters(&env, &entry.asset, fee, net_amount);
+        update_asset_counters(&env, &entry.asset, fee, net_amount)?;
 
         env.events().publish(
             ("TimelockClaimed", entry.target),
@@ -4357,10 +4366,10 @@ impl OnboardingBridge {
             token_client.transfer(&contract_addr, &target, &net_amount);
         }
 
-        increment_accrued_fees(&env, &asset, fee);
-        increment_total_bridged(&env, &asset, net_amount);
-        increment_total_fees_collected(&env, &asset, fee);
-        increment_source_bridged_volume(&env, &source, amount);
+        increment_accrued_fees(&env, &asset, fee)?;
+        increment_total_bridged(&env, &asset, net_amount)?;
+        increment_total_fees_collected(&env, &asset, fee)?;
+        increment_source_bridged_volume(&env, &source, amount)?;
         extend_instance_ttl(&env);
 
         mint_loyalty_tokens(&env, &source);
@@ -4525,10 +4534,10 @@ impl OnboardingBridge {
             target_token.transfer(&contract_addr, &target, &net_amount);
         }
 
-        increment_accrued_fees(&env, &target_asset, fee);
-        increment_total_bridged(&env, &target_asset, net_amount);
-        increment_total_fees_collected(&env, &target_asset, fee);
-        increment_source_bridged_volume(&env, &source, source_amount);
+        increment_accrued_fees(&env, &target_asset, fee)?;
+        increment_total_bridged(&env, &target_asset, net_amount)?;
+        increment_total_fees_collected(&env, &target_asset, fee)?;
+        increment_source_bridged_volume(&env, &source, source_amount)?;
 
         mint_loyalty_tokens(&env, &source);
 
@@ -4697,11 +4706,11 @@ impl OnboardingBridge {
             token_client.transfer(&contract_addr, &params.target, &net_amount);
         }
 
-        increment_user_deposit(&env, &params.source, &params.asset, params.amount);
-        increment_accrued_fees(&env, &params.asset, fee);
-        increment_total_bridged(&env, &params.asset, net_amount);
-        increment_total_fees_collected(&env, &params.asset, fee);
-        increment_source_bridged_volume(&env, &params.source, params.amount);
+        increment_user_deposit(&env, &params.source, &params.asset, params.amount)?;
+        increment_accrued_fees(&env, &params.asset, fee)?;
+        increment_total_bridged(&env, &params.asset, net_amount)?;
+        increment_total_fees_collected(&env, &params.asset, fee)?;
+        increment_source_bridged_volume(&env, &params.source, params.amount)?;
 
         extend_instance_ttl(&env);
 
@@ -4758,6 +4767,9 @@ pub struct MetaFundParams {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod overflow_accumulator_tests;
 
 #[cfg(test)]
 mod fee_fuzz_tests;
