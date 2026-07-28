@@ -442,6 +442,144 @@ fn test_set_admin_paused() {
     );
 }
 
+/********** Issue: check_not_paused consistency across admin setters **********/
+
+#[test]
+fn test_set_referral_rate_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+    assert_eq!(
+        bridge.try_set_referral_rate(&1000u32, &None),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_set_asset_fee_cap_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+    assert_eq!(
+        bridge.try_set_asset_fee_cap(&token_id, &50u32, &None),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_set_source_daily_limit_paused() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+    assert_eq!(
+        bridge.try_set_source_daily_limit(&user, &token_id, &10_000i128, &None),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_set_loyalty_token_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+    assert_eq!(
+        bridge.try_set_loyalty_token(&token_id, &10i128),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_set_fee_tiers_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier {
+            min_volume: 0,
+            max_volume: 1000i128,
+            fee_bps: 50u32,
+        }],
+    );
+    assert_eq!(
+        bridge.try_set_fee_tiers(&tiers),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_add_relayer_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+    let pubkey = BytesN::from_array(&env, &[7u8; 32]);
+    assert_eq!(
+        bridge.try_add_relayer(&pubkey),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_remove_relayer_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let pubkey = BytesN::from_array(&env, &[7u8; 32]);
+    bridge.add_relayer(&pubkey);
+    bridge.pause(&None);
+    assert_eq!(
+        bridge.try_remove_relayer(&pubkey),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_set_relayer_threshold_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let pubkey = BytesN::from_array(&env, &[7u8; 32]);
+    bridge.add_relayer(&pubkey);
+    bridge.pause(&None);
+    assert_eq!(
+        bridge.try_set_relayer_threshold(&1u32),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
 #[test]
 fn test_view_functions_work_when_paused() {
     let env = Env::default();

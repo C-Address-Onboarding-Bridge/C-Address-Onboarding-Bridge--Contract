@@ -1732,6 +1732,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -1798,6 +1799,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         if max_fee_bps > MAX_FEE_BPS {
             return Err(BridgeError::FeeTooHigh);
         }
@@ -2115,6 +2117,7 @@ impl OnboardingBridge {
     pub fn set_referral_rate(env: Env, bps: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         if bps > 10_000 {
             return Err(BridgeError::FeeTooHigh);
         }
@@ -3338,6 +3341,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         if amount_per_fund < 0 {
@@ -3408,6 +3412,7 @@ impl OnboardingBridge {
     pub fn set_fee_tiers(env: Env, tiers: Vec<FeeTier>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         for i in 0..tiers.len() {
@@ -3675,6 +3680,7 @@ impl OnboardingBridge {
     pub fn add_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         read_admin(&env).require_auth();
         extend_instance_ttl(&env);
         add_relayer(&env, &pubkey);
@@ -3703,6 +3709,7 @@ impl OnboardingBridge {
     pub fn remove_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         read_admin(&env).require_auth();
         // Prevent removing below threshold
         let new_count = relayer_count(&env).saturating_sub(1);
@@ -3733,6 +3740,7 @@ impl OnboardingBridge {
     pub fn set_relayer_threshold(env: Env, threshold: u32) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         read_admin(&env).require_auth();
         if threshold > relayer_count(&env) {
             return Err(BridgeError::ThresholdExceedsRelayers);
