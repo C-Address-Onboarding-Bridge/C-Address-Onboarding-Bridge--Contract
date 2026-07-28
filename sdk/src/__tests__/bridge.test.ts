@@ -795,6 +795,58 @@ describe('OnboardingBridgeSDK', () => {
     });
   });
 
+  describe('addRelayer / removeRelayer pubkey validation', () => {
+    it('addRelayer rejects pubkey shorter than 32 bytes', async () => {
+      const result = await sdk.addRelayer({ pubkey: 'a'.repeat(32) }, mockKeypair);
+
+      expect(result.status).toBe('failed');
+      expect(result.error).toMatch(/expected a 64-character lowercase hex string/);
+    });
+
+    it('addRelayer rejects pubkey longer than 32 bytes', async () => {
+      const result = await sdk.addRelayer({ pubkey: 'a'.repeat(66) }, mockKeypair);
+
+      expect(result.status).toBe('failed');
+      expect(result.error).toMatch(/expected a 64-character lowercase hex string/);
+    });
+
+    it('addRelayer rejects non-hex characters in pubkey', async () => {
+      const result = await sdk.addRelayer({ pubkey: 'z'.repeat(64) }, mockKeypair);
+
+      expect(result.status).toBe('failed');
+      expect(result.error).toMatch(/expected a 64-character lowercase hex string/);
+    });
+
+    it('addRelayer rejects uppercase hex pubkey', async () => {
+      const result = await sdk.addRelayer({ pubkey: 'A'.repeat(64) }, mockKeypair);
+
+      expect(result.status).toBe('failed');
+      expect(result.error).toMatch(/expected a 64-character lowercase hex string/);
+    });
+
+    it('addRelayer rejects empty pubkey', async () => {
+      const result = await sdk.addRelayer({ pubkey: '' }, mockKeypair);
+
+      expect(result.status).toBe('failed');
+      expect(result.error).toMatch(/expected a 64-character lowercase hex string/);
+    });
+
+    it('removeRelayer rejects malformed pubkey', async () => {
+      const result = await sdk.removeRelayer({ pubkey: 'deadbeef' }, mockKeypair);
+
+      expect(result.status).toBe('failed');
+      expect(result.error).toMatch(/expected a 64-character lowercase hex string/);
+    });
+
+    it('addRelayer accepts valid 64-char lowercase hex pubkey', async () => {
+      const result = await sdk.addRelayer({ pubkey: 'a'.repeat(64) }, mockKeypair);
+
+      // Should not fail on validation; proceeds to RPC
+      expect(result.status).toBe('pending');
+      expect(mockProvider.getAccount).toHaveBeenCalled();
+    });
+  });
+
   describe('setRelayerThreshold', () => {
     it('returns pending status on success', async () => {
       const result = await sdk.setRelayerThreshold(2, mockKeypair);
