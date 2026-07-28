@@ -1693,7 +1693,7 @@ fn test_batch_exceeds_max_size() {
 
     assert_eq!(
         bridge.try_batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None),
-        Err(Ok(BridgeError::InvalidAmount))
+        Err(Ok(BridgeError::BatchTooLarge))
     );
     assert_eq!(check_balance(&env, &token_id, &user), 1_000_000i128);
 }

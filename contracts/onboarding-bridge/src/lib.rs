@@ -145,6 +145,8 @@ pub enum BridgeError {
     MetaTxNonceAlreadyUsed = 39,
     /// The contract is deactivated (permanently paused/migrated).
     ContractDeactivated = 40,
+    /// The `targets` array passed to `batch_fund_c_address` exceeds `MAX_BATCH_SIZE` (100).
+    BatchTooLarge = 41,
 }
 
 // ---------------------------------------------------------------------------
@@ -1368,6 +1370,7 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::BatchTooLarge`] — `targets.len()` exceeds `MAX_BATCH_SIZE` (100).
     /// * [`BridgeError::TransactionExpired`] — `deadline` is in the past.
     /// * [`BridgeError::MismatchedArrays`] — `targets.len() != amounts.len()`.
     /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
@@ -1410,7 +1413,7 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         check_not_paused(&env)?;
         if targets.len() > MAX_BATCH_SIZE {
-            return Err(BridgeError::InvalidAmount);
+            return Err(BridgeError::BatchTooLarge);
         }
         if let Some(d) = deadline {
             if env.ledger().timestamp() > d {
