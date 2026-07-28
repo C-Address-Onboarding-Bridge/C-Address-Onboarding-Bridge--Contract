@@ -1,6 +1,6 @@
 import { OnboardingBridgeSDK } from '../bridge';
 import { OffRampIntegration } from '../offramp';
-import { SorobanRpc, Contract, scValToNative, xdr, Address, nativeToScVal } from '@stellar/stellar-sdk';
+import { SorobanRpc, Contract, scValToNative, xdr, Address, nativeToScVal, TransactionBuilder } from '@stellar/stellar-sdk';
 
 jest.mock('@stellar/stellar-sdk', () => ({
   SorobanRpc: {
@@ -1109,6 +1109,74 @@ describe('Type validation at runtime', () => {
       rpcUrl: 'https://rpc', 
       networkPassphrase: 'test' 
     })).not.toThrow();
+  });
+
+  it('uses the configured timeout instead of the default 30 seconds', async () => {
+    (SorobanRpc.Server as jest.Mock).mockClear();
+    (TransactionBuilder as unknown as jest.Mock).mockClear();
+
+    const setTimeoutSpy = jest.fn().mockReturnThis();
+    (TransactionBuilder as unknown as jest.Mock).mockImplementation(() => ({
+      addOperation: jest.fn().mockReturnThis(),
+      setTimeout: setTimeoutSpy,
+      build: jest.fn().mockReturnValue({}),
+    }));
+
+    const customSdk = new OnboardingBridgeSDK({ ...CONFIG, timeout: 60 });
+
+    const mockProvider = {
+      getAccount: jest.fn().mockResolvedValue({}),
+      prepareTransaction: jest.fn().mockResolvedValue({ sign: jest.fn() }),
+      sendTransaction: jest.fn().mockResolvedValue({ hash: 'h', status: 'PENDING' }),
+      simulateTransaction: jest.fn().mockResolvedValue({}),
+    };
+    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+
+    await customSdk.fundCAddress(
+      { source: MOCK_ADDRESS, target: MOCK_ASSET, asset: MOCK_ASSET, amount: '1000' },
+      mockKeypair,
+    );
+
+    // The last TransactionBuilder instance should have been called with timeout 60
+    const calls = setTimeoutSpy.mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    // Every setTimeout call should be with 60 (the custom timeout)
+    calls.forEach((call: any[]) => {
+      expect(call[0]).toBe(60);
+    });
+  });
+
+  it('falls back to 30-second timeout when config.timeout is omitted', async () => {
+    (SorobanRpc.Server as jest.Mock).mockClear();
+    (TransactionBuilder as unknown as jest.Mock).mockClear();
+
+    const setTimeoutSpy = jest.fn().mockReturnThis();
+    (TransactionBuilder as unknown as jest.Mock).mockImplementation(() => ({
+      addOperation: jest.fn().mockReturnThis(),
+      setTimeout: setTimeoutSpy,
+      build: jest.fn().mockReturnValue({}),
+    }));
+
+    const defaultSdk = new OnboardingBridgeSDK(CONFIG);
+
+    const mockProvider = {
+      getAccount: jest.fn().mockResolvedValue({}),
+      prepareTransaction: jest.fn().mockResolvedValue({ sign: jest.fn() }),
+      sendTransaction: jest.fn().mockResolvedValue({ hash: 'h', status: 'PENDING' }),
+      simulateTransaction: jest.fn().mockResolvedValue({}),
+    };
+    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+
+    await (defaultSdk as any).fundCAddress(
+      { source: MOCK_ADDRESS, target: MOCK_ASSET, asset: MOCK_ASSET, amount: '1000' },
+      mockKeypair,
+    );
+
+    const calls = setTimeoutSpy.mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    calls.forEach((call: any[]) => {
+      expect(call[0]).toBe(30);
+    });
   });
 
   it('BridgeConfig constructor validates contractId at construction time', () => {

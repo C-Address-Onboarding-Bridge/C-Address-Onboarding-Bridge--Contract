@@ -215,7 +215,7 @@ export class OnboardingBridgeSDK {
                 ]),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -288,7 +288,7 @@ export class OnboardingBridgeSDK {
                 ]),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -356,7 +356,7 @@ export class OnboardingBridgeSDK {
                 nativeToScVal(BigInt(options.deadline), { type: 'u64' }),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -425,7 +425,7 @@ export class OnboardingBridgeSDK {
                 nativeToScVal(BigInt(options.nonce), { type: 'u64' }),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -508,7 +508,7 @@ export class OnboardingBridgeSDK {
                 nativeToScVal(BigInt(options.cliffTime ?? 0), { type: 'u64' }),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -571,7 +571,7 @@ export class OnboardingBridgeSDK {
                 nativeToScVal(BigInt(id), { type: 'u64' }),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -619,7 +619,7 @@ export class OnboardingBridgeSDK {
           nativeToScVal(BigInt(id), { type: 'u64' }),
         ),
       )
-      .setTimeout(30)
+      .setTimeout(this.config.timeout ?? 30)
       .build();
 
     const result = await this.provider.simulateTransaction(
@@ -717,7 +717,7 @@ export class OnboardingBridgeSDK {
                 ]),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -858,7 +858,7 @@ export class OnboardingBridgeSDK {
                   ]),
                 ),
               )
-              .setTimeout(30)
+              .setTimeout(this.config.timeout ?? 30)
               .build();
 
             const preparedTx = await withRpcHook(
@@ -956,7 +956,7 @@ export class OnboardingBridgeSDK {
                 ...toScVals([options.asset, options.amount]),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1039,7 +1039,7 @@ export class OnboardingBridgeSDK {
                 ...toScVals([options.asset, options.amount, options.to]),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1445,7 +1445,7 @@ export class OnboardingBridgeSDK {
                 ...toScVals([newFeeBps]),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1507,7 +1507,7 @@ export class OnboardingBridgeSDK {
                 nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(nonce), { type: 'u64' }),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1570,7 +1570,7 @@ export class OnboardingBridgeSDK {
                 nativeToScVal(BigInt(amountPerFund), { type: 'i128' }),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1630,7 +1630,7 @@ export class OnboardingBridgeSDK {
                 xdr.ScVal.scvVec(tiers.map((tier) => this.feeTierToScVal(tier))),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1709,7 +1709,7 @@ export class OnboardingBridgeSDK {
                 ...toScVals([newFeeCollector]),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1789,7 +1789,7 @@ export class OnboardingBridgeSDK {
                 ...toScVals([newAdmin]),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1854,7 +1854,7 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call('upgrade', wasmHashScVal),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1938,7 +1938,7 @@ export class OnboardingBridgeSDK {
                 sigsScVal,
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1993,7 +1993,7 @@ export class OnboardingBridgeSDK {
           );
           const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
             .addOperation(this.contract.call('add_relayer', xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex'))))
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
           const preparedTx = await withRpcHook(
             this.hooks,
@@ -2045,7 +2045,7 @@ export class OnboardingBridgeSDK {
           );
           const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
             .addOperation(this.contract.call('remove_relayer', xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex'))))
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
           const preparedTx = await withRpcHook(
             this.hooks,
@@ -2102,7 +2102,7 @@ export class OnboardingBridgeSDK {
           );
           const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
             .addOperation(this.contract.call('set_relayer_threshold', nativeToScVal(threshold, { type: 'u32' })))
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
           const preparedTx = await withRpcHook(
             this.hooks,
@@ -2208,7 +2208,7 @@ export class OnboardingBridgeSDK {
           ),
         );
 
-        const deployTx = txBuilder.setTimeout(30).build();
+        const deployTx = txBuilder.setTimeout(this.config.timeout ?? 30).build();
         const preparedDeployTx = await withRpcHook(
           this.hooks,
           'prepareTransaction',
@@ -2274,7 +2274,7 @@ export class OnboardingBridgeSDK {
                 ]),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedFundTx = await withRpcHook(
@@ -2543,7 +2543,7 @@ export class OnboardingBridgeSDK {
           ]),
         ),
       )
-      .setTimeout(30)
+      .setTimeout(this.config.timeout ?? 30)
       .build();
 
     const result = await this.provider.simulateTransaction(tx);
@@ -2602,7 +2602,7 @@ export class OnboardingBridgeSDK {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(this.contract.call(method, ...args))
-      .setTimeout(30)
+      .setTimeout(this.config.timeout ?? 30)
       .build();
   }
 

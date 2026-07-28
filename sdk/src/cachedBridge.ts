@@ -226,7 +226,7 @@ class ContractClient {
   ): Promise<TransactionResult> {
     const account = await this.provider.getAccount(signer.publicKey());
     const tx = transactionBuilder
-      .setTimeout(30)
+      .setTimeout(this.config.timeout ?? 30)
       .build();
     const preparedTx = await this.provider.prepareTransaction(tx);
     preparedTx.sign(signer);
