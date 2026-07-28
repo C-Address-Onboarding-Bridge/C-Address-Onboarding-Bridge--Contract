@@ -2035,6 +2035,145 @@ mod timelocked_tests {
     }
 }
 
+/********** Commit-reveal funding tests **********/
+
+#[cfg(test)]
+mod commit_reveal_tests {
+    use super::*;
+
+    /// Minimum ledgers that must elapse between commit_fund and reveal_fund.
+    const MIN_DELAY_LEDGERS: u32 = 5;
+
+    fn setup_commit_reveal(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, Address) {
+        let (bridge_id, token_id) = register_all_contracts_mocked(env);
+        let bridge = create_bridge_client(env, &bridge_id);
+        let (admin, user, fee_collector) = create_test_users(env);
+        init_token(env, &token_id, &admin);
+        bridge.initialize(&admin, &fee_collector, &100u32, &None); // 1% fee
+        bridge.add_asset(&token_id, &None);
+        mint_tokens(env, &token_id, &user, 10_000i128);
+        (bridge, user, token_id)
+    }
+
+    /// Mirrors the contract's `sha256(amount_be16 || nonce_be8)` commitment hash.
+    fn amount_hash(env: &Env, amount: i128, nonce: u64) -> BytesN<32> {
+        let mut preimage = Bytes::new(env);
+        preimage.extend_from_array(&amount.to_be_bytes());
+        preimage.extend_from_array(&nonce.to_be_bytes());
+        env.crypto().sha256(&preimage).into()
+    }
+
+    /// Advances the ledger past the commit-reveal minimum delay.
+    fn advance_past_min_delay(env: &Env) {
+        let seq = env.ledger().sequence();
+        env.ledger().set_sequence_number(seq + MIN_DELAY_LEDGERS);
+    }
+
+    #[test]
+    fn test_commit_reveal_happy_path() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(&env, 500i128, 42u64);
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
+
+        let entry = bridge.query_commitment(&id);
+        assert_eq!(entry.source, user);
+        assert_eq!(entry.target, target);
+        assert!(!entry.revealed);
+
+        advance_past_min_delay(&env);
+        bridge.reveal_fund(&id, &user, &target, &token_id, &500i128, &42u64);
+
+        assert_eq!(check_balance(&env, &token_id, &target), 495i128);
+        assert_eq!(check_balance(&env, &token_id, &user), 9_500i128);
+        assert_eq!(bridge.query_accrued_fees(&token_id), 5i128);
+        assert!(bridge.query_commitment(&id).revealed);
+    }
+
+    #[test]
+    fn test_reveal_before_min_delay_fails() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(&env, 500i128, 7u64);
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
+
+        // Revealed in the same ledger the commitment was created in.
+        assert_eq!(
+            bridge.try_reveal_fund(&id, &user, &target, &token_id, &500i128, &7u64),
+            Err(Ok(BridgeError::CommitmentNotMatured))
+        );
+        assert_eq!(check_balance(&env, &token_id, &target), 0i128);
+    }
+
+    #[test]
+    fn test_reveal_after_deadline_fails() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(&env, 500i128, 9u64);
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &1_500u64);
+
+        advance_past_min_delay(&env);
+        env.ledger().set_timestamp(1_501);
+
+        assert_eq!(
+            bridge.try_reveal_fund(&id, &user, &target, &token_id, &500i128, &9u64),
+            Err(Ok(BridgeError::CommitmentExpired))
+        );
+        assert_eq!(check_balance(&env, &token_id, &target), 0i128);
+    }
+
+    #[test]
+    fn test_reveal_twice_fails() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(&env, 500i128, 11u64);
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
+
+        advance_past_min_delay(&env);
+        bridge.reveal_fund(&id, &user, &target, &token_id, &500i128, &11u64);
+
+        assert_eq!(
+            bridge.try_reveal_fund(&id, &user, &target, &token_id, &500i128, &11u64),
+            Err(Ok(BridgeError::CommitmentAlreadyRevealed))
+        );
+        // Only the first reveal moved funds.
+        assert_eq!(check_balance(&env, &token_id, &target), 495i128);
+    }
+
+    #[test]
+    fn test_reveal_hash_mismatch_fails() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(&env, 500i128, 13u64);
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
+
+        advance_past_min_delay(&env);
+
+        // Committed to 500, revealing 900 with the same nonce.
+        assert_eq!(
+            bridge.try_reveal_fund(&id, &user, &target, &token_id, &900i128, &13u64),
+            Err(Ok(BridgeError::CommitmentHashMismatch))
+        );
+        assert_eq!(check_balance(&env, &token_id, &target), 0i128);
+        assert!(!bridge.query_commitment(&id).revealed);
+    }
+}
+
 /********** Cross-chain Onboarding Tests **********/
 
 #[cfg(test)]
