@@ -137,18 +137,71 @@ stateDiagram-v2
     Upgraded --> Active : (same state, new code)
 ```
 
-### Contract (`contracts/onboarding-bridge/`)
+### System Components
 
-| Function | Description |
-|---|---|
-| `initialize` | Set admin, fee collector, and fee rate |
-| `fund_c_address` | Route tokens from source to a C-address |
-| `batch_fund_c_address` | Fund multiple C-addresses in one tx |
-| `set_fee_bps` / `set_fee_collector` / `set_admin` | Admin management |
-| `withdraw_fees` | Fee collector drains accumulated fees |
-| `query_fee_bps` / `query_fee_collector` / `query_admin` | Read config |
-| `query_balance` | Check any address's token balance |
-| `query_is_initialized` | Check if contract is initialized |
+The contract itself only ever sees direct calls — it has no way to watch
+other chains or push notifications on its own. Two off-chain services fill
+those gaps: the **indexer** and the **relayer**. Both are in-scope for this
+repo per [SECURITY.md](SECURITY.md).
+
+```mermaid
+graph LR
+    subgraph Off-Chain Services
+        Indexer["Indexer\n(indexer/)\nRust · axum + SQLite"]
+        Relayer["Relayer\n(relayer/)\nTypeScript"]
+    end
+
+    subgraph Source Chains
+        EVM["Ethereum / EVM"]
+        SOL["Solana"]
+    end
+
+    subgraph Soroban
+        Bridge["OnboardingBridge\nContract"]
+    end
+
+    Subscriber["Webhook subscribers\n(dashboards, alerting, etc.)"]
+
+    Bridge -->|poll for contract events\nvia Soroban RPC| Indexer
+    Indexer -->|persist events| Indexer
+    Indexer -->|deliver webhook\non new event| Subscriber
+
+    EVM -->|watch for BridgeFund event| Relayer
+    SOL -->|watch for BridgeFund event| Relayer
+    Relayer -->|sign payload hash,\naggregate >= threshold sigs| Relayer
+    Relayer -->|fund_c_address_crosschain| Bridge
+```
+
+#### Indexer (`indexer/`)
+
+A Rust service (axum HTTP server + SQLite) that:
+
+- Polls the Soroban RPC (`poller.rs`) for `OnboardingBridge` contract events
+  (`events.rs`) — funding, batch completion, fee withdrawals, admin changes.
+- Persists every event to its own database (`db.rs`) so historical event
+  data survives independently of the chain's own retention/pruning.
+- Delivers webhooks (`webhook.rs`) to subscribers (dashboards, alerting,
+  accounting systems) whenever a new event is indexed, so consumers don't
+  need to poll the chain themselves.
+
+Configured via `SOROBAN_RPC_URL`, `CONTRACT_ID`, `DATABASE_URL`, and
+`LISTEN_ADDR` environment variables (see `indexer/src/main.rs`).
+
+#### Relayer (`relayer/`)
+
+A TypeScript, multi-signature cross-chain relay service that lets a user
+fund a C-address by sending funds on a *different* chain (Ethereum, Solana,
+etc.) rather than Stellar directly:
+
+1. Watches a source chain for a `BridgeFund` event via a pluggable
+   `ChainListener` (EVM/Solana transports are injected — this file has no
+   direct dependency on ethers.js/web3.js/etc.).
+2. Each relayer node signs the event's canonical payload hash with its own
+   Ed25519 key.
+3. Once at least the configured signature threshold is reached, the
+   aggregated signatures are submitted to the Soroban contract's
+   `fund_c_address_crosschain` method via the SDK — no single relayer can
+   authorize a cross-chain fund on its own.
 
 ### SDK (`sdk/`)
 
