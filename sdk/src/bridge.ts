@@ -21,6 +21,12 @@ import {
   FeeTier,
   WithdrawFeesOptions,
   UpgradeOptions,
+  ScheduleUpgradeOptions,
+  ExecuteUpgradeOptions,
+  CancelUpgradeOptions,
+  PendingUpgrade,
+  ExecuteMetaFundOptions,
+  MetaFundParams,
   ReclaimTokensOptions,
   TransactionResult,
   CrossChainFundOptions,
@@ -28,6 +34,7 @@ import {
   CreateCOptions,
   CreateCAddressResult,
   FundCAddressWithSwapOptions,
+  FundCTimelockedOptions,
   PaginatedResult,
   PaginationOptions,
   CostEstimate,
@@ -1885,6 +1892,181 @@ export class OnboardingBridgeSDK {
     );
   }
 
+  async scheduleUpgrade(
+    options: ScheduleUpgradeOptions,
+    adminKeypair: Keypair,
+  ): Promise<TransactionResult> {
+    return this.submitAdminWasmHashMutation(
+      'scheduleUpgrade',
+      'schedule_upgrade',
+      options.newWasmHash,
+      adminKeypair,
+      options.nonce,
+    );
+  }
+
+  async executeUpgrade(
+    options: ExecuteUpgradeOptions,
+    adminKeypair: Keypair,
+  ): Promise<TransactionResult> {
+    return this.submitAdminWasmHashMutation(
+      'executeUpgrade',
+      'execute_upgrade',
+      options.expectedHash,
+      adminKeypair,
+      options.nonce,
+    );
+  }
+
+  async cancelUpgrade(
+    options: CancelUpgradeOptions,
+    adminKeypair: Keypair,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'cancelUpgrade',
+      { nonce: options.nonce },
+      async () => {
+        try {
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'cancel_upgrade',
+                this.optionalNonceToScVal(options.nonce),
+              ),
+            )
+            .setTimeout(30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'cancel_upgrade' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'cancel_upgrade' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  async queryPendingUpgrade(): Promise<PendingUpgrade | null> {
+    const tx = this.buildSimulationTx('query_pending_upgrade', []);
+    const result = await this.provider.simulateTransaction(tx);
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query pending upgrade: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    if (!scVal) return null;
+
+    const pending = scValToNative(scVal) as any;
+    if (!pending) return null;
+
+    const wasmHash = pending.new_wasm_hash ?? pending.newWasmHash;
+    const executableAfterLedger =
+      pending.executable_after_ledger ?? pending.executableAfterLedger;
+
+    return {
+      newWasmHash: this.bytesToHex(wasmHash),
+      executableAfterLedger: Number(executableAfterLedger),
+    };
+  }
+
+  async executeMetaFund(
+    options: ExecuteMetaFundOptions,
+    relayerKeypair: Keypair,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'executeMetaFund',
+      { source: options.params.source, target: options.params.target, asset: options.params.asset, amount: options.params.amount },
+      async () => {
+        try {
+          assertAccountAddress(options.params.source, 'params.source');
+          assertContractAddress(options.params.target, 'params.target');
+          assertContractAddress(options.params.asset, 'params.asset');
+
+          const relayerAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: relayerKeypair.publicKey() },
+            () => this.provider.getAccount(relayerKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(relayerAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'execute_meta_fund',
+                this.metaFundParamsToScVal(options.params),
+                this.hexBytesToScVal(options.pubkey, 32, 'pubkey'),
+                this.hexBytesToScVal(options.signature, 64, 'signature'),
+              ),
+            )
+            .setTimeout(30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'execute_meta_fund' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(relayerKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'execute_meta_fund' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
   // --- Cross-chain methods ---
 
   /**
@@ -2648,6 +2830,111 @@ export class OnboardingBridgeSDK {
       .addOperation(this.contract.call(method, ...args))
       .setTimeout(30)
       .build();
+  }
+
+  private async submitAdminWasmHashMutation(
+    hookName: string,
+    contractMethod: string,
+    wasmHash: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      hookName,
+      { wasmHash, nonce },
+      async () => {
+        try {
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                contractMethod,
+                this.hexBytesToScVal(wasmHash, 32, 'wasmHash'),
+                this.optionalNonceToScVal(nonce),
+              ),
+            )
+            .setTimeout(30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  private hexBytesToScVal(hex: string, expectedBytes: number, fieldName: string): xdr.ScVal {
+    if (!/^[0-9a-fA-F]+$/.test(hex) || hex.length !== expectedBytes * 2) {
+      throw new Error(`${fieldName} must be a ${expectedBytes}-byte hex string`);
+    }
+    return xdr.ScVal.scvBytes(Buffer.from(hex, 'hex'));
+  }
+
+  private optionalNonceToScVal(nonce?: string | number | bigint): xdr.ScVal {
+    return nonce === undefined
+      ? xdr.ScVal.scvVoid()
+      : nativeToScVal(BigInt(nonce), { type: 'u64' });
+  }
+
+  private metaFundParamsToScVal(params: MetaFundParams): xdr.ScVal {
+    return xdr.ScVal.scvMap([
+      this.scMapEntry('source', new Address(params.source).toScVal()),
+      this.scMapEntry('target', new Address(params.target).toScVal()),
+      this.scMapEntry('asset', new Address(params.asset).toScVal()),
+      this.scMapEntry('amount', nativeToScVal(BigInt(params.amount), { type: 'i128' })),
+      this.scMapEntry('nonce', nativeToScVal(BigInt(params.nonce), { type: 'u64' })),
+      this.scMapEntry('deadline', nativeToScVal(BigInt(params.deadline), { type: 'u64' })),
+    ]);
+  }
+
+  private scMapEntry(key: string, val: xdr.ScVal): xdr.ScMapEntry {
+    return new xdr.ScMapEntry({
+      key: xdr.ScVal.scvSymbol(key),
+      val,
+    });
+  }
+
+  private bytesToHex(value: unknown): string {
+    if (typeof value === 'string') return value;
+    if (value instanceof Uint8Array) return Buffer.from(value).toString('hex');
+    if (Buffer.isBuffer(value)) return value.toString('hex');
+    if (value && typeof (value as any).toString === 'function') {
+      return (value as any).toString('hex');
+    }
+    return '';
   }
 
   private feeTierToScVal(tier: FeeTier): xdr.ScVal {

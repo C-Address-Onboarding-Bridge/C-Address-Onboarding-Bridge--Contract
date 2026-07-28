@@ -354,6 +354,49 @@ export interface UpgradeOptions {
   newWasmHash: string;
 }
 
+export interface ScheduleUpgradeOptions extends UpgradeOptions {
+  /** Optional admin nonce consumed by the contract. */
+  nonce?: string | number | bigint;
+}
+
+export interface ExecuteUpgradeOptions {
+  /** 32-byte WASM hash expected to be pending, as a 64-character hex string. */
+  expectedHash: string;
+
+  /** Optional admin nonce consumed by the contract. */
+  nonce?: string | number | bigint;
+}
+
+export interface CancelUpgradeOptions {
+  /** Optional admin nonce consumed by the contract. */
+  nonce?: string | number | bigint;
+}
+
+export interface PendingUpgrade {
+  /** Pending 32-byte WASM hash as a 64-character hex string. */
+  newWasmHash: string;
+
+  /** Ledger sequence at or after which the upgrade can execute. */
+  executableAfterLedger: number;
+}
+
+export interface MetaFundParams {
+  source: string;
+  target: string;
+  asset: string;
+  amount: string | number | bigint;
+  nonce: string | number | bigint;
+  deadline: string | number | bigint;
+}
+
+export interface ExecuteMetaFundOptions {
+  params: MetaFundParams;
+  /** 32-byte Ed25519 public key as hex. */
+  pubkey: string;
+  /** 64-byte Ed25519 signature as hex. */
+  signature: string;
+}
+
 /**
  * Options for reclaiming tokens accidentally sent directly to the contract
  * address via {@link OnboardingBridgeSDK.reclaimTokens}.
