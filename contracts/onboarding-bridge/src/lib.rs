@@ -1839,8 +1839,10 @@ impl OnboardingBridge {
 
     /// Returns the configured minimum transfer amount.
     ///
-    /// > **Note:** Currently always returns `0` because the persistence layer
-    /// > is a stub. See `set_minimum_amount` for details.
+    /// Returns the value last stored by `set_minimum_amount`, or `0` (no
+    /// minimum) if it has never been called. The minimum is enforced by
+    /// `fund_c_address`, which rejects amounts below it with
+    /// [`BridgeError::InvalidAmount`].
     ///
     /// # Errors
     ///
