@@ -922,8 +922,16 @@ fn test_reclaim_cannot_drain_active_timelocks() {
 
     // 500 tokens locked in an unclaimed timelock; nothing else in the balance.
     let release_time = 1_100u64;
-    let id =
-        bridge.fund_c_address_timelocked(&user, &target, &token_id, &500i128, &release_time, &0u64);
+    let id = bridge.fund_c_address_timelocked(
+        &user,
+        &target,
+        &token_id,
+        &500i128,
+        &release_time,
+        &0u64,
+        &None,
+        &None,
+    );
     assert_eq!(check_balance(&env, &token_id, &bridge.address), 500i128);
 
     // Locked funds cannot be reclaimed at all before the timelock is claimed.
@@ -1433,6 +1441,8 @@ fn test_swap_rejects_non_whitelisted_pool() {
             &500i128,
             &400i128,
             &swap_route,
+            &None,
+            &None,
         ),
         Err(Ok(BridgeError::PoolNotWhitelisted))
     );
@@ -1464,6 +1474,8 @@ fn test_swap_multi_hop_route_rejected() {
             &500i128,
             &400i128,
             &swap_route,
+            &None,
+            &None,
         ),
         Err(Ok(BridgeError::MultiHopNotSupported))
     );
@@ -1490,8 +1502,114 @@ fn test_swap_happy_path_single_hop() {
         &500i128,
         &400i128,
         &swap_route,
+        &None,
+        &None,
     );
 
+    assert_eq!(check_balance(&env, &target_token_id, &target), 500i128);
+}
+
+#[test]
+fn test_swap_nonce_replay_rejected() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &target_token_id, &1i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+
+    bridge.fund_c_address_with_swap(
+        &user,
+        &target,
+        &source_token_id,
+        &target_token_id,
+        &500i128,
+        &400i128,
+        &swap_route,
+        &Some(0u64),
+        &None,
+    );
+    assert_eq!(bridge.query_nonce(&user), 1u64);
+
+    // Reusing nonce=0 is rejected.
+    let target2 = Address::generate(&env);
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target2,
+            &source_token_id,
+            &target_token_id,
+            &500i128,
+            &400i128,
+            &swap_route,
+            &Some(0u64),
+            &None,
+        ),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+}
+
+#[test]
+fn test_swap_deadline_expired_reverts() {
+    let env = Env::default();
+    env.ledger().set_timestamp(2_000);
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &target_token_id, &1i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target,
+            &source_token_id,
+            &target_token_id,
+            &500i128,
+            &400i128,
+            &swap_route,
+            &None,
+            &Some(1_999u64),
+        ),
+        Err(Ok(BridgeError::TransactionExpired))
+    );
+    // Nothing was pulled from the user since the deadline check runs first.
+    assert_eq!(check_balance(&env, &source_token_id, &user), 1_000i128);
+}
+
+#[test]
+fn test_swap_deadline_in_future_passes() {
+    let env = Env::default();
+    env.ledger().set_timestamp(2_000);
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &target_token_id, &1i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+
+    bridge.fund_c_address_with_swap(
+        &user,
+        &target,
+        &source_token_id,
+        &target_token_id,
+        &500i128,
+        &400i128,
+        &swap_route,
+        &None,
+        &Some(3_000u64),
+    );
     assert_eq!(check_balance(&env, &target_token_id, &target), 500i128);
 }
 
@@ -2233,6 +2351,8 @@ mod timelocked_tests {
             &500i128,
             &release_time,
             &0u64,
+            &None,
+            &None,
         );
 
         env.ledger().set_timestamp(release_time + 1);
@@ -2256,6 +2376,8 @@ mod timelocked_tests {
             &500i128,
             &(2_100u64),
             &0u64,
+            &None,
+            &None,
         );
 
         assert_eq!(
@@ -2279,6 +2401,8 @@ mod timelocked_tests {
                 &500i128,
                 &3_100u64,
                 &3_101u64,
+                &None,
+                &None,
             ),
             Err(Ok(BridgeError::InvalidReleaseTime))
         );
@@ -2299,6 +2423,8 @@ mod timelocked_tests {
                 &500i128,
                 &4_000u64,
                 &0u64,
+                &None,
+                &None,
             ),
             Err(Ok(BridgeError::InvalidReleaseTime))
         );
@@ -2319,6 +2445,8 @@ mod timelocked_tests {
             &500i128,
             &release_time,
             &0u64,
+            &None,
+            &None,
         );
 
         env.ledger().set_timestamp(release_time + 1);
@@ -2339,6 +2467,86 @@ mod timelocked_tests {
             bridge.try_query_timelocked(&999_999u64),
             Err(Ok(BridgeError::TimelockNotFound))
         );
+    }
+
+    #[test]
+    fn test_timelocked_nonce_replay_rejected() {
+        let env = Env::default();
+        env.ledger().set_timestamp(6_000);
+        let (bridge, user, token_id, _fee_collector, _admin) = setup_timelocked(&env);
+        let target = Address::generate(&env);
+        let release_time = 6_100u64;
+
+        bridge.fund_c_address_timelocked(
+            &user,
+            &target,
+            &token_id,
+            &500i128,
+            &release_time,
+            &0u64,
+            &Some(0u64),
+            &None,
+        );
+        assert_eq!(bridge.query_nonce(&user), 1u64);
+
+        // Reusing nonce=0 is rejected.
+        let target2 = Address::generate(&env);
+        assert_eq!(
+            bridge.try_fund_c_address_timelocked(
+                &user,
+                &target2,
+                &token_id,
+                &500i128,
+                &release_time,
+                &0u64,
+                &Some(0u64),
+                &None,
+            ),
+            Err(Ok(BridgeError::DuplicateNonce))
+        );
+    }
+
+    #[test]
+    fn test_timelocked_deadline_expired_reverts() {
+        let env = Env::default();
+        env.ledger().set_timestamp(7_000);
+        let (bridge, user, token_id, _fee_collector, _admin) = setup_timelocked(&env);
+        let target = Address::generate(&env);
+
+        assert_eq!(
+            bridge.try_fund_c_address_timelocked(
+                &user,
+                &target,
+                &token_id,
+                &500i128,
+                &7_100u64,
+                &0u64,
+                &None,
+                &Some(6_999u64),
+            ),
+            Err(Ok(BridgeError::TransactionExpired))
+        );
+    }
+
+    #[test]
+    fn test_timelocked_deadline_in_future_passes() {
+        let env = Env::default();
+        env.ledger().set_timestamp(8_000);
+        let (bridge, user, token_id, _fee_collector, _admin) = setup_timelocked(&env);
+        let target = Address::generate(&env);
+
+        let id = bridge.fund_c_address_timelocked(
+            &user,
+            &target,
+            &token_id,
+            &500i128,
+            &8_100u64,
+            &0u64,
+            &None,
+            &Some(9_000u64),
+        );
+        assert_eq!(check_balance(&env, &token_id, &bridge.address), 500i128);
+        let _ = id;
     }
 }
 

@@ -3796,6 +3796,9 @@ impl OnboardingBridge {
     /// * `cliff_time` (`u64`) — Optional cliff timestamp. If > 0 it must be
     ///   ≤ `release_time`. Currently informational only; not enforced by
     ///   `claim_timelocked`.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for `source`.
+    /// * `deadline` (`Option<u64>`) — Optional Unix timestamp (seconds) after
+    ///   which the call is rejected. Pass `None` for no expiry.
     ///
     /// # Authorization
     ///
@@ -3810,6 +3813,7 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::TransactionExpired`] — `deadline` is in the past.
     /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
     /// * [`BridgeError::InvalidReleaseTime`] — `release_time` ≤ current timestamp,
     ///   or `cliff_time > release_time`.
@@ -3817,6 +3821,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode on and `target`
     ///   is not allowlisted.
     /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     ///
     /// # Events
     ///
@@ -3836,10 +3841,17 @@ impl OnboardingBridge {
         amount: i128,
         release_time: u64,
         cliff_time: u64,
+        nonce: Option<u64>,
+        deadline: Option<u64>,
     ) -> Result<u64, BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
         check_not_paused(&env)?;
+        if let Some(d) = deadline {
+            if env.ledger().timestamp() > d {
+                return Err(BridgeError::TransactionExpired);
+            }
+        }
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -3853,6 +3865,7 @@ impl OnboardingBridge {
         check_access(&env, &target)?;
         check_asset_whitelisted(&env, &asset)?;
         source.require_auth();
+        consume_nonce(&env, &source, nonce)?;
         extend_instance_ttl(&env);
 
         token::Client::new(&env, &asset)
@@ -4769,10 +4782,17 @@ impl OnboardingBridge {
         source_amount: i128,
         min_target_amount: i128,
         swap_route: Vec<Address>,
+        nonce: Option<u64>,
+        deadline: Option<u64>,
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
         check_not_paused(&env)?;
+        if let Some(d) = deadline {
+            if env.ledger().timestamp() > d {
+                return Err(BridgeError::TransactionExpired);
+            }
+        }
 
         if source_amount <= 0 || min_target_amount <= 0 {
             return Err(BridgeError::InvalidAmount);
@@ -4792,6 +4812,7 @@ impl OnboardingBridge {
         check_pool_whitelisted(&env, &pool)?;
 
         source.require_auth();
+        consume_nonce(&env, &source, nonce)?;
         extend_instance_ttl(&env);
 
         let contract_addr = env.current_contract_address();
