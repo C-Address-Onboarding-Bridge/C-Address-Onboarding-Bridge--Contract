@@ -12,6 +12,7 @@ import {
   BridgeConfig,
   FundCOptions,
   FundCAddressWithReferralOptions,
+  FundCTimelockedOptions,
   BatchFundCOptions,
   BatchProgressCallback,
   CommitFundOptions,
@@ -185,7 +186,7 @@ export class OnboardingBridgeSDK {
     return withTransactionHooks(
       this.hooks,
       'fundCAddress',
-      { source: options.source, target: options.target, asset: options.asset, amount: options.amount },
+      { source: options.source, target: options.target, asset: options.asset, amount: options.amount, nonce: options.nonce, deadline: options.deadline },
       async () => {
         try {
           assertAccountAddress(options.source, 'source');
@@ -197,6 +198,13 @@ export class OnboardingBridgeSDK {
             { address: options.source },
             () => this.provider.getAccount(options.source),
           );
+
+          const nonceScVal = options.nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+          const deadlineScVal = options.deadline === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
 
           const tx = new TransactionBuilder(sourceAccount, {
             fee: BASE_FEE,
@@ -211,6 +219,8 @@ export class OnboardingBridgeSDK {
                   options.asset,
                   options.amount,
                 ]),
+                nonceScVal,
+                deadlineScVal,
               ),
             )
             .setTimeout(30)
@@ -812,7 +822,7 @@ export class OnboardingBridgeSDK {
     return withTransactionHooks(
       this.hooks,
       'batchFundCAddresses',
-      { source: options.source, targetCount: options.targets.length, asset: options.asset },
+      { source: options.source, targetCount: options.targets.length, asset: options.asset, nonce: options.nonce, deadline: options.deadline },
       async () => {
         // Validate inputs before splitting so we fail fast on bad input.
         try {
@@ -826,6 +836,13 @@ export class OnboardingBridgeSDK {
         const total = options.targets.length;
         const results: TransactionResult[] = [];
         let completed = 0;
+
+        const nonceScVal = options.nonce === undefined
+          ? xdr.ScVal.scvVoid()
+          : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+        const deadlineScVal = options.deadline === undefined
+          ? xdr.ScVal.scvVoid()
+          : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
 
         // Split targets/amounts into chunks of at most BATCH_TX_LIMIT.
         for (let offset = 0; offset < total; offset += BATCH_TX_LIMIT) {
@@ -854,6 +871,8 @@ export class OnboardingBridgeSDK {
                     chunkAmounts,
                     options.asset,
                   ]),
+                  nonceScVal,
+                  deadlineScVal,
                 ),
               )
               .setTimeout(30)
@@ -1415,6 +1434,7 @@ export class OnboardingBridgeSDK {
   async setFee(
     newFeeBps: number,
     adminKeypair: Keypair,
+    nonce?: string | number | bigint,
   ): Promise<TransactionResult> {
     if (newFeeBps < 0 || newFeeBps > 1000) {
       throw new Error('Fee basis points must be between 0 and 1000');
@@ -1423,7 +1443,7 @@ export class OnboardingBridgeSDK {
     return withTransactionHooks(
       this.hooks,
       'setFee',
-      { newFeeBps },
+      { newFeeBps, nonce },
       async () => {
         try {
           const adminAccount = await withRpcHook(
@@ -1433,6 +1453,10 @@ export class OnboardingBridgeSDK {
             () => this.provider.getAccount(adminKeypair.publicKey()),
           );
 
+          const nonceScVal = nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(nonce), { type: 'u64' });
+
           const tx = new TransactionBuilder(adminAccount, {
             fee: BASE_FEE,
             networkPassphrase: this.networkPassphrase,
@@ -1440,7 +1464,8 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'set_fee_bps',
-                ...this.toScVals([newFeeBps]),
+                nativeToScVal(newFeeBps, { type: 'u32' }),
+                nonceScVal,
               ),
             )
             .setTimeout(30)
@@ -1682,11 +1707,12 @@ export class OnboardingBridgeSDK {
   async setFeeCollector(
     newFeeCollector: string,
     adminKeypair: Keypair,
+    nonce?: string | number | bigint,
   ): Promise<TransactionResult> {
     return withTransactionHooks(
       this.hooks,
       'setFeeCollector',
-      { newFeeCollector },
+      { newFeeCollector, nonce },
       async () => {
         try {
           assertAccountAddress(newFeeCollector, 'newFeeCollector');
@@ -1697,6 +1723,10 @@ export class OnboardingBridgeSDK {
             () => this.provider.getAccount(adminKeypair.publicKey()),
           );
 
+          const nonceScVal = nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(nonce), { type: 'u64' });
+
           const tx = new TransactionBuilder(adminAccount, {
             fee: BASE_FEE,
             networkPassphrase: this.networkPassphrase,
@@ -1704,7 +1734,8 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'set_fee_collector',
-                ...this.toScVals([newFeeCollector]),
+                new Address(newFeeCollector).toScVal(),
+                nonceScVal,
               ),
             )
             .setTimeout(30)
@@ -1762,11 +1793,12 @@ export class OnboardingBridgeSDK {
   async setAdmin(
     newAdmin: string,
     adminKeypair: Keypair,
+    nonce?: string | number | bigint,
   ): Promise<TransactionResult> {
     return withTransactionHooks(
       this.hooks,
       'setAdmin',
-      { newAdmin },
+      { newAdmin, nonce },
       async () => {
         try {
           assertAccountAddress(newAdmin, 'newAdmin');
@@ -1777,6 +1809,10 @@ export class OnboardingBridgeSDK {
             () => this.provider.getAccount(adminKeypair.publicKey()),
           );
 
+          const nonceScVal = nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(nonce), { type: 'u64' });
+
           const tx = new TransactionBuilder(adminAccount, {
             fee: BASE_FEE,
             networkPassphrase: this.networkPassphrase,
@@ -1784,7 +1820,8 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'set_admin',
-                ...this.toScVals([newAdmin]),
+                new Address(newAdmin).toScVal(),
+                nonceScVal,
               ),
             )
             .setTimeout(30)
