@@ -145,6 +145,8 @@ pub enum BridgeError {
     MetaTxNonceAlreadyUsed = 39,
     /// The contract is deactivated (permanently paused/migrated).
     ContractDeactivated = 40,
+    /// The same relayer pubkey appeared more than once in `sigs`.
+    DuplicateRelayerSignature = 41,
 }
 
 // ---------------------------------------------------------------------------
@@ -3274,6 +3276,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::ReplayedNonce`] — This `(chain_id, tx_hash)` combination
     ///   has already been processed.
     /// * [`BridgeError::NotRelayer`] — A signature's pubkey is not a registered relayer.
+    /// * [`BridgeError::DuplicateRelayerSignature`] — The same relayer pubkey
+    ///   appears more than once in `sigs`.
     /// * [`BridgeError::BelowThreshold`] — Fewer than `threshold` valid signatures.
     ///
     /// # Events
@@ -3286,10 +3290,10 @@ impl OnboardingBridge {
     /// marked used before the token transfer, preventing replay attacks. An
     /// invalid Ed25519 signature causes a host-level trap (panic) rather than
     /// returning an error code, so callers should pre-validate signatures
-    /// off-chain. The contract does not verify that `sigs` contains distinct
-    /// pubkeys — a single relayer submitting the same signature twice counts
-    /// as two signatures and could satisfy a threshold of 2. Callers and
-    /// relayer infrastructure should deduplicate signatures before submission.
+    /// off-chain. The contract verifies that `sigs` contains distinct
+    /// pubkeys — a relayer submitting the same signature twice only counts
+    /// once toward the threshold; duplicates are rejected with
+    /// [`BridgeError::DuplicateRelayerSignature`].
     pub fn fund_c_address_crosschain(
         env: Env,
         chain_id: u32,
@@ -3351,17 +3355,25 @@ impl OnboardingBridge {
 
         let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
 
-        // Verify M-of-N relayer signatures
+        // Verify M-of-N relayer signatures. Each relayer pubkey may only be
+        // counted once — track pubkeys already seen and reject duplicates so
+        // a single relayer's signature submitted twice cannot satisfy a
+        // threshold of 2 (or more).
         let threshold = relayer_threshold(&env);
         let mut valid: u32 = 0;
+        let mut seen_pubkeys: Vec<BytesN<32>> = Vec::new(&env);
         for i in 0..sigs.len() {
             let sig = sigs.get(i).unwrap();
             if !is_relayer(&env, &sig.pubkey) {
                 return Err(BridgeError::NotRelayer);
             }
+            if seen_pubkeys.contains(&sig.pubkey) {
+                return Err(BridgeError::DuplicateRelayerSignature);
+            }
             // Panics (traps) on invalid sig — convert to error via try pattern
             env.crypto()
                 .ed25519_verify(&sig.pubkey, &payload_hash.clone().into(), &sig.signature);
+            seen_pubkeys.push_back(sig.pubkey.clone());
             valid += 1;
         }
         if valid < threshold {

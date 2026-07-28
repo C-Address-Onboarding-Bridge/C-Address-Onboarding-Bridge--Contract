@@ -2285,6 +2285,32 @@ mod crosschain_tests {
             Err(Ok(BridgeError::BelowThreshold))
         );
     }
+
+    #[test]
+    fn test_crosschain_duplicate_relayer_signature_rejected() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+
+        let sk1 = make_signing_key([1u8; 32]);
+        let sk2 = make_signing_key([2u8; 32]);
+
+        bridge.add_relayer(&BytesN::from_array(&env, sk1.verifying_key().as_bytes()));
+        bridge.add_relayer(&BytesN::from_array(&env, sk2.verifying_key().as_bytes()));
+        bridge.set_relayer_threshold(&2u32);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0x33; 32]);
+
+        let payload_hash = build_payload_hash(&env, 1, &tx_hash, &target, &token_id, 100);
+        // Same relayer's signature submitted twice must not satisfy a threshold of 2.
+        let sig = make_relayer_sig(&env, &sk1, &payload_hash);
+        let sigs = Vec::from_array(&env, [sig.clone(), sig]);
+
+        assert_eq!(
+            bridge.try_fund_c_address_crosschain(&1u32, &tx_hash, &target, &token_id, &100i128, &sigs),
+            Err(Ok(BridgeError::DuplicateRelayerSignature))
+        );
+    }
 }
 
 /********** Referral system tests **********/
