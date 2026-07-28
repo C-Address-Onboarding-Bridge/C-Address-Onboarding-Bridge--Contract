@@ -104,6 +104,10 @@ The following components and attack surfaces are within scope for security resea
 | **Relayer** (`relayer/`) | TypeScript | Authentication bypasses, relay manipulation, replay attacks, insecure configuration handling |
 | **Deployment Scripts** (`scripts/`) | TypeScript | Secret key exposure, insecure configuration, supply chain attacks |
 
+Security-relevant tests for the Indexer and Relayer should cover the
+vulnerability classes listed above. See `TESTING.md` for the expected indexer
+and relayer testing strategy once their test harnesses are added.
+
 ### Out of Scope
 
 The following are **not** eligible for vulnerability reports under this policy:

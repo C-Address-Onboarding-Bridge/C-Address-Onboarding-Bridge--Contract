@@ -6,6 +6,8 @@ This document describes the testing strategy and how to contribute tests to the 
 
 - [Contract Tests](#contract-tests)
 - [SDK Tests](#sdk-tests)
+- [Indexer Tests](#indexer-tests)
+- [Relayer Tests](#relayer-tests)
 - [Running Tests](#running-tests)
 - [Test Checklist](#test-checklist)
 - [Best Practices](#best-practices)
@@ -403,6 +405,54 @@ it('should calculate fee correctly', () => {
   // Assert
   expect(fee).toBe('10');
 });
+```
+
+## Indexer Tests
+
+The indexer is a Rust service under `indexer/`. It currently has no committed
+test harness, so new infrastructure should start with focused unit tests around
+event parsing, database writes, replay queries, and webhook queueing before
+adding end-to-end polling tests.
+
+Recommended coverage once test infrastructure exists:
+
+- Unit-test event decoding and normalization without network calls.
+- Use a temporary SQLite database for database migration, insert, query, and
+  replay behavior.
+- Mock Soroban RPC responses for poller tests so ledger ordering and retry
+  behavior are deterministic.
+- Mock webhook delivery endpoints and assert retry/queue state, not external
+  provider behavior.
+- Exercise `/health`, `/api/events`, `/api/subscriptions`, and `/api/replay`
+  with an Axum test server.
+
+Expected command shape:
+
+```bash
+cargo test --manifest-path indexer/Cargo.toml
+```
+
+## Relayer Tests
+
+The relayer is a TypeScript service under `relayer/`. It currently shares the
+repository TypeScript toolchain but has no dedicated test suite. Add tests around
+signature verification, replay protection inputs, chain listener parsing, and
+Soroban transaction submission boundaries.
+
+Recommended coverage once test infrastructure exists:
+
+- Unit-test event payload normalization for each supported source chain.
+- Mock RPC/WebSocket clients and Soroban SDK calls; do not hit live networks in
+  normal CI.
+- Verify threshold handling and duplicate signature rejection.
+- Verify required environment variables fail fast with clear errors.
+- Add integration tests only after local chain simulators or deterministic
+  fixtures are available.
+
+Expected command shape:
+
+```bash
+npm test -- relayer
 ```
 
 ## Running Tests

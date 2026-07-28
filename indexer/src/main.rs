@@ -26,7 +26,8 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env().add_directive("bridge_indexer=info".parse().unwrap()))
         .init();
 
-    let rpc_url = std::env::var("SOROBAN_RPC_URL")
+    let rpc_url = std::env::var("STELLAR_RPC_URL")
+        .or_else(|_| std::env::var("SOROBAN_RPC_URL"))
         .unwrap_or_else(|_| "https://soroban-testnet.stellar.org".to_string());
     let contract_id = std::env::var("CONTRACT_ID").expect("CONTRACT_ID must be set");
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:indexer.db".to_string());

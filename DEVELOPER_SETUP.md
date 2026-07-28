@@ -58,11 +58,12 @@ cd sdk && npm install && cd ..
 docker compose up -d
 ```
 
-This starts four services:
+This starts five services:
 
 | Service | Port | Description |
 |---|---|---|
 | `api` | 3000 | Relayer service with ts-node-dev hot reload |
+| `indexer` | 3001 | Rust indexer API and webhook delivery worker |
 | `postgres` | 5432 | Event store and reconciliation DB |
 | `redis` | 6379 | Nonce deduplication cache |
 | `soroban` | 8000 | Stellar + Soroban local sandbox |
@@ -78,6 +79,7 @@ View logs (all services or a specific one):
 ```bash
 docker compose logs -f
 docker compose logs -f api
+docker compose logs -f indexer
 ```
 
 Stop the stack:
@@ -203,6 +205,7 @@ Workspace settings (`.vscode/settings.json`) are already configured for:
 | Variable | Required | Description |
 |---|---|---|
 | `STELLAR_RPC_URL` | ✅ | Soroban JSON-RPC endpoint |
+| `SOROBAN_RPC_URL` | optional | Backwards-compatible alias for indexer RPC URL |
 | `NETWORK_PASSPHRASE` | ✅ | Stellar network passphrase |
 | `CONTRACT_ID` | ✅ | Deployed bridge contract C-address |
 | `ADMIN_SECRET_KEY` | ✅ | Admin keypair secret (load from secrets manager in prod) |
@@ -212,6 +215,7 @@ Workspace settings (`.vscode/settings.json`) are already configured for:
 | `THRESHOLD` | ✅ | Minimum signatures required (must match on-chain value) |
 | `DATABASE_URL` | ✅ | PostgreSQL connection string |
 | `REDIS_URL` | ✅ | Redis connection string |
+| `LISTEN_ADDR` | ✅ | Indexer bind address, for example `0.0.0.0:3001` |
 | `ETH_RPC_URL` | optional | Ethereum JSON-RPC endpoint |
 | `ETH_BRIDGE_CONTRACT` | optional | Ethereum bridge contract address |
 | `ETH_EVENT_TOPIC` | optional | keccak256 of the BridgeFund event signature |
@@ -297,6 +301,9 @@ docker compose down -v && docker compose up -d
 │       └── __tests__/          # SDK unit tests
 ├── relayer/
 │   └── index.ts                # Off-chain relayer service
+├── indexer/
+│   ├── Cargo.toml              # Rust indexer crate
+│   └── src/                    # Event polling API and webhook workers
 ├── scripts/
 │   └── deploy.ts               # Deploy + initialize script
 ├── .husky/

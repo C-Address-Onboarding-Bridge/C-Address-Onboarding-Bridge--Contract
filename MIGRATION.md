@@ -56,10 +56,13 @@ Some versions may require storage schema changes. See [Storage Migration Steps](
 
 #### Step 3: Execute Upgrade Transaction
 
-The contract uses a governance-grade timelocked upgrade path:
+The current SDK exposes the contract's direct admin-only `upgrade` entrypoint.
+Upload the new WASM to the target network first, then pass the resulting 32-byte
+WASM hash to `sdk.upgrade`.
 
 ```typescript
 import { OnboardingBridgeSDK } from '@stellar/c-address-onboarding-bridge-sdk';
+import { Keypair } from '@stellar/stellar-sdk';
 
 const sdk = new OnboardingBridgeSDK({
   contractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4',
@@ -67,26 +70,20 @@ const sdk = new OnboardingBridgeSDK({
   networkPassphrase: 'Public Global Stellar Network ; September 2015',
 });
 
-// Step 1: Request upgrade (requires admin)
-const upgradeId = await sdk.requestUpgrade(
-  adminKeypair,
+const adminKeypair = Keypair.fromSecret(process.env.ADMIN_SECRET_KEY!);
+
+const result = await sdk.upgrade(
   {
     newWasmHash: 'new_wasm_hash_hex',
-    timelockDays: 7  // Standard 7-day timelock for production
-  }
-);
-
-// Step 2: Wait for timelock period
-console.log(`Upgrade scheduled. ID: ${upgradeId}`);
-console.log('Upgrade can be executed after 7 days');
-
-// Step 3: Execute upgrade (after timelock)
-const txResult = await sdk.executeUpgrade(
+  },
   adminKeypair,
-  { upgradeId }
 );
 
-console.log(`Upgrade complete. TX: ${txResult.hash}`);
+if (result.status === 'failed') {
+  throw new Error(result.error);
+}
+
+console.log(`Upgrade submitted. TX: ${result.hash}`);
 ```
 
 #### Step 4: Verify Contract Upgrade
@@ -169,34 +166,37 @@ No migration needed. Instance storage persists across upgrades in the same accou
 
 #### For Schema Changes (v0.1.0 → v1.0.0, Planned)
 
-If storage schema changes, a migration transaction will be required:
+If storage schema changes, write and deploy a contract version that performs the
+required migration as part of its on-chain upgrade path. Before submitting the
+upgrade, capture the existing queryable state with the SDK methods that exist
+today.
 
 ```typescript
-// Example migration (hypothetical v0.1.0 → v1.0.0)
-async function migrateContractData(adminKeypair: Keypair) {
+async function upgradeWithStateSnapshot(adminKeypair: Keypair, newWasmHash: string) {
   const sdk = new OnboardingBridgeSDK(CONFIG);
-  
-  // 1. Backup current state
-  const backupState = await sdk.dumpState();
+
+  const backupState = {
+    admin: await sdk.getAdmin(),
+    feeCollector: await sdk.getFeeCollector(),
+    feeBps: await sdk.getFee(),
+    initialized: await sdk.isInitialized(),
+  };
   fs.writeFileSync('state_backup_v0.1.0.json', JSON.stringify(backupState));
-  
-  // 2. Execute migration transaction
-  const result = await sdk.migrateStorage(adminKeypair, {
-    fromVersion: '0.1.0',
-    toVersion: '1.0.0',
-    backupPath: 'state_backup_v0.1.0.json'
-  });
-  
-  console.log(`Migration complete: ${result.hash}`);
-  
-  // 3. Verify state integrity
-  const verifyResult = await sdk.verifyMigration({
-    expectedCount: backupState.entries.length,
-    expectedHash: backupState.stateHash
-  });
-  
-  if (!verifyResult.valid) {
-    throw new Error('Migration verification failed');
+
+  const result = await sdk.upgrade({ newWasmHash }, adminKeypair);
+  if (result.status === 'failed') {
+    throw new Error(result.error);
+  }
+
+  const postUpgradeState = {
+    admin: await sdk.getAdmin(),
+    feeCollector: await sdk.getFeeCollector(),
+    feeBps: await sdk.getFee(),
+    initialized: await sdk.isInitialized(),
+  };
+
+  if (postUpgradeState.admin !== backupState.admin) {
+    throw new Error('Admin changed unexpectedly during upgrade');
   }
 }
 ```
@@ -206,20 +206,9 @@ async function migrateContractData(adminKeypair: Keypair) {
 Persistent storage entries have time-to-live (TTL) values. Before a long maintenance window:
 
 ```typescript
-// Extend TTL for all persistent entries
-async function extendAllTTLs(adminKeypair: Keypair) {
-  const sdk = new OnboardingBridgeSDK(CONFIG);
-  
-  // Extend for 6 months (default)
-  await sdk.extendPersistentTTL(adminKeypair, {
-    durationDays: 180
-  });
-  
-  console.log('All persistent storage TTLs extended');
-}
-
-// Call before maintenance window
-await extendAllTTLs(adminKeypair);
+// The SDK does not currently expose a bulk TTL extension helper.
+// Use Stellar CLI or a purpose-built maintenance script to extend each
+// persistent ledger entry required by the migration.
 ```
 
 ## Testing Upgrades on Testnet
@@ -228,7 +217,7 @@ await extendAllTTLs(adminKeypair);
 
 ```bash
 # 1. Build contract
-cargo build -p onboarding-bridge --release --target wasm32-unknown-unsigned
+cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
 
 # 2. Deploy current version to testnet
 soroban contract deploy \
@@ -260,35 +249,32 @@ npm run test:smoke
 const newWasmPath = 'target/wasm32-unknown-unknown/release/onboarding_bridge_v0.2.0.wasm';
 const newWasmHash = await calculateWasmHash(fs.readFileSync(newWasmPath));
 
-// 2. Request upgrade with short timelock (1 minute for testing)
-const upgradeId = await sdk.requestUpgrade(testAdminKeypair, {
+// 2. Submit upgrade on testnet
+const txResult = await sdk.upgrade({
   newWasmHash: newWasmHash,
-  timelockDays: 0.001  // 1 minute for testing
-});
+}, testAdminKeypair);
 
-// 3. Wait for timelock
-await sleep(60000);
-
-// 4. Execute upgrade
-const txResult = await sdk.executeUpgrade(testAdminKeypair, { upgradeId });
-
-// 5. Verify upgrade
-const postUpgradeState = await sdk.dumpState();
-assert.deepEqual(
+// 3. Verify upgrade
+const postUpgradeState = {
+  admin: await sdk.getAdmin(),
+  feeBps: await sdk.getFee(),
+  initialized: await sdk.isInitialized(),
+};
+assert.equal(
   preUpgradeState.admin,
   postUpgradeState.admin,
   'Admin should persist across upgrade'
 );
 
-// 6. Verify functionality
-const fundTx = await sdk.fundCAddress(testUserKeypair, {
+// 4. Verify functionality
+const fundTx = await sdk.fundCAddress({
   source: testUserAddress,
   target: testCAddress,
   asset: testTokenAddress,
   amount: '1000'
-});
+}, testUserKeypair);
 
-assert.equal(fundTx.status, 'PENDING');
+assert.equal(fundTx.status, 'pending');
 ```
 
 ### Step 4: Stress Test
@@ -330,21 +316,19 @@ If critical bugs are discovered during the timelocked upgrade window:
 // Once the buggy timelock expires (no action needed):
 // The upgrade request will become invalid and expire.
 
-// Then request new upgrade with fix:
-const fixedUpgradeId = await sdk.requestUpgrade(adminKeypair, {
+// Then submit the corrected upgrade:
+const fixedUpgrade = await sdk.upgrade({
   newWasmHash: fixedWasmHash,
-  timelockDays: 7
-});
+}, adminKeypair);
 ```
 
 ### Emergency Rollback (After Upgrade Deployed)
 
 If the upgraded contract has a critical issue:
 
-1. **Pause the contract** — Prevent further damage
-   ```typescript
-   await sdk.pauseContract(adminKeypair);
-   ```
+1. **Stop client and relayer traffic** — Prevent further damage while the
+   hotfix is prepared. If the deployed contract version exposes a pause
+   entrypoint, call it through the matching contract client.
 
 2. **Notify all users** — Post incident report
 3. **Deploy hotfix** — Prepare corrected version
@@ -352,10 +336,9 @@ If the upgraded contract has a critical issue:
 
 ```typescript
 // Emergency upgrade (if available)
-const emergencyUpgradeId = await sdk.requestUpgrade(adminKeypair, {
+const emergencyUpgrade = await sdk.upgrade({
   newWasmHash: hotfixWasmHash,
-  timelockDays: 0.5  // 12 hours emergency timelock
-});
+}, adminKeypair);
 ```
 
 ## Troubleshooting
@@ -367,11 +350,11 @@ const emergencyUpgradeId = await sdk.requestUpgrade(adminKeypair, {
 **Solution:**
 ```typescript
 // Check current version
-const version = await sdk.queryVersion();
-console.log(`Current version: ${version}`);
+const initialized = await sdk.isInitialized();
+console.log(`Initialized: ${initialized}`);
 
 // If upgrade should be complete, investigate the contract state
-const admin = await sdk.queryAdmin();
+const admin = await sdk.getAdmin();
 console.log(`Admin: ${admin}`);
 ```
 
@@ -381,15 +364,8 @@ console.log(`Admin: ${admin}`);
 
 **Solution:**
 ```typescript
-// Check TTL status
-const entries = await sdk.inspectPersistentStorage();
-entries.forEach(entry => {
-  console.log(`${entry.key}: TTL expires in ${entry.ttlBlocks} blocks`);
-});
-
-// Restore from backup if available
-const backup = JSON.parse(fs.readFileSync('state_backup.json'));
-await sdk.restoreFromBackup(adminKeypair, backup);
+// Check TTL status with Stellar CLI or Soroban RPC ledger-entry queries.
+// Restore state only through audited contract-specific recovery tooling.
 ```
 
 ### Issue: Transaction fee estimation incorrect post-upgrade
@@ -399,12 +375,14 @@ await sdk.restoreFromBackup(adminKeypair, backup);
 **Solution:**
 ```typescript
 // Re-estimate fees after upgrade
-const feeEstimate = await sdk.estimateTransactionFee({
-  operation: 'fund_c_address',
-  amount: '1000'
+const feeEstimate = await sdk.estimateCost({
+  source: testUserAddress,
+  target: testCAddress,
+  asset: testTokenAddress,
+  amount: '1000',
 });
 
-console.log(`Updated fee estimate: ${feeEstimate} stroops`);
+console.log(`Updated resource fee estimate: ${feeEstimate.resourceFee} stroops`);
 
 // Update client-side fee calculations
 const txConfig = { ...oldConfig, baseFee: feeEstimate };
@@ -418,9 +396,9 @@ const txConfig = { ...oldConfig, baseFee: feeEstimate };
 ```typescript
 // 1. Check SDK version compatibility
 const sdkVersion = require('@stellar/c-address-onboarding-bridge-sdk/package.json').version;
-const contractVersion = await sdk.queryVersion();
+const initialized = await sdk.isInitialized();
 
-console.log(`SDK ${sdkVersion} with Contract ${contractVersion}`);
+console.log(`SDK ${sdkVersion}; contract initialized: ${initialized}`);
 
 // 2. If incompatible, upgrade SDK
 npm install @stellar/c-address-onboarding-bridge-sdk@latest
