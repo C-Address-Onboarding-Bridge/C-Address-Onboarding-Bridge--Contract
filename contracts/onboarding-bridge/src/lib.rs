@@ -2318,11 +2318,16 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `assets` (`Vec<Address>`) — List of token contract addresses to query.
+    ///   Must contain at most `MAX_BATCH_SIZE` (100) entries.
     ///
     /// # Returns
     ///
     /// A `Map<Address, i128>` mapping each asset address to the contract's balance.
     /// Assets with a zero balance are included.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::BatchTooLarge`] — `assets.len()` exceeds `MAX_BATCH_SIZE` (100).
     ///
     /// # Examples
     ///
@@ -2330,7 +2335,13 @@ impl OnboardingBridge {
     /// // let assets = Vec::from_array(&env, [usdc, xlm]);
     /// // let balances = bridge.query_all_balances(&assets);
     /// ```
-    pub fn query_all_balances(env: Env, assets: Vec<Address>) -> Map<Address, i128> {
+    pub fn query_all_balances(
+        env: Env,
+        assets: Vec<Address>,
+    ) -> Result<Map<Address, i128>, BridgeError> {
+        if assets.len() > MAX_BATCH_SIZE {
+            return Err(BridgeError::BatchTooLarge);
+        }
         let contract = env.current_contract_address();
         let mut result: Map<Address, i128> = Map::new(&env);
         for i in 0..assets.len() {
@@ -2338,7 +2349,7 @@ impl OnboardingBridge {
             let balance = token::Client::new(&env, &asset).balance(&contract);
             result.set(asset, balance);
         }
-        result
+        Ok(result)
     }
 
     /// Returns the contract's total token balance for `asset`.
@@ -3225,14 +3236,40 @@ impl OnboardingBridge {
         Ok(read_whitelist(&env).get(asset).unwrap_or(false))
     }
 
-    /// Returns the list of all currently whitelisted asset addresses.
+    /// Returns a page of currently whitelisted asset addresses.
+    ///
+    /// The whitelist can grow without bound over the contract's lifetime, so
+    /// results are paginated rather than returned in a single unbounded call.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` (`u32`) — Number of whitelist entries to skip.
+    /// * `limit` (`u32`) — Maximum number of entries to return. Capped at
+    ///   `MAX_BATCH_SIZE` (100); values above that are silently clamped.
     ///
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_whitelisted_assets(env: Env) -> Result<Vec<Address>, BridgeError> {
+    pub fn query_whitelisted_assets(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<Address>, BridgeError> {
         check_initialized(&env)?;
-        Ok(read_whitelist(&env).keys())
+        let all = read_whitelist(&env).keys();
+        let page_size = if limit > MAX_BATCH_SIZE {
+            MAX_BATCH_SIZE
+        } else {
+            limit
+        };
+        let mut page: Vec<Address> = Vec::new(&env);
+        let total = all.len();
+        let mut i = offset;
+        while i < total && (i - offset) < page_size {
+            page.push_back(all.get(i).unwrap());
+            i += 1;
+        }
+        Ok(page)
     }
 
     // -----------------------------------------------------------------------

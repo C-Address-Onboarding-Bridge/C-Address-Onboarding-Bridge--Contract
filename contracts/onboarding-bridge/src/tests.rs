@@ -1025,7 +1025,7 @@ fn test_query_whitelisted_assets() {
     bridge.add_asset(&asset1, &None);
     bridge.add_asset(&asset2, &None);
 
-    let assets = bridge.query_whitelisted_assets();
+    let assets = bridge.query_whitelisted_assets(&0u32, &100u32);
     assert_eq!(assets.len(), 2);
 
     let mut found1 = false;
@@ -1052,7 +1052,7 @@ fn test_add_asset_is_idempotent() {
     bridge.add_asset(&token_id, &None);
     bridge.add_asset(&token_id, &None);
 
-    assert_eq!(bridge.query_whitelisted_assets().len(), 1);
+    assert_eq!(bridge.query_whitelisted_assets(&0u32, &100u32).len(), 1);
 }
 
 #[test]
@@ -1165,6 +1165,56 @@ fn test_query_all_balances_empty_input() {
     let assets: Vec<Address> = Vec::new(&env);
     let balances = bridge.query_all_balances(&assets);
     assert_eq!(balances.len(), 0);
+}
+
+#[test]
+fn test_query_all_balances_rejects_oversized_input() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+
+    // MAX_BATCH_SIZE is 100 — one more than that must be rejected.
+    let mut assets: Vec<Address> = Vec::new(&env);
+    for _ in 0..101 {
+        assets.push_back(Address::generate(&env));
+    }
+    assert_eq!(
+        bridge.try_query_all_balances(&assets),
+        Err(Ok(BridgeError::BatchTooLarge))
+    );
+
+    // Exactly MAX_BATCH_SIZE is accepted.
+    assets.pop_back();
+    assert_eq!(bridge.query_all_balances(&assets).len(), 100);
+}
+
+#[test]
+fn test_query_whitelisted_assets_pagination() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    for _ in 0..5 {
+        bridge.add_asset(&Address::generate(&env), &None);
+    }
+
+    let page1 = bridge.query_whitelisted_assets(&0u32, &2u32);
+    assert_eq!(page1.len(), 2);
+    let page2 = bridge.query_whitelisted_assets(&2u32, &2u32);
+    assert_eq!(page2.len(), 2);
+    let page3 = bridge.query_whitelisted_assets(&4u32, &2u32);
+    assert_eq!(page3.len(), 1);
+    // Offset past the end returns an empty page rather than erroring.
+    let page4 = bridge.query_whitelisted_assets(&5u32, &2u32);
+    assert_eq!(page4.len(), 0);
+
+    // A limit above MAX_BATCH_SIZE is silently clamped, not rejected.
+    let clamped = bridge.query_whitelisted_assets(&0u32, &1000u32);
+    assert_eq!(clamped.len(), 5);
 }
 
 #[test]
