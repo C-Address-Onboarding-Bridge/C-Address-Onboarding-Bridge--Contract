@@ -517,6 +517,86 @@ describe('OnboardingBridgeSDK', () => {
     });
   });
 
+  describe('timelocked upgrades', () => {
+    const wasmHash = 'a'.repeat(64);
+
+    it('submits schedule_upgrade', async () => {
+      const result = await sdk.scheduleUpgrade({ newWasmHash: wasmHash, nonce: 1 }, mockKeypair);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'schedule_upgrade',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('submits execute_upgrade', async () => {
+      const result = await sdk.executeUpgrade({ expectedHash: wasmHash }, mockKeypair);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'execute_upgrade',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('submits cancel_upgrade', async () => {
+      const result = await sdk.cancelUpgrade({}, mockKeypair);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith('cancel_upgrade', expect.anything());
+    });
+
+    it('queries pending upgrade', async () => {
+      (scValToNative as jest.Mock).mockReturnValue({
+        new_wasm_hash: Buffer.from(wasmHash, 'hex'),
+        executable_after_ledger: 123,
+      });
+      mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+      const pending = await sdk.queryPendingUpgrade();
+
+      expect(pending).toEqual({
+        newWasmHash: wasmHash,
+        executableAfterLedger: 123,
+      });
+    });
+  });
+
+  describe('executeMetaFund', () => {
+    it('submits execute_meta_fund', async () => {
+      const result = await sdk.executeMetaFund(
+        {
+          params: {
+            source: MOCK_ADDRESS,
+            target: MOCK_ASSET,
+            asset: MOCK_ASSET,
+            amount: '1000',
+            nonce: 1,
+            deadline: 9999999999,
+          },
+          pubkey: 'b'.repeat(64),
+          signature: 'c'.repeat(128),
+        },
+        mockKeypair,
+      );
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'execute_meta_fund',
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
   describe('getFee', () => {
     it('returns the fee as a number from simulation result', async () => {
       (scValToNative as jest.Mock).mockReturnValue(50);

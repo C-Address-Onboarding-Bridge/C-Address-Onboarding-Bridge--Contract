@@ -150,6 +150,10 @@ npm run lint
 cd ..
 ```
 
+The SDK ESLint setup lives in `sdk/.eslintrc.json` and is installed with the
+SDK dev dependencies. The pre-commit hook lints staged files under `sdk/src/`
+with the same configuration.
+
 ## Code Style Guide
 
 ### Rust
