@@ -1768,6 +1768,153 @@ fn test_query_calculate_fee_max_fee() {
     assert_eq!(net, 900i128);
 }
 
+/********** query_effective_fee tests **********/
+
+#[test]
+fn test_query_effective_fee_matches_fund_c_address() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 2000i128);
+
+    // Query the expected fee before calling fund_c_address
+    let amount = 1000i128;
+    let (bps, predicted_fee, predicted_net) =
+        bridge.query_effective_fee(&user, &token_id, &amount);
+
+    assert_eq!(bps, 100u32);
+    assert_eq!(predicted_fee, 100i128);
+    assert_eq!(predicted_net, 900i128);
+
+    // Now actually fund and verify the fee charged matches
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &amount, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &target), predicted_net);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), predicted_fee);
+}
+
+#[test]
+fn test_query_effective_fee_with_asset_cap() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &500u32, &None);
+    bridge.add_asset(&token_id, &None);
+    // Set a per-asset cap lower than global fee
+    bridge.set_asset_fee_cap(&token_id, &200u32, &None);
+    mint_tokens(&env, &token_id, &user, 2000i128);
+
+    let amount = 1000i128;
+    let (bps, predicted_fee, predicted_net) =
+        bridge.query_effective_fee(&user, &token_id, &amount);
+
+    // Global = 500, cap = 200, so effective = 200
+    // fee = 1000 * 200 / 10000 = 20
+    assert_eq!(bps, 200u32);
+    assert_eq!(predicted_fee, 20i128);
+    assert_eq!(predicted_net, 980i128);
+
+    // Verify fund_c_address produces the same fee
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &amount, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &target), predicted_net);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), predicted_fee);
+}
+
+#[test]
+fn test_query_effective_fee_with_tier_discount() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &500u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    // Set a tier: volume < 5000 → 100 bps (discounted)
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier {
+            min_volume: 0,
+            max_volume: 5_000i128,
+            fee_bps: 100u32,
+        }],
+    );
+    bridge.set_fee_tiers(&tiers);
+    mint_tokens(&env, &token_id, &user, 2000i128);
+
+    let amount = 1000i128;
+    let (bps, predicted_fee, predicted_net) =
+        bridge.query_effective_fee(&user, &token_id, &amount);
+
+    // Global = 500, tier = 100 (volume 0 < 5000), so effective = 100
+    // fee = 1000 * 100 / 10000 = 10
+    assert_eq!(bps, 100u32);
+    assert_eq!(predicted_fee, 10i128);
+    assert_eq!(predicted_net, 990i128);
+
+    // Verify fund_c_address produces the same fee
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &amount, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &target), predicted_net);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 10i128);
+}
+
+#[test]
+fn test_query_effective_fee_with_cap_and_tier() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &500u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    // Tier: volume < 5000 → 200 bps
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier {
+            min_volume: 0,
+            max_volume: 5_000i128,
+            fee_bps: 200u32,
+        }],
+    );
+    bridge.set_fee_tiers(&tiers);
+    // Cap at 150 bps (below tier rate)
+    bridge.set_asset_fee_cap(&token_id, &150u32, &None);
+    mint_tokens(&env, &token_id, &user, 2000i128);
+
+    let amount = 1000i128;
+    let (bps, predicted_fee, predicted_net) =
+        bridge.query_effective_fee(&user, &token_id, &amount);
+
+    // Global = 500, tier = 200, cap = 150, so effective = 150
+    // fee = 1000 * 150 / 10000 = 15
+    assert_eq!(bps, 150u32);
+    assert_eq!(predicted_fee, 15i128);
+    assert_eq!(predicted_net, 985i128);
+
+    // Verify fund_c_address produces the same fee
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &amount, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &target), predicted_net);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), predicted_fee);
+}
+
 /********** cumulative counters tests **********/
 
 #[test]
