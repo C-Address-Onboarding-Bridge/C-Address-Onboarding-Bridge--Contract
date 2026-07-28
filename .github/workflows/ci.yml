@@ -64,12 +64,22 @@ jobs:
             python3 - <<'EOF'
           import sys
           baseline = {}
+          invalid_baselines = []
           with open("bench_baseline.txt") as f:
               next(f)  # skip header
-              for line in f:
+              for line_no, line in enumerate(f, start=2):
                   parts = line.strip().split("\t")
                   if len(parts) == 3:
-                      baseline[parts[0]] = (int(parts[1]), int(parts[2]))
+                      cpu, mem = int(parts[1]), int(parts[2])
+                      baseline[parts[0]] = (cpu, mem)
+                      if cpu == 0 and mem == 0:
+                          invalid_baselines.append(f"{line_no}: {parts[0]}")
+
+          if invalid_baselines:
+              print("INVALID BENCHMARK BASELINE: zero cpu/memory rows found:")
+              for row in invalid_baselines:
+                  print(" ", row)
+              sys.exit(1)
 
           results = {}
           with open("bench_results.txt") as f:
