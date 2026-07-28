@@ -774,6 +774,66 @@ fn test_reclaim_emits_event() {
     assert_eq!(contract_id, &bridge.address);
 }
 
+#[test]
+fn test_reclaim_cannot_drain_active_timelocks() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+    let destination = Address::generate(&env);
+
+    // 500 tokens locked in an unclaimed timelock; nothing else in the balance.
+    let release_time = 1_100u64;
+    let id =
+        bridge.fund_c_address_timelocked(&user, &target, &token_id, &500i128, &release_time, &0u64);
+    assert_eq!(check_balance(&env, &token_id, &bridge.address), 500i128);
+
+    // Locked funds cannot be reclaimed at all before the timelock is claimed.
+    assert_eq!(
+        bridge.try_reclaim_tokens(&token_id, &1i128, &destination, &None),
+        Err(Ok(crate::BridgeError::InsufficientReclaimable))
+    );
+
+    // Tokens sent to the contract by accident, on top of the locked timelock,
+    // remain reclaimable up to the excess only.
+    mint_tokens(&env, &token_id, &bridge.address, 200i128);
+    bridge.reclaim_tokens(&token_id, &200i128, &destination, &None);
+    assert_eq!(check_balance(&env, &token_id, &destination), 200i128);
+    assert_eq!(
+        bridge.try_reclaim_tokens(&token_id, &1i128, &destination, &None),
+        Err(Ok(crate::BridgeError::InsufficientReclaimable))
+    );
+
+    // Once claimed, the timelocked amount leaves the contract balance and is
+    // no longer ring-fenced: freshly accidental tokens are reclaimable again.
+    env.ledger().set_timestamp(release_time + 1);
+    bridge.claim_timelocked(&id);
+    mint_tokens(&env, &token_id, &bridge.address, 50i128);
+    bridge.reclaim_tokens(&token_id, &50i128, &destination, &None);
+}
+
+#[test]
+fn test_reclaim_cannot_drain_active_commitments() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+    let destination = Address::generate(&env);
+
+    // commit_fund never transfers tokens into the contract up front — the
+    // actual transfer happens atomically inside reveal_fund — so an
+    // unrevealed commitment holds no contract balance to protect.
+    let amount_hash: BytesN<32> =
+        env.crypto().sha256(&Bytes::from_array(&env, &[0u8; 24])).into();
+    bridge.commit_fund(&user, &target, &token_id, &amount_hash, &2_000u64);
+
+    // Tokens sent to the contract are fully reclaimable; the pending
+    // commitment does not reduce the reclaimable amount.
+    mint_tokens(&env, &token_id, &bridge.address, 300i128);
+    bridge.reclaim_tokens(&token_id, &300i128, &destination, &None);
+    assert_eq!(check_balance(&env, &token_id, &destination), 300i128);
+}
+
 /********** Asset whitelist tests **********/
 
 #[test]

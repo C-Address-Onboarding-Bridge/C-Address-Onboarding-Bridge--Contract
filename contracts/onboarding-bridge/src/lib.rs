@@ -275,6 +275,10 @@ pub struct AssetCounters {
     pub total_bridged: i128,
     /// Cumulative gross fees collected since deployment.
     pub total_fees_collected: i128,
+    /// Sum of `TimelockEntry.amount` for entries not yet claimed. Sits in the
+    /// contract's token balance but is not owned by the fee collector or
+    /// available for `reclaim_tokens`.
+    pub locked_timelock: i128,
 }
 
 /// A volume-based fee tier.
@@ -712,7 +716,20 @@ fn read_asset_counters(env: &Env, asset: &Address) -> AssetCounters {
             accrued_fees: 0,
             total_bridged: 0,
             total_fees_collected: 0,
+            locked_timelock: 0,
         })
+}
+
+fn increment_locked_timelock(env: &Env, asset: &Address, amount: i128) {
+    let mut c = read_asset_counters(env, asset);
+    c.locked_timelock += amount;
+    save_asset_counters(env, asset, &c);
+}
+
+fn decrement_locked_timelock(env: &Env, asset: &Address, amount: i128) {
+    let mut c = read_asset_counters(env, asset);
+    c.locked_timelock -= amount;
+    save_asset_counters(env, asset, &c);
 }
 
 fn save_asset_counters(env: &Env, asset: &Address, counters: &AssetCounters) {
@@ -2965,10 +2982,16 @@ impl OnboardingBridge {
     ///
     /// # Security Considerations
     ///
-    /// The check `reclaimable = balance − accrued_fees` ensures that fee
-    /// reserves are ring-fenced. However, timelocked funds also sit in the
-    /// contract balance and are not tracked separately. Do not reclaim tokens
-    /// if there are active timelocks denominated in the same asset.
+    /// The check `reclaimable = balance − accrued_fees − locked_timelock`
+    /// ensures that both fee reserves and unclaimed `TimelockEntry` deposits
+    /// are ring-fenced: `locked_timelock` is a running per-asset total
+    /// incremented in `fund_c_address_timelocked` and decremented in
+    /// `claim_timelocked`, so admins cannot drain tokens that are owed to a
+    /// pending timelock claim. Unrevealed `CommitmentEntry` records created
+    /// by `commit_fund` never hold contract balance in the first place —
+    /// `reveal_fund` pulls the tokens from `source` and forwards them to
+    /// `target` atomically within a single call — so no separate accounting
+    /// is required for them.
     pub fn reclaim_tokens(
         env: Env,
         asset: Address,
@@ -2987,8 +3010,8 @@ impl OnboardingBridge {
 
         let token_client = token::Client::new(&env, &asset);
         let contract_balance = token_client.balance(&env.current_contract_address());
-        let accrued = read_accrued_fees(&env, &asset);
-        let reclaimable = contract_balance - accrued;
+        let counters = read_asset_counters(&env, &asset);
+        let reclaimable = contract_balance - counters.accrued_fees - counters.locked_timelock;
 
         if reclaimable < amount {
             return Err(BridgeError::InsufficientReclaimable);
@@ -3710,6 +3733,8 @@ impl OnboardingBridge {
                 claimed: false,
             },
         );
+        // Ring-fence this deposit so reclaim_tokens cannot drain it before claim.
+        increment_locked_timelock(&env, &asset, amount);
 
         env.events().publish(
             ("TimelockCreated", source, target),
@@ -3769,6 +3794,10 @@ impl OnboardingBridge {
 
         entry.claimed = true;
         save_timelock_entry(&env, id, &entry);
+        // This entry's full deposit is leaving the "locked" pool: the fee
+        // portion is now tracked in accrued_fees and net_amount leaves the
+        // contract balance entirely.
+        decrement_locked_timelock(&env, &entry.asset, entry.amount);
 
         let fee_bps = read_fee_bps(&env);
         let effective_fee_bps = get_effective_fee_bps(&env, &entry.asset, fee_bps);
