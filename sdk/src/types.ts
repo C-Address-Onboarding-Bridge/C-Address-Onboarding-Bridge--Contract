@@ -10,6 +10,7 @@
 
 import type { RpcRetryOptions } from './retry';
 import type { ObservabilityHooks } from './observability';
+import type { Keypair } from '@stellar/stellar-sdk';
 
 // ---------------------------------------------------------------------------
 // SDK configuration
@@ -739,7 +740,7 @@ export interface CreateCOptions {
    * Keypair used to sign the contract-creation transaction.
    * This account pays the deployment fees.
    */
-  deployerKeypair: any;
+  deployerKeypair: Keypair;
 
   /**
    * Optional 32-byte salt for deterministic address derivation, as a hex string.
