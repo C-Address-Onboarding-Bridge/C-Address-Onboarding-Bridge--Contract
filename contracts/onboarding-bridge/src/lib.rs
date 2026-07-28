@@ -151,6 +151,8 @@ pub enum BridgeError {
     MetaTxNonceAlreadyUsed = 39,
     /// The contract is deactivated (permanently paused/migrated).
     ContractDeactivated = 40,
+    /// A requested TTL value is outside `[MIN_ALLOWED_TTL, MAX_ALLOWED_TTL]`.
+    InvalidTtl = 41,
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +228,14 @@ const MAX_FEE_BPS: u32 = 1_000;
 const FEE_DENOMINATOR: i128 = 10_000;
 const MAX_BATCH_SIZE: u32 = 100;
 const MAX_ALLOWED_TTL: u32 = 3_110_400; // ~1 year in ledgers (5s/ledger)
+/// Minimum configurable value for `MaxInstanceTtl` / `MaxPersistentTtl`.
+///
+/// Without a floor, an admin setting either max to `0` would make
+/// `extend_instance_ttl`'s `threshold = max_ttl / 4` evaluate to `0`, which
+/// effectively disables TTL extension and risks near-term expiry of all
+/// instance (or persistent) data. Set to roughly one week of ledgers
+/// (5 s/ledger) — comfortably above `CRITICAL_ENTRY_TTL_THRESHOLD`.
+const MIN_ALLOWED_TTL: u32 = 120_960;
 const CRITICAL_ENTRY_TTL_THRESHOLD: u32 = 100_000;
 /// Minimum ledgers that must pass before a scheduled upgrade becomes executable (~24 h at 5 s/ledger).
 const UPGRADE_TIMELOCK_LEDGERS: u32 = 17_280;
@@ -4045,11 +4055,15 @@ impl OnboardingBridge {
     /// Overrides the maximum instance-storage TTL used by the internal
     /// `extend_instance_ttl` helper called on every mutating operation.
     ///
-    /// Values above `MAX_ALLOWED_TTL` are silently capped.
+    /// Values above `MAX_ALLOWED_TTL` are silently capped. Values below
+    /// `MIN_ALLOWED_TTL` are rejected outright: `extend_instance_ttl` derives
+    /// its extension threshold as `max_ttl / 4`, so a max of `0` (or any very
+    /// small value) would make the threshold `0` too, effectively disabling
+    /// TTL extension and risking near-term expiry of all instance data.
     ///
     /// # Arguments
     ///
-    /// * `ttl` (`u32`) — New maximum in ledgers.
+    /// * `ttl` (`u32`) — New maximum in ledgers. Must be ≥ `MIN_ALLOWED_TTL`.
     ///
     /// # Authorization
     ///
@@ -4058,11 +4072,15 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::InvalidTtl`] — `ttl` is below `MIN_ALLOWED_TTL`.
     pub fn set_max_instance_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        if ttl < MIN_ALLOWED_TTL {
+            return Err(BridgeError::InvalidTtl);
+        }
         let capped = if ttl > MAX_ALLOWED_TTL {
             MAX_ALLOWED_TTL
         } else {
@@ -4077,11 +4095,14 @@ impl OnboardingBridge {
 
     /// Overrides the maximum persistent-storage TTL used by `extend_persistent_ttl`.
     ///
-    /// Values above `MAX_ALLOWED_TTL` are silently capped.
+    /// Values above `MAX_ALLOWED_TTL` are silently capped. Values below
+    /// `MIN_ALLOWED_TTL` are rejected for the same reason as
+    /// `set_max_instance_ttl`: a near-zero max would collapse the extension
+    /// threshold to zero and disable TTL extension entirely.
     ///
     /// # Arguments
     ///
-    /// * `ttl` (`u32`) — New maximum in ledgers.
+    /// * `ttl` (`u32`) — New maximum in ledgers. Must be ≥ `MIN_ALLOWED_TTL`.
     ///
     /// # Authorization
     ///
@@ -4090,11 +4111,15 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::InvalidTtl`] — `ttl` is below `MIN_ALLOWED_TTL`.
     pub fn set_max_persistent_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        if ttl < MIN_ALLOWED_TTL {
+            return Err(BridgeError::InvalidTtl);
+        }
         let capped = if ttl > MAX_ALLOWED_TTL {
             MAX_ALLOWED_TTL
         } else {

@@ -3224,3 +3224,76 @@ fn test_extend_timelock_ttl_rejects_unknown_id() {
     );
 }
 
+// --------- TTL floor validation tests ---------
+
+/// Without a floor, setting the max instance TTL to `0` would make
+/// `extend_instance_ttl`'s `threshold = max_ttl / 4` evaluate to `0`,
+/// effectively disabling TTL extension forever and risking near-term expiry
+/// of the entire instance (including the `Admin` entry).
+#[test]
+fn test_set_max_instance_ttl_rejects_zero() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let (before_instance, before_persistent, _, _) = bridge.query_ttl_config();
+
+    assert_eq!(
+        bridge.try_set_max_instance_ttl(&0u32),
+        Err(Ok(BridgeError::InvalidTtl))
+    );
+
+    // A too-low value below the floor is likewise rejected.
+    assert_eq!(
+        bridge.try_set_max_instance_ttl(&1u32),
+        Err(Ok(BridgeError::InvalidTtl))
+    );
+
+    // Config is left untouched by the rejected calls.
+    let (after_instance, after_persistent, _, _) = bridge.query_ttl_config();
+    assert_eq!(before_instance, after_instance);
+    assert_eq!(before_persistent, after_persistent);
+}
+
+#[test]
+fn test_set_max_persistent_ttl_rejects_zero() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let (before_instance, before_persistent, _, _) = bridge.query_ttl_config();
+
+    assert_eq!(
+        bridge.try_set_max_persistent_ttl(&0u32),
+        Err(Ok(BridgeError::InvalidTtl))
+    );
+    assert_eq!(
+        bridge.try_set_max_persistent_ttl(&1u32),
+        Err(Ok(BridgeError::InvalidTtl))
+    );
+
+    let (after_instance, after_persistent, _, _) = bridge.query_ttl_config();
+    assert_eq!(before_instance, after_instance);
+    assert_eq!(before_persistent, after_persistent);
+}
+
+#[test]
+fn test_set_max_instance_ttl_accepts_valid_value() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.set_max_instance_ttl(&500_000u32);
+
+    let (instance_ttl, _, _, _) = bridge.query_ttl_config();
+    assert_eq!(instance_ttl, 500_000u32);
+}
+
