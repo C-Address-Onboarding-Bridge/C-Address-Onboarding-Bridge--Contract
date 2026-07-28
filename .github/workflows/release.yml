@@ -40,12 +40,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: sdk/node_modules
-          key: ${{ runner.os }}-node-${{ hashFiles('sdk/package.json') }}
+          key: ${{ runner.os }}-node-${{ hashFiles('sdk/package-lock.json') }}
 
       - name: Install SDK dependencies
         run: |
           cd sdk
-          npm install
+          npm ci
 
       - name: Sign and Publish Hash
         env:
