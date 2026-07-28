@@ -3173,3 +3173,54 @@ fn test_fund_c_address_extends_instance_ttl_past_original_threshold() {
     assert_eq!(check_balance(&env, &token_id, &target), 500i128);
 }
 
+// --------- Persistent TTL extension tests ---------
+
+/// `extend_persistent_ttl` only ever refreshed the three per-asset counter
+/// keys. A `TimelockEntry` created via `fund_c_address_timelocked` had no
+/// admin-callable way to have its own TTL refreshed, so a long-dated
+/// timelock's persistent entry could be archived by the network before
+/// `release_time`, making it permanently unclaimable. This test exercises
+/// the new `extend_timelock_ttl` companion function and confirms the entry
+/// survives a ledger advance far past the default (unextended) persistent
+/// TTL window.
+#[test]
+fn test_extend_persistent_ttl_covers_timelock_entries() {
+    let env = Env::default();
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+
+    let release_time = 1_000_000u64;
+    let id = bridge.fund_c_address_timelocked(
+        &user,
+        &target,
+        &token_id,
+        &500i128,
+        &release_time,
+        &0u64,
+    );
+
+    // Refresh the entry's persistent TTL well beyond the default
+    // (network-baseline) window it was created with.
+    bridge.extend_timelock_ttl(&id, &3_000_000u32);
+
+    // Advance far past where the *default* persistent TTL would have expired
+    // the entry, but still within the window granted above.
+    env.ledger().set_sequence_number(2_500_000);
+
+    let entry = bridge.query_timelocked(&id);
+    assert_eq!(entry.target, target);
+    assert_eq!(entry.amount, 500i128);
+    assert!(!entry.claimed);
+}
+
+#[test]
+fn test_extend_timelock_ttl_rejects_unknown_id() {
+    let env = Env::default();
+    let (bridge, _user, _token_id, _admin) = setup_bridge(&env);
+
+    assert_eq!(
+        bridge.try_extend_timelock_ttl(&999u64, &1_000u32),
+        Err(Ok(BridgeError::TimelockNotFound))
+    );
+}
+

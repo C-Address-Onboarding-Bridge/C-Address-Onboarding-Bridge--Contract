@@ -3829,6 +3829,8 @@ impl OnboardingBridge {
             DataKey::AccruedFees(key_asset.clone()),
             DataKey::TotalBridged(key_asset.clone()),
             DataKey::TotalFeesCollected(key_asset.clone()),
+            DataKey::AssetStats(key_asset.clone()),
+            DataKey::AssetFeeCap(key_asset.clone()),
         ];
         for key in keys.iter() {
             if env.storage().persistent().has(key) {
@@ -3839,6 +3841,204 @@ impl OnboardingBridge {
         }
         env.events()
             .publish(("PersistentTtlExtended",), (admin, key_asset, max_ttl));
+        Ok(())
+    }
+
+    /// Extends the persistent-storage TTL for a specific timelock entry.
+    ///
+    /// `extend_persistent_ttl` only ever covered per-asset counter keys, so a
+    /// long-dated `TimelockEntry` (see `fund_c_address_timelocked`) had no way
+    /// to have its TTL refreshed and could be archived by the network before
+    /// `release_time`, making it permanently unclaimable. Call this
+    /// periodically for any timelock whose `release_time` is far in the future.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` (`u64`) — The timelock entry ID, as returned by
+    ///   `fund_c_address_timelocked`.
+    /// * `ttl` (`u32`) — Desired TTL in ledgers (capped at `MAX_ALLOWED_TTL`).
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::TimelockNotFound`] — No entry exists for `id`.
+    ///
+    /// # Events
+    ///
+    /// * `("TimelockTtlExtended",)` — data: `(admin, id, actual_ttl)`
+    pub fn extend_timelock_ttl(env: Env, id: u64, ttl: u32) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let key = DataKey::Timelock(id);
+        if !env.storage().persistent().has(&key) {
+            return Err(BridgeError::TimelockNotFound);
+        }
+        let max_ttl = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        let threshold = max_ttl / 4;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, max_ttl);
+        env.events()
+            .publish(("TimelockTtlExtended",), (admin, id, max_ttl));
+        Ok(())
+    }
+
+    /// Extends the persistent-storage TTL for a specific commit-reveal entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` (`u64`) — The commitment ID, as returned by `commit_fund`.
+    /// * `ttl` (`u32`) — Desired TTL in ledgers (capped at `MAX_ALLOWED_TTL`).
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::CommitmentNotFound`] — No entry exists for `id`.
+    ///
+    /// # Events
+    ///
+    /// * `("CommitmentTtlExtended",)` — data: `(admin, id, actual_ttl)`
+    pub fn extend_commitment_ttl(env: Env, id: u64, ttl: u32) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let key = DataKey::Commitment(id);
+        if !env.storage().persistent().has(&key) {
+            return Err(BridgeError::CommitmentNotFound);
+        }
+        let max_ttl = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        let threshold = max_ttl / 4;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, max_ttl);
+        env.events()
+            .publish(("CommitmentTtlExtended",), (admin, id, max_ttl));
+        Ok(())
+    }
+
+    /// Extends the persistent-storage TTL for a registered relayer's entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `pubkey` (`BytesN<32>`) — The relayer's Ed25519 public key.
+    /// * `ttl` (`u32`) — Desired TTL in ledgers (capped at `MAX_ALLOWED_TTL`).
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::NotRelayer`] — `pubkey` is not a registered relayer.
+    ///
+    /// # Events
+    ///
+    /// * `("RelayerTtlExtended",)` — data: `(admin, pubkey, actual_ttl)`
+    pub fn extend_relayer_ttl(env: Env, pubkey: BytesN<32>, ttl: u32) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let key = DataKey::Relayer(pubkey.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(BridgeError::NotRelayer);
+        }
+        let max_ttl = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        let threshold = max_ttl / 4;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, max_ttl);
+        env.events()
+            .publish(("RelayerTtlExtended",), (admin, pubkey, max_ttl));
+        Ok(())
+    }
+
+    /// Extends the persistent-storage TTL for all per-`(source, asset)` and
+    /// per-`source` keys used by the core funding paths: `SourceDailyLimit`,
+    /// the current day's `DailyUsage`, `UserDeposit`, `SourceBridgedVolume`,
+    /// the sequential `Nonce`, and the auth-entry `AuthNonce` counter.
+    ///
+    /// Only keys that already exist in storage are extended; missing keys are
+    /// silently skipped, mirroring `extend_persistent_ttl`.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The address whose per-source entries should
+    ///   have their TTL extended.
+    /// * `asset` (`Address`) — The asset half of the `(source, asset)` keys.
+    /// * `ttl` (`u32`) — Desired TTL in ledgers (capped at `MAX_ALLOWED_TTL`).
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    ///
+    /// # Events
+    ///
+    /// * `("SourcePersistentTtlExtended",)` — data: `(admin, source, asset, actual_ttl)`
+    pub fn extend_source_persistent_ttl(
+        env: Env,
+        source: Address,
+        asset: Address,
+        ttl: u32,
+    ) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let max_ttl = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        let threshold = max_ttl / 4;
+        let day = current_day(&env);
+        let keys = [
+            DataKey::SourceDailyLimit(source.clone(), asset.clone()),
+            DataKey::DailyUsage(source.clone(), asset.clone(), day),
+            DataKey::UserDeposit(source.clone(), asset.clone()),
+            DataKey::SourceBridgedVolume(source.clone()),
+            DataKey::Nonce(source.clone()),
+            DataKey::AuthNonce(source.clone()),
+        ];
+        for key in keys.iter() {
+            if env.storage().persistent().has(key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(key, threshold, max_ttl);
+            }
+        }
+        env.events().publish(
+            ("SourcePersistentTtlExtended",),
+            (admin, source, asset, max_ttl),
+        );
         Ok(())
     }
 
