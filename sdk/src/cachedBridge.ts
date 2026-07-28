@@ -83,7 +83,13 @@ export class CachedContractClient {
   }
 
   /**
-   * Returns the wrapped SDK instance with all original transaction methods.
+   * Returns the wrapped ContractClient with a curated subset of transaction
+   * methods: fundCAddress, fundCAddressWithSwap, withdrawFees, setFee,
+   * setFeeCollector, setAdmin, and upgrade.
+   *
+   * For the full set of SDK methods (batch operations, cross-chain, relayers,
+   * paginated queries, etc.), use
+   * {@link OnboardingBridgeSDK} directly.
    */
   get client() {
     return this.sdk;
