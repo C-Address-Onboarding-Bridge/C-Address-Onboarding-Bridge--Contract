@@ -147,6 +147,8 @@ pub enum BridgeError {
     ContractDeactivated = 40,
     /// The same relayer pubkey appeared more than once in `sigs`.
     DuplicateRelayerSignature = 41,
+    /// A pool address in `swap_route` is not on the swap-pool whitelist.
+    PoolNotWhitelisted = 42,
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +214,8 @@ pub enum DataKey {
     // Issue #35: EIP-712-style meta-transaction used nonces
     MetaTxNonce(Address, u64),
     Deactivated,
+    // Admin-managed whitelist of DEX pool addresses usable in `swap_route`.
+    PoolWhitelist,
 }
 
 // ---------------------------------------------------------------------------
@@ -655,6 +659,30 @@ fn save_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
 fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError> {
     if !read_whitelist(env).get(asset.clone()).unwrap_or(false) {
         return Err(BridgeError::AssetNotWhitelisted);
+    }
+    Ok(())
+}
+
+// fund_c_address_with_swap must not invoke arbitrary caller-supplied pool
+// addresses. Mirrors the asset whitelist pattern above.
+#[inline(never)]
+fn read_pool_whitelist(env: &Env) -> Map<Address, bool> {
+    env.storage()
+        .instance()
+        .get(&DataKey::PoolWhitelist)
+        .unwrap_or_else(|| Map::new(env))
+}
+
+#[inline(never)]
+fn save_pool_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PoolWhitelist, whitelist);
+}
+
+fn check_pool_whitelisted(env: &Env, pool: &Address) -> Result<(), BridgeError> {
+    if !read_pool_whitelist(env).get(pool.clone()).unwrap_or(false) {
+        return Err(BridgeError::PoolNotWhitelisted);
     }
     Ok(())
 }
@@ -3057,6 +3085,81 @@ impl OnboardingBridge {
     }
 
     // -----------------------------------------------------------------------
+    // Swap pool whitelist
+    // -----------------------------------------------------------------------
+
+    /// Adds `pool` to the DEX swap-pool whitelist.
+    ///
+    /// Only whitelisted pool addresses may appear in the `swap_route` passed
+    /// to `fund_c_address_with_swap`. Adding a pool that is already
+    /// whitelisted is idempotent.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` (`Address`) — The DEX pool contract address to whitelist.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    pub fn add_swap_pool(env: Env, pool: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        let mut whitelist = read_pool_whitelist(&env);
+        whitelist.set(pool, true);
+        save_pool_whitelist(&env, &whitelist);
+        Ok(())
+    }
+
+    /// Removes `pool` from the DEX swap-pool whitelist.
+    ///
+    /// After removal, any `fund_c_address_with_swap` call whose `swap_route`
+    /// references this pool returns [`BridgeError::PoolNotWhitelisted`].
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` (`Address`) — The DEX pool contract address to remove.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    pub fn remove_swap_pool(env: Env, pool: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        let mut whitelist = read_pool_whitelist(&env);
+        whitelist.remove(pool);
+        save_pool_whitelist(&env, &whitelist);
+        Ok(())
+    }
+
+    /// Returns `true` if `pool` is currently on the swap-pool whitelist.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    pub fn query_is_pool_whitelisted(env: Env, pool: Address) -> Result<bool, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_pool_whitelist(&env).get(pool).unwrap_or(false))
+    }
+
+    // -----------------------------------------------------------------------
     // Loyalty token
     // -----------------------------------------------------------------------
 
@@ -4228,8 +4331,9 @@ impl OnboardingBridge {
     /// * `source_amount` — Gross amount of `source_asset` to pull from source.
     /// * `min_target_amount` — Slippage guard: revert if the swap yields less.
     /// * `swap_route` — Ordered list of DEX pool contract addresses. At least
-    ///   one pool is required. Each pool must implement the interface:
-    ///   `swap(amount_in: i128, min_amount_out: i128, to: Address) -> i128`.
+    ///   one pool is required, and every pool must be on the swap-pool
+    ///   whitelist (see `add_swap_pool`). Each pool must implement the
+    ///   interface: `swap(amount_in: i128, min_amount_out: i128, to: Address) -> i128`.
     ///
     /// # Authorization
     ///
@@ -4243,8 +4347,22 @@ impl OnboardingBridge {
     /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode is on and `target` is not listed.
     /// * [`BridgeError::AssetNotWhitelisted`] — `target_asset` is not whitelisted.
+    /// * [`BridgeError::PoolNotWhitelisted`] — A pool in `swap_route` is not
+    ///   on the swap-pool whitelist.
     /// * [`BridgeError::SwapFailed`] — A pool returned zero tokens out.
     /// * [`BridgeError::SlippageExceeded`] — Swap output < `min_target_amount`.
+    ///
+    /// # Security Considerations
+    ///
+    /// `swap_route` addresses are invoked with `env.invoke_contract` after
+    /// the contract has already transferred tokens to them. Without a
+    /// whitelist, a malicious or unvetted pool could keep the transferred
+    /// tokens and return a fabricated `amount_out`, effectively stealing
+    /// from the source. Every address in `swap_route` is therefore required
+    /// to be present in the admin-managed pool whitelist (`add_swap_pool` /
+    /// `remove_swap_pool`), which mirrors the existing asset whitelist
+    /// pattern. Only the admin should whitelist pools, and only after
+    /// auditing their `swap` implementation and token-return behavior.
     pub fn fund_c_address_with_swap(
         env: Env,
         source: Address,
@@ -4266,6 +4384,13 @@ impl OnboardingBridge {
         check_access(&env, &target)?;
         // Only the output asset needs to be whitelisted (what arrives at target).
         check_asset_whitelisted(&env, &target_asset)?;
+
+        // Every pool address in the route must be admin-whitelisted; otherwise
+        // a malicious/unvetted pool could keep the transferred tokens and
+        // return a fabricated amount_out. See "Security Considerations" above.
+        for pool in swap_route.iter() {
+            check_pool_whitelisted(&env, &pool)?;
+        }
 
         source.require_auth();
 

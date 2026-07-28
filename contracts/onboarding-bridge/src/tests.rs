@@ -1188,6 +1188,60 @@ mod swap_pool_contract {
 
 use swap_pool_contract::{SwapPool, SwapPoolClient};
 
+/********** fund_c_address_with_swap tests **********/
+
+fn setup_swap(
+    env: &Env,
+) -> (
+    crate::OnboardingBridgeClient<'_>,
+    Address,
+    Address,
+    Address,
+) {
+    let (admin, user, fee_collector) = create_test_users(env);
+    let (bridge_id, source_token_id) = register_all_contracts_mocked(env);
+    let bridge = create_bridge_client(env, &bridge_id);
+    init_token(env, &source_token_id, &admin);
+
+    let target_token_id = env.register(TestToken, ());
+    init_token(env, &target_token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.add_asset(&target_token_id, &None);
+    mint_tokens(env, &source_token_id, &user, 1_000i128);
+
+    (bridge, user, source_token_id, target_token_id)
+}
+
+#[test]
+fn test_swap_rejects_non_whitelisted_pool() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+
+    // A pool that would happily perform the swap, but was never whitelisted.
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &target_token_id, &1i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target,
+            &source_token_id,
+            &target_token_id,
+            &500i128,
+            &400i128,
+            &swap_route,
+        ),
+        Err(Ok(BridgeError::PoolNotWhitelisted))
+    );
+    // Nothing was pulled from the user since the whitelist check runs first.
+    assert_eq!(check_balance(&env, &source_token_id, &user), 1_000i128);
+}
+
 /********** query_calculate_fee tests **********/
 
 #[test]
