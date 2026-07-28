@@ -161,6 +161,8 @@ pub enum BridgeError {
     PoolNotWhitelisted = 42,
     /// `swap_route` contained more than one hop; multi-hop swaps are not supported.
     MultiHopNotSupported = 43,
+    /// `set_fee_tiers` was called with more tiers than `MAX_FEE_TIERS` (50).
+    TooManyFeeTiers = 44,
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +239,10 @@ pub enum DataKey {
 const MAX_FEE_BPS: u32 = 1_000;
 const FEE_DENOMINATOR: i128 = 10_000;
 const MAX_BATCH_SIZE: u32 = 100;
+/// Maximum number of tiers accepted by `set_fee_tiers`. `get_tiered_fee_bps`
+/// / `find_current_tier` scan the full tier list linearly on every funding
+/// call, so this bounds the per-call cost of that scan.
+const MAX_FEE_TIERS: u32 = 50;
 const MAX_ALLOWED_TTL: u32 = 3_110_400; // ~1 year in ledgers (5s/ledger)
 /// Minimum configurable value for `MaxInstanceTtl` / `MaxPersistentTtl`.
 ///
@@ -3394,8 +3400,8 @@ impl OnboardingBridge {
     ///
     /// # Arguments
     ///
-    /// * `tiers` (`Vec<FeeTier>`) — Ordered list of fee tiers. Each tier's
-    ///   `fee_bps` must be ≤ 1 000.
+    /// * `tiers` (`Vec<FeeTier>`) — Ordered list of fee tiers. Must contain at
+    ///   most `MAX_FEE_TIERS` (50) entries. Each tier's `fee_bps` must be ≤ 1 000.
     ///
     /// # Authorization
     ///
@@ -3404,6 +3410,8 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::TooManyFeeTiers`] — `tiers.len()` exceeds `MAX_FEE_TIERS` (50).
     /// * [`BridgeError::FeeTooHigh`] — Any tier's `fee_bps` exceeds 1 000.
     ///
     /// # Events
@@ -3415,6 +3423,9 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        if tiers.len() > MAX_FEE_TIERS {
+            return Err(BridgeError::TooManyFeeTiers);
+        }
         for i in 0..tiers.len() {
             let tier = tiers.get(i).unwrap();
             if tier.fee_bps > MAX_FEE_BPS {

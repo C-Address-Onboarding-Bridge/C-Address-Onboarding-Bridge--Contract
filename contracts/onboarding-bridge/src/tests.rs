@@ -3997,6 +3997,42 @@ fn test_batch_fund_applies_tiered_fee() {
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 1i128);
 }
 
+#[test]
+fn test_set_fee_tiers_rejects_excessive_tier_count() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+
+    // MAX_FEE_TIERS is 50 — one more than that must be rejected.
+    let mut too_many: Vec<FeeTier> = Vec::new(&env);
+    for i in 0..51u32 {
+        too_many.push_back(FeeTier {
+            min_volume: (i as i128) * 1000,
+            max_volume: (i as i128) * 1000 + 999,
+            fee_bps: 10u32,
+        });
+    }
+    assert_eq!(
+        bridge.try_set_fee_tiers(&too_many),
+        Err(Ok(BridgeError::TooManyFeeTiers))
+    );
+
+    // Exactly MAX_FEE_TIERS is accepted.
+    let mut exactly_max: Vec<FeeTier> = Vec::new(&env);
+    for i in 0..50u32 {
+        exactly_max.push_back(FeeTier {
+            min_volume: (i as i128) * 1000,
+            max_volume: (i as i128) * 1000 + 999,
+            fee_bps: 10u32,
+        });
+    }
+    bridge.set_fee_tiers(&exactly_max);
+    assert_eq!(bridge.query_fee_tiers().len(), 50);
+}
+
 // fund_c_address_with_referral computed its fee straight from the global rate via
 // get_effective_fee_bps, never consulting the caller's volume tier.
 #[test]
