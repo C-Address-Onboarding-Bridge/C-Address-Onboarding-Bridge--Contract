@@ -165,6 +165,48 @@ export interface FundCOptions {
   amount: string;
 }
 
+export interface FundCAddressWithReferralOptions extends FundCOptions {
+  /** Optional referrer address that receives a configured share of the fee. */
+  referrer?: string;
+}
+
+export interface CommitFundOptions extends FundCOptions {
+  /** 32-byte sha256(amount_be16 || nonce_be8) commitment hash as hex. */
+  amountHash: string;
+
+  /** Unix timestamp deadline for revealing the commitment. */
+  deadline: string | number | bigint;
+}
+
+export interface RevealFundOptions extends FundCOptions {
+  /** Commitment ID returned by commitFund. */
+  commitmentId: string | number | bigint;
+
+  /** Blinding nonce used to compute amountHash. */
+  nonce: string | number | bigint;
+}
+
+export interface CommitmentEntry {
+  source: string;
+  target: string;
+  asset: string;
+  amount_hash: unknown;
+  deadline: string | number | bigint;
+  committed_at_ledger: number;
+  revealed: boolean;
+}
+
+export interface LoyaltyToken {
+  token: string;
+  amount_per_fund: string | number | bigint;
+}
+
+export interface FeeTier {
+  min_volume: string | number | bigint;
+  max_volume: string | number | bigint;
+  fee_bps: number;
+}
+
 /**
  * Options for funding multiple C-addresses in one or more transactions via
  * {@link OnboardingBridgeSDK.batchFundCAddresses}.

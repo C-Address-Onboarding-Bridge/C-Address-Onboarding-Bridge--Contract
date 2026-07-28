@@ -1,6 +1,6 @@
 import { OnboardingBridgeSDK } from '../bridge';
 import { OffRampIntegration } from '../offramp';
-import { SorobanRpc, scValToNative, xdr, Address, nativeToScVal } from '@stellar/stellar-sdk';
+import { SorobanRpc, Contract, scValToNative, xdr, Address, nativeToScVal } from '@stellar/stellar-sdk';
 
 jest.mock('@stellar/stellar-sdk', () => ({
   SorobanRpc: {
@@ -113,6 +113,81 @@ describe('OnboardingBridgeSDK', () => {
       expect(result.status).toBe('failed');
       expect(result.error).toBe('Network timeout');
       expect(result.hash).toBe('');
+    });
+  });
+
+  describe('fundCAddressWithReferral', () => {
+    it('submits fund_c_address_with_referral', async () => {
+      const result = await sdk.fundCAddressWithReferral(
+        { source: MOCK_ADDRESS, target: MOCK_ASSET, asset: MOCK_ASSET, amount: '1000', referrer: MOCK_ADDRESS },
+        mockKeypair,
+      );
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'fund_c_address_with_referral',
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
+  describe('commitFund', () => {
+    it('submits commit_fund', async () => {
+      const result = await sdk.commitFund(
+        {
+          source: MOCK_ADDRESS,
+          target: MOCK_ASSET,
+          asset: MOCK_ASSET,
+          amount: '1000',
+          amountHash: 'ab'.repeat(32),
+          deadline: 123456,
+        },
+        mockKeypair,
+      );
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'commit_fund',
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
+  describe('revealFund', () => {
+    it('submits reveal_fund', async () => {
+      const result = await sdk.revealFund(
+        {
+          commitmentId: 1,
+          source: MOCK_ADDRESS,
+          target: MOCK_ASSET,
+          asset: MOCK_ASSET,
+          amount: '1000',
+          nonce: 42,
+        },
+        mockKeypair,
+      );
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'reveal_fund',
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
     });
   });
 
@@ -375,6 +450,47 @@ describe('OnboardingBridgeSDK', () => {
     });
   });
 
+  describe('setReferralRate', () => {
+    it('submits set_referral_rate', async () => {
+      const result = await sdk.setReferralRate(2000, mockKeypair);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'set_referral_rate',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
+  describe('setLoyaltyToken', () => {
+    it('submits set_loyalty_token', async () => {
+      const result = await sdk.setLoyaltyToken(MOCK_ASSET, '10', mockKeypair);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'set_loyalty_token',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
+  describe('setFeeTiers', () => {
+    it('submits set_fee_tiers', async () => {
+      const result = await sdk.setFeeTiers(
+        [{ min_volume: '0', max_volume: '1000', fee_bps: 50 }],
+        mockKeypair,
+      );
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith('set_fee_tiers', expect.anything());
+    });
+  });
+
   describe('setFeeCollector', () => {
     it('returns pending status on success', async () => {
       const result = await sdk.setFeeCollector(MOCK_ADDRESS, mockKeypair);
@@ -416,6 +532,55 @@ describe('OnboardingBridgeSDK', () => {
       mockProvider.simulateTransaction.mockResolvedValue({ error: 'contract error' });
 
       await expect(sdk.getFee()).rejects.toThrow('Failed to get fee');
+    });
+  });
+
+  describe('queryReferralRate', () => {
+    it('returns referral rate as a number', async () => {
+      (scValToNative as jest.Mock).mockReturnValue(2000);
+      mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+      await expect(sdk.queryReferralRate()).resolves.toBe(2000);
+    });
+  });
+
+  describe('queryCommitment', () => {
+    it('returns commitment entry from simulation result', async () => {
+      const entry = { source: MOCK_ADDRESS, target: MOCK_ASSET, asset: MOCK_ASSET, revealed: false };
+      (scValToNative as jest.Mock).mockReturnValue(entry);
+      mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+      await expect(sdk.queryCommitment(1)).resolves.toBe(entry);
+    });
+  });
+
+  describe('queryLoyaltyToken', () => {
+    it('returns loyalty token config from simulation result', async () => {
+      const config = { token: MOCK_ASSET, amount_per_fund: '10' };
+      (scValToNative as jest.Mock).mockReturnValue(config);
+      mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+      await expect(sdk.queryLoyaltyToken()).resolves.toBe(config);
+    });
+  });
+
+  describe('queryFeeTiers', () => {
+    it('returns configured fee tiers from simulation result', async () => {
+      const tiers = [{ min_volume: '0', max_volume: '1000', fee_bps: 50 }];
+      (scValToNative as jest.Mock).mockReturnValue(tiers);
+      mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+      await expect(sdk.queryFeeTiers()).resolves.toBe(tiers);
+    });
+  });
+
+  describe('queryCurrentTier', () => {
+    it('returns current fee tier from simulation result', async () => {
+      const tier = { min_volume: '0', max_volume: '1000', fee_bps: 50 };
+      (scValToNative as jest.Mock).mockReturnValue(tier);
+      mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+      await expect(sdk.queryCurrentTier(MOCK_ADDRESS)).resolves.toBe(tier);
     });
   });
 
