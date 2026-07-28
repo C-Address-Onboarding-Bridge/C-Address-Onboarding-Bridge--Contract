@@ -1398,6 +1398,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
     /// * [`BridgeError::InvalidAmount`] — Any element of `amounts` is ≤ 0 or below
     ///   the configured minimum transfer amount.
+    /// * [`BridgeError::DailyLimitExceeded`] — The aggregate batch amount would
+    ///   exceed `source`'s daily limit for this asset.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     ///
     /// # Events
@@ -1464,6 +1466,11 @@ impl OnboardingBridge {
             }
             total = safe_math::safe_add(total, amount)?;
         }
+
+        // Enforce the source's daily limit against the aggregate batch amount,
+        // same as `fund_c_address` / `fund_c_address_with_referral` / `execute_meta_fund` —
+        // otherwise a source could evade a configured limit via the batch path.
+        check_daily_limit(&env, &source, &asset, total)?;
 
         let token_client = token::Client::new(&env, &asset);
         let contract_addr = env.current_contract_address();

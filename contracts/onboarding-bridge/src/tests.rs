@@ -3213,3 +3213,68 @@ fn test_batch_fund_rejects_amount_below_minimum() {
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 0i128);
 }
 
+/********** Batch fund daily-limit enforcement **********/
+
+// check_daily_limit was only wired into fund_c_address, fund_c_address_with_referral,
+// and execute_meta_fund — never batch_fund_c_address, so a source could evade a
+// configured SourceDailyLimit entirely by using the batch path.
+#[test]
+fn test_batch_fund_respects_daily_limit() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_source_daily_limit(&user, &token_id, &500i128, &None);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let targets = Vec::from_array(&env, [Address::generate(&env), Address::generate(&env)]);
+    // 300 + 300 = 600 exceeds the configured daily limit of 500, even though
+    // no single amount would trip a per-transfer check.
+    let amounts = Vec::from_array(&env, [300i128, 300i128]);
+
+    assert_eq!(
+        bridge.try_batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None),
+        Err(Ok(BridgeError::DailyLimitExceeded))
+    );
+
+    assert_eq!(check_balance(&env, &token_id, &user), 1000i128);
+}
+
+// A batch within the daily limit should still succeed and consume the usage,
+// so a subsequent batch that would push cumulative usage over the limit fails.
+#[test]
+fn test_batch_fund_within_daily_limit_succeeds() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_source_daily_limit(&user, &token_id, &500i128, &None);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target1 = Address::generate(&env);
+    let target2 = Address::generate(&env);
+    let targets = Vec::from_array(&env, [target1.clone(), target2.clone()]);
+    let amounts = Vec::from_array(&env, [200i128, 200i128]);
+
+    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &user), 600i128);
+
+    let more_targets = Vec::from_array(&env, [Address::generate(&env)]);
+    let more_amounts = Vec::from_array(&env, [200i128]);
+    assert_eq!(
+        bridge.try_batch_fund_c_address(&user, &more_targets, &more_amounts, &token_id, &None, &None),
+        Err(Ok(BridgeError::DailyLimitExceeded))
+    );
+}
+
