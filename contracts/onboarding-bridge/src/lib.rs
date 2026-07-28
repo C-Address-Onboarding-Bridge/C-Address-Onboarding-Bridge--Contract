@@ -946,6 +946,26 @@ fn remove_relayer(env: &Env, pubkey: &BytesN<32>) {
     }
 }
 
+// --- Meta-transaction signer registry ---
+//
+// `execute_meta_fund` authenticates purely via Ed25519 signature (no
+// `require_auth`), so nothing inherently ties the supplied `pubkey` to
+// `params.source`. This registry lets `source` bind the one pubkey it will
+// accept meta-tx signatures from, via `register_meta_signer` (which itself
+// requires `source.require_auth()` once, on-chain).
+
+fn save_meta_signer(env: &Env, source: &Address, pubkey: &BytesN<32>) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::MetaSigner(source.clone()), pubkey);
+}
+
+fn read_meta_signer(env: &Env, source: &Address) -> Option<BytesN<32>> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::MetaSigner(source.clone()))
+}
+
 fn relayer_threshold(env: &Env) -> u32 {
     env.storage()
         .instance()
@@ -1420,7 +1440,10 @@ impl OnboardingBridge {
     /// * [`BridgeError::TransactionExpired`] — `deadline` is in the past.
     /// * [`BridgeError::MismatchedArrays`] — `targets.len() != amounts.len()`.
     /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
-    /// * [`BridgeError::InvalidAmount`] — Any element of `amounts` is ≤ 0.
+    /// * [`BridgeError::InvalidAmount`] — Any element of `amounts` is ≤ 0 or below
+    ///   the configured minimum transfer amount.
+    /// * [`BridgeError::DailyLimitExceeded`] — The aggregate batch amount would
+    ///   exceed `source`'s daily limit for this asset.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     ///
     /// # Events
@@ -1480,18 +1503,28 @@ impl OnboardingBridge {
         let mut total: i128 = 0;
         for i in 0..targets.len() {
             let amount = amounts.get(i).unwrap();
-            if amount <= 0 {
+            // Enforce the same per-transfer minimum as `fund_c_address` — otherwise
+            // a source could evade it entirely by routing through the batch path.
+            if amount <= 0 || amount < minimum_amount {
                 return Err(BridgeError::InvalidAmount);
             }
             total = safe_math::safe_add(total, amount)?;
         }
+
+        // Enforce the source's daily limit against the aggregate batch amount,
+        // same as `fund_c_address` / `fund_c_address_with_referral` / `execute_meta_fund` —
+        // otherwise a source could evade a configured limit via the batch path.
+        check_daily_limit(&env, &source, &asset, total)?;
 
         let token_client = token::Client::new(&env, &asset);
         let contract_addr = env.current_contract_address();
         token_client.transfer(&source, &contract_addr, &total);
 
         let config = read_bridge_config(&env);
-        let effective_fee_bps = get_effective_fee_bps(&env, &asset, config.fee_bps);
+        // Route through the same volume-tiered fee lookup as the other funding
+        // entry points, instead of the flat global rate.
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, config.fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
         let mut num_success = 0u32;
         let mut num_failures = 0u32;
         let mut refund_amount = 0i128;
@@ -1544,6 +1577,13 @@ impl OnboardingBridge {
         // Batch-update all counters in a single storage read+write
         if total_fees > 0 || total_bridged > 0 {
             update_asset_counters(&env, &asset, total_fees, total_bridged);
+        }
+
+        // Track bridged volume for the tiered-fee lookup, mirroring the other
+        // funding entry points. Only the amount that actually succeeded counts.
+        let successful_amount = total - refund_amount;
+        if successful_amount > 0 {
+            increment_source_bridged_volume(&env, &source, successful_amount);
         }
 
         if refund_amount > 0 {
@@ -2125,7 +2165,11 @@ impl OnboardingBridge {
         token_client.transfer(&source, &env.current_contract_address(), &amount);
 
         let global_fee_bps = read_fee_bps(&env);
-        let effective_fee_bps = get_effective_fee_bps(&env, &asset, global_fee_bps);
+        // Route through the volume-tiered fee lookup, same as fund_c_address /
+        // reveal_fund / fund_c_address_with_swap / execute_meta_fund — otherwise
+        // a source could bypass their tier by using the referral path instead.
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
         let fee = calculate_fee(amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(amount, fee)?;
 
@@ -2153,6 +2197,7 @@ impl OnboardingBridge {
         increment_accrued_fees(&env, &asset, protocol_fee);
         increment_total_bridged(&env, &asset, net_amount);
         increment_total_fees_collected(&env, &asset, fee);
+        increment_source_bridged_volume(&env, &source, amount);
 
         env.events().publish(
             ("CAddressFunded", asset, source, target),
@@ -4501,6 +4546,57 @@ impl OnboardingBridge {
     // Issue #35: EIP-712-style meta-transaction (gasless / relayer-submitted)
     // -----------------------------------------------------------------------
 
+    /// Binds an Ed25519 public key to `source` for use with `execute_meta_fund`.
+    ///
+    /// `execute_meta_fund` authenticates purely via an Ed25519 signature check —
+    /// it never calls `require_auth`. Without this registry, verifying that
+    /// *some* keypair signed the payload proves nothing about whose funds are
+    /// being moved: any keypair holder could submit a validly-signed meta-tx
+    /// naming an arbitrary `params.source`. Calling this once (authorised by
+    /// `source` itself) establishes the binding that `execute_meta_fund` then
+    /// enforces on every subsequent call.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The account this pubkey is allowed to sign for.
+    /// * `pubkey` (`BytesN<32>`) — The Ed25519 public key to bind to `source`.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `source.require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    ///
+    /// # Events
+    ///
+    /// * `("MetaSignerRegistered", source)` — data: `(pubkey,)`
+    pub fn register_meta_signer(
+        env: Env,
+        source: Address,
+        pubkey: BytesN<32>,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        source.require_auth();
+        save_meta_signer(&env, &source, &pubkey);
+        env.events()
+            .publish(("MetaSignerRegistered", source), (pubkey,));
+        Ok(())
+    }
+
+    /// Returns the Ed25519 public key currently bound to `source` via
+    /// `register_meta_signer`, or `None` if no key has been registered.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The address to query.
+    pub fn query_meta_signer(env: Env, source: Address) -> Option<BytesN<32>> {
+        read_meta_signer(&env, &source)
+    }
+
     /// Execute a fund_c_address on behalf of a user who signed the parameters
     /// off-chain.
     ///
@@ -4530,7 +4626,8 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `params` — Funding parameters signed by the user.
-    /// * `pubkey` — The user's Ed25519 public key (`BytesN<32>`).
+    /// * `pubkey` — The user's Ed25519 public key (`BytesN<32>`). Must already be
+    ///   bound to `params.source` via `register_meta_signer`.
     /// * `signature` — Ed25519 signature over the canonical payload hash.
     ///
     /// # Authorization
@@ -4552,6 +4649,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode and target not listed.
     /// * [`BridgeError::AssetNotWhitelisted`] — Asset not whitelisted.
     /// * [`BridgeError::DailyLimitExceeded`] — Daily limit exceeded.
+    /// * [`BridgeError::MetaTxPubkeySourceMismatch`] — `pubkey` is not the key
+    ///   `params.source` registered via `register_meta_signer`.
     ///
     /// # Events
     ///
@@ -4594,6 +4693,15 @@ impl OnboardingBridge {
         check_access(&env, &params.target)?;
         check_asset_whitelisted(&env, &params.asset)?;
         check_daily_limit(&env, &params.source, &params.asset, params.amount)?;
+
+        // 4b. Bind the signature to `params.source`: verifying the Ed25519
+        //     signature alone only proves *some* keypair signed the payload,
+        //     not that it belongs to `params.source`. Require `pubkey` to be
+        //     the one `params.source` registered via `register_meta_signer`.
+        match read_meta_signer(&env, &params.source) {
+            Some(registered) if registered == pubkey => {}
+            _ => return Err(BridgeError::MetaTxPubkeySourceMismatch),
+        }
 
         // 5. Build canonical payload hash and verify signature
         //    payload = sha256(domain || source_hash || target_hash || asset_hash
@@ -4695,7 +4803,9 @@ impl OnboardingBridge {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetaFundParams {
-    /// The user's Stellar address (source of funds). Must match `pubkey`.
+    /// The user's Stellar address (source of funds). `pubkey` must be the key
+    /// registered for this address via `register_meta_signer` — enforced by
+    /// `execute_meta_fund`, not merely documented here.
     pub source: Address,
     /// Destination C-address.
     pub target: Address,
