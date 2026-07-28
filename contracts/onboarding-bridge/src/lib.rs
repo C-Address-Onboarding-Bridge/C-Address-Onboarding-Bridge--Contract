@@ -151,6 +151,8 @@ pub enum BridgeError {
     PoolNotWhitelisted = 42,
     /// `swap_route` contained more than one hop; multi-hop swaps are not supported.
     MultiHopNotSupported = 43,
+    /// A mutating call was re-entered while another call was already in progress.
+    Reentrant = 44,
 }
 
 // ---------------------------------------------------------------------------
@@ -1183,16 +1185,16 @@ struct ReentrancyGuard {
 }
 
 impl ReentrancyGuard {
-    fn enter(env: &Env) -> Self {
+    fn enter(env: &Env) -> Result<Self, BridgeError> {
         let entered: bool = env.storage()
             .instance()
             .get(&DataKey::Entered)
             .unwrap_or(false);
         if entered {
-            panic!("reentrant call");
+            return Err(BridgeError::Reentrant);
         }
         env.storage().instance().set(&DataKey::Entered, &true);
-        Self { env: env.clone() }
+        Ok(Self { env: env.clone() })
     }
 }
 
@@ -1261,7 +1263,7 @@ impl OnboardingBridge {
         fee_bps: u32,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         if read_initialized(&env) {
             return Err(BridgeError::AlreadyInitialized);
         }
@@ -1353,7 +1355,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
         deadline: Option<u64>,
     ) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         if let Some(d) = deadline {
@@ -1468,7 +1470,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
         deadline: Option<u64>,
     ) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         if targets.len() > MAX_BATCH_SIZE {
@@ -1613,7 +1615,7 @@ impl OnboardingBridge {
     /// // assert_eq!(bridge.query_fee_bps(), 200u32);
     /// ```
     pub fn set_fee_bps(env: Env, new_fee_bps: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         if new_fee_bps > MAX_FEE_BPS {
@@ -1667,7 +1669,7 @@ impl OnboardingBridge {
         limit_amount: i128,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -1732,7 +1734,7 @@ impl OnboardingBridge {
         max_fee_bps: u32,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         if max_fee_bps > MAX_FEE_BPS {
             return Err(BridgeError::FeeTooHigh);
@@ -1792,7 +1794,7 @@ impl OnboardingBridge {
     /// // assert_eq!(bridge.query_fee_collector(), new_collector);
     /// ```
     pub fn set_fee_collector(env: Env, new_fee_collector: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         let mut config = read_bridge_config(&env);
@@ -1808,7 +1810,7 @@ impl OnboardingBridge {
     }
 
     pub fn propose_new_fee_collector(env: Env, new_collector: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         let admin = read_admin(&env);
@@ -1821,7 +1823,7 @@ impl OnboardingBridge {
     }
 
     pub fn accept_fee_collector(env: Env) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         let pending = read_pending_fee_collector(&env).ok_or(BridgeError::Unauthorized)?;
@@ -1842,7 +1844,7 @@ impl OnboardingBridge {
     }
 
     pub fn set_admin(env: Env, new_admin: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         let mut config = read_bridge_config(&env);
@@ -1858,7 +1860,7 @@ impl OnboardingBridge {
     }
 
     pub fn propose_new_admin(env: Env, new_admin: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         let admin = read_admin(&env);
@@ -1871,7 +1873,7 @@ impl OnboardingBridge {
     }
 
     pub fn accept_admin(env: Env) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         let pending = read_pending_admin(&env).ok_or(BridgeError::Unauthorized)?;
@@ -1892,7 +1894,7 @@ impl OnboardingBridge {
     }
 
     pub fn set_minimum_amount(env: Env, amount: i128, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_deactivated(&env)?;
         if amount < 0 {
@@ -1960,7 +1962,7 @@ impl OnboardingBridge {
     /// // bridge.withdraw_fees(&usdc, &5i128, &None);
     /// ```
     pub fn withdraw_fees(env: Env, asset: Address, amount: i128, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         if amount <= 0 {
@@ -1988,7 +1990,7 @@ impl OnboardingBridge {
     }
 
     pub fn set_max_withdraw_per_tx(env: Env, amount: i128, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         if amount < 0 {
             return Err(BridgeError::InvalidAmount);
@@ -2037,7 +2039,7 @@ impl OnboardingBridge {
     ///
     /// * `("ReferralRateChanged", bps)` — no additional data.
     pub fn set_referral_rate(env: Env, bps: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         if bps > 10_000 {
             return Err(BridgeError::FeeTooHigh);
@@ -2129,7 +2131,7 @@ impl OnboardingBridge {
         amount: i128,
         referrer: Option<Address>,
     ) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         if amount <= 0 {
@@ -2381,7 +2383,7 @@ impl OnboardingBridge {
     /// scheduling or executing upgrades, which are intentionally not pause-gated
     /// so that an upgrade can fix whatever condition required the pause.
     pub fn pause(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_deactivated(&env)?;
         let admin = read_admin(&env);
@@ -2411,7 +2413,7 @@ impl OnboardingBridge {
     ///
     /// * `("ContractUnpaused",)` — data: `(admin,)`
     pub fn unpause(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_deactivated(&env)?;
         let admin = read_admin(&env);
@@ -2463,7 +2465,7 @@ impl OnboardingBridge {
     /// The `old_hash` in the event lets off-chain monitors detect unexpected
     /// upgrades. Consider using the timelocked path for mainnet deployments.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_deactivated(&env)?;
         let admin = read_admin(&env);
@@ -2543,7 +2545,7 @@ impl OnboardingBridge {
         new_wasm_hash: BytesN<32>,
         nonce: Option<u64>,
     ) -> Result<u32, BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_deactivated(&env)?;
         let admin = read_admin(&env);
@@ -2604,7 +2606,7 @@ impl OnboardingBridge {
         expected_hash: BytesN<32>,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_deactivated(&env)?;
         let admin = read_admin(&env);
@@ -2664,7 +2666,7 @@ impl OnboardingBridge {
     ///
     /// * `("UpgradeCancelled",)` — data: `(cancelled_wasm_hash, admin)`
     pub fn cancel_upgrade(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_deactivated(&env)?;
         let admin = read_admin(&env);
@@ -2706,7 +2708,7 @@ impl OnboardingBridge {
         new_contract: Address,
         migrate_data: bool,
     ) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_deactivated(&env)?;
 
@@ -2826,7 +2828,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn add_to_blocklist(env: Env, address: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -2853,7 +2855,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn remove_from_blocklist(env: Env, address: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -2884,7 +2886,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn add_to_allowlist(env: Env, address: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -2914,7 +2916,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn remove_from_allowlist(env: Env, address: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -2947,7 +2949,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn set_allowlist_mode(env: Env, enabled: bool, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -3024,7 +3026,7 @@ impl OnboardingBridge {
         destination: Address,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
@@ -3072,7 +3074,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn add_asset(env: Env, asset: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -3103,7 +3105,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn remove_asset(env: Env, asset: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -3158,7 +3160,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn add_swap_pool(env: Env, pool: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -3188,7 +3190,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn remove_swap_pool(env: Env, pool: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -3244,7 +3246,7 @@ impl OnboardingBridge {
         token: Address,
         amount_per_fund: i128,
     ) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -3313,7 +3315,7 @@ impl OnboardingBridge {
     ///
     /// * `("FeeTiersSet", admin)` — data: `(tiers.len(),)`
     pub fn set_fee_tiers(env: Env, tiers: Vec<FeeTier>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -3456,7 +3458,7 @@ impl OnboardingBridge {
         amount: i128,
         sigs: Vec<RelayerSig>,
     ) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         if amount <= 0 {
@@ -3576,7 +3578,7 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn add_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         read_admin(&env).require_auth();
         add_relayer(&env, &pubkey);
@@ -3603,7 +3605,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::BelowThreshold`] — Removing this relayer would drop the
     ///   count below the required threshold.
     pub fn remove_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         read_admin(&env).require_auth();
         // Prevent removing below threshold
@@ -3632,7 +3634,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::ThresholdExceedsRelayers`] — `threshold` is greater than
     ///   the number of registered relayers.
     pub fn set_relayer_threshold(env: Env, threshold: u32) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         read_admin(&env).require_auth();
         if threshold > relayer_count(&env) {
@@ -3729,7 +3731,7 @@ impl OnboardingBridge {
         release_time: u64,
         cliff_time: u64,
     ) -> Result<u64, BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         if amount <= 0 {
@@ -3811,7 +3813,7 @@ impl OnboardingBridge {
     /// prevents re-entrancy. The fee rate is the **current** global rate at
     /// claim time, which may differ from the rate at deposit time.
     pub fn claim_timelocked(env: Env, id: u64) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
 
@@ -3890,7 +3892,7 @@ impl OnboardingBridge {
     ///
     /// * `("InstanceTtlExtended",)` — data: `(admin, actual_ttl)`
     pub fn extend_instance_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -3934,7 +3936,7 @@ impl OnboardingBridge {
         key_asset: Address,
         ttl: u32,
     ) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -3978,7 +3980,7 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn set_max_instance_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -4009,7 +4011,7 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn set_max_persistent_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -4112,7 +4114,7 @@ impl OnboardingBridge {
         valid_after_ledger: u32,
         valid_before_ledger: u32,
     ) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         source.require_auth();
@@ -4210,7 +4212,7 @@ impl OnboardingBridge {
         amount_hash: BytesN<32>,
         deadline: u64,
     ) -> Result<u64, BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         if env.ledger().timestamp() >= deadline {
@@ -4291,7 +4293,7 @@ impl OnboardingBridge {
         amount: i128,
         nonce: u64,
     ) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
 
@@ -4454,7 +4456,7 @@ impl OnboardingBridge {
         min_target_amount: i128,
         swap_route: Vec<Address>,
     ) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
 
@@ -4603,7 +4605,7 @@ impl OnboardingBridge {
         pubkey: BytesN<32>,
         signature: BytesN<64>,
     ) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
 

@@ -3385,6 +3385,30 @@ mod concurrent_sequential_tests {
     }
 
     // -----------------------------------------------------------------------
+    // Reentrancy guard now returns BridgeError::Reentrant instead of
+    // panicking. This directly exercises ReentrancyGuard::enter re-entering
+    // while a guard is already held for the current contract, which is what
+    // a malicious token callback into a bridge function would trigger.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reentrant_call_returns_error() {
+        let s = ConcurrentSetup::new();
+
+        s.env.as_contract(&s.bridge_id, || {
+            let _outer_guard = crate::ReentrancyGuard::enter(&s.env).unwrap();
+            let inner = crate::ReentrancyGuard::enter(&s.env);
+            assert!(matches!(inner, Err(BridgeError::Reentrant)));
+        });
+
+        // Once the outer guard drops, entry succeeds again (sequential calls
+        // are unaffected — only true reentrancy is rejected).
+        s.env.as_contract(&s.bridge_id, || {
+            assert!(crate::ReentrancyGuard::enter(&s.env).is_ok());
+        });
+    }
+
+    // -----------------------------------------------------------------------
     // Scenario 6: Fee counter consistency across mixed batch + single calls
     //
     // Mixing batch_fund_c_address and fund_c_address in sequence must keep
