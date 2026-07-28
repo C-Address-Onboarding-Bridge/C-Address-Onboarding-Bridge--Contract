@@ -236,12 +236,27 @@ class ContractClient {
 
     if (response.status !== 'ERROR') {
       await Promise.all(CACHE_KEYS.map((key) => this.cache.delete(key)));
+      void this.invalidateAfterConfirmation(response.hash);
     }
 
     return {
       hash: response.hash,
       status: response.status === 'ERROR' ? 'failed' : 'pending',
     };
+  }
+
+  private async invalidateAfterConfirmation(hash: string): Promise<void> {
+    try {
+      let result = await this.provider.getTransaction(hash);
+      while (result.status === 'NOT_FOUND') {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        result = await this.provider.getTransaction(hash);
+      }
+      await Promise.all(CACHE_KEYS.map((key) => this.cache.delete(key)));
+    } catch {
+      // Cache was already invalidated on submission; confirmation invalidation
+      // is best-effort and must not surface as an unhandled background error.
+    }
   }
 
   async fundCAddress(options: any, sourceKeypair: Keypair): Promise<TransactionResult> {

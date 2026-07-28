@@ -58,11 +58,13 @@ describe('CachedContractClient', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    (scValToNative as jest.Mock).mockReset();
 
     mockProvider = {
       getAccount: jest.fn().mockResolvedValue({}),
       prepareTransaction: jest.fn().mockResolvedValue({ sign: jest.fn() }),
       sendTransaction: jest.fn().mockResolvedValue({ hash: 'mock_tx_hash', status: 'PENDING' }),
+      getTransaction: jest.fn().mockResolvedValue({ status: 'SUCCESS' }),
       simulateTransaction: jest.fn(),
     };
 
@@ -112,6 +114,35 @@ describe('CachedContractClient', () => {
 
     await wrapper.getFee();
     expect(mockProvider.simulateTransaction).toHaveBeenCalledTimes(2);
+  });
+
+  it('invalidates cache again after confirmation if a racing read repopulates it', async () => {
+    let confirm!: () => void;
+    const confirmation = new Promise<void>((resolve) => {
+      confirm = resolve;
+    });
+    mockProvider.getTransaction.mockImplementation(() =>
+      confirmation.then(() => ({ status: 'SUCCESS' })),
+    );
+
+    (scValToNative as jest.Mock)
+      .mockReturnValueOnce(50)
+      .mockReturnValueOnce(50)
+      .mockReturnValueOnce(60);
+    mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+    await wrapper.getFee();
+    await wrapper.client.setAdmin(MOCK_ADDRESS, { publicKey: () => MOCK_ADDRESS, sign: jest.fn() });
+    await wrapper.getFee();
+    expect(await cache.get('getFee')).toBe(50);
+
+    confirm();
+    await confirmation;
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(await cache.get('getFee')).toBeUndefined();
+    await expect(wrapper.getFee()).resolves.toBe(60);
   });
 
   it('allows manual invalidation via invalidateCache', async () => {

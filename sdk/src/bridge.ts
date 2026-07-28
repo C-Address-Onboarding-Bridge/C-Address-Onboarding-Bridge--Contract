@@ -1228,6 +1228,10 @@ export class OnboardingBridgeSDK {
     newFeeBps: number,
     adminKeypair: Keypair,
   ): Promise<TransactionResult> {
+    if (newFeeBps < 0 || newFeeBps > 1000) {
+      throw new Error('Fee basis points must be between 0 and 1000');
+    }
+
     return withTransactionHooks(
       this.hooks,
       'setFee',

@@ -1,8 +1,14 @@
-use crate::{BridgeError, FeeTier, MetaFundParams, OnboardingBridge};
+use crate::{
+    BridgeError, DataKey, FeeTier, MetaFundParams, OnboardingBridge,
+    CRITICAL_ENTRY_TTL_THRESHOLD, MAX_ALLOWED_TTL,
+};
 
 use soroban_sdk::{
     contract, contractimpl, contracttype,
-    testutils::{Address as _, Events, Ledger},
+    testutils::{
+        storage::{Instance as _, Persistent as _},
+        Address as _, Events, Ledger,
+    },
     Address, Bytes, BytesN, Env, IntoVal, Vec,
 };
 
@@ -3651,6 +3657,100 @@ fn test_batch_fund_applies_tiered_fee() {
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 1i128);
 }
 
+#[test]
+fn test_extend_instance_ttl_extends_instance_storage() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+
+    bridge.extend_instance_ttl(&200_000u32);
+
+    let ttl = env.as_contract(&bridge_id, || env.storage().instance().get_ttl());
+    assert!(ttl >= 200_000);
+}
+
+#[test]
+fn test_extend_persistent_ttl_extends_asset_keys() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    bridge.fund_c_address(
+        &user,
+        &Address::generate(&env),
+        &token_id,
+        &500i128,
+        &None,
+        &None,
+    );
+    bridge.set_asset_fee_cap(&token_id, &1000u32);
+
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    bridge.extend_persistent_ttl(&token_id, &200_000u32);
+
+    let expected_keys = [
+        DataKey::AccruedFees(token_id.clone()),
+        DataKey::TotalBridged(token_id.clone()),
+        DataKey::TotalFeesCollected(token_id.clone()),
+        DataKey::AssetStats(token_id.clone()),
+        DataKey::AssetFeeCap(token_id.clone()),
+    ];
+    for key in expected_keys.iter() {
+        let ttl = env.as_contract(&bridge_id, || env.storage().persistent().get_ttl(key));
+        assert!(ttl >= 200_000);
+    }
+}
+
+#[test]
+fn test_set_max_ttl_updates_config() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+
+    bridge.set_max_instance_ttl(&200_000u32);
+    let instance_ttl = env.as_contract(&bridge_id, || env.storage().instance().get_ttl());
+    assert!(instance_ttl >= 200_000);
+
+    bridge.set_max_persistent_ttl(&300_000u32);
+
+    let (instance_ttl, persistent_ttl, hard_ceiling, critical_threshold) =
+        bridge.query_ttl_config();
+    assert_eq!(instance_ttl, 200_000);
+    assert_eq!(persistent_ttl, 300_000);
+    assert_eq!(hard_ceiling, MAX_ALLOWED_TTL);
+    assert_eq!(critical_threshold, CRITICAL_ENTRY_TTL_THRESHOLD);
+}
+
+#[test]
+fn test_query_ttl_config_returns_current_settings() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let (instance_ttl, persistent_ttl, hard_ceiling, critical_threshold) =
+        bridge.query_ttl_config();
+    assert_eq!(instance_ttl, MAX_ALLOWED_TTL);
+    assert_eq!(persistent_ttl, MAX_ALLOWED_TTL);
+    assert_eq!(hard_ceiling, MAX_ALLOWED_TTL);
+    assert_eq!(critical_threshold, CRITICAL_ENTRY_TTL_THRESHOLD);
+}
+
 // fund_c_address_with_referral computed its fee straight from the global rate via
 // get_effective_fee_bps, never consulting the caller's volume tier.
 #[test]
@@ -3682,4 +3782,3 @@ fn test_referral_fund_applies_tiered_fee() {
     assert_eq!(check_balance(&env, &token_id, &target), 999i128);
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 1i128);
 }
-
