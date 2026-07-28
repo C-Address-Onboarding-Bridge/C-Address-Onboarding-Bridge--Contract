@@ -373,6 +373,16 @@ describe('OnboardingBridgeSDK', () => {
       expect(result.status).toBe('pending');
       expect(mockProvider.getAccount).toHaveBeenCalledWith(MOCK_ADDRESS);
     });
+
+    it('rejects fee bps outside the documented range before RPC', async () => {
+      await expect(sdk.setFee(-1, mockKeypair)).rejects.toThrow(
+        'Fee basis points must be between 0 and 1000',
+      );
+      await expect(sdk.setFee(1001, mockKeypair)).rejects.toThrow(
+        'Fee basis points must be between 0 and 1000',
+      );
+      expect(mockProvider.getAccount).not.toHaveBeenCalled();
+    });
   });
 
   describe('setFeeCollector', () => {
@@ -812,11 +822,12 @@ describe('address validation', () => {
 describe('Error handling - invalid inputs', () => {
   let sdk: OnboardingBridgeSDK;
   let mockKeypair: any;
+  let mockProvider: any;
 
   beforeEach(() => {
     jest.clearAllMocks();
     mockKeypair = { publicKey: jest.fn().mockReturnValue(MOCK_ADDRESS), sign: jest.fn() };
-    const mockProvider = {
+    mockProvider = {
       getAccount: jest.fn().mockResolvedValue({}),
       prepareTransaction: jest.fn().mockResolvedValue({ sign: jest.fn() }),
       sendTransaction: jest.fn().mockResolvedValue({ hash: 'h', status: 'PENDING' }),
@@ -883,9 +894,11 @@ describe('Error handling - invalid inputs', () => {
     expect(result.status).toBe('pending');
   });
 
-  it('setFee passes negative fee bps to contract (no client-side validation)', async () => {
-    const result = await sdk.setFee(-100, mockKeypair);
-    expect(result.status).toBe('pending');
+  it('setFee rejects negative fee bps before RPC', async () => {
+    await expect(sdk.setFee(-100, mockKeypair)).rejects.toThrow(
+      'Fee basis points must be between 0 and 1000',
+    );
+    expect(mockProvider.getAccount).not.toHaveBeenCalled();
   });
 
   it('reclaimTokens rejects invalid to address (C-address)', async () => {
