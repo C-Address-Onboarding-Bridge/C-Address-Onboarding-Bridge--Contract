@@ -1,5 +1,6 @@
 use crate::events::{BridgeEventType, IndexedEvent};
 use crate::AppState;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const POLL_INTERVAL_MS: u64 = 5000;
@@ -61,6 +62,11 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut max_ledger = start_ledger;
+    // Position of each event within its transaction. Combined with the ledger
+    // and tx hash this yields a stable primary key, so re-polling a range
+    // already seen (after a restart, or a crash before `set_last_ledger`)
+    // regenerates the same ids and `insert_event` deduplicates them.
+    let mut events_seen_per_tx: HashMap<&str, usize> = HashMap::new();
 
     for raw_event in &events {
         let ledger = raw_event
@@ -71,14 +77,27 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
             max_ledger = ledger;
         }
 
-        if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id) {
-            state.db.insert_event(&indexed).await?;
-            state.db.queue_webhook_deliveries(&indexed).await?;
-            tracing::info!(
-                "Indexed event: {} at ledger {}",
-                indexed.event_type,
-                indexed.ledger_sequence
-            );
+        let tx_hash = raw_event
+            .get("txHash")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        let counter = events_seen_per_tx.entry(tx_hash).or_insert(0);
+        let event_index = *counter;
+        *counter += 1;
+
+        if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id, event_index) {
+            // Only fan out webhooks for events we have not indexed before;
+            // otherwise a re-poll would re-deliver every event in the range.
+            if state.db.insert_event(&indexed).await? {
+                state.db.queue_webhook_deliveries(&indexed).await?;
+                tracing::info!(
+                    "Indexed event: {} at ledger {}",
+                    indexed.event_type,
+                    indexed.ledger_sequence
+                );
+            } else {
+                tracing::debug!("Skipping already-indexed event {}", indexed.id);
+            }
         }
     }
 
@@ -88,9 +107,15 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Build an [`IndexedEvent`] from a raw `getEvents` entry.
+///
+/// `event_index` is the position of this event within its transaction; it is
+/// part of the event id, so the same on-chain event always parses to the same
+/// id no matter how many times it is polled.
 fn parse_contract_event(
     raw: &serde_json::Value,
     contract_id: &str,
+    event_index: usize,
 ) -> Option<IndexedEvent> {
     let topics = raw.get("topic")?.as_array()?;
     if topics.is_empty() {

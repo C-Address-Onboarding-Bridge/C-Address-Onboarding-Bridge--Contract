@@ -55,6 +55,16 @@ import {
  * size and submits one transaction per chunk.
  */
 export const BATCH_TX_LIMIT = 100;
+
+/**
+ * Stellar's default base reserve, in stroops (0.5 XLM).
+ *
+ * An account's minimum balance is `(2 + numSubentries) * baseReserve`: two
+ * reserves for the account itself plus one for every subentry (trustline,
+ * offer, data entry, or signer). Override per-instance with
+ * `BridgeConfig.baseReserveStroops` if the network uses a different value.
+ */
+export const BASE_RESERVE_STROOPS = 5_000_000;
 import { assertAccountAddress, assertContractAddress, assertRelayerPubkey } from './validate';
 import { withRpcRetry } from './retry';
 import { toScVals, buildSimulationTx as buildSharedSimTx } from './encoding';
@@ -2614,20 +2624,14 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Convert an array of JavaScript values to Soroban `ScVal` XDR values.
-   *
-   * Handles strings (G-/C-addresses, numeric strings, plain strings), numbers,
-   * bigints, `Address` instances, arrays (→ `scvVec`), and `null`/`undefined`
-   * (→ `scvVoid`).
-   *
-   * @param args - Values to convert.
-   * @returns Array of `xdr.ScVal` suitable for passing to `Contract.call`.
-   * @internal
    * Estimate the transaction cost for a `fundCAddress` call without submitting
    * it to the network.
    *
    * Runs `simulateTransaction` under the hood and extracts the Soroban resource
    * fee, the base inclusion fee, and the minimum account balance required.
+   *
+   * @param options - The `fundCAddress` call to price.
+   * @returns The estimated fees plus the source account's minimum balance.
    *
    * @example
    * ```ts
@@ -2639,6 +2643,7 @@ export class OnboardingBridgeSDK {
    * });
    * console.log('Resource fee:', estimate.resourceFee, 'stroops');
    * console.log('Total fee:   ', estimate.fee, 'stroops');
+   * console.log('Min balance: ', estimate.minBalance, 'stroops');
    * ```
    */
   async estimateCost(options: FundCOptions): Promise<CostEstimate> {
@@ -2704,10 +2709,12 @@ export class OnboardingBridgeSDK {
       BigInt(inclusionFee) + BigInt(resourceFee),
     );
 
-    // Minimum balance: Stellar base reserve is 0.5 XLM per entry.
-    // For a basic funded account the minimum is 1 XLM (2 base reserves).
-    // 1 XLM = 10_000_000 stroops.
-    const minBalance = '10000000';
+    // Minimum balance = (2 + numSubentries) * baseReserve. The two fixed
+    // reserves cover the account entry itself; every trustline, offer, data
+    // entry, or extra signer on the source account adds another one.
+    const subentryCount = await this.getSubentryCount(options.source);
+    const baseReserve = BigInt(this.config.baseReserveStroops ?? BASE_RESERVE_STROOPS);
+    const minBalance = String(BigInt(2 + subentryCount) * baseReserve);
 
     return {
       fee: totalFee,
@@ -2715,6 +2722,34 @@ export class OnboardingBridgeSDK {
       resourceFee,
       executionTimeMs,
     };
+  }
+
+  /**
+   * Read the number of subentries held by an account.
+   *
+   * Reads the raw `AccountEntry` because Soroban RPC's `getAccount` only
+   * surfaces the account ID and sequence number. An account that does not exist
+   * on-chain yet has no subentries, so it reports 0.
+   *
+   * @internal
+   */
+  private async getSubentryCount(address: string): Promise<number> {
+    const ledgerKey = xdr.LedgerKey.account(
+      new xdr.LedgerKeyAccount({
+        accountId: Keypair.fromPublicKey(address).xdrAccountId(),
+      }),
+    );
+
+    const response = await withRpcHook(
+      this.hooks,
+      'getLedgerEntries',
+      { address },
+      () => this.provider.getLedgerEntries(ledgerKey),
+    );
+
+    const entry = response.entries?.[0];
+    if (!entry) return 0;
+    return entry.val.account().numSubEntries();
   }
 
   /**

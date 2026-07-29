@@ -38,6 +38,8 @@
  * | `computeBackoffDelay` | Computes exponential backoff delay with optional jitter |
  * | `VIEW_RETRY_POLICY` | Default retry policy for idempotent read calls |
  * | `STATE_CHANGING_RETRY_POLICY` | Conservative retry policy for write calls |
+ * | `BATCH_TX_LIMIT` | Maximum targets per batch funding transaction |
+ * | `BASE_RESERVE_STROOPS` | Stellar base reserve used to derive minimum balances |
  *
  * All types are also re-exported; import them directly:
  *
@@ -49,7 +51,7 @@
  * @packageDocumentation
  */
 
-export { OnboardingBridgeSDK, BATCH_TX_LIMIT } from './bridge';
+export { OnboardingBridgeSDK, BATCH_TX_LIMIT, BASE_RESERVE_STROOPS } from './bridge';
 export { OffRampIntegration } from './offramp';
 export { assertAccountAddress, assertContractAddress } from './validate';
 export { CachedContractClient } from './cachedBridge';

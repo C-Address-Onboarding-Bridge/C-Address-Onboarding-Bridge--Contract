@@ -114,9 +114,14 @@ impl Database {
         Ok(())
     }
 
-    pub async fn insert_event(&self, event: &IndexedEvent) -> Result<(), sqlx::Error> {
+    /// Insert an event, ignoring it if its id was already indexed.
+    ///
+    /// Returns `true` when a new row was written and `false` when the event was
+    /// a duplicate. Callers use this to avoid re-queuing webhook deliveries for
+    /// an event that has already been delivered.
+    pub async fn insert_event(&self, event: &IndexedEvent) -> Result<bool, sqlx::Error> {
         let data_str = serde_json::to_string(&event.data).unwrap_or_default();
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT OR IGNORE INTO events (id, event_type, ledger_sequence, contract_id, tx_hash, timestamp, data)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
@@ -129,7 +134,7 @@ impl Database {
         .bind(&data_str)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn list_events(
