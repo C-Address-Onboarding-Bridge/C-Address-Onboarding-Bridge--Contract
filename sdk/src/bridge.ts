@@ -59,6 +59,7 @@ import {
 export const BATCH_TX_LIMIT = 100;
 import { assertAccountAddress, assertContractAddress, assertRelayerPubkey } from './validate';
 import { withRpcRetry } from './retry';
+import { toScVals, buildSimulationTx as buildSharedSimTx } from './encoding';
 import {
   SorobanRpc,
   Contract,
@@ -219,7 +220,7 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'fund_c_address',
-                ...this.toScVals([
+                ...toScVals([
                   options.source,
                   options.target,
                   options.asset,
@@ -229,7 +230,7 @@ export class OnboardingBridgeSDK {
                 deadlineScVal,
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -293,7 +294,7 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'fund_c_address_with_referral',
-                ...this.toScVals([
+                ...toScVals([
                   options.source,
                   options.target,
                   options.asset,
@@ -302,7 +303,7 @@ export class OnboardingBridgeSDK {
                 ]),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -370,7 +371,7 @@ export class OnboardingBridgeSDK {
                 nativeToScVal(BigInt(options.deadline), { type: 'u64' }),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -439,7 +440,7 @@ export class OnboardingBridgeSDK {
                 nativeToScVal(BigInt(options.nonce), { type: 'u64' }),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -522,7 +523,7 @@ export class OnboardingBridgeSDK {
                 nativeToScVal(BigInt(options.cliffTime ?? 0), { type: 'u64' }),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -585,7 +586,7 @@ export class OnboardingBridgeSDK {
                 nativeToScVal(BigInt(id), { type: 'u64' }),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -633,7 +634,7 @@ export class OnboardingBridgeSDK {
           nativeToScVal(BigInt(id), { type: 'u64' }),
         ),
       )
-      .setTimeout(30)
+      .setTimeout(this.config.timeout ?? 30)
       .build();
 
     const result = await this.provider.simulateTransaction(
@@ -720,7 +721,7 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'fund_c_address_with_swap',
-                ...this.toScVals([
+                ...toScVals([
                   options.source,
                   options.target,
                   options.sourceAsset,
@@ -731,7 +732,7 @@ export class OnboardingBridgeSDK {
                 ]),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -871,7 +872,7 @@ export class OnboardingBridgeSDK {
               .addOperation(
                 this.contract.call(
                   'batch_fund_c_address',
-                  ...this.toScVals([
+                  ...toScVals([
                     options.source,
                     chunkTargets,
                     chunkAmounts,
@@ -881,7 +882,7 @@ export class OnboardingBridgeSDK {
                   deadlineScVal,
                 ),
               )
-              .setTimeout(30)
+              .setTimeout(this.config.timeout ?? 30)
               .build();
 
             const preparedTx = await withRpcHook(
@@ -980,7 +981,7 @@ export class OnboardingBridgeSDK {
                 options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' }),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1064,7 +1065,7 @@ export class OnboardingBridgeSDK {
                 options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' }),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1476,7 +1477,7 @@ export class OnboardingBridgeSDK {
                 nonceScVal,
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1538,7 +1539,7 @@ export class OnboardingBridgeSDK {
                 nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(nonce), { type: 'u64' }),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1601,7 +1602,7 @@ export class OnboardingBridgeSDK {
                 nativeToScVal(BigInt(amountPerFund), { type: 'i128' }),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1661,7 +1662,7 @@ export class OnboardingBridgeSDK {
                 xdr.ScVal.scvVec(tiers.map((tier) => this.feeTierToScVal(tier))),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1746,7 +1747,7 @@ export class OnboardingBridgeSDK {
                 nonceScVal,
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1832,7 +1833,7 @@ export class OnboardingBridgeSDK {
                 nonceScVal,
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -1900,7 +1901,7 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call('upgrade', wasmHashScVal, nonceScVal),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -2159,7 +2160,7 @@ export class OnboardingBridgeSDK {
                 sigsScVal,
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -2215,7 +2216,7 @@ export class OnboardingBridgeSDK {
           );
           const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
             .addOperation(this.contract.call('add_relayer', xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex'))))
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
           const preparedTx = await withRpcHook(
             this.hooks,
@@ -2268,7 +2269,7 @@ export class OnboardingBridgeSDK {
           );
           const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
             .addOperation(this.contract.call('remove_relayer', xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex'))))
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
           const preparedTx = await withRpcHook(
             this.hooks,
@@ -2325,7 +2326,7 @@ export class OnboardingBridgeSDK {
           );
           const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
             .addOperation(this.contract.call('set_relayer_threshold', nativeToScVal(threshold, { type: 'u32' })))
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
           const preparedTx = await withRpcHook(
             this.hooks,
@@ -2601,7 +2602,7 @@ export class OnboardingBridgeSDK {
       .addOperation(
         this.contract.call(
           'fund_c_address',
-          ...this.toScVals([
+          ...toScVals([
             options.source,
             options.target,
             options.asset,
@@ -2609,7 +2610,7 @@ export class OnboardingBridgeSDK {
           ]),
         ),
       )
-      .setTimeout(30)
+      .setTimeout(this.config.timeout ?? 30)
       .build();
 
     const result = await this.provider.simulateTransaction(tx);
@@ -2656,54 +2657,8 @@ export class OnboardingBridgeSDK {
   /**
    * Convert JavaScript values to Soroban SCVals.
    */
-  private toScVals(args: any[]): xdr.ScVal[] {
-    return args.map((arg) => {
-      if (arg === null || arg === undefined) {
-        return xdr.ScVal.scvVoid();
-      }
-
-      if (Array.isArray(arg)) {
-        return xdr.ScVal.scvVec(
-          arg.map((item) => this.toSingleScVal(item)),
-        );
-      }
-
-      return this.toSingleScVal(arg);
-    });
-  }
-
-  private toSingleScVal(arg: any): xdr.ScVal {
-    if (typeof arg === 'string') {
-      if (arg.startsWith('C') || arg.startsWith('G')) {
-        return new Address(arg).toScVal();
-      }
-      if (/^\d+$/.test(arg)) {
-        return nativeToScVal(BigInt(arg), { type: 'i128' });
-      }
-      return nativeToScVal(arg, { type: 'string' });
-    }
-    if (typeof arg === 'number') {
-      return nativeToScVal(arg, { type: 'i128' });
-    }
-    if (typeof arg === 'bigint') {
-      return nativeToScVal(arg, { type: 'i128' });
-    }
-    if (arg instanceof Address) {
-      return arg.toScVal();
-    }
-    return nativeToScVal(arg);
-  }
-
   private buildSimulationTx(method: string, args: any[]) {
-    const source = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
-    const account = new Account(source, '0');
-    return new TransactionBuilder(account, {
-      fee: '100',
-      networkPassphrase: this.networkPassphrase,
-    })
-      .addOperation(this.contract.call(method, ...this.toScVals(args)))
-      .setTimeout(30)
-      .build();
+    return buildSharedSimTx(this.contract, method, args, this.networkPassphrase, this.config.timeout ?? 30);
   }
 
   private buildSimulationTxWithScVals(method: string, args: xdr.ScVal[]) {
@@ -2714,7 +2669,7 @@ export class OnboardingBridgeSDK {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(this.contract.call(method, ...args))
-      .setTimeout(30)
+      .setTimeout(this.config.timeout ?? 30)
       .build();
   }
 

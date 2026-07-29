@@ -14,15 +14,13 @@ import {
   SorobanRpc,
   Contract,
   xdr,
-  Address,
-  Account,
   Keypair,
-  nativeToScVal,
   scValToNative,
   TransactionBuilder,
   BASE_FEE,
 } from '@stellar/stellar-sdk';
 import { ICacheProvider, InMemoryCache } from './cache';
+import { toScVals, buildSimulationTx as buildSharedSimTx } from './encoding';
 
 export type CacheKey =
   | 'getFee'
@@ -85,7 +83,13 @@ export class CachedContractClient {
   }
 
   /**
-   * Returns the wrapped SDK instance with all original transaction methods.
+   * Returns the wrapped ContractClient with a curated subset of transaction
+   * methods: fundCAddress, fundCAddressWithSwap, withdrawFees, setFee,
+   * setFeeCollector, setAdmin, and upgrade.
+   *
+   * For the full set of SDK methods (batch operations, cross-chain, relayers,
+   * paginated queries, etc.), use
+   * {@link OnboardingBridgeSDK} directly.
    */
   get client() {
     return this.sdk;
@@ -104,20 +108,6 @@ export class CachedContractClient {
     await Promise.all(keysToDelete.map((key) => this.cache.delete(key)));
   }
 }
-
-const MUTATION_METHODS = new Set([
-  'fundCAddress',
-  'fundCAddressWithSwap',
-  'withdrawFees',
-  'setFee',
-  'setFeeCollector',
-  'setAdmin',
-  'upgrade',
-  'fundCrosschain',
-  'addRelayer',
-  'removeRelayer',
-  'setRelayerThreshold',
-]);
 
 class ContractClient {
   private config: BridgeConfig;
@@ -228,7 +218,7 @@ class ContractClient {
   ): Promise<TransactionResult> {
     const account = await this.provider.getAccount(signer.publicKey());
     const tx = transactionBuilder
-      .setTimeout(30)
+      .setTimeout(this.config.timeout ?? 30)
       .build();
     const preparedTx = await this.provider.prepareTransaction(tx);
     preparedTx.sign(signer);
@@ -272,7 +262,7 @@ class ContractClient {
       .addOperation(
         this.contract.call(
           'fund_c_address',
-          ...this.toScVals([options.source, options.target, options.asset, options.amount]),
+          ...toScVals([options.source, options.target, options.asset, options.amount]),
         ),
       );
 
@@ -294,7 +284,7 @@ class ContractClient {
       .addOperation(
         this.contract.call(
           'fund_c_address_with_swap',
-          ...this.toScVals([
+          ...toScVals([
             options.source,
             options.target,
             options.sourceAsset,
@@ -332,7 +322,7 @@ class ContractClient {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(
-        this.contract.call('set_fee_bps', ...this.toScVals([newFeeBps])),
+        this.contract.call('set_fee_bps', ...toScVals([newFeeBps])),
       );
 
     return this.submitMutation('setFee', tx, adminKeypair);
@@ -346,7 +336,7 @@ class ContractClient {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(
-        this.contract.call('set_fee_collector', ...this.toScVals([newFeeCollector])),
+        this.contract.call('set_fee_collector', ...toScVals([newFeeCollector])),
       );
 
     return this.submitMutation('setFeeCollector', tx, adminKeypair);
@@ -360,7 +350,7 @@ class ContractClient {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(
-        this.contract.call('set_admin', ...this.toScVals([newAdmin])),
+        this.contract.call('set_admin', ...toScVals([newAdmin])),
       );
 
     return this.submitMutation('setAdmin', tx, adminKeypair);
@@ -383,48 +373,7 @@ class ContractClient {
     return this.submitMutation('upgrade', tx, adminKeypair);
   }
 
-  private toScVals(args: any[]): xdr.ScVal[] {
-    return args.map((arg) => {
-      if (arg === null || arg === undefined) {
-        return xdr.ScVal.scvVoid();
-      }
-
-      if (Array.isArray(arg)) {
-        return xdr.ScVal.scvVec(arg.map((item) => this.toSingleScVal(item)));
-      }
-
-      return this.toSingleScVal(arg);
-    });
-  }
-
-  private toSingleScVal(arg: any): xdr.ScVal {
-    if (typeof arg === 'string') {
-      if (arg.startsWith('C') || arg.startsWith('G')) {
-        return new Address(arg).toScVal();
-      }
-      if (/^\d+$/.test(arg)) {
-        return nativeToScVal(BigInt(arg), { type: 'i128' });
-      }
-      return nativeToScVal(arg, { type: 'string' });
-    }
-    if (typeof arg === 'number' || typeof arg === 'bigint') {
-      return nativeToScVal(arg, { type: 'i128' });
-    }
-    if (arg instanceof Address) {
-      return arg.toScVal();
-    }
-    return nativeToScVal(arg);
-  }
-
   private buildSimulationTx(method: string, args: any[]) {
-    const source = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
-    const account = new Account(source, '0');
-    return new TransactionBuilder(account, {
-      fee: '100',
-      networkPassphrase: this.networkPassphrase,
-    })
-      .addOperation(this.contract.call(method, ...this.toScVals(args)))
-      .setTimeout(30)
-      .build();
+    return buildSharedSimTx(this.contract, method, args, this.networkPassphrase, this.config.timeout ?? 30);
   }
 }

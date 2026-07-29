@@ -155,4 +155,56 @@ describe('CachedContractClient', () => {
     await wrapper.invalidateCache('getFee');
     expect(await cache.get('getFee')).toBeUndefined();
   });
+
+  it('forwards the configured timeout to transaction builders', async () => {
+    (SorobanRpc.Server as jest.Mock).mockClear();
+    (TransactionBuilder as unknown as jest.Mock).mockClear();
+
+    const setTimeoutSpy = jest.fn().mockReturnThis();
+    (TransactionBuilder as unknown as jest.Mock).mockImplementation(() => ({
+      addOperation: jest.fn().mockReturnThis(),
+      setTimeout: setTimeoutSpy,
+      build: jest.fn().mockReturnValue({}),
+    }));
+
+    const mockAccountProvider = {
+      getAccount: jest.fn().mockResolvedValue({}),
+      prepareTransaction: jest.fn().mockResolvedValue({ sign: jest.fn() }),
+      sendTransaction: jest.fn().mockResolvedValue({ hash: 'h', status: 'PENDING' }),
+      simulateTransaction: jest.fn().mockResolvedValue({}),
+    };
+    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockAccountProvider);
+
+    const customWrapper = new CachedContractClient({ ...CONFIG, timeout: 45 }, { provider: cache });
+
+    await customWrapper.client.setAdmin(
+      MOCK_ADDRESS,
+      { publicKey: () => MOCK_ADDRESS, sign: jest.fn() },
+    );
+
+    const calls = setTimeoutSpy.mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    calls.forEach((call: any[]) => {
+      expect(call[0]).toBe(45);
+    });
+  });
+
+  it('ContractClient exposes the documented transaction methods', () => {
+    const client = wrapper.client;
+
+    // Methods documented in CachedContractClient.get client()
+    const documentedMethods = [
+      'fundCAddress',
+      'fundCAddressWithSwap',
+      'withdrawFees',
+      'setFee',
+      'setFeeCollector',
+      'setAdmin',
+      'upgrade',
+    ];
+
+    for (const method of documentedMethods) {
+      expect(typeof client[method]).toBe('function');
+    }
+  });
 });
