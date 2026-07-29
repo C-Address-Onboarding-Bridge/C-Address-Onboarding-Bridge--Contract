@@ -1452,23 +1452,23 @@ describe('Error handling - invalid inputs', () => {
   });
 
   it('upgrade rejects newWasmHash shorter than 64 hex chars', async () => {
-    await expect(sdk.upgrade({ newWasmHash: 'ab12' }, mockKeypair)).rejects.toThrow(
-      /newWasmHash must be a 64-character hex string/,
-    );
+    const result = await sdk.upgrade({ newWasmHash: 'ab12' }, mockKeypair);
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/newWasmHash must be a 64-character hex string/);
     expect(mockProvider.getAccount).not.toHaveBeenCalled();
   });
 
   it('upgrade rejects newWasmHash longer than 64 hex chars', async () => {
-    await expect(sdk.upgrade({ newWasmHash: 'a'.repeat(128) }, mockKeypair)).rejects.toThrow(
-      /newWasmHash must be a 64-character hex string/,
-    );
+    const result = await sdk.upgrade({ newWasmHash: 'a'.repeat(128) }, mockKeypair);
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/newWasmHash must be a 64-character hex string/);
     expect(mockProvider.getAccount).not.toHaveBeenCalled();
   });
 
   it('upgrade rejects newWasmHash with non-hex characters', async () => {
-    await expect(sdk.upgrade({ newWasmHash: 'g'.repeat(64) }, mockKeypair)).rejects.toThrow(
-      /newWasmHash must be a 64-character hex string/,
-    );
+    const result = await sdk.upgrade({ newWasmHash: 'g'.repeat(64) }, mockKeypair);
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/newWasmHash must be a 64-character hex string/);
     expect(mockProvider.getAccount).not.toHaveBeenCalled();
   });
 

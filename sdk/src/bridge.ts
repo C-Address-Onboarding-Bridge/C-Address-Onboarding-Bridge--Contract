@@ -33,12 +33,10 @@ import {
   CrossChainFundOptions,
   RelayerManagementOptions,
   FundCAddressWithSwapOptions,
-  FundCTimelockedOptions,
   PaginatedResult,
   PaginationOptions,
   CostEstimate,
   TimelockEntry,
-  FundCTimelockedOptions,
 } from './types';
 import {
   type ObservabilityHooks,
@@ -982,7 +980,7 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'withdraw_fees',
-                ...this.toScVals([options.asset, options.amount]),
+                ...toScVals([options.asset, options.amount]),
                 options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' }),
               ),
             )
@@ -1066,7 +1064,7 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'reclaim_tokens',
-                ...this.toScVals([options.asset, options.amount, options.to]),
+                ...toScVals([options.asset, options.amount, options.to]),
                 options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' }),
               ),
             )
