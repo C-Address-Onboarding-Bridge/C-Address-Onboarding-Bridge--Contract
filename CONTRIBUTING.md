@@ -42,11 +42,15 @@ Ensure you have the following installed:
    ```
    Edit `.env` with your local configuration (Docker Compose provides defaults for local development).
 
-3. **Install SDK dependencies:**
+3. **Install all workspace dependencies (SDK + relayer):**
    ```bash
-   cd sdk
    npm install
-   cd ..
+   ```
+   This installs both `sdk/` and `relayer/` in one step from the repo root.
+   You can also install each workspace individually:
+   ```bash
+   cd sdk && npm install && cd ..
+   cd relayer && npm install && cd ..
    ```
 
 4. **Start local services:**
@@ -111,6 +115,12 @@ npm install
 npx tsc --noEmit
 npm run build
 npm test
+cd ..
+
+# Relayer
+cd relayer
+npm install
+npx tsc --noEmit
 cd ..
 ```
 

@@ -454,3 +454,89 @@ fn row_to_event(
         data: serde_json::from_str(&data).unwrap_or(serde_json::Value::Null),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::IndexedEvent;
+
+    /// Create an in-memory SQLite database and run migrations.
+    async fn setup_db() -> Database {
+        let db = Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        db
+    }
+
+    /// Build a minimal `IndexedEvent` with the given id.
+    fn make_event(id: &str) -> IndexedEvent {
+        IndexedEvent {
+            id: id.to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 100,
+            contract_id: "CONTRACT_A".to_string(),
+            tx_hash: "deadbeef".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({ "amount": "1000" }),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 2 — INSERT OR IGNORE deduplication
+    // -----------------------------------------------------------------------
+
+    /// Inserting the same event twice must be a no-op: only one row should exist.
+    #[tokio::test]
+    async fn test_insert_duplicate_event_is_ignored() {
+        let db = setup_db().await;
+        let event = make_event("evt-001");
+
+        db.insert_event(&event).await.expect("first insert");
+        // Second insert of the same id should silently do nothing (INSERT OR IGNORE).
+        db.insert_event(&event).await.expect("duplicate insert must not error");
+
+        let rows = db.list_events(10, 0).await.expect("list_events");
+        assert_eq!(rows.len(), 1, "duplicate insert must leave exactly one row");
+        assert_eq!(rows[0].id, "evt-001");
+    }
+
+    /// Two events with *different* ids must both persist.
+    #[tokio::test]
+    async fn test_insert_two_distinct_events_both_persist() {
+        let db = setup_db().await;
+
+        db.insert_event(&make_event("evt-001")).await.expect("first insert");
+        db.insert_event(&make_event("evt-002")).await.expect("second insert");
+
+        let rows = db.list_events(10, 0).await.expect("list_events");
+        assert_eq!(rows.len(), 2, "two distinct events must both be stored");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 2 — Deterministic ID from parse_contract_event (regression guard)
+    // -----------------------------------------------------------------------
+
+    /// `parse_contract_event` must produce the same id when called twice with
+    /// the identical raw event payload.  If it generates a random UUID every
+    /// time, this test will fail — which is exactly the bug this PR fixes.
+    #[test]
+    fn test_parse_contract_event_produces_deterministic_id() {
+        use crate::poller::parse_contract_event_for_test;
+
+        let raw = serde_json::json!({
+            "topic": ["CAddressFunded", "GSOURCE", "CTARGET"],
+            "ledger": 42,
+            "txHash": "abcdef1234567890",
+            "createdAt": "2024-01-01T00:00:00Z",
+            "value": { "amount": "500" }
+        });
+
+        let id1 = parse_contract_event_for_test(&raw, "CONTRACT_A")
+            .expect("first parse must succeed")
+            .id;
+        let id2 = parse_contract_event_for_test(&raw, "CONTRACT_A")
+            .expect("second parse must succeed")
+            .id;
+
+        assert_eq!(id1, id2, "parse_contract_event must produce the same id for the same input");
+    }
+}
