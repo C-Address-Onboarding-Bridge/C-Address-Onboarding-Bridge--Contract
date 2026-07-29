@@ -367,6 +367,42 @@ describe('OffRampIntegration', () => {
       expect(comparison.banxa).toBeUndefined();
     });
 
+    it('throws for malformed amount (non-numeric)', () => {
+      const offramp = new OffRampIntegration({});
+
+      expect(() => offramp.compareProviders('abc', 'XLM', 'USD'))
+        .toThrow(/amount must be a well-formed positive numeric string/);
+    });
+
+    it('throws for empty amount string', () => {
+      const offramp = new OffRampIntegration({});
+
+      expect(() => offramp.compareProviders('', 'XLM', 'USD'))
+        .toThrow(/amount must be a well-formed positive numeric string/);
+    });
+
+    it('throws for negative amount', () => {
+      const offramp = new OffRampIntegration({});
+
+      expect(() => offramp.compareProviders('-100', 'XLM', 'USD'))
+        .toThrow(/amount must be a well-formed positive numeric string/);
+    });
+
+    it('throws for zero amount', () => {
+      const offramp = new OffRampIntegration({});
+
+      expect(() => offramp.compareProviders('0', 'XLM', 'USD'))
+        .toThrow(/amount must be a well-formed positive numeric string/);
+    });
+
+    it('does not throw for valid amount formats', () => {
+      const offramp = new OffRampIntegration({});
+
+      expect(() => offramp.compareProviders('100', 'XLM', 'USD')).not.toThrow();
+      expect(() => offramp.compareProviders('100.50', 'XLM', 'USD')).not.toThrow();
+      expect(() => offramp.compareProviders('0.01', 'XLM', 'USD')).not.toThrow();
+    });
+
     it('returns empty when no provider supports asset/fiat combo', () => {
       const offramp = new OffRampIntegration({});
       
@@ -536,12 +572,12 @@ describe('OffRampIntegration', () => {
     it('compareProviders handles edge cases', () => {
       const offramp = new OffRampIntegration({});
       
-      // Zero amount
-      let comparison = offramp.compareProviders('0', 'XLM', 'USD');
-      expect(comparison.moonpay?.feeAmount).toBe('0.00');
-      
+      // Zero amount now throws (validated as non-positive)
+      expect(() => offramp.compareProviders('0', 'XLM', 'USD'))
+        .toThrow(/amount must be a well-formed positive numeric string/);
+
       // Very large amount - floating point precision may vary
-      comparison = offramp.compareProviders('999999999', 'XLM', 'USD');
+      let comparison = offramp.compareProviders('999999999', 'XLM', 'USD');
       expect(parseFloat(comparison.moonpay?.feeAmount || '0')).toBeCloseTo(44999999.96, 1);
       
       // Decimal amount

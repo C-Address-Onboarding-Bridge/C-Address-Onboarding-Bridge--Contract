@@ -1629,3 +1629,56 @@ describe('Type validation at runtime', () => {
     expect(options.sigs).toBeDefined();
   });
 });
+
+describe('Observability hooks - onRpcCall coverage', () => {
+  let onRpcCall: jest.Mock;
+  let sdk: OnboardingBridgeSDK;
+  let mockProvider: any;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    onRpcCall = jest.fn();
+
+    mockProvider = {
+      getAccount: jest.fn().mockResolvedValue({}),
+      prepareTransaction: jest.fn().mockResolvedValue({ sign: jest.fn() }),
+      sendTransaction: jest.fn().mockResolvedValue({ hash: 'h', status: 'PENDING' }),
+      simulateTransaction: jest.fn().mockResolvedValue({ results: [{ retval: {} }] }),
+    };
+
+    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    (scValToNative as jest.Mock).mockReturnValue({ toString: () => '100' });
+
+    sdk = new OnboardingBridgeSDK({
+      ...CONFIG,
+      hooks: { onRpcCall },
+    });
+  });
+
+  const methodsToTest = [
+    { name: 'getFeeBalance', call: (s: OnboardingBridgeSDK) => s.getFeeBalance(MOCK_ASSET) },
+    { name: 'getAllBalances', call: (s: OnboardingBridgeSDK) => s.getAllBalances([MOCK_ASSET]) },
+    { name: 'isInitialized', call: (s: OnboardingBridgeSDK) => s.isInitialized() },
+    { name: 'queryRelayerThreshold', call: (s: OnboardingBridgeSDK) => s.queryRelayerThreshold() },
+    { name: 'queryIsRelayer', call: (s: OnboardingBridgeSDK) => s.queryIsRelayer('aa'.repeat(32)) },
+    { name: 'getWhitelistedAssets', call: (s: OnboardingBridgeSDK) => s.getWhitelistedAssets() },
+    { name: 'getFeeExemptAddresses', call: (s: OnboardingBridgeSDK) => s.getFeeExemptAddresses() },
+    { name: 'getBlocklistedAddresses', call: (s: OnboardingBridgeSDK) => s.getBlocklistedAddresses() },
+    { name: 'getAllowlistedAddresses', call: (s: OnboardingBridgeSDK) => s.getAllowlistedAddresses() },
+    { name: 'estimateCost', call: (s: OnboardingBridgeSDK) => s.estimateCost({ source: MOCK_ADDRESS, target: MOCK_ASSET, asset: MOCK_ASSET, amount: '100' }) },
+  ];
+
+  methodsToTest.forEach(({ name, call }) => {
+    it(`fires onRpcCall for ${name}`, async () => {
+      // Catch post-simulation errors (e.g. map failures on mock data);
+      // onRpcCall fires in a finally block regardless.
+      await call(sdk).catch(() => {});
+
+      expect(onRpcCall).toHaveBeenCalledWith(
+        'simulateTransaction',
+        expect.any(Object),
+        expect.any(Number),
+      );
+    });
+  });
+});

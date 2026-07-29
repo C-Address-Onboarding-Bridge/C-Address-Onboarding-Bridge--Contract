@@ -1342,10 +1342,14 @@ export class OnboardingBridgeSDK {
    */
   async getFeeBalance(asset: string): Promise<string> {
     assertContractAddress(asset, 'asset');
-    const result = await this.provider
-      .simulateTransaction(
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_fee_balance' },
+      () => this.provider.simulateTransaction(
         this.buildSimulationTx('query_fee_balance', [asset]),
-      );
+      ),
+    );
 
     if ('error' in result && result.error) {
       throw new Error(`Failed to get fee balance: ${result.error}`);
@@ -1376,10 +1380,14 @@ export class OnboardingBridgeSDK {
    */
   async getAllBalances(assets: string[]): Promise<Record<string, string>> {
     assets.forEach((a, i) => assertContractAddress(a, `assets[${i}]`));
-    const result = await this.provider
-      .simulateTransaction(
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_all_balances' },
+      () => this.provider.simulateTransaction(
         this.buildSimulationTx('query_all_balances', [assets]),
-      );
+      ),
+    );
 
     if ('error' in result && result.error) {
       throw new Error(`Failed to get all balances: ${result.error}`);
@@ -1414,10 +1422,14 @@ export class OnboardingBridgeSDK {
    * ```
    */
   async isInitialized(): Promise<boolean> {
-    const result = await this.provider
-      .simulateTransaction(
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_is_initialized' },
+      () => this.provider.simulateTransaction(
         this.buildSimulationTx('query_is_initialized', []),
-      );
+      ),
+    );
 
     if ('error' in result && result.error) {
       throw new Error(`Failed to check initialization: ${result.error}`);
@@ -2375,8 +2387,13 @@ export class OnboardingBridgeSDK {
    * @throws {Error} On RPC failure.
    */
   async queryRelayerThreshold(): Promise<number> {
-    const result = await this.provider.simulateTransaction(
-      this.buildSimulationTx('query_relayer_threshold', []),
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_relayer_threshold' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_relayer_threshold', []),
+      ),
     );
     if ('error' in result && result.error) {
       throw new Error(`Failed to query relayer threshold: ${result.error}`);
@@ -2395,8 +2412,13 @@ export class OnboardingBridgeSDK {
    * @throws {Error} On RPC failure.
    */
   async queryIsRelayer(pubkeyHex: string): Promise<boolean> {
-    const result = await this.provider.simulateTransaction(
-      this.buildSimulationTx('query_is_relayer', [Buffer.from(pubkeyHex, 'hex')]),
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_is_relayer' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_is_relayer', [Buffer.from(pubkeyHex, 'hex')]),
+      ),
     );
     if ('error' in result && result.error) {
       throw new Error(`Failed to query relayer: ${result.error}`);
@@ -2468,8 +2490,13 @@ export class OnboardingBridgeSDK {
     cursor?: string,
     limit = 20,
   ): Promise<PaginatedResult<string>> {
-    const result = await this.provider.simulateTransaction(
-      this.buildSimulationTx('query_whitelisted_assets', []),
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_whitelisted_assets' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_whitelisted_assets', []),
+      ),
     );
     if ('error' in result && result.error) {
       throw new Error(`Failed to query whitelisted assets: ${result.error}`);
@@ -2499,8 +2526,13 @@ export class OnboardingBridgeSDK {
     cursor?: string,
     limit = 20,
   ): Promise<PaginatedResult<string>> {
-    const result = await this.provider.simulateTransaction(
-      this.buildSimulationTx('query_fee_exempt_addresses', []),
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_fee_exempt_addresses' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_fee_exempt_addresses', []),
+      ),
     );
     if ('error' in result && result.error) {
       throw new Error(`Failed to query fee-exempt addresses: ${result.error}`);
@@ -2529,8 +2561,13 @@ export class OnboardingBridgeSDK {
     cursor?: string,
     limit = 20,
   ): Promise<PaginatedResult<string>> {
-    const result = await this.provider.simulateTransaction(
-      this.buildSimulationTx('query_blocklist', []),
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_blocklist' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_blocklist', []),
+      ),
     );
     if ('error' in result && result.error) {
       throw new Error(`Failed to query blocklist: ${result.error}`);
@@ -2560,8 +2597,13 @@ export class OnboardingBridgeSDK {
     cursor?: string,
     limit = 20,
   ): Promise<PaginatedResult<string>> {
-    const result = await this.provider.simulateTransaction(
-      this.buildSimulationTx('query_allowlist', []),
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_allowlist' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_allowlist', []),
+      ),
     );
     if ('error' in result && result.error) {
       throw new Error(`Failed to query allowlist: ${result.error}`);
@@ -2631,7 +2673,12 @@ export class OnboardingBridgeSDK {
       .setTimeout(this.config.timeout ?? 30)
       .build();
 
-    const result = await this.provider.simulateTransaction(tx);
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'estimate_cost' },
+      () => this.provider.simulateTransaction(tx),
+    );
     const executionTimeMs = Date.now() - start;
 
     if ('error' in result && result.error) {
