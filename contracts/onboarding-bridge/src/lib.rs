@@ -2463,6 +2463,66 @@ impl OnboardingBridge {
         Ok((fee, net))
     }
 
+    /// Returns the real effective fee that would be charged for a specific
+    /// `(source, asset, amount)` combination, taking into account the global
+    /// fee rate, any volume-based tier applicable to `source`, and the
+    /// per-asset fee cap.
+    ///
+    /// Unlike [`Self::query_calculate_fee`], which only uses the flat global
+    /// fee rate, this function runs the full fee-resolution pipeline:
+    ///
+    /// 1. **Global rate** — the contract-wide fee_bps.
+    /// 2. **Volume tier** — if `source`&#39;s cumulative bridged volume falls
+    ///    within a configured `FeeTier`, that tier&#39;s rate is used instead.
+    /// 3. **Asset cap** — the per-asset maximum fee cap is applied as an
+    ///    upper bound on the tiered rate.
+    ///
+    /// The referral fee split does **not** affect the gross fee amount;
+    /// it only determines how the fee is distributed between the fee
+    /// collector and the referrer.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` — The address that would provide the tokens.
+    /// * `asset` — The whitelisted token contract address.
+    /// * `amount` — The hypothetical gross transfer amount.
+    ///
+    /// # Returns
+    ///
+    /// `(effective_fee_bps, fee, net)` where:
+    /// - `effective_fee_bps` is the resolved basis-point rate after cap + tier.
+    /// - `fee = floor(amount × effective_fee_bps / 10_000)`.
+    /// - `net = amount − fee`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::Overflow`] — Arithmetic overflow in fee calculation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// // At fee_bps = 100 (1 %), no asset cap, no tiers:
+    /// // let (bps, fee, net) = bridge.query_effective_fee(&source, &usdc, &1000i128);
+    /// // assert_eq!(bps, 100u32);
+    /// // assert_eq!(fee, 10i128);
+    /// // assert_eq!(net, 990i128);
+    /// ```
+    pub fn query_effective_fee(
+        env: Env,
+        source: Address,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(u32, i128, i128), BridgeError> {
+        check_initialized(&env)?;
+        let global_fee_bps = read_fee_bps(&env);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
+        let fee = calculate_fee(amount, effective_fee_bps)?;
+        let net = safe_math::safe_sub(amount, fee)?;
+        Ok((effective_fee_bps, fee, net))
+    }
+
     /// Returns the cumulative net amount of `asset` that has been delivered to
     /// recipients since deployment.
     ///
