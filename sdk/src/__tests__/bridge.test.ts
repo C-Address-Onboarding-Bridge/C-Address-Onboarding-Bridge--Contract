@@ -114,6 +114,55 @@ describe('OnboardingBridgeSDK', () => {
       expect(result.error).toBe('Network timeout');
       expect(result.hash).toBe('');
     });
+
+    it('passes nonce and deadline to contract.call when provided', async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      const result = await sdk.fundCAddress(
+        {
+          source: MOCK_ADDRESS,
+          target: MOCK_ASSET,
+          asset: MOCK_ASSET,
+          amount: '1000',
+          nonce: 42,
+          deadline: 1234567890,
+        },
+        mockKeypair,
+      );
+
+      expect(result.status).toBe('pending');
+      // 1 method name + 4 base args + 2 optional args = 7 total
+      expect(contract.call).toHaveBeenCalledWith(
+        'fund_c_address',
+        expect.anything(), // source
+        expect.anything(), // target
+        expect.anything(), // asset
+        expect.anything(), // amount
+        expect.anything(), // nonce
+        expect.anything(), // deadline
+      );
+    });
+
+    it('omits nonce and deadline (scvVoid) when not provided', async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      const result = await sdk.fundCAddress(
+        { source: MOCK_ADDRESS, target: MOCK_ASSET, asset: MOCK_ASSET, amount: '1000' },
+        mockKeypair,
+      );
+
+      expect(result.status).toBe('pending');
+      // 1 method name + 4 base args + 2 void optionals = 7 total
+      expect(contract.call).toHaveBeenCalledWith(
+        'fund_c_address',
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
   });
 
   describe('fundCAddressWithReferral', () => {
@@ -192,6 +241,35 @@ describe('OnboardingBridgeSDK', () => {
   });
 
   describe('batchFundCAddresses', () => {
+    it('passes nonce and deadline to contract.call when provided', async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      const results = await sdk.batchFundCAddresses(
+        {
+          source: MOCK_ADDRESS,
+          targets: [MOCK_ASSET],
+          amounts: ['500'],
+          asset: MOCK_ASSET,
+          nonce: 7,
+          deadline: 987654321,
+        },
+        mockKeypair,
+      );
+
+      expect(results).toHaveLength(1);
+      expect(results[0].status).toBe('pending');
+      // 1 method name + 4 base args + 2 optional args = 7 total
+      expect(contract.call).toHaveBeenCalledWith(
+        'batch_fund_c_address',
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(), // nonce
+        expect.anything(), // deadline
+      );
+    });
+
     it('returns array with one pending result on success', async () => {
       const results = await sdk.batchFundCAddresses(
         {
@@ -439,6 +517,22 @@ describe('OnboardingBridgeSDK', () => {
       expect(result.hash).toBe('mock_tx_hash');
       expect(mockProvider.getAccount).toHaveBeenCalledWith(MOCK_ADDRESS);
     });
+
+    it('passes nonce argument when provided', async () => {
+      const result = await sdk.withdrawFees(
+        { asset: MOCK_ASSET, amount: '100', nonce: 42 },
+        mockKeypair,
+      );
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'withdraw_fees',
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
   });
 
   describe('setFee', () => {
@@ -457,6 +551,20 @@ describe('OnboardingBridgeSDK', () => {
         'Fee basis points must be between 0 and 1000',
       );
       expect(mockProvider.getAccount).not.toHaveBeenCalled();
+    });
+
+    it('passes nonce to contract.call when provided', async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      const result = await sdk.setFee(50, mockKeypair, 99);
+
+      expect(result.status).toBe('pending');
+      // 1 method name + newFeeBps + nonce = 3 total
+      expect(contract.call).toHaveBeenCalledWith(
+        'set_fee_bps',
+        expect.anything(),
+        expect.anything(),
+      );
     });
   });
 
@@ -507,6 +615,20 @@ describe('OnboardingBridgeSDK', () => {
 
       expect(result.status).toBe('pending');
     });
+
+    it('passes nonce to contract.call when provided', async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      const result = await sdk.setFeeCollector(MOCK_ADDRESS, mockKeypair, 123);
+
+      expect(result.status).toBe('pending');
+      // 1 method name + newFeeCollector + nonce = 3 total
+      expect(contract.call).toHaveBeenCalledWith(
+        'set_fee_collector',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
   });
 
   describe('setAdmin', () => {
@@ -514,6 +636,169 @@ describe('OnboardingBridgeSDK', () => {
       const result = await sdk.setAdmin(MOCK_ADDRESS, mockKeypair);
 
       expect(result.status).toBe('pending');
+    });
+
+    it('passes nonce to contract.call when provided', async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      const result = await sdk.setAdmin(MOCK_ADDRESS, mockKeypair, 456);
+
+      expect(result.status).toBe('pending');
+      // 1 method name + newAdmin + nonce = 3 total
+      expect(contract.call).toHaveBeenCalledWith(
+        'set_admin',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
+  describe('timelocked upgrades', () => {
+    const wasmHash = 'a'.repeat(64);
+
+    it('submits schedule_upgrade', async () => {
+      const result = await sdk.scheduleUpgrade({ newWasmHash: wasmHash, nonce: 1 }, mockKeypair);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'schedule_upgrade',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('submits execute_upgrade', async () => {
+      const result = await sdk.executeUpgrade({ expectedHash: wasmHash }, mockKeypair);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'execute_upgrade',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('submits cancel_upgrade', async () => {
+      const result = await sdk.cancelUpgrade({}, mockKeypair);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith('cancel_upgrade', expect.anything());
+    });
+
+    it('queries pending upgrade', async () => {
+      (scValToNative as jest.Mock).mockReturnValue({
+        new_wasm_hash: Buffer.from(wasmHash, 'hex'),
+        executable_after_ledger: 123,
+      });
+      mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+      const pending = await sdk.queryPendingUpgrade();
+
+      expect(pending).toEqual({
+        newWasmHash: wasmHash,
+        executableAfterLedger: 123,
+      });
+    });
+  });
+
+  describe('executeMetaFund', () => {
+    it('submits execute_meta_fund', async () => {
+      const result = await sdk.executeMetaFund(
+        {
+          params: {
+            source: MOCK_ADDRESS,
+            target: MOCK_ASSET,
+            asset: MOCK_ASSET,
+            amount: '1000',
+            nonce: 1,
+            deadline: 9999999999,
+          },
+          pubkey: 'b'.repeat(64),
+          signature: 'c'.repeat(128),
+        },
+        mockKeypair,
+      );
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'execute_meta_fund',
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
+  describe('upgrade', () => {
+    it('submits upgrade with wasm hash and optional nonce', async () => {
+      const result = await sdk.upgrade(
+        { newWasmHash: 'a'.repeat(64) },
+        mockKeypair,
+      );
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'upgrade',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('passes nonce argument when provided', async () => {
+      const result = await sdk.upgrade(
+        { newWasmHash: 'a'.repeat(64), nonce: 99 },
+        mockKeypair,
+      );
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'upgrade',
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
+  describe('reclaimTokens', () => {
+    it('returns pending status on success', async () => {
+      const result = await sdk.reclaimTokens(
+        { asset: MOCK_ASSET, amount: '100', to: MOCK_ADDRESS },
+        mockKeypair,
+      );
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(result.hash).toBe('mock_tx_hash');
+      expect(contract.call).toHaveBeenCalledWith(
+        'reclaim_tokens',
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('passes nonce argument when provided', async () => {
+      const result = await sdk.reclaimTokens(
+        { asset: MOCK_ASSET, amount: '100', to: MOCK_ADDRESS, nonce: 7 },
+        mockKeypair,
+      );
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(result.status).toBe('pending');
+      expect(contract.call).toHaveBeenCalledWith(
+        'reclaim_tokens',
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
     });
   });
 
