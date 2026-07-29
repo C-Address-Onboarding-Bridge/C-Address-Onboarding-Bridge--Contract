@@ -39,3 +39,15 @@ remove_from_allowlist	135717	24022
 set_allowlist_mode	152203	23703
 pause	167410	25728
 unpause	171778	26868
+# ── Second-sprint features (placeholder entries — run benchmarks to capture real values) ──
+fund_c_address_timelocked	0	0
+claim_timelocked	0	0
+fund_c_address_crosschain	0	0
+commit_fund	0	0
+reveal_fund	0	0
+fund_c_address_with_swap	0	0
+execute_meta_fund	0	0
+fund_c_address/tiered_fee	0	0
+set_max_withdraw_per_tx	0	0
+set_source_daily_limit	0	0
+set_asset_fee_cap	0	0
