@@ -1,5 +1,6 @@
 use crate::events::{BridgeEventType, IndexedEvent};
 use crate::AppState;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const POLL_INTERVAL_MS: u64 = 5000;
@@ -61,6 +62,11 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut max_ledger = start_ledger;
+    // Position of each event within its transaction. Combined with the ledger
+    // and tx hash this yields a stable primary key, so re-polling a range
+    // already seen (after a restart, or a crash before `set_last_ledger`)
+    // regenerates the same ids and `insert_event` deduplicates them.
+    let mut events_seen_per_tx: HashMap<&str, usize> = HashMap::new();
 
     for raw_event in &events {
         let ledger = raw_event
@@ -71,14 +77,27 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
             max_ledger = ledger;
         }
 
-        if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id) {
-            state.db.insert_event(&indexed).await?;
-            state.db.queue_webhook_deliveries(&indexed).await?;
-            tracing::info!(
-                "Indexed event: {} at ledger {}",
-                indexed.event_type,
-                indexed.ledger_sequence
-            );
+        let tx_hash = raw_event
+            .get("txHash")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        let counter = events_seen_per_tx.entry(tx_hash).or_insert(0);
+        let event_index = *counter;
+        *counter += 1;
+
+        if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id, event_index) {
+            // Only fan out webhooks for events we have not indexed before;
+            // otherwise a re-poll would re-deliver every event in the range.
+            if state.db.insert_event(&indexed).await? {
+                state.db.queue_webhook_deliveries(&indexed).await?;
+                tracing::info!(
+                    "Indexed event: {} at ledger {}",
+                    indexed.event_type,
+                    indexed.ledger_sequence
+                );
+            } else {
+                tracing::debug!("Skipping already-indexed event {}", indexed.id);
+            }
         }
     }
 
@@ -88,9 +107,15 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Build an [`IndexedEvent`] from a raw `getEvents` entry.
+///
+/// `event_index` is the position of this event within its transaction; it is
+/// part of the event id, so the same on-chain event always parses to the same
+/// id no matter how many times it is polled.
 fn parse_contract_event(
     raw: &serde_json::Value,
     contract_id: &str,
+    event_index: usize,
 ) -> Option<IndexedEvent> {
     let topics = raw.get("topic")?.as_array()?;
     if topics.is_empty() {
@@ -129,11 +154,18 @@ fn parse_contract_event(
         }
     }
 
+    // Deterministic primary key: the same (ledger, tx, position) triple always
+    // produces the same id, which is what makes `INSERT OR IGNORE` in
+    // `Database::insert_event` an effective dedup on re-processing.
     let id = format!(
         "{}-{}-{}",
         ledger,
-        tx_hash.get(..8).unwrap_or("unknown"),
-        uuid::Uuid::new_v4().to_string().get(..8).unwrap_or("rand")
+        if tx_hash.is_empty() {
+            "unknown"
+        } else {
+            tx_hash.as_str()
+        },
+        event_index
     );
 
     Some(IndexedEvent {
@@ -145,4 +177,57 @@ fn parse_contract_event(
         timestamp,
         data: serde_json::Value::Object(data),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONTRACT_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+
+    fn raw_event() -> serde_json::Value {
+        serde_json::json!({
+            "ledger": 4242,
+            "txHash": "9f1c0e6a4b2d8e7f00112233445566778899aabbccddeeff0011223344556677",
+            "createdAt": "2026-07-29T10:00:00Z",
+            "topic": ["CAddressFunded", "GSOURCE", "CTARGET"],
+            "value": { "amount": "1000" },
+        })
+    }
+
+    #[test]
+    fn parsing_the_same_event_twice_yields_the_same_id() {
+        let raw = raw_event();
+
+        let first = parse_contract_event(&raw, CONTRACT_ID, 0).expect("event should parse");
+        let second = parse_contract_event(&raw, CONTRACT_ID, 0).expect("event should parse");
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            first.id,
+            "4242-9f1c0e6a4b2d8e7f00112233445566778899aabbccddeeff0011223344556677-0"
+        );
+    }
+
+    #[test]
+    fn events_at_different_positions_in_a_tx_get_distinct_ids() {
+        let raw = raw_event();
+
+        let first = parse_contract_event(&raw, CONTRACT_ID, 0).expect("event should parse");
+        let second = parse_contract_event(&raw, CONTRACT_ID, 1).expect("event should parse");
+
+        assert_ne!(first.id, second.id);
+    }
+
+    #[test]
+    fn a_missing_tx_hash_still_produces_a_deterministic_id() {
+        let mut raw = raw_event();
+        raw.as_object_mut().unwrap().remove("txHash");
+
+        let first = parse_contract_event(&raw, CONTRACT_ID, 0).expect("event should parse");
+        let second = parse_contract_event(&raw, CONTRACT_ID, 0).expect("event should parse");
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.id, "4242-unknown-0");
+    }
 }

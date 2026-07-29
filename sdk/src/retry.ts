@@ -49,11 +49,22 @@ export interface RetryOptions {
   /** Retry logger. Default: no-op. */
   onRetry?: RetryLogger;
   /**
+   * Cancels an in-flight retry loop.
+   *
+   * The signal is checked before each attempt and interrupts the backoff delay
+   * itself, so an abort takes effect immediately rather than after the current
+   * sleep (which can be up to `maxDelayMs`) elapses. When it fires,
+   * {@link withRetry} rejects with the signal's `reason`.
+   */
+  signal?: AbortSignal;
+  /**
    * Clock seam used to wait between attempts. Injectable for tests.
-   * Default: a `setTimeout`-based sleep.
+   * Default: a `setTimeout`-based sleep. Receives {@link RetryOptions.signal}
+   * when one is set; implementations may ignore it, since `withRetry` also
+   * races the sleep against the signal.
    * @internal
    */
-  sleep?: (ms: number) => Promise<void>;
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
 /** Tunable knobs for {@link withRpcRetry}, surfaced on `BridgeConfig.retry`. */
@@ -72,8 +83,62 @@ export interface RpcRetryOptions {
 
 const noopLogger: RetryLogger = () => {};
 
-const defaultSleep = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * The value an aborted {@link withRetry} rejects with. Environments that
+ * predate `AbortSignal.reason` leave it undefined, so fall back to an
+ * equivalent error.
+ */
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new Error('The operation was aborted');
+}
+
+/**
+ * Default backoff sleep. When given a signal it clears its own timer on abort
+ * so a cancelled retry leaves nothing pending on the event loop.
+ */
+const defaultSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    if (!signal) {
+      setTimeout(resolve, ms);
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortReason(signal));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+
+/**
+ * Sleep for `ms`, rejecting early if `signal` aborts.
+ *
+ * Without this a single backoff can block for `maxDelayMs` after the caller has
+ * already given up. The signal is forwarded to `sleep` so a signal-aware
+ * implementation can release its timer, and raced against separately so that
+ * sleeps which ignore it are still cut short.
+ */
+function abortableSleep(
+  ms: number,
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void>,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (!signal) return sleep(ms);
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+
+  let onAbort: () => void = () => {};
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(abortReason(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+
+  return Promise.race([sleep(ms, signal), aborted]).finally(() => {
+    signal.removeEventListener('abort', onAbort);
+  });
+}
 
 /** Node network error codes that indicate a transient, retryable failure. */
 const RETRYABLE_ERROR_CODES = new Set([
@@ -151,6 +216,9 @@ export function computeBackoffDelay(
  * The initial call counts as attempt 0; up to `maxRetries` further attempts are
  * made. Permanent errors (per {@link isRetryableRpcError}) are re-thrown
  * immediately. The last error is re-thrown once retries are exhausted.
+ *
+ * Pass `options.signal` to cancel the loop; the pending backoff is cut short
+ * and the returned promise rejects with the signal's reason.
  */
 export async function withRetry<T>(
   fn: () => Promise<T>,
@@ -163,19 +231,24 @@ export async function withRetry<T>(
   const isRetryable = options.isRetryable ?? isRetryableRpcError;
   const onRetry = options.onRetry ?? noopLogger;
   const sleep = options.sleep ?? defaultSleep;
+  const signal = options.signal;
 
   let lastError: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (signal?.aborted) throw abortReason(signal);
     try {
       return await fn();
     } catch (error) {
       lastError = error;
+      // An abort that landed while `fn` was in flight wins over its error:
+      // the caller no longer wants the result either way.
+      if (signal?.aborted) throw abortReason(signal);
       if (attempt >= maxRetries || !isRetryable(error)) {
         throw error;
       }
       const delayMs = computeBackoffDelay(attempt, baseDelayMs, maxDelayMs, jitter);
       onRetry({ attempt: attempt + 1, maxRetries, delayMs, error });
-      await sleep(delayMs);
+      await abortableSleep(delayMs, sleep, signal);
     }
   }
   // Unreachable: the loop either returns or throws, but TS needs a terminator.

@@ -33,3 +33,4 @@ bench_results.txt
 
 # Lock files for sub-packages (keep root Cargo.lock, ignore sdk sub-lock)
 sdk/package-lock.json
+indexer/Cargo.lock

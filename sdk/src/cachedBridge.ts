@@ -15,6 +15,7 @@ import {
   Contract,
   xdr,
   Keypair,
+  nativeToScVal,
   scValToNative,
   TransactionBuilder,
   BASE_FEE,
@@ -308,7 +309,7 @@ class ContractClient {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(
-        this.contract.call('withdraw_fees', ...this.toScVals([options.asset, options.amount]),
+        this.contract.call('withdraw_fees', ...toScVals([options.asset, options.amount]),
           options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' })),
       );
 

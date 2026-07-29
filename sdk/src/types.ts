@@ -117,6 +117,17 @@ export interface BridgeConfig {
    * ```
    */
   hooks?: ObservabilityHooks;
+
+  /**
+   * Network base reserve in stroops, used by
+   * {@link OnboardingBridgeSDK.estimateCost} to compute the minimum account
+   * balance.
+   *
+   * Both the public and test networks currently use 0.5 XLM (5,000,000
+   * stroops), which is the default. Override it if you run against a network
+   * configured with a different reserve.
+   */
+  baseReserveStroops?: number | string;
 }
 
 // ---------------------------------------------------------------------------

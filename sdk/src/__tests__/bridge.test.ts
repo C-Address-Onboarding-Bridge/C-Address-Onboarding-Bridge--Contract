@@ -1,6 +1,6 @@
-import { OnboardingBridgeSDK } from '../bridge';
+import { OnboardingBridgeSDK, BASE_RESERVE_STROOPS } from '../bridge';
 import { OffRampIntegration } from '../offramp';
-import { SorobanRpc, Contract, scValToNative, xdr, Address, nativeToScVal, TransactionBuilder } from '@stellar/stellar-sdk';
+import { SorobanRpc, Contract, scValToNative, xdr, Address, nativeToScVal, TransactionBuilder, Keypair } from '@stellar/stellar-sdk';
 
 jest.mock('@stellar/stellar-sdk', () => ({
   SorobanRpc: {
@@ -24,6 +24,15 @@ jest.mock('@stellar/stellar-sdk', () => ({
       scvSymbol: jest.fn().mockReturnValue({}),
     },
     ScMapEntry: jest.fn().mockImplementation(() => ({})),
+    LedgerKey: {
+      account: jest.fn().mockReturnValue({}),
+    },
+    LedgerKeyAccount: jest.fn().mockImplementation(() => ({})),
+  },
+  Keypair: {
+    fromPublicKey: jest.fn().mockReturnValue({
+      xdrAccountId: jest.fn().mockReturnValue({}),
+    }),
   },
   Address: jest.fn().mockImplementation(() => ({
     toScVal: jest.fn().mockReturnValue({}),
@@ -52,6 +61,18 @@ const CONFIG = {
 const MOCK_ADDRESS = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 const MOCK_ASSET = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4';
 
+/**
+ * A `getLedgerEntries` result shaped like a real `AccountEntry` lookup.
+ * Pass `null` to model an account that does not exist on-chain yet.
+ */
+function ledgerEntriesFor(numSubEntries: number | null) {
+  if (numSubEntries === null) return { entries: [], latestLedger: 1 };
+  return {
+    entries: [{ val: { account: () => ({ numSubEntries: () => numSubEntries }) } }],
+    latestLedger: 1,
+  };
+}
+
 describe('OnboardingBridgeSDK', () => {
   let sdk: OnboardingBridgeSDK;
   let mockProvider: any;
@@ -70,6 +91,7 @@ describe('OnboardingBridgeSDK', () => {
       prepareTransaction: jest.fn().mockResolvedValue({ sign: jest.fn() }),
       sendTransaction: jest.fn().mockResolvedValue({ hash: 'mock_tx_hash', status: 'PENDING' }),
       simulateTransaction: jest.fn().mockResolvedValue({}),
+      getLedgerEntries: jest.fn().mockResolvedValue(ledgerEntriesFor(0)),
     };
 
     (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
@@ -1216,6 +1238,73 @@ describe('OnboardingBridgeSDK', () => {
       await expect(sdk.queryIsRelayer('a'.repeat(64))).rejects.toThrow('Failed to query relayer');
     });
   });
+
+  describe('estimateCost minimum balance', () => {
+    const ESTIMATE_ARGS = {
+      source: MOCK_ADDRESS,
+      target: MOCK_ASSET,
+      asset: MOCK_ASSET,
+      amount: '100',
+    };
+
+    beforeEach(() => {
+      mockProvider.simulateTransaction.mockResolvedValue({ minResourceFee: '5000' });
+    });
+
+    it('charges two base reserves for an account with no subentries', async () => {
+      mockProvider.getLedgerEntries.mockResolvedValue(ledgerEntriesFor(0));
+
+      const estimate = await sdk.estimateCost(ESTIMATE_ARGS);
+
+      expect(estimate.minBalance).toBe(String(2 * BASE_RESERVE_STROOPS));
+    });
+
+    it('adds one base reserve per subentry', async () => {
+      mockProvider.getLedgerEntries.mockResolvedValue(ledgerEntriesFor(5));
+
+      const estimate = await sdk.estimateCost(ESTIMATE_ARGS);
+
+      // (2 + 5) * 0.5 XLM = 3.5 XLM
+      expect(estimate.minBalance).toBe(String(7 * BASE_RESERVE_STROOPS));
+      expect(estimate.minBalance).not.toBe('10000000');
+    });
+
+    it('reads the subentry count from the source account', async () => {
+      mockProvider.getLedgerEntries.mockResolvedValue(ledgerEntriesFor(3));
+
+      await sdk.estimateCost(ESTIMATE_ARGS);
+
+      expect(Keypair.fromPublicKey).toHaveBeenCalledWith(MOCK_ADDRESS);
+      expect(mockProvider.getLedgerEntries).toHaveBeenCalled();
+    });
+
+    it('treats an account that does not exist yet as having no subentries', async () => {
+      mockProvider.getLedgerEntries.mockResolvedValue(ledgerEntriesFor(null));
+
+      const estimate = await sdk.estimateCost(ESTIMATE_ARGS);
+
+      expect(estimate.minBalance).toBe(String(2 * BASE_RESERVE_STROOPS));
+    });
+
+    it('honours a configured base reserve', async () => {
+      mockProvider.getLedgerEntries.mockResolvedValue(ledgerEntriesFor(2));
+      const customSdk = new OnboardingBridgeSDK({ ...CONFIG, baseReserveStroops: 1_000_000 });
+
+      const estimate = await customSdk.estimateCost(ESTIMATE_ARGS);
+
+      expect(estimate.minBalance).toBe(String(4 * 1_000_000));
+    });
+
+    it('still reports the simulated fees alongside the minimum balance', async () => {
+      mockProvider.getLedgerEntries.mockResolvedValue(ledgerEntriesFor(1));
+
+      const estimate = await sdk.estimateCost(ESTIMATE_ARGS);
+
+      expect(estimate.resourceFee).toBe('5000');
+      expect(estimate.fee).toBe('5100'); // BASE_FEE (100) + resource fee
+      expect(estimate.minBalance).toBe(String(3 * BASE_RESERVE_STROOPS));
+    });
+  });
 });
 
 describe('address validation', () => {
@@ -1451,24 +1540,27 @@ describe('Error handling - invalid inputs', () => {
       .rejects.toThrow(/Invalid contract address for "assets\[0\]"/);
   });
 
+  // `upgrade` is a mutating method, so it reports validation failures through
+  // the returned TransactionResult rather than throwing — same as
+  // `reclaimTokens` above.
   it('upgrade rejects newWasmHash shorter than 64 hex chars', async () => {
-    await expect(sdk.upgrade({ newWasmHash: 'ab12' }, mockKeypair)).rejects.toThrow(
-      /newWasmHash must be a 64-character hex string/,
-    );
+    const result = await sdk.upgrade({ newWasmHash: 'ab12' }, mockKeypair);
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/newWasmHash must be a 64-character hex string/);
     expect(mockProvider.getAccount).not.toHaveBeenCalled();
   });
 
   it('upgrade rejects newWasmHash longer than 64 hex chars', async () => {
-    await expect(sdk.upgrade({ newWasmHash: 'a'.repeat(128) }, mockKeypair)).rejects.toThrow(
-      /newWasmHash must be a 64-character hex string/,
-    );
+    const result = await sdk.upgrade({ newWasmHash: 'a'.repeat(128) }, mockKeypair);
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/newWasmHash must be a 64-character hex string/);
     expect(mockProvider.getAccount).not.toHaveBeenCalled();
   });
 
   it('upgrade rejects newWasmHash with non-hex characters', async () => {
-    await expect(sdk.upgrade({ newWasmHash: 'g'.repeat(64) }, mockKeypair)).rejects.toThrow(
-      /newWasmHash must be a 64-character hex string/,
-    );
+    const result = await sdk.upgrade({ newWasmHash: 'g'.repeat(64) }, mockKeypair);
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/newWasmHash must be a 64-character hex string/);
     expect(mockProvider.getAccount).not.toHaveBeenCalled();
   });
 
@@ -1644,6 +1736,7 @@ describe('Observability hooks - onRpcCall coverage', () => {
       prepareTransaction: jest.fn().mockResolvedValue({ sign: jest.fn() }),
       sendTransaction: jest.fn().mockResolvedValue({ hash: 'h', status: 'PENDING' }),
       simulateTransaction: jest.fn().mockResolvedValue({ results: [{ retval: {} }] }),
+      getLedgerEntries: jest.fn().mockResolvedValue(ledgerEntriesFor(0)),
     };
 
     (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);

@@ -114,9 +114,14 @@ impl Database {
         Ok(())
     }
 
-    pub async fn insert_event(&self, event: &IndexedEvent) -> Result<(), sqlx::Error> {
+    /// Insert an event, ignoring it if its id was already indexed.
+    ///
+    /// Returns `true` when a new row was written and `false` when the event was
+    /// a duplicate. Callers use this to avoid re-queuing webhook deliveries for
+    /// an event that has already been delivered.
+    pub async fn insert_event(&self, event: &IndexedEvent) -> Result<bool, sqlx::Error> {
         let data_str = serde_json::to_string(&event.data).unwrap_or_default();
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT OR IGNORE INTO events (id, event_type, ledger_sequence, contract_id, tx_hash, timestamp, data)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
@@ -129,7 +134,7 @@ impl Database {
         .bind(&data_str)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn list_events(
@@ -452,5 +457,128 @@ fn row_to_event(
         tx_hash,
         timestamp,
         data: serde_json::from_str(&data).unwrap_or(serde_json::Value::Null),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A throwaway on-disk SQLite database. In-memory SQLite is per-connection,
+    /// so it cannot be shared across the pool's connections.
+    struct TempDb {
+        path: std::path::PathBuf,
+    }
+
+    impl TempDb {
+        fn new() -> Self {
+            let mut path = std::env::temp_dir();
+            path.push(format!("bridge-indexer-{}.db", uuid::Uuid::new_v4()));
+            Self { path }
+        }
+
+        fn url(&self) -> String {
+            format!("sqlite:{}?mode=rwc", self.path.display())
+        }
+    }
+
+    impl Drop for TempDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn sample_event(id: &str) -> IndexedEvent {
+        IndexedEvent {
+            id: id.to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 4242,
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".to_string(),
+            tx_hash: "9f1c0e6a".to_string(),
+            timestamp: "2026-07-29T10:00:00Z".to_string(),
+            data: serde_json::json!({ "amount": "1000" }),
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_event_ignores_a_repeated_id() {
+        let temp = TempDb::new();
+        let db = Database::new(&temp.url()).await;
+        db.migrate().await;
+
+        let event = sample_event("4242-9f1c0e6a-0");
+        db.insert_event(&event).await.unwrap();
+        db.insert_event(&event).await.unwrap();
+
+        let stored = db.list_events(10, 0).await.unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "re-inserting the same id must not duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_event_stores_distinct_ids_separately() {
+        let temp = TempDb::new();
+        let db = Database::new(&temp.url()).await;
+        db.migrate().await;
+
+        db.insert_event(&sample_event("4242-9f1c0e6a-0"))
+            .await
+            .unwrap();
+        db.insert_event(&sample_event("4242-9f1c0e6a-1"))
+            .await
+            .unwrap();
+
+        let stored = db.list_events(10, 0).await.unwrap();
+        assert_eq!(stored.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn insert_event_reports_whether_the_row_was_new() {
+        let temp = TempDb::new();
+        let db = Database::new(&temp.url()).await;
+        db.migrate().await;
+
+        let event = sample_event("4242-9f1c0e6a-0");
+        assert!(
+            db.insert_event(&event).await.unwrap(),
+            "first insert is new"
+        );
+        assert!(
+            !db.insert_event(&event).await.unwrap(),
+            "second insert must be reported as a duplicate"
+        );
+    }
+
+    /// Mirrors the poller's flow: webhooks are only queued for events that were
+    /// actually newly inserted, so re-polling never re-delivers.
+    #[tokio::test]
+    async fn a_duplicate_event_does_not_queue_another_webhook_delivery() {
+        let temp = TempDb::new();
+        let db = Database::new(&temp.url()).await;
+        db.migrate().await;
+
+        db.create_subscription(CreateSubscription {
+            url: "https://example.test/hook".to_string(),
+            event_type: None,
+            asset_filter: None,
+            source_filter: None,
+            target_filter: None,
+        })
+        .await
+        .unwrap();
+
+        let event = sample_event("4242-9f1c0e6a-0");
+        for _ in 0..3 {
+            if db.insert_event(&event).await.unwrap() {
+                db.queue_webhook_deliveries(&event).await.unwrap();
+            }
+        }
+
+        let stats = db.get_stats().await.unwrap();
+        assert_eq!(stats["total_events"], 1);
+        assert_eq!(stats["pending_deliveries"], 1);
     }
 }
