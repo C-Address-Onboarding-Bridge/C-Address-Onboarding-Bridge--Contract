@@ -308,7 +308,8 @@ class ContractClient {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(
-        this.contract.call('withdraw_fees', ...toScVals([options.asset, options.amount])),
+        this.contract.call('withdraw_fees', ...this.toScVals([options.asset, options.amount]),
+          options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' })),
       );
 
     return this.submitMutation('withdrawFees', tx, sourceKeypair);
@@ -359,12 +360,15 @@ class ContractClient {
     const adminAccount = await this.provider.getAccount(adminKeypair.publicKey());
     const wasmHashBytes = Buffer.from(options.newWasmHash, 'hex');
     const wasmHashScVal = xdr.ScVal.scvBytes(wasmHashBytes);
+    const nonceScVal = options.nonce === undefined
+      ? xdr.ScVal.scvVoid()
+      : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
 
     const tx = new TransactionBuilder(adminAccount, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
     })
-      .addOperation(this.contract.call('upgrade', wasmHashScVal));
+      .addOperation(this.contract.call('upgrade', wasmHashScVal, nonceScVal));
 
     return this.submitMutation('upgrade', tx, adminKeypair);
   }

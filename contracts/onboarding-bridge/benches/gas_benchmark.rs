@@ -3,7 +3,7 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::Address as _,
-    Address, Env, IntoVal, Vec,
+    Address, Bytes, BytesN, Env, IntoVal, Vec,
 };
 
 use onboarding_bridge::OnboardingBridge;
@@ -308,6 +308,152 @@ fn bench_query_total_bridged() -> BenchResult {
     }
 }
 
+// ── Second-sprint feature benchmarks ──────────────────────────────────────────
+
+fn bench_fund_c_address_timelocked() -> BenchResult {
+    let (env, bridge_id, token_id, admin, fee_collector) = setup_env();
+    let bridge = onboarding_bridge::OnboardingBridgeClient::new(&env, &bridge_id);
+    let token = BenchTokenClient::new(&env, &token_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    let user = Address::generate(&env);
+    token.mint(&user, &20_000i128);
+    let target = Address::generate(&env);
+    let release_time = env.ledger().timestamp() + 365 * 86_400u64;
+
+    env.budget().reset_default();
+    env.budget().reset_tracker();
+
+    bridge.fund_c_address_timelocked(&user, &target, &token_id, &10_000i128, &release_time, &0u64, &None, &None);
+
+    let cpu = env.budget().cpu_instruction_cost();
+    let mem = env.budget().memory_bytes_cost();
+
+    BenchResult { function_name: "fund_c_address_timelocked", variant: "default", cpu_insns: cpu, mem_bytes: mem }
+}
+
+fn bench_claim_timelocked() -> BenchResult {
+    let (env, bridge_id, token_id, admin, fee_collector) = setup_env();
+    let bridge = onboarding_bridge::OnboardingBridgeClient::new(&env, &bridge_id);
+    let token = BenchTokenClient::new(&env, &token_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    let user = Address::generate(&env);
+    token.mint(&user, &20_000i128);
+    let target = Address::generate(&env);
+    let release_time = env.ledger().timestamp() + 86_400u64;
+    let id = bridge.fund_c_address_timelocked(&user, &target, &token_id, &10_000i128, &release_time, &0u64, &None, &None);
+    env.ledger().set_timestamp(release_time + 1);
+
+    env.budget().reset_default();
+    env.budget().reset_tracker();
+
+    bridge.claim_timelocked(&id);
+
+    let cpu = env.budget().cpu_instruction_cost();
+    let mem = env.budget().memory_bytes_cost();
+
+    BenchResult { function_name: "claim_timelocked", variant: "default", cpu_insns: cpu, mem_bytes: mem }
+}
+
+fn bench_commit_fund() -> BenchResult {
+    let (env, bridge_id, token_id, admin, fee_collector) = setup_env();
+    let bridge = onboarding_bridge::OnboardingBridgeClient::new(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    let user = Address::generate(&env);
+    let target = Address::generate(&env);
+    let mut preimage = soroban_sdk::Bytes::new(&env);
+    preimage.extend_from_array(&10_000i128.to_be_bytes());
+    preimage.extend_from_array(&1u64.to_be_bytes());
+    let amount_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+    let deadline = env.ledger().timestamp() + 86_400;
+
+    env.budget().reset_default();
+    env.budget().reset_tracker();
+
+    bridge.commit_fund(&user, &target, &token_id, &amount_hash, &deadline);
+
+    let cpu = env.budget().cpu_instruction_cost();
+    let mem = env.budget().memory_bytes_cost();
+
+    BenchResult { function_name: "commit_fund", variant: "default", cpu_insns: cpu, mem_bytes: mem }
+}
+
+fn bench_reveal_fund() -> BenchResult {
+    let (env, bridge_id, token_id, admin, fee_collector) = setup_env();
+    let bridge = onboarding_bridge::OnboardingBridgeClient::new(&env, &bridge_id);
+    let token = BenchTokenClient::new(&env, &token_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    let user = Address::generate(&env);
+    let target = Address::generate(&env);
+    let amount: i128 = 10_000;
+    let nonce: u64 = 1;
+    token.mint(&user, &(amount * 2));
+
+    let mut preimage = soroban_sdk::Bytes::new(&env);
+    preimage.extend_from_array(&amount.to_be_bytes());
+    preimage.extend_from_array(&nonce.to_be_bytes());
+    let amount_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+    let deadline = env.ledger().timestamp() + 86_400;
+    let id = bridge.commit_fund(&user, &target, &token_id, &amount_hash, &deadline);
+    env.ledger().set_sequence_number(env.ledger().sequence() + 6);
+
+    env.budget().reset_default();
+    env.budget().reset_tracker();
+
+    bridge.reveal_fund(&id, &user, &target, &token_id, &amount, &nonce);
+
+    let cpu = env.budget().cpu_instruction_cost();
+    let mem = env.budget().memory_bytes_cost();
+
+    BenchResult { function_name: "reveal_fund", variant: "default", cpu_insns: cpu, mem_bytes: mem }
+}
+
+fn bench_tiered_fee_lookup() -> BenchResult {
+    let (env, bridge_id, token_id, admin, fee_collector) = setup_env();
+    let bridge = onboarding_bridge::OnboardingBridgeClient::new(&env, &bridge_id);
+    let token = BenchTokenClient::new(&env, &token_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    let user = Address::generate(&env);
+    token.mint(&user, &2_000_000i128);
+
+    let tiers = Vec::from_array(
+        &env,
+        [
+            onboarding_bridge::FeeTier { min_volume: 0, max_volume: 1_000i128, fee_bps: 10u32 },
+            onboarding_bridge::FeeTier { min_volume: 1_001i128, max_volume: 10_000i128, fee_bps: 25u32 },
+            onboarding_bridge::FeeTier { min_volume: 10_001i128, max_volume: 1_000_000i128, fee_bps: 50u32 },
+        ],
+    );
+    bridge.set_fee_tiers(&tiers);
+
+    // Fund once to build volume so tiered lookup is exercised.
+    bridge.fund_c_address(&user, &Address::generate(&env), &token_id, &10_000i128, &None, &None);
+
+    env.budget().reset_default();
+    env.budget().reset_tracker();
+
+    bridge.fund_c_address(&user, &Address::generate(&env), &token_id, &10_000i128, &None, &None);
+
+    let cpu = env.budget().cpu_instruction_cost();
+    let mem = env.budget().memory_bytes_cost();
+
+    BenchResult { function_name: "fund_c_address/tiered_fee", variant: "default", cpu_insns: cpu, mem_bytes: mem }
+}
+
 fn main() {
     let results = vec![
         bench_initialize(),
@@ -323,6 +469,12 @@ fn main() {
         bench_query_fee_bps(),
         bench_query_balance(),
         bench_query_total_bridged(),
+        // Second-sprint features
+        bench_fund_c_address_timelocked(),
+        bench_claim_timelocked(),
+        bench_commit_fund(),
+        bench_reveal_fund(),
+        bench_tiered_fee_lookup(),
     ];
 
     println!("{{");
@@ -358,6 +510,12 @@ mod bench_tests {
             bench_query_fee_bps(),
             bench_query_balance(),
             bench_query_total_bridged(),
+            // Second-sprint features
+            bench_fund_c_address_timelocked(),
+            bench_claim_timelocked(),
+            bench_commit_fund(),
+            bench_reveal_fund(),
+            bench_tiered_fee_lookup(),
         ];
 
         for r in &results {
