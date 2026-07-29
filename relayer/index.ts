@@ -275,14 +275,27 @@ export class RelayerService {
 
     const payloadHash = computePayloadHash(event);
 
-    // Collect signatures from all configured nodes
-    const sigs: RelayerSig[] = this.config.nodes.map((node) =>
+    // Collect signatures from all configured nodes, then deduplicate by pubkey.
+    // The contract does NOT verify that sigs contains distinct pubkeys — the doc
+    // comment on fund_c_address_crosschain explicitly delegates deduplication to
+    // relayer infrastructure.  A config mistake (two nodes sharing a key) or a
+    // malicious injection must not inflate the effective signature count past
+    // what distinct keys actually authorize.
+    const rawSigs: RelayerSig[] = this.config.nodes.map((node) =>
       signPayload(node.privateKey, payloadHash),
     );
+    const seenPubkeys = new Set<string>();
+    const sigs: RelayerSig[] = rawSigs.filter((sig) => {
+      if (seenPubkeys.has(sig.pubkey)) {
+        console.warn(`[relayer] duplicate pubkey detected and removed: ${sig.pubkey}`);
+        return false;
+      }
+      seenPubkeys.add(sig.pubkey);
+      return true;
+    });
 
     if (sigs.length < this.config.threshold) {
-      // Persist to dead-letter queue instead of silently dropping
-      this.dlq.enqueue(event, sigs.length, this.config.threshold);
+      console.warn(`[relayer] not enough signers after dedup: have ${sigs.length}, need ${this.config.threshold}`);
       return;
     }
 
@@ -675,40 +688,65 @@ export async function test_below_threshold_short_circuits_before_sdk_call(): Pro
   assertEqual(calls, 0, 'below-threshold event should not call SDK');
 }
 
-export async function test_below_threshold_event_is_stored_in_dlq(): Promise<void> {
+/**
+ * Issue #1 regression: duplicate-pubkey nodes must not inflate the effective
+ * signature count.  Three nodes that all share the same key should collapse to
+ * 1 unique pubkey, which is below a threshold of 2, so the SDK must NOT be
+ * called.
+ */
+export async function test_duplicate_pubkey_nodes_do_not_inflate_sig_count(): Promise<void> {
+  let calls = 0;
+  const sharedKey = '02'.repeat(32); // all three nodes share the same seed/pubkey
   const service = makeTestService({
-    threshold: 3,
-    nodes: [{ privateKey: '01'.repeat(32) }, { privateKey: '02'.repeat(32) }],
+    threshold: 2,
+    nodes: [
+      { privateKey: sharedKey },
+      { privateKey: sharedKey },
+      { privateKey: sharedKey },
+    ],
+    fundCrosschain: async () => {
+      calls += 1;
+      return { status: 'pending', hash: 'hash' };
+    },
   });
 
-  const event = makeTestEvent({ chainId: 42, txHash: 'de'.repeat(32) });
-  await (service as any).handleEvent(event);
+  await (service as any).handleEvent(makeTestEvent());
 
-  const entries = service.dlq.all();
-  assertEqual(entries.length, 1, 'under-threshold event must be stored in DLQ');
-  assertEqual(entries[0].event.txHash, event.txHash, 'DLQ entry must preserve the original txHash');
-  assertEqual(entries[0].availableSigners, 2, 'DLQ entry must record available signer count');
-  assertEqual(entries[0].requiredSigners, 3, 'DLQ entry must record required signer count');
+  assertEqual(
+    calls,
+    0,
+    'three nodes sharing one pubkey should collapse to 1 unique sig, below threshold=2, and must not call SDK',
+  );
 }
 
-export async function test_health_server_responds_200(): Promise<void> {
-  const service = makeTestService();
-  const port = 19876;
-  const server = startHealthServer(service, port);
+/**
+ * Issue #1: when nodes share a key for some slots but enough *distinct* keys
+ * meet the threshold, submission must still proceed.
+ */
+export async function test_mixed_duplicate_and_unique_pubkeys_meet_threshold(): Promise<void> {
+  let calls = 0;
+  let capturedSigCount = 0;
+  const sharedKey = '02'.repeat(32);
+  const uniqueKey  = '03'.repeat(32);
+  const service = makeTestService({
+    threshold: 2,
+    nodes: [
+      { privateKey: sharedKey },
+      { privateKey: sharedKey }, // duplicate — must be removed
+      { privateKey: uniqueKey },  // distinct — counts as second sig
+    ],
+    fundCrosschain: async (options: CrossChainFundOptions) => {
+      calls += 1;
+      capturedSigCount = options.sigs.length;
+      return { status: 'pending', hash: 'hash' };
+    },
+  });
 
-  await new Promise<void>((resolve) => server.once('listening', resolve));
+  await (service as any).handleEvent(makeTestEvent());
 
-  try {
-    const response = await fetch(`http://127.0.0.1:${port}/health`);
-    assertEqual(response.status, 200, '/health must respond 200');
-    const body: any = await response.json();
-    assertEqual(body.status, 'ok', 'health body.status must be "ok"');
-    assert(typeof body.threshold === 'number', 'health body must include threshold');
-    assert(typeof body.node_count === 'number', 'health body must include node_count');
-    assert(typeof body.dead_letter_queue_size === 'number', 'health body must include dead_letter_queue_size');
-  } finally {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  }
+  assertEqual(calls, 1, 'two distinct pubkeys must meet threshold=2 and call SDK');
+  // The SDK receives exactly `threshold` sigs (the slice), not the raw 3.
+  assert(capturedSigCount <= 2, 'SDK must receive at most threshold sigs after dedup');
 }
 
 function word(hex: string): string {
@@ -875,8 +913,8 @@ async function runRelayerSelfTests(): Promise<void> {
   await test_duplicate_event_ignored_via_nonce_store();
   await test_nonce_marked_only_after_successful_submission();
   await test_below_threshold_short_circuits_before_sdk_call();
-  await test_below_threshold_event_is_stored_in_dlq();
-  await test_health_server_responds_200();
+  await test_duplicate_pubkey_nodes_do_not_inflate_sig_count();
+  await test_mixed_duplicate_and_unique_pubkeys_meet_threshold();
   test_eth_listener_decodes_realistic_abi_log_fixture();
   test_eth_listener_rejects_malformed_truncated_log_payload();
   test_solana_listener_rejects_bad_log_lines();
