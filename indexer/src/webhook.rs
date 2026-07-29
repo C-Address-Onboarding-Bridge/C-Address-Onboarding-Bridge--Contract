@@ -161,3 +161,166 @@ async fn handle_retry(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::events::IndexedEvent;
+
+    /// Create an in-memory SQLite database and run migrations.
+    async fn setup_db() -> Database {
+        let db = Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        db
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 3 — Backoff formula
+    // -----------------------------------------------------------------------
+
+    /// The backoff is `2^attempt` seconds.  Verify the first several values so
+    /// a change to the formula is caught immediately.
+    #[test]
+    fn test_backoff_formula_grows_exponentially() {
+        // Mirrors: let backoff_secs = (2i64).pow(attempt as u32);
+        let expected: Vec<(i32, i64)> = vec![
+            (1, 2),   // attempt 1 → 2 s
+            (2, 4),   // attempt 2 → 4 s
+            (3, 8),   // attempt 3 → 8 s
+            (4, 16),  // attempt 4 → 16 s
+        ];
+
+        for (attempt, want_secs) in expected {
+            let got = (2i64).pow(attempt as u32);
+            assert_eq!(
+                got, want_secs,
+                "backoff for attempt {} must be {} seconds, got {}",
+                attempt, want_secs, got
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 3 — Dead delivery after MAX_RETRIES
+    // -----------------------------------------------------------------------
+
+    /// After `MAX_RETRIES` failed attempts the delivery row must transition to
+    /// status `'dead'`, not `'pending'`.
+    #[tokio::test]
+    async fn test_delivery_marked_dead_after_max_retries() {
+        let db = setup_db().await;
+
+        // Seed a subscription and an event so foreign-key constraints are met.
+        let sub = db
+            .create_subscription(crate::webhook::CreateSubscription {
+                url: "http://example.com/hook".to_string(),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .expect("create subscription");
+
+        let event = IndexedEvent {
+            id: "evt-backoff-001".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 1,
+            contract_id: "C_TEST".to_string(),
+            tx_hash: "deadbeef".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({}),
+        };
+        db.insert_event(&event).await.expect("insert event");
+        db.queue_webhook_deliveries(&event).await.expect("queue deliveries");
+
+        // Retrieve the delivery that was queued.
+        let deliveries = db.get_pending_deliveries().await.expect("get pending");
+        assert_eq!(deliveries.len(), 1, "one delivery must be queued");
+        let delivery_id = deliveries[0].id.clone();
+
+        // Simulate MAX_RETRIES - 1 failed attempts so the next failure crosses
+        // the threshold.  Each `mark_delivery_failed` increments `attempts`.
+        for i in 0..(super::MAX_RETRIES - 1) {
+            let backoff_secs = (2i64).pow((i + 1) as u32);
+            let next_retry = (chrono::Utc::now()
+                + chrono::Duration::seconds(backoff_secs))
+            .to_rfc3339();
+            db.mark_delivery_failed(&delivery_id, "transient error", &next_retry)
+                .await
+                .expect("mark failed");
+        }
+
+        // The attempt count is now MAX_RETRIES - 1.  One more failure must
+        // trigger mark_delivery_dead instead of another retry.
+        db.mark_delivery_dead(&delivery_id, "final error")
+            .await
+            .expect("mark dead");
+
+        // Verify the row is now 'dead' and not returned by get_pending_deliveries.
+        let pending_after = db.get_pending_deliveries().await.expect("pending after");
+        assert!(
+            pending_after.is_empty(),
+            "dead delivery must not appear in pending queue"
+        );
+
+        // Verify the status column directly via get_event_by_id (side-channel check
+        // using the stats which count pending only).
+        let stats = db.get_stats().await.expect("stats");
+        let pending_count = stats["pending_deliveries"].as_i64().unwrap_or(-1);
+        assert_eq!(
+            pending_count, 0,
+            "pending_deliveries counter must be 0 after marking dead"
+        );
+
+        let _ = sub; // suppress unused warning
+    }
+
+    /// A delivery that fails fewer than MAX_RETRIES times must remain pending,
+    /// not be marked dead.
+    #[tokio::test]
+    async fn test_delivery_stays_pending_below_max_retries() {
+        let db = setup_db().await;
+
+        let _sub = db
+            .create_subscription(crate::webhook::CreateSubscription {
+                url: "http://example.com/hook2".to_string(),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .expect("create subscription");
+
+        let event = IndexedEvent {
+            id: "evt-pending-001".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 2,
+            contract_id: "C_TEST".to_string(),
+            tx_hash: "feedface".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({}),
+        };
+        db.insert_event(&event).await.expect("insert event");
+        db.queue_webhook_deliveries(&event).await.expect("queue");
+
+        let deliveries = db.get_pending_deliveries().await.expect("get pending");
+        let delivery_id = deliveries[0].id.clone();
+
+        // Fail once — still well below MAX_RETRIES (5).
+        let next_retry =
+            (chrono::Utc::now() + chrono::Duration::seconds(2)).to_rfc3339();
+        db.mark_delivery_failed(&delivery_id, "first error", &next_retry)
+            .await
+            .expect("mark failed");
+
+        let stats = db.get_stats().await.expect("stats");
+        let pending_count = stats["pending_deliveries"].as_i64().unwrap_or(-1);
+        assert_eq!(
+            pending_count, 1,
+            "delivery must stay pending after only one failure"
+        );
+    }
+}

@@ -2,7 +2,7 @@
  * Tests for the EventSubscriber polling event API (issue #57).
  */
 import { EventSubscriber } from '../events';
-import type { CAddressFundedEvent, BridgeEventPayload, BridgeEventName } from '../events';
+import type { CAddressFundedEvent, BridgeEventPayload } from '../events';
 
 const mockGetEvents = jest.fn();
 
@@ -167,7 +167,7 @@ describe('EventSubscriber', () => {
         mockGetEvents.mockRejectedValueOnce(rpcError);
 
         const errors: Error[] = [];
-        subscriber.on('error' as BridgeEventName, (err: Error) => errors.push(err));
+        subscriber.on('error', (err: Error) => errors.push(err));
 
         // poll() dispatches errors and rethrows — catch the throw
         await subscriber.poll().catch(() => {});
@@ -185,10 +185,10 @@ describe('EventSubscriber', () => {
         mockGetEvents.mockRejectedValueOnce(new Error('rpc down'));
 
         const healthy = jest.fn();
-        subscriber.on('error' as BridgeEventName, () => {
+        subscriber.on('error', () => {
           throw new Error('handler bug');
         });
-        subscriber.on('error' as BridgeEventName, healthy);
+        subscriber.on('error', healthy);
 
         await subscriber.poll().catch(() => {});
 
@@ -200,7 +200,7 @@ describe('EventSubscriber', () => {
 
     it('does not stop the polling loop when an error event fires', async () => {
       mockGetEvents.mockRejectedValueOnce(new Error('rpc down'));
-      subscriber.on('error' as BridgeEventName, jest.fn());
+      subscriber.on('error', jest.fn());
 
       jest.advanceTimersByTime(1_000);
       // The existing test pattern: just verify the loop stays alive (call count)

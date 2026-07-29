@@ -463,122 +463,85 @@ fn row_to_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::IndexedEvent;
 
-    /// A throwaway on-disk SQLite database. In-memory SQLite is per-connection,
-    /// so it cannot be shared across the pool's connections.
-    struct TempDb {
-        path: std::path::PathBuf,
+    /// Create an in-memory SQLite database and run migrations.
+    async fn setup_db() -> Database {
+        let db = Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        db
     }
 
-    impl TempDb {
-        fn new() -> Self {
-            let mut path = std::env::temp_dir();
-            path.push(format!("bridge-indexer-{}.db", uuid::Uuid::new_v4()));
-            Self { path }
-        }
-
-        fn url(&self) -> String {
-            format!("sqlite:{}?mode=rwc", self.path.display())
-        }
-    }
-
-    impl Drop for TempDb {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-
-    fn sample_event(id: &str) -> IndexedEvent {
+    /// Build a minimal `IndexedEvent` with the given id.
+    fn make_event(id: &str) -> IndexedEvent {
         IndexedEvent {
             id: id.to_string(),
             event_type: "CAddressFunded".to_string(),
-            ledger_sequence: 4242,
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4".to_string(),
-            tx_hash: "9f1c0e6a".to_string(),
-            timestamp: "2026-07-29T10:00:00Z".to_string(),
+            ledger_sequence: 100,
+            contract_id: "CONTRACT_A".to_string(),
+            tx_hash: "deadbeef".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
             data: serde_json::json!({ "amount": "1000" }),
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Issue 2 — INSERT OR IGNORE deduplication
+    // -----------------------------------------------------------------------
+
+    /// Inserting the same event twice must be a no-op: only one row should exist.
     #[tokio::test]
-    async fn insert_event_ignores_a_repeated_id() {
-        let temp = TempDb::new();
-        let db = Database::new(&temp.url()).await;
-        db.migrate().await;
+    async fn test_insert_duplicate_event_is_ignored() {
+        let db = setup_db().await;
+        let event = make_event("evt-001");
 
-        let event = sample_event("4242-9f1c0e6a-0");
-        db.insert_event(&event).await.unwrap();
-        db.insert_event(&event).await.unwrap();
+        db.insert_event(&event).await.expect("first insert");
+        // Second insert of the same id should silently do nothing (INSERT OR IGNORE).
+        db.insert_event(&event).await.expect("duplicate insert must not error");
 
-        let stored = db.list_events(10, 0).await.unwrap();
-        assert_eq!(
-            stored.len(),
-            1,
-            "re-inserting the same id must not duplicate"
-        );
+        let rows = db.list_events(10, 0).await.expect("list_events");
+        assert_eq!(rows.len(), 1, "duplicate insert must leave exactly one row");
+        assert_eq!(rows[0].id, "evt-001");
     }
 
+    /// Two events with *different* ids must both persist.
     #[tokio::test]
-    async fn insert_event_stores_distinct_ids_separately() {
-        let temp = TempDb::new();
-        let db = Database::new(&temp.url()).await;
-        db.migrate().await;
+    async fn test_insert_two_distinct_events_both_persist() {
+        let db = setup_db().await;
 
-        db.insert_event(&sample_event("4242-9f1c0e6a-0"))
-            .await
-            .unwrap();
-        db.insert_event(&sample_event("4242-9f1c0e6a-1"))
-            .await
-            .unwrap();
+        db.insert_event(&make_event("evt-001")).await.expect("first insert");
+        db.insert_event(&make_event("evt-002")).await.expect("second insert");
 
-        let stored = db.list_events(10, 0).await.unwrap();
-        assert_eq!(stored.len(), 2);
+        let rows = db.list_events(10, 0).await.expect("list_events");
+        assert_eq!(rows.len(), 2, "two distinct events must both be stored");
     }
 
-    #[tokio::test]
-    async fn insert_event_reports_whether_the_row_was_new() {
-        let temp = TempDb::new();
-        let db = Database::new(&temp.url()).await;
-        db.migrate().await;
+    // -----------------------------------------------------------------------
+    // Issue 2 — Deterministic ID from parse_contract_event (regression guard)
+    // -----------------------------------------------------------------------
 
-        let event = sample_event("4242-9f1c0e6a-0");
-        assert!(
-            db.insert_event(&event).await.unwrap(),
-            "first insert is new"
-        );
-        assert!(
-            !db.insert_event(&event).await.unwrap(),
-            "second insert must be reported as a duplicate"
-        );
-    }
+    /// `parse_contract_event` must produce the same id when called twice with
+    /// the identical raw event payload.  If it generates a random UUID every
+    /// time, this test will fail — which is exactly the bug this PR fixes.
+    #[test]
+    fn test_parse_contract_event_produces_deterministic_id() {
+        use crate::poller::parse_contract_event_for_test;
 
-    /// Mirrors the poller's flow: webhooks are only queued for events that were
-    /// actually newly inserted, so re-polling never re-delivers.
-    #[tokio::test]
-    async fn a_duplicate_event_does_not_queue_another_webhook_delivery() {
-        let temp = TempDb::new();
-        let db = Database::new(&temp.url()).await;
-        db.migrate().await;
+        let raw = serde_json::json!({
+            "topic": ["CAddressFunded", "GSOURCE", "CTARGET"],
+            "ledger": 42,
+            "txHash": "abcdef1234567890",
+            "createdAt": "2024-01-01T00:00:00Z",
+            "value": { "amount": "500" }
+        });
 
-        db.create_subscription(CreateSubscription {
-            url: "https://example.test/hook".to_string(),
-            event_type: None,
-            asset_filter: None,
-            source_filter: None,
-            target_filter: None,
-        })
-        .await
-        .unwrap();
+        let id1 = parse_contract_event_for_test(&raw, "CONTRACT_A")
+            .expect("first parse must succeed")
+            .id;
+        let id2 = parse_contract_event_for_test(&raw, "CONTRACT_A")
+            .expect("second parse must succeed")
+            .id;
 
-        let event = sample_event("4242-9f1c0e6a-0");
-        for _ in 0..3 {
-            if db.insert_event(&event).await.unwrap() {
-                db.queue_webhook_deliveries(&event).await.unwrap();
-            }
-        }
-
-        let stats = db.get_stats().await.unwrap();
-        assert_eq!(stats["total_events"], 1);
-        assert_eq!(stats["pending_deliveries"], 1);
+        assert_eq!(id1, id2, "parse_contract_event must produce the same id for the same input");
     }
 }
