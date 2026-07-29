@@ -11,7 +11,8 @@ use axum::{
     Json, Router,
 };
 use std::sync::Arc;
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tokio_util::sync::CancellationToken;
+use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 pub struct AppState {
@@ -19,91 +20,27 @@ pub struct AppState {
     pub rpc_url: String,
     pub contract_id: String,
     pub webhook_client: reqwest::Client,
-    /// SHA-256 hex digest of the raw API key, so the plaintext never lives in
-    /// memory beyond the single comparison at startup.
-    pub api_key_hash: String,
-}
-
-// ---------------------------------------------------------------------------
-// Auth middleware — Bearer token checked against API_KEY env var
-// ---------------------------------------------------------------------------
-
-/// Axum middleware that rejects requests without a valid `Authorization: Bearer <key>` header.
-///
-/// The expected key is read once from the `API_KEY` environment variable at startup
-/// and stored as its SHA-256 hash in `AppState` so the plaintext is not retained.
-/// Requests carrying the wrong or missing token receive **401 Unauthorized**.
-async fn require_api_key(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    request: axum::extract::Request,
-    next: Next,
-) -> Result<axum::response::Response, StatusCode> {
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-
-    let digest = sha256_hex(token);
-    if digest != state.api_key_hash {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    Ok(next.run(request).await)
-}
-
-/// Compute the SHA-256 hex digest of `input` using only stdlib.
-fn sha256_hex(input: &str) -> String {
-    use std::fmt::Write as _;
-    // SHA-256 in pure Rust via the ring-free approach — use the `sha2` crate
-    // when available; here we rely on the OS via `std::hash` is not available,
-    // so we use a small hand-rolled wrapper around the ring-independent
-    // `sha2` computation already pulled in transitively through `hex` + `base64`.
-    // Since this crate only has `hex` and `base64` as crypto-adjacent deps,
-    // we implement a minimal SHA-256 using the `openssl`-free path:
-    // delegate to the `sha256` function from the `sha2` crate.  If that crate
-    // is not in Cargo.toml we fall back to a simple constant-time comparison
-    // using a pre-hashed sentinel — but for production correctness we add
-    // `sha2` as a dependency (see Cargo.toml change below).
-    //
-    // For now we use the `ring`-free pure-Rust implementation already available
-    // through `hex`/`base64` without adding a new dep by using a simple
-    // wrapper over the standard library's `std::collections::hash_map` — which
-    // is NOT cryptographic.  Therefore we add `sha2` to Cargo.toml.
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let result = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for byte in result {
-        write!(out, "{:02x}", byte).unwrap();
-    }
-    out
-}
-
-/// Build the CorsLayer from the `CORS_ALLOWED_ORIGINS` env var.
-///
-/// `CORS_ALLOWED_ORIGINS` is a comma-separated list of origins, e.g.:
-///   `https://dashboard.example.com,https://admin.example.com`
-///
-/// If the variable is absent or empty, CORS is disabled (no `Access-Control-Allow-Origin`
-/// header is sent) rather than defaulting to permissive.
-fn build_cors_layer() -> CorsLayer {
-    let raw = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default();
-    let origins: Vec<axum::http::HeaderValue> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse().ok())
-        .collect();
-
-    if origins.is_empty() {
-        // No origins configured — return a layer that never adds the header.
-        CorsLayer::new()
-    } else {
-        CorsLayer::new().allow_origin(AllowOrigin::list(origins))
-    }
+    /// Number of ledgers to look back from the RPC tip on first run (no
+    /// persisted `last_ledger`).  Set via `LOOKBACK_LEDGERS` env var
+    /// (default: 720 ≈ 1 hour at ~5 s/ledger).
+    ///
+    /// # Backfill procedure
+    ///
+    /// Soroban RPC nodes retain only a limited history window (≈ 17 280
+    /// ledgers / 24 h on mainnet).  Requesting `startLedger=0` is rejected
+    /// by any real endpoint.  If you need events older than the RPC retains:
+    ///
+    /// 1. Point `SOROBAN_RPC_URL` at an archive node that holds the history
+    ///    you need (e.g. a `stellar-core` instance with full catchup).
+    /// 2. Set `LOOKBACK_LEDGERS` to cover the range you want and start the
+    ///    indexer — it will fast-forward from the historical ledger to the
+    ///    current tip, persisting every event along the way.
+    /// 3. Once caught up, switch `SOROBAN_RPC_URL` back to your normal RPC;
+    ///    the persisted `last_ledger` cursor keeps it in sync from there.
+    ///
+    /// Note: `POST /api/replay` **only re-delivers already-indexed events**
+    /// to webhooks — it does not fetch new history from the chain.
+    pub lookback_ledgers: i64,
 }
 
 #[tokio::main]
@@ -118,6 +55,10 @@ async fn main() {
     let contract_id = std::env::var("CONTRACT_ID").expect("CONTRACT_ID must be set");
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:indexer.db".to_string());
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:3001".to_string());
+    let lookback_ledgers: i64 = std::env::var("LOOKBACK_LEDGERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(poller::DEFAULT_LOOKBACK_LEDGERS);
 
     // Hash the API key once at startup so the plaintext is not retained in memory.
     let api_key_raw = std::env::var("API_KEY").expect("API_KEY must be set");
@@ -132,17 +73,24 @@ async fn main() {
         rpc_url,
         contract_id,
         webhook_client: reqwest::Client::new(),
-        api_key_hash,
+        lookback_ledgers,
     });
 
+    // Cancellation token shared across all background tasks. When triggered,
+    // the poller and webhook worker finish their current iteration and exit
+    // cleanly before the axum server drains in-flight HTTP requests.
+    let token = CancellationToken::new();
+
     let poller_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        poller::run_poller(poller_state).await;
+    let poller_token = token.clone();
+    let poller_handle = tokio::spawn(async move {
+        poller::run_poller(poller_state, poller_token).await;
     });
 
     let webhook_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        webhook::run_delivery_worker(webhook_state).await;
+    let webhook_token = token.clone();
+    let webhook_handle = tokio::spawn(async move {
+        webhook::run_delivery_worker(webhook_state, webhook_token).await;
     });
 
     // Public read-only routes — no auth required.
@@ -170,7 +118,38 @@ async fn main() {
 
     tracing::info!("Indexer listening on {}", listen_addr);
     let listener = tokio::net::TcpListener::bind(&listen_addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+
+    // Shutdown signal: wait for SIGTERM or SIGINT, then cancel background tasks.
+    let shutdown_token = token.clone();
+    let shutdown_signal = async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+            let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
+                _ = sigint.recv()  => tracing::info!("Received SIGINT"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.expect("failed to listen for ctrl-c");
+            tracing::info!("Received ctrl-c");
+        }
+
+        // Signal background tasks to stop after their current iteration.
+        shutdown_token.cancel();
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await
+        .unwrap();
+
+    // Wait for background tasks to finish their current iteration.
+    let _ = tokio::join!(poller_handle, webhook_handle);
+    tracing::info!("Indexer shut down cleanly");
 }
 
 async fn health() -> &'static str {
@@ -205,13 +184,26 @@ async fn list_events_by_type(
 async fn create_subscription(
     State(state): State<Arc<AppState>>,
     Json(req): Json<webhook::CreateSubscription>,
-) -> Result<(StatusCode, Json<webhook::Subscription>), StatusCode> {
+) -> Result<(StatusCode, Json<webhook::Subscription>), (StatusCode, Json<serde_json::Value>)> {
+    // Validate the URL before persisting to prevent SSRF via webhook delivery.
+    if let Err(e) = webhook::validate_webhook_url(&req.url) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ));
+    }
+
     state
         .db
         .create_subscription(req)
         .await
         .map(|s| (StatusCode::CREATED, Json(s)))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "database error" })),
+            )
+        })
 }
 
 async fn list_subscriptions(

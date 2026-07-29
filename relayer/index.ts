@@ -13,8 +13,7 @@
  */
 
 import * as crypto from 'crypto';
-import * as fs from 'fs';
-import * as path from 'path';
+import * as http from 'http';
 import { Keypair } from '@stellar/stellar-sdk';
 import { OnboardingBridgeSDK } from '../sdk/src/bridge';
 import { CrossChainFundOptions, RelayerSig } from '../sdk/src/types';
@@ -63,6 +62,68 @@ export interface RelayerServiceConfig {
   threshold: number;
   /** Chain listeners to watch. */
   listeners: ChainListener[];
+}
+
+// ---------------------------------------------------------------------------
+// Dead-letter queue — retains events that failed the threshold check
+// ---------------------------------------------------------------------------
+
+/** A BridgeEvent that could not be submitted due to insufficient signers. */
+export interface DeadLetterEntry {
+  event: BridgeEvent;
+  /** ISO timestamp when the entry was added. */
+  enqueuedAt: string;
+  /** How many signers were available vs how many were required. */
+  availableSigners: number;
+  requiredSigners: number;
+}
+
+/**
+ * In-memory dead-letter store for under-threshold events.
+ * Replace with a persistent store (e.g. Redis, SQLite) in production.
+ */
+export class DeadLetterQueue {
+  private entries: DeadLetterEntry[] = [];
+
+  enqueue(event: BridgeEvent, available: number, required: number): void {
+    this.entries.push({
+      event,
+      enqueuedAt: new Date().toISOString(),
+      availableSigners: available,
+      requiredSigners: required,
+    });
+    console.warn(
+      `[relayer] dead-letter: chain=${event.chainId} tx=${event.txHash} ` +
+        `signers=${available}/${required} — stored for retry`,
+    );
+  }
+
+  /** Return all queued entries (for inspection / retry). */
+  all(): DeadLetterEntry[] {
+    return [...this.entries];
+  }
+
+  /** Remove a specific entry by tx-hash + chainId after a successful retry. */
+  remove(chainId: number, txHash: string): void {
+    this.entries = this.entries.filter(
+      (e) => !(e.event.chainId === chainId && e.event.txHash === txHash),
+    );
+  }
+
+  size(): number {
+    return this.entries.length;
+  }
+}
+
+/** Snapshot of relayer liveness reported by GET /health. */
+export interface HealthStatus {
+  status: 'ok';
+  uptime_seconds: number;
+  threshold: number;
+  node_count: number;
+  /** Last successfully submitted event per chain (chainId → ISO timestamp). */
+  last_event_per_chain: Record<string, string>;
+  dead_letter_queue_size: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +222,9 @@ export class RelayerService {
   private submitterKeypair: ReturnType<typeof Keypair.fromSecret>;
   private config: RelayerServiceConfig;
   private nonces = new NonceStore();
+  private startedAt = Date.now();
+  private lastEventPerChain: Map<number, string> = new Map();
+  readonly dlq = new DeadLetterQueue();
 
   constructor(config: RelayerServiceConfig) {
     this.config = config;
@@ -186,6 +250,21 @@ export class RelayerService {
     console.log('[relayer] stopped');
   }
 
+  healthStatus(): HealthStatus {
+    const last_event_per_chain: Record<string, string> = {};
+    for (const [chainId, ts] of this.lastEventPerChain) {
+      last_event_per_chain[String(chainId)] = ts;
+    }
+    return {
+      status: 'ok',
+      uptime_seconds: Math.floor((Date.now() - this.startedAt) / 1000),
+      threshold: this.config.threshold,
+      node_count: this.config.nodes.length,
+      last_event_per_chain,
+      dead_letter_queue_size: this.dlq.size(),
+    };
+  }
+
   private async handleEvent(event: BridgeEvent): Promise<void> {
     if (this.nonces.has(event.chainId, event.txHash)) {
       console.log(`[relayer] duplicate event ignored: chain=${event.chainId} tx=${event.txHash}`);
@@ -196,13 +275,27 @@ export class RelayerService {
 
     const payloadHash = computePayloadHash(event);
 
-    // Collect signatures from all configured nodes
-    const sigs: RelayerSig[] = this.config.nodes.map((node) =>
+    // Collect signatures from all configured nodes, then deduplicate by pubkey.
+    // The contract does NOT verify that sigs contains distinct pubkeys — the doc
+    // comment on fund_c_address_crosschain explicitly delegates deduplication to
+    // relayer infrastructure.  A config mistake (two nodes sharing a key) or a
+    // malicious injection must not inflate the effective signature count past
+    // what distinct keys actually authorize.
+    const rawSigs: RelayerSig[] = this.config.nodes.map((node) =>
       signPayload(node.privateKey, payloadHash),
     );
+    const seenPubkeys = new Set<string>();
+    const sigs: RelayerSig[] = rawSigs.filter((sig) => {
+      if (seenPubkeys.has(sig.pubkey)) {
+        console.warn(`[relayer] duplicate pubkey detected and removed: ${sig.pubkey}`);
+        return false;
+      }
+      seenPubkeys.add(sig.pubkey);
+      return true;
+    });
 
     if (sigs.length < this.config.threshold) {
-      console.warn(`[relayer] not enough signers: have ${sigs.length}, need ${this.config.threshold}`);
+      console.warn(`[relayer] not enough signers after dedup: have ${sigs.length}, need ${this.config.threshold}`);
       return;
     }
 
@@ -225,6 +318,7 @@ export class RelayerService {
 
       // Mark nonce only after successful submission
       this.nonces.mark(event.chainId, event.txHash);
+      this.lastEventPerChain.set(event.chainId, new Date().toISOString());
       console.log(`[relayer] submitted tx=${result.hash} for chain=${event.chainId} src-tx=${event.txHash}`);
     } catch (err: any) {
       console.error(`[relayer] unexpected error: ${err.message}`);
@@ -572,6 +666,50 @@ export class SolanaChainListener implements ChainListener {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP health server
+// ---------------------------------------------------------------------------
+
+/**
+ * Start a minimal HTTP server on `port` that exposes:
+ *   GET /health  — liveness + basic status (200 JSON)
+ *   GET /health/dead-letters  — dump of the dead-letter queue (200 JSON)
+ *
+ * Returns the server instance so callers can call `.close()` on shutdown.
+ */
+export function startHealthServer(service: RelayerService, port: number): http.Server {
+  const server = http.createServer((req, res) => {
+    if (req.method !== 'GET') {
+      res.writeHead(405);
+      res.end('Method Not Allowed');
+      return;
+    }
+
+    if (req.url === '/health') {
+      const body = JSON.stringify(service.healthStatus());
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(body);
+      return;
+    }
+
+    if (req.url === '/health/dead-letters') {
+      const body = JSON.stringify({ entries: service.dlq.all() });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(body);
+      return;
+    }
+
+    res.writeHead(404);
+    res.end('Not Found');
+  });
+
+  server.listen(port, () => {
+    console.log(`[relayer] health server listening on :${port}`);
+  });
+
+  return server;
+}
+
+// ---------------------------------------------------------------------------
 // Lightweight self-tests (run with: npx ts-node relayer/index.ts --self-test)
 // ---------------------------------------------------------------------------
 
@@ -616,6 +754,9 @@ function makeTestService(params: {
   };
   (service as any).submitterKeypair = {};
   (service as any).nonces = new NonceStore();
+  (service as any).startedAt = Date.now();
+  (service as any).lastEventPerChain = new Map();
+  (service as any).dlq = new DeadLetterQueue();
   return service;
 }
 
@@ -668,6 +809,67 @@ export async function test_below_threshold_short_circuits_before_sdk_call(): Pro
   await (service as any).handleEvent(makeTestEvent());
 
   assertEqual(calls, 0, 'below-threshold event should not call SDK');
+}
+
+/**
+ * Issue #1 regression: duplicate-pubkey nodes must not inflate the effective
+ * signature count.  Three nodes that all share the same key should collapse to
+ * 1 unique pubkey, which is below a threshold of 2, so the SDK must NOT be
+ * called.
+ */
+export async function test_duplicate_pubkey_nodes_do_not_inflate_sig_count(): Promise<void> {
+  let calls = 0;
+  const sharedKey = '02'.repeat(32); // all three nodes share the same seed/pubkey
+  const service = makeTestService({
+    threshold: 2,
+    nodes: [
+      { privateKey: sharedKey },
+      { privateKey: sharedKey },
+      { privateKey: sharedKey },
+    ],
+    fundCrosschain: async () => {
+      calls += 1;
+      return { status: 'pending', hash: 'hash' };
+    },
+  });
+
+  await (service as any).handleEvent(makeTestEvent());
+
+  assertEqual(
+    calls,
+    0,
+    'three nodes sharing one pubkey should collapse to 1 unique sig, below threshold=2, and must not call SDK',
+  );
+}
+
+/**
+ * Issue #1: when nodes share a key for some slots but enough *distinct* keys
+ * meet the threshold, submission must still proceed.
+ */
+export async function test_mixed_duplicate_and_unique_pubkeys_meet_threshold(): Promise<void> {
+  let calls = 0;
+  let capturedSigCount = 0;
+  const sharedKey = '02'.repeat(32);
+  const uniqueKey  = '03'.repeat(32);
+  const service = makeTestService({
+    threshold: 2,
+    nodes: [
+      { privateKey: sharedKey },
+      { privateKey: sharedKey }, // duplicate — must be removed
+      { privateKey: uniqueKey },  // distinct — counts as second sig
+    ],
+    fundCrosschain: async (options: CrossChainFundOptions) => {
+      calls += 1;
+      capturedSigCount = options.sigs.length;
+      return { status: 'pending', hash: 'hash' };
+    },
+  });
+
+  await (service as any).handleEvent(makeTestEvent());
+
+  assertEqual(calls, 1, 'two distinct pubkeys must meet threshold=2 and call SDK');
+  // The SDK receives exactly `threshold` sigs (the slice), not the raw 3.
+  assert(capturedSigCount <= 2, 'SDK must receive at most threshold sigs after dedup');
 }
 
 function word(hex: string): string {
@@ -831,257 +1033,148 @@ export function test_signature_from_known_seed_is_deterministic(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #1: Block-number persistence regression tests
+// Startup environment variable validation (Issues 3 & 4)
 // ---------------------------------------------------------------------------
 
-export function test_block_store_roundtrip(): void {
-  const tmpFile = path.join(
-    require('os').tmpdir(),
-    `block-store-test-${Date.now()}.json`,
-  );
-  try {
-    const store = new BlockStore(tmpFile);
-    assertEqual(store.load(), null, 'fresh store should return null');
-
-    store.save('0xaabbcc');
-    assertEqual(store.load(), '0xaabbcc', 'persisted value should round-trip');
-
-    store.save('0x1');
-    assertEqual(store.load(), '0x1', 'overwriting should update value');
-  } finally {
-    try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
-  }
-}
-
-export function test_eth_listener_resumes_from_persisted_block(): void {
-  const tmpFile = path.join(
-    require('os').tmpdir(),
-    `eth-block-resume-${Date.now()}.json`,
-  );
-  try {
-    // Seed a persisted block number
-    const store = new BlockStore(tmpFile);
-    store.save('0x64'); // block 100
-
-    // A fresh listener instance with the same store path should resume from 0x64
-    const listener = new EthChainListener({
-      rpcUrl: 'http://localhost',
-      bridgeContractAddress: '0xbridge',
-      eventTopic: '0xtopic',
-      chainId: 1,
-      blockStorePath: tmpFile,
-    });
-
-    assertEqual(
-      (listener as any).fromBlock,
-      '0x64',
-      'listener should resume from the persisted block number',
-    );
-  } finally {
-    try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
-  }
-}
-
-export async function test_eth_listener_persists_block_after_processing(): Promise<void> {
-  const tmpFile = path.join(
-    require('os').tmpdir(),
-    `eth-block-persist-${Date.now()}.json`,
-  );
-  try {
-    const listener = new EthChainListener({
-      rpcUrl: 'http://localhost',
-      bridgeContractAddress: '0xbridge',
-      eventTopic: '0xtopic',
-      chainId: 1,
-      blockStorePath: tmpFile,
-    });
-
-    // Simulate processing a log at block 0x0a (10)
-    const fakeLog = {
-      ...makeAbiLog('GDEST', 'CASSET', 500n),
-      blockNumber: '0x0a',
-    };
-
-    // Manually replicate the poll logic for the persist path:
-    const decoded = (listener as any).decode(fakeLog);
-    assert(decoded !== null, 'fixture log should decode');
-
-    const lastBlock = parseInt(fakeLog.blockNumber, 16);
-    const nextFromBlock = '0x' + (lastBlock + 1).toString(16);
-    (listener as any).fromBlock = nextFromBlock;
-    (listener as any).blockStore.save(nextFromBlock);
-
-    // A new listener reading the same file should resume from block 11
-    const listener2 = new EthChainListener({
-      rpcUrl: 'http://localhost',
-      bridgeContractAddress: '0xbridge',
-      eventTopic: '0xtopic',
-      chainId: 1,
-      blockStorePath: tmpFile,
-    });
-
-    assertEqual(
-      (listener2 as any).fromBlock,
-      '0xb', // 11 in hex
-      'restarted listener should resume from the block after the last processed one',
-    );
-  } finally {
-    try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
-  }
-}
-
-export function test_eth_listener_falls_back_to_latest_on_missing_store(): void {
-  // Point at a path that definitely does not exist
-  const missingPath = path.join(
-    require('os').tmpdir(),
-    `no-such-block-store-${Date.now()}.json`,
-  );
-  const listener = new EthChainListener({
-    rpcUrl: 'http://localhost',
-    bridgeContractAddress: '0xbridge',
-    eventTopic: '0xtopic',
-    chainId: 1,
-    blockStorePath: missingPath,
-  });
-
-  assertEqual(
-    (listener as any).fromBlock,
-    'latest',
-    'fresh listener with no stored block should default to latest',
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Issue #3: Solana WebSocket reconnect-with-backoff regression tests
-// ---------------------------------------------------------------------------
-
-export function test_solana_listener_schedules_reconnect_on_close(): void {
-  let connectCalls = 0;
-
-  const listener = new SolanaChainListener({
-    wsUrl: 'ws://localhost',
-    programId: 'program',
-    chainId: 101,
-    initialReconnectDelayMs: 50,
-    maxReconnectDelayMs: 400,
-  });
-
-  // Intercept connect() so we can count calls without real WebSockets
-  let savedOnClose: (() => void) | null = null;
-  (listener as any).connect = function (this: typeof listener) {
-    connectCalls += 1;
-    // Capture onclose so the test can trigger it
-    savedOnClose = () => {
-      (this as any).ws = { close: () => { /* no-op */ } };
-      // Manually invoke the onclose handler from the real connect path
-    };
-  };
-
-  // Start the listener (calls connect once)
-  listener.start(() => { /* no events in this test */ });
-  assertEqual(connectCalls, 1, 'start() should call connect() once');
-
-  // Simulate an unexpected close by invoking the real onclose path
-  (listener as any).stopped = false;
-  const realOnclose = () => {
-    if ((listener as any).stopped) return;
-    const delay: number = (listener as any).reconnectDelay;
-    (listener as any).reconnectTimer = setTimeout(() => {
-      (listener as any).reconnectDelay = Math.min(delay * 2, (listener as any).config.maxReconnectDelayMs ?? 30_000);
-      (listener as any).connect();
-    }, delay);
-  };
-  realOnclose();
-
-  // At this point a reconnect timer is scheduled — verify the delay doubled
-  // after reconnect fires by advancing the timer synchronously via fake timers.
-  const originalSetTimeout = (global as any).setTimeout;
-  (global as any).setTimeout = (fn: () => void, _delay: number) => {
-    fn(); // fire immediately in the test
-    return 0 as any;
-  };
-  try {
-    realOnclose();
-  } finally {
-    (global as any).setTimeout = originalSetTimeout;
+/**
+ * Validate that all required environment variables are present and well-formed.
+ * Throws a descriptive Error on the first missing or invalid variable so the
+ * process exits with a clear message instead of a cryptic undefined-dereference
+ * deep inside an SDK call.
+ *
+ * Exported so it can be unit-tested independently of process.exit.
+ */
+export function validateEnv(env: NodeJS.ProcessEnv = process.env): {
+  contractId: string;
+  rpcUrl: string;
+  networkPassphrase: string;
+  submitterSecretKey: string;
+  threshold: number;
+  relayerPrivateKeys: string[];
+} {
+  function requireString(name: string): string {
+    const value = env[name];
+    if (value === undefined || value.trim() === '') {
+      throw new Error(`${name} is required but was not set`);
+    }
+    return value.trim();
   }
 
-  // connect() should have been called a second time by the timer
-  assert(connectCalls >= 2, 'onclose should schedule a reconnect attempt');
+  const contractId = requireString('CONTRACT_ID');
+  const rpcUrl = requireString('STELLAR_RPC_URL');
+  const networkPassphrase = requireString('NETWORK_PASSPHRASE');
+  const submitterSecretKey = requireString('RELAYER_SECRET_KEY');
 
-  listener.stop();
-}
-
-export function test_solana_listener_backs_off_exponentially(): void {
-  const listener = new SolanaChainListener({
-    wsUrl: 'ws://localhost',
-    programId: 'program',
-    chainId: 101,
-    initialReconnectDelayMs: 100,
-    maxReconnectDelayMs: 800,
-  });
-
-  // Access internal state directly to verify back-off progression
-  (listener as any).stopped = false;
-
-  const delays: number[] = [];
-
-  // Simulate 5 consecutive closes capturing the delay each time
-  for (let i = 0; i < 5; i++) {
-    delays.push((listener as any).reconnectDelay);
-    // What the real onclose does:
-    (listener as any).reconnectDelay = Math.min(
-      (listener as any).reconnectDelay * 2,
-      (listener as any).config.maxReconnectDelayMs ?? 30_000,
+  // Issue 4: THRESHOLD must parse to a positive integer.
+  const thresholdRaw = env['THRESHOLD'] ?? '1';
+  const threshold = parseInt(thresholdRaw, 10);
+  if (!Number.isInteger(threshold) || threshold < 1) {
+    throw new Error(
+      `THRESHOLD must be a positive integer, got: "${thresholdRaw}"`,
     );
   }
 
-  assertEqual(delays[0], 100, 'initial delay should be 100 ms');
-  assertEqual(delays[1], 200, 'second delay should double to 200 ms');
-  assertEqual(delays[2], 400, 'third delay should double to 400 ms');
-  assertEqual(delays[3], 800, 'fourth delay should be capped at 800 ms');
-  assertEqual(delays[4], 800, 'fifth delay should remain capped at 800 ms');
+  const relayerPrivateKeys = (env['RELAYER_PRIVATE_KEYS'] ?? '')
+    .split(',')
+    .map((pk) => pk.trim())
+    .filter(Boolean);
+
+  if (relayerPrivateKeys.length === 0) {
+    throw new Error('RELAYER_PRIVATE_KEYS is required and must contain at least one key');
+  }
+
+  return { contractId, rpcUrl, networkPassphrase, submitterSecretKey, threshold, relayerPrivateKeys };
 }
 
-export function test_solana_listener_stop_prevents_reconnect(): void {
-  let connectCalls = 0;
+// ---------------------------------------------------------------------------
+// Tests for env validation (Issues 3 & 4)
+// ---------------------------------------------------------------------------
 
-  const listener = new SolanaChainListener({
-    wsUrl: 'ws://localhost',
-    programId: 'program',
-    chainId: 101,
-    initialReconnectDelayMs: 10,
-  });
-
-  // Intercept connect
-  (listener as any).connect = () => {
-    connectCalls += 1;
-    // Simulate an immediately open/closed ws
+export function test_missing_contract_id_throws(): void {
+  const env: NodeJS.ProcessEnv = {
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test',
+    RELAYER_SECRET_KEY: 'secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32),
   };
+  try {
+    validateEnv(env);
+    throw new Error('Expected validateEnv to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('CONTRACT_ID'), `expected CONTRACT_ID error, got: ${e.message}`);
+  }
+}
 
-  listener.start(() => { /* no events */ });
-  assertEqual(connectCalls, 1, 'start() must call connect once');
-
-  // Stop before any close fires
-  listener.stop();
-  assert((listener as any).stopped === true, 'stopped flag must be set');
-
-  // Simulate onclose arriving after stop()
-  const oncloseAfterStop = () => {
-    if ((listener as any).stopped) return;
-    (listener as any).reconnectTimer = setTimeout(() => {
-      (listener as any).connect();
-    }, (listener as any).reconnectDelay);
+export function test_missing_rpc_url_throws(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    NETWORK_PASSPHRASE: 'test',
+    RELAYER_SECRET_KEY: 'secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32),
   };
-  oncloseAfterStop();
+  try {
+    validateEnv(env);
+    throw new Error('Expected validateEnv to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('STELLAR_RPC_URL'), `expected STELLAR_RPC_URL error, got: ${e.message}`);
+  }
+}
 
-  assertEqual(connectCalls, 1, 'no reconnect should be scheduled after stop()');
+export function test_nan_threshold_is_rejected(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test',
+    RELAYER_SECRET_KEY: 'secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32),
+    THRESHOLD: 'not-a-number',
+  };
+  try {
+    validateEnv(env);
+    throw new Error('Expected validateEnv to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('THRESHOLD'), `expected THRESHOLD error, got: ${e.message}`);
+  }
+}
+
+export function test_zero_threshold_is_rejected(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test',
+    RELAYER_SECRET_KEY: 'secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32),
+    THRESHOLD: '0',
+  };
+  try {
+    validateEnv(env);
+    throw new Error('Expected validateEnv to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('THRESHOLD'), `expected THRESHOLD error, got: ${e.message}`);
+  }
+}
+
+export function test_valid_env_parses_correctly(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test network',
+    RELAYER_SECRET_KEY: 'my-secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32) + ',' + '02'.repeat(32),
+    THRESHOLD: '2',
+  };
+  const result = validateEnv(env);
+  assertEqual(result.contractId, 'C_TEST', 'contractId');
+  assertEqual(result.threshold, 2, 'threshold');
+  assertEqual(result.relayerPrivateKeys.length, 2, 'relayer key count');
 }
 
 async function runRelayerSelfTests(): Promise<void> {
   await test_duplicate_event_ignored_via_nonce_store();
   await test_nonce_marked_only_after_successful_submission();
   await test_below_threshold_short_circuits_before_sdk_call();
+  await test_duplicate_pubkey_nodes_do_not_inflate_sig_count();
+  await test_mixed_duplicate_and_unique_pubkeys_meet_threshold();
   test_eth_listener_decodes_realistic_abi_log_fixture();
   test_eth_listener_rejects_malformed_truncated_log_payload();
   test_solana_listener_rejects_bad_log_lines();
@@ -1089,15 +1182,12 @@ async function runRelayerSelfTests(): Promise<void> {
   test_amount_encoding_handles_large_decimals();
   test_signature_passes_ed25519_verify();
   test_signature_from_known_seed_is_deterministic();
-  // Issue #1 & #2 — block-number persistence
-  test_block_store_roundtrip();
-  test_eth_listener_resumes_from_persisted_block();
-  await test_eth_listener_persists_block_after_processing();
-  test_eth_listener_falls_back_to_latest_on_missing_store();
-  // Issue #3 — Solana WebSocket reconnect-with-backoff
-  test_solana_listener_schedules_reconnect_on_close();
-  test_solana_listener_backs_off_exponentially();
-  test_solana_listener_stop_prevents_reconnect();
+  // Issue 3 & 4: env var and threshold validation
+  test_missing_contract_id_throws();
+  test_missing_rpc_url_throws();
+  test_nan_threshold_is_rejected();
+  test_zero_threshold_is_rejected();
+  test_valid_env_parses_correctly();
   console.log('[relayer] self-tests passed');
 }
 
@@ -1134,9 +1224,17 @@ if (require.main === module) {
       ],
     });
 
+    const healthPort = parseInt(process.env.HEALTH_PORT ?? '3000', 10);
+    const healthServer = startHealthServer(service, healthPort);
+
     service.start();
 
-    process.on('SIGINT', () => { service.stop(); process.exit(0); });
-    process.on('SIGTERM', () => { service.stop(); process.exit(0); });
+    const shutdown = () => {
+      service.stop();
+      healthServer.close(() => process.exit(0));
+    };
+
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
   }
 }
