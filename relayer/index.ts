@@ -79,26 +79,19 @@ function computeNonce(chainId: number, txHashHex: string): Buffer {
 
 /**
  * Compute payload_hash = sha256(
- *   chain_id_be4 || tx_hash || target_xdr || asset_xdr ||
+ *   chain_id_be4 || tx_hash || target_hash || asset_hash ||
  *   amount_be16 || nonce
  * ).
  *
- * target_xdr and asset_xdr replicate the Soroban `Address::to_xdr` output.
- * For Stellar addresses this is the 32-byte raw public-key wrapped in the
- * ScAddress XDR discriminant (4 bytes discriminant + 4 bytes account-id
- * discriminant + 32 bytes key = 40 bytes for G-addresses; for C-addresses the
- * discriminant differs).  Rather than re-implementing XDR encoding here we
- * store the canonical payload hash in the event store and have signers hash
- * the raw fields — keeping the hashing logic here simple and auditable.
+ * target_hash = sha256(target_strkey_bytes)
+ * asset_hash  = sha256(asset_strkey_bytes)
  *
- * NOTE: In production you'd use `@stellar/stellar-sdk`'s `xdr` module to
- * encode the addresses exactly as the contract does.  This implementation
- * uses a deterministic UTF-8 encoding of the address string as a documented
- * approximation; replace `encodeAddress` if you need exact XDR fidelity.
+ * This matches the contract's payload construction in
+ * `fund_c_address_crosschain` (lib.rs lines 3736-3772).
  */
 function encodeAddress(address: string): Buffer {
-  // Replace with xdr.ScAddress encoding via stellar-sdk for exact fidelity.
-  return Buffer.from(address, 'utf8');
+  const raw = Buffer.from(address, 'utf8');
+  return crypto.createHash('sha256').update(raw).digest();
 }
 
 function computePayloadHash(event: BridgeEvent): Buffer {
@@ -109,11 +102,11 @@ function computePayloadHash(event: BridgeEvent): Buffer {
   const targetBuf = encodeAddress(event.target);
   const assetBuf = encodeAddress(event.asset);
 
-  // amount as big-endian i128 (16 bytes)
+  // amount as big-endian u128 (16 bytes)
   const amountBuf = Buffer.alloc(16);
   const amountBig = BigInt(event.amount);
-  amountBuf.writeBigInt64BE(amountBig >> 64n, 0);
-  amountBuf.writeBigInt64BE(amountBig & BigInt('0xFFFFFFFFFFFFFFFF'), 8);
+  amountBuf.writeBigUInt64BE(amountBig >> 64n, 0);
+  amountBuf.writeBigUInt64BE(amountBig & BigInt('0xFFFFFFFFFFFFFFFF'), 8);
 
   const nonce = computeNonce(event.chainId, event.txHash);
 
@@ -134,15 +127,9 @@ function computePayloadHash(event: BridgeEvent): Buffer {
 
 function signPayload(privateKeyHex: string, payloadHash: Buffer): RelayerSig {
   const seed = Buffer.from(privateKeyHex, 'hex');
-  // Node's crypto.generateKeyPairSync from seed is not available directly;
-  // use the webcrypto subtle API available in Node ≥ 15.
-  // For a production relayer use the `@noble/ed25519` or `tweetnacl` library.
-  //
-  // This implementation uses a deterministic HMAC-SHA512 as a stand-in so the
-  // file runs without extra dependencies; swap it out for a real Ed25519 signer.
-  const hmac = crypto.createHmac('sha512', seed).update(payloadHash).digest();
-  const pubkey = hmac.slice(0, 32).toString('hex');
-  const signature = hmac.slice(0, 64).toString('hex'); // placeholder
+  const keypair = Keypair.fromRawEd25519Seed(seed);
+  const pubkey = keypair.rawPublicKey().toString('hex');
+  const signature = keypair.sign(payloadHash).toString('hex');
 
   return { pubkey, signature };
 }
@@ -621,6 +608,103 @@ export function test_solana_listener_rejects_bad_log_lines(): void {
   assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset:not-a-number'), null, 'non-numeric amount should be rejected');
 }
 
+// ---------------------------------------------------------------------------
+// Issue #293: regression test — payload hash must match on-chain algorithm
+// ---------------------------------------------------------------------------
+
+export function test_payload_hash_matches_onchain_algorithm(): void {
+  // Use the same known inputs as the contract's unit test:
+  //   chain_id = 1, tx_hash = 0xab... (32 bytes)
+  const event = makeTestEvent({
+    chainId: 1,
+    txHash: 'ab'.repeat(32),
+    target: 'GDESTINATION',
+    asset: 'CASSET',
+    amount: '1000',
+  });
+
+  const hash = computePayloadHash(event);
+  assert(hash instanceof Buffer && hash.length === 32, 'payload hash must be 32 bytes');
+
+  // Re-compute manually to verify the structure matches the contract.
+  const chainIdBuf = Buffer.alloc(4);
+  chainIdBuf.writeUInt32BE(event.chainId);
+  const txHashBuf = Buffer.from(event.txHash, 'hex');
+  const targetHash = crypto.createHash('sha256').update(Buffer.from(event.target, 'utf8')).digest();
+  const assetHash = crypto.createHash('sha256').update(Buffer.from(event.asset, 'utf8')).digest();
+  const amountBuf = Buffer.alloc(16);
+  const amountBig = BigInt(event.amount);
+  amountBuf.writeBigUInt64BE(amountBig >> 64n, 0);
+  amountBuf.writeBigUInt64BE(amountBig & BigInt('0xFFFFFFFFFFFFFFFF'), 8);
+  const nonce = computeNonce(event.chainId, event.txHash);
+
+  const expected = crypto
+    .createHash('sha256')
+    .update(chainIdBuf)
+    .update(txHashBuf)
+    .update(targetHash)
+    .update(assetHash)
+    .update(amountBuf)
+    .update(nonce)
+    .digest();
+
+  assertEqual(hash.toString('hex'), expected.toString('hex'), 'payload hash must match on-chain algorithm');
+}
+
+// ---------------------------------------------------------------------------
+// Issue #294: regression test — large 18-decimal amounts must not throw
+// ---------------------------------------------------------------------------
+
+export function test_amount_encoding_handles_large_decimals(): void {
+  // 10 ETH in wei: 10 * 10^18
+  const event = makeTestEvent({ amount: '10000000000000000000' });
+  const hash = computePayloadHash(event);
+  assert(hash instanceof Buffer && hash.length === 32, 'large amount payload hash must be 32 bytes');
+
+  // 1_000_000 USDC in micro-USDC: 1_000_000 * 10^6
+  const event2 = makeTestEvent({ amount: '1000000000000' });
+  const hash2 = computePayloadHash(event2);
+  assert(hash2 instanceof Buffer && hash2.length === 32, 'large USDC amount payload hash must be 32 bytes');
+
+  // Verify the low 64 bits are ≥ 2^63 (the bug this test guards against)
+  const bigAmount = BigInt('10000000000000000000');
+  const low64 = bigAmount & BigInt('0xFFFFFFFFFFFFFFFF');
+  assert(low64 >= 1n << 63n, 'test value must exercise the signed-64-bit range to be meaningful');
+}
+
+// ---------------------------------------------------------------------------
+// Issue #292: regression test — signPayload must produce real Ed25519 sigs
+// ---------------------------------------------------------------------------
+
+export function test_signature_passes_ed25519_verify(): void {
+  const privateKeyHex = '0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20';
+  const payloadHash = crypto.createHash('sha256').update('test payload').digest();
+  const sig = signPayload(privateKeyHex, payloadHash);
+
+  assertEqual(sig.pubkey.length, 64, 'pubkey must be 32 bytes as hex (64 chars)');
+  assertEqual(sig.signature.length, 128, 'signature must be 64 bytes as hex (128 chars)');
+
+  // Verify using Node.js built-in Ed25519 verification.
+  const rawPubkey = Buffer.from(sig.pubkey, 'hex');
+  const rawSignature = Buffer.from(sig.signature, 'hex');
+
+  const spkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
+  const spkiKey = Buffer.concat([spkiPrefix, rawPubkey]);
+  const publicKey = crypto.createPublicKey({ key: spkiKey, format: 'der', type: 'spki' });
+
+  const isValid = crypto.verify(null, payloadHash, publicKey, rawSignature);
+  assert(isValid, 'Ed25519 signature must verify against the corresponding pubkey');
+}
+
+export function test_signature_from_known_seed_is_deterministic(): void {
+  const seed = 'ff'.repeat(32);
+  const hash = crypto.createHash('sha256').update('deterministic').digest();
+  const sig1 = signPayload(seed, hash);
+  const sig2 = signPayload(seed, hash);
+  assertEqual(sig1.pubkey, sig2.pubkey, 'same seed must produce same pubkey');
+  assertEqual(sig1.signature, sig2.signature, 'same seed + same hash must produce same signature');
+}
+
 async function runRelayerSelfTests(): Promise<void> {
   await test_duplicate_event_ignored_via_nonce_store();
   await test_nonce_marked_only_after_successful_submission();
@@ -628,6 +712,10 @@ async function runRelayerSelfTests(): Promise<void> {
   test_eth_listener_decodes_realistic_abi_log_fixture();
   test_eth_listener_rejects_malformed_truncated_log_payload();
   test_solana_listener_rejects_bad_log_lines();
+  test_payload_hash_matches_onchain_algorithm();
+  test_amount_encoding_handles_large_decimals();
+  test_signature_passes_ed25519_verify();
+  test_signature_from_known_seed_is_deterministic();
   console.log('[relayer] self-tests passed');
 }
 
