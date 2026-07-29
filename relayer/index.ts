@@ -705,6 +705,143 @@ export function test_signature_from_known_seed_is_deterministic(): void {
   assertEqual(sig1.signature, sig2.signature, 'same seed + same hash must produce same signature');
 }
 
+// ---------------------------------------------------------------------------
+// Startup environment variable validation (Issues 3 & 4)
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate that all required environment variables are present and well-formed.
+ * Throws a descriptive Error on the first missing or invalid variable so the
+ * process exits with a clear message instead of a cryptic undefined-dereference
+ * deep inside an SDK call.
+ *
+ * Exported so it can be unit-tested independently of process.exit.
+ */
+export function validateEnv(env: NodeJS.ProcessEnv = process.env): {
+  contractId: string;
+  rpcUrl: string;
+  networkPassphrase: string;
+  submitterSecretKey: string;
+  threshold: number;
+  relayerPrivateKeys: string[];
+} {
+  function requireString(name: string): string {
+    const value = env[name];
+    if (value === undefined || value.trim() === '') {
+      throw new Error(`${name} is required but was not set`);
+    }
+    return value.trim();
+  }
+
+  const contractId = requireString('CONTRACT_ID');
+  const rpcUrl = requireString('STELLAR_RPC_URL');
+  const networkPassphrase = requireString('NETWORK_PASSPHRASE');
+  const submitterSecretKey = requireString('RELAYER_SECRET_KEY');
+
+  // Issue 4: THRESHOLD must parse to a positive integer.
+  const thresholdRaw = env['THRESHOLD'] ?? '1';
+  const threshold = parseInt(thresholdRaw, 10);
+  if (!Number.isInteger(threshold) || threshold < 1) {
+    throw new Error(
+      `THRESHOLD must be a positive integer, got: "${thresholdRaw}"`,
+    );
+  }
+
+  const relayerPrivateKeys = (env['RELAYER_PRIVATE_KEYS'] ?? '')
+    .split(',')
+    .map((pk) => pk.trim())
+    .filter(Boolean);
+
+  if (relayerPrivateKeys.length === 0) {
+    throw new Error('RELAYER_PRIVATE_KEYS is required and must contain at least one key');
+  }
+
+  return { contractId, rpcUrl, networkPassphrase, submitterSecretKey, threshold, relayerPrivateKeys };
+}
+
+// ---------------------------------------------------------------------------
+// Tests for env validation (Issues 3 & 4)
+// ---------------------------------------------------------------------------
+
+export function test_missing_contract_id_throws(): void {
+  const env: NodeJS.ProcessEnv = {
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test',
+    RELAYER_SECRET_KEY: 'secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32),
+  };
+  try {
+    validateEnv(env);
+    throw new Error('Expected validateEnv to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('CONTRACT_ID'), `expected CONTRACT_ID error, got: ${e.message}`);
+  }
+}
+
+export function test_missing_rpc_url_throws(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    NETWORK_PASSPHRASE: 'test',
+    RELAYER_SECRET_KEY: 'secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32),
+  };
+  try {
+    validateEnv(env);
+    throw new Error('Expected validateEnv to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('STELLAR_RPC_URL'), `expected STELLAR_RPC_URL error, got: ${e.message}`);
+  }
+}
+
+export function test_nan_threshold_is_rejected(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test',
+    RELAYER_SECRET_KEY: 'secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32),
+    THRESHOLD: 'not-a-number',
+  };
+  try {
+    validateEnv(env);
+    throw new Error('Expected validateEnv to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('THRESHOLD'), `expected THRESHOLD error, got: ${e.message}`);
+  }
+}
+
+export function test_zero_threshold_is_rejected(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test',
+    RELAYER_SECRET_KEY: 'secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32),
+    THRESHOLD: '0',
+  };
+  try {
+    validateEnv(env);
+    throw new Error('Expected validateEnv to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('THRESHOLD'), `expected THRESHOLD error, got: ${e.message}`);
+  }
+}
+
+export function test_valid_env_parses_correctly(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test network',
+    RELAYER_SECRET_KEY: 'my-secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32) + ',' + '02'.repeat(32),
+    THRESHOLD: '2',
+  };
+  const result = validateEnv(env);
+  assertEqual(result.contractId, 'C_TEST', 'contractId');
+  assertEqual(result.threshold, 2, 'threshold');
+  assertEqual(result.relayerPrivateKeys.length, 2, 'relayer key count');
+}
+
 async function runRelayerSelfTests(): Promise<void> {
   await test_duplicate_event_ignored_via_nonce_store();
   await test_nonce_marked_only_after_successful_submission();
@@ -716,6 +853,12 @@ async function runRelayerSelfTests(): Promise<void> {
   test_amount_encoding_handles_large_decimals();
   test_signature_passes_ed25519_verify();
   test_signature_from_known_seed_is_deterministic();
+  // Issue 3 & 4: env var and threshold validation
+  test_missing_contract_id_throws();
+  test_missing_rpc_url_throws();
+  test_nan_threshold_is_rejected();
+  test_zero_threshold_is_rejected();
+  test_valid_env_parses_correctly();
   console.log('[relayer] self-tests passed');
 }
 
