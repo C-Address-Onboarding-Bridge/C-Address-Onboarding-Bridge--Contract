@@ -167,13 +167,26 @@ async fn list_events_by_type(
 async fn create_subscription(
     State(state): State<Arc<AppState>>,
     Json(req): Json<webhook::CreateSubscription>,
-) -> Result<(StatusCode, Json<webhook::Subscription>), StatusCode> {
+) -> Result<(StatusCode, Json<webhook::Subscription>), (StatusCode, Json<serde_json::Value>)> {
+    // Validate the URL before persisting to prevent SSRF via webhook delivery.
+    if let Err(e) = webhook::validate_webhook_url(&req.url) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ));
+    }
+
     state
         .db
         .create_subscription(req)
         .await
         .map(|s| (StatusCode::CREATED, Json(s)))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "database error" })),
+            )
+        })
 }
 
 async fn list_subscriptions(

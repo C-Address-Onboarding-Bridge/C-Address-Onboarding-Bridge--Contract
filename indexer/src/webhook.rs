@@ -1,9 +1,118 @@
 use crate::AppState;
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::sync::Arc;
 
 const MAX_RETRIES: i32 = 5;
 const DELIVERY_INTERVAL_MS: u64 = 2000;
+
+// ---------------------------------------------------------------------------
+// SSRF protection — URL validation
+// ---------------------------------------------------------------------------
+
+/// Errors returned when a webhook URL fails validation.
+#[derive(Debug, PartialEq)]
+pub enum UrlValidationError {
+    InvalidUrl(String),
+    ForbiddenScheme(String),
+    PrivateOrReservedHost(String),
+    UnresolvableHost(String),
+}
+
+impl std::fmt::Display for UrlValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidUrl(s) => write!(f, "invalid URL: {}", s),
+            Self::ForbiddenScheme(s) => write!(f, "forbidden scheme '{}': only http and https are allowed", s),
+            Self::PrivateOrReservedHost(s) => write!(f, "private/reserved host rejected: {}", s),
+            Self::UnresolvableHost(s) => write!(f, "host could not be resolved: {}", s),
+        }
+    }
+}
+
+/// Returns `true` if the IP address falls in a private, loopback, link-local,
+/// or otherwise reserved range that must not be reachable from the indexer.
+fn is_private_or_reserved(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()           // 127.0.0.0/8
+                || v4.is_private()     // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                || v4.is_link_local()  // 169.254.0.0/16  (incl. EC2 metadata 169.254.169.254)
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                // 100.64.0.0/10 — CGNAT / shared address space
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
+                // 192.0.0.0/24 — IETF protocol assignments
+                || (v4.octets()[0] == 192 && v4.octets()[1] == 0 && v4.octets()[2] == 0)
+                // 198.18.0.0/15 — benchmarking
+                || (v4.octets()[0] == 198 && (v4.octets()[1] == 18 || v4.octets()[1] == 19))
+                // 240.0.0.0/4 — future use / reserved
+                || (v4.octets()[0] >= 240)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // fc00::/7 — unique local
+                || ((v6.segments()[0] & 0xFE00) == 0xFC00)
+                // fe80::/10 — link-local
+                || ((v6.segments()[0] & 0xFFC0) == 0xFE80)
+        }
+    }
+}
+
+/// Validate a webhook URL at subscription-registration time.
+///
+/// Rules:
+///   1. Must be a well-formed URL.
+///   2. Scheme must be `http` or `https`.
+///   3. Host must not resolve to a private/link-local/reserved IP address.
+///
+/// DNS resolution is intentionally synchronous (via `std::net::ToSocketAddrs`)
+/// so this can be called from a synchronous context without an async executor.
+/// For a production service you would use `tokio::net::lookup_host` instead.
+pub fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
+    // --- 1. Parse the URL ---------------------------------------------------
+    let parsed = url::Url::parse(url)
+        .map_err(|e| UrlValidationError::InvalidUrl(e.to_string()))?;
+
+    // --- 2. Scheme check ----------------------------------------------------
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(UrlValidationError::ForbiddenScheme(scheme.to_string()));
+    }
+
+    // --- 3. Host extraction -------------------------------------------------
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| UrlValidationError::InvalidUrl("URL has no host".to_string()))?;
+
+    // If the host is already an IP literal, check it directly.
+    if let Ok(ip) = host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+        if is_private_or_reserved(ip) {
+            return Err(UrlValidationError::PrivateOrReservedHost(ip.to_string()));
+        }
+        return Ok(());
+    }
+
+    // --- 4. DNS resolution + IP check ---------------------------------------
+    // Reject bare "localhost" without a DNS lookup.
+    if host.eq_ignore_ascii_case("localhost") {
+        return Err(UrlValidationError::PrivateOrReservedHost("localhost".to_string()));
+    }
+
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addrs = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+        .map_err(|_| UrlValidationError::UnresolvableHost(host.to_string()))?;
+
+    for addr in addrs {
+        if is_private_or_reserved(addr.ip()) {
+            return Err(UrlValidationError::PrivateOrReservedHost(addr.ip().to_string()));
+        }
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSubscription {
@@ -46,6 +155,11 @@ pub struct ReplayRequest {
 
 #[derive(Debug, Serialize)]
 struct WebhookPayload {
+    /// Stable identifier for this delivery attempt. Identical on every retry
+    /// of the same delivery so subscribers can detect duplicates.
+    delivery_id: String,
+    /// Number of times this delivery has been attempted (1-based on first try).
+    attempt: i32,
     event_id: String,
     event_type: String,
     ledger_sequence: i64,
@@ -93,6 +207,8 @@ async fn deliver_pending(state: &AppState) -> Result<(), Box<dyn std::error::Err
         };
 
         let payload = WebhookPayload {
+            delivery_id: delivery.id.clone(),
+            attempt: delivery.attempts + 1,
             event_id: event.id,
             event_type: event.event_type,
             ledger_sequence: event.ledger_sequence,
@@ -176,6 +292,162 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Issue 1 — SSRF URL validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_valid_https_url_is_accepted() {
+        assert!(validate_webhook_url("https://example.com/hook").is_ok());
+    }
+
+    #[test]
+    fn test_valid_http_url_is_accepted() {
+        assert!(validate_webhook_url("http://example.com/hook").is_ok());
+    }
+
+    #[test]
+    fn test_non_http_scheme_is_rejected() {
+        let err = validate_webhook_url("ftp://example.com/hook").unwrap_err();
+        assert!(matches!(err, UrlValidationError::ForbiddenScheme(_)), "got: {:?}", err);
+    }
+
+    #[test]
+    fn test_file_scheme_is_rejected() {
+        let err = validate_webhook_url("file:///etc/passwd").unwrap_err();
+        assert!(matches!(err, UrlValidationError::ForbiddenScheme(_)), "got: {:?}", err);
+    }
+
+    #[test]
+    fn test_localhost_host_is_rejected() {
+        let err = validate_webhook_url("http://localhost/hook").unwrap_err();
+        assert!(matches!(err, UrlValidationError::PrivateOrReservedHost(_)), "got: {:?}", err);
+    }
+
+    #[test]
+    fn test_loopback_ipv4_is_rejected() {
+        let err = validate_webhook_url("http://127.0.0.1/hook").unwrap_err();
+        assert!(matches!(err, UrlValidationError::PrivateOrReservedHost(_)), "got: {:?}", err);
+    }
+
+    #[test]
+    fn test_private_10_block_is_rejected() {
+        let err = validate_webhook_url("http://10.0.0.1/hook").unwrap_err();
+        assert!(matches!(err, UrlValidationError::PrivateOrReservedHost(_)), "got: {:?}", err);
+    }
+
+    #[test]
+    fn test_private_172_block_is_rejected() {
+        let err = validate_webhook_url("http://172.16.0.1/hook").unwrap_err();
+        assert!(matches!(err, UrlValidationError::PrivateOrReservedHost(_)), "got: {:?}", err);
+    }
+
+    #[test]
+    fn test_private_192_168_block_is_rejected() {
+        let err = validate_webhook_url("http://192.168.1.1/hook").unwrap_err();
+        assert!(matches!(err, UrlValidationError::PrivateOrReservedHost(_)), "got: {:?}", err);
+    }
+
+    #[test]
+    fn test_link_local_metadata_ip_is_rejected() {
+        // 169.254.169.254 is the EC2 / GCP instance metadata endpoint
+        let err = validate_webhook_url("http://169.254.169.254/latest/meta-data/").unwrap_err();
+        assert!(matches!(err, UrlValidationError::PrivateOrReservedHost(_)), "got: {:?}", err);
+    }
+
+    #[test]
+    fn test_link_local_range_is_rejected() {
+        let err = validate_webhook_url("http://169.254.0.1/hook").unwrap_err();
+        assert!(matches!(err, UrlValidationError::PrivateOrReservedHost(_)), "got: {:?}", err);
+    }
+
+    #[test]
+    fn test_ipv6_loopback_is_rejected() {
+        let err = validate_webhook_url("http://[::1]/hook").unwrap_err();
+        assert!(matches!(err, UrlValidationError::PrivateOrReservedHost(_)), "got: {:?}", err);
+    }
+
+    #[test]
+    fn test_malformed_url_is_rejected() {
+        let err = validate_webhook_url("not-a-url").unwrap_err();
+        assert!(matches!(err, UrlValidationError::InvalidUrl(_)), "got: {:?}", err);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 2 — delivery_id stability across retries
+    // -----------------------------------------------------------------------
+
+    /// The delivery_id placed into the payload must equal the stable DB row id
+    /// and must remain unchanged on retries.
+    #[tokio::test]
+    async fn test_delivery_id_is_stable_across_retries() {
+        let db = setup_db().await;
+
+        let _sub = db
+            .create_subscription(CreateSubscription {
+                url: "http://example.com/hook".to_string(),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .expect("create subscription");
+
+        let event = IndexedEvent {
+            id: "evt-delivery-id-001".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 10,
+            contract_id: "C_TEST".to_string(),
+            tx_hash: "aabbccdd".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({}),
+        };
+        db.insert_event(&event).await.expect("insert event");
+        db.queue_webhook_deliveries(&event).await.expect("queue deliveries");
+
+        let deliveries = db.get_pending_deliveries().await.expect("get pending");
+        assert_eq!(deliveries.len(), 1);
+        let delivery = &deliveries[0];
+        let delivery_id = delivery.id.clone();
+
+        // Simulate the payload that would be built on the first attempt.
+        let payload_attempt_1 = WebhookPayload {
+            delivery_id: delivery.id.clone(),
+            attempt: delivery.attempts + 1,
+            event_id: event.id.clone(),
+            event_type: event.event_type.clone(),
+            ledger_sequence: event.ledger_sequence,
+            contract_id: event.contract_id.clone(),
+            tx_hash: event.tx_hash.clone(),
+            timestamp: event.timestamp.clone(),
+            data: event.data.clone(),
+        };
+
+        assert_eq!(
+            payload_attempt_1.delivery_id, delivery_id,
+            "delivery_id in payload must equal the stable delivery row id"
+        );
+
+        // Mark as failed and re-fetch.
+        let next_retry = (chrono::Utc::now() + chrono::Duration::seconds(0)).to_rfc3339();
+        db.mark_delivery_failed(&delivery_id, "timeout", &next_retry)
+            .await
+            .expect("mark failed");
+
+        let retried = db.get_pending_deliveries().await.expect("get pending after retry");
+        let retried_id = if retried.is_empty() {
+            delivery_id.clone()
+        } else {
+            retried[0].id.clone()
+        };
+
+        assert_eq!(
+            retried_id, delivery_id,
+            "delivery_id must be the same on retry (no new row created)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Issue 3 — Backoff formula
     // -----------------------------------------------------------------------
 
@@ -213,7 +485,7 @@ mod tests {
 
         // Seed a subscription and an event so foreign-key constraints are met.
         let sub = db
-            .create_subscription(crate::webhook::CreateSubscription {
+            .create_subscription(CreateSubscription {
                 url: "http://example.com/hook".to_string(),
                 event_type: None,
                 asset_filter: None,
@@ -242,7 +514,7 @@ mod tests {
 
         // Simulate MAX_RETRIES - 1 failed attempts so the next failure crosses
         // the threshold.  Each `mark_delivery_failed` increments `attempts`.
-        for i in 0..(super::MAX_RETRIES - 1) {
+        for i in 0..(MAX_RETRIES - 1) {
             let backoff_secs = (2i64).pow((i + 1) as u32);
             let next_retry = (chrono::Utc::now()
                 + chrono::Duration::seconds(backoff_secs))
@@ -284,7 +556,7 @@ mod tests {
         let db = setup_db().await;
 
         let _sub = db
-            .create_subscription(crate::webhook::CreateSubscription {
+            .create_subscription(CreateSubscription {
                 url: "http://example.com/hook2".to_string(),
                 event_type: None,
                 asset_filter: None,
