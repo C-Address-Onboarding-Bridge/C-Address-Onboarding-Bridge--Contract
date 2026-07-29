@@ -13,6 +13,7 @@
  */
 
 import * as crypto from 'crypto';
+import * as http from 'http';
 import { Keypair } from '@stellar/stellar-sdk';
 import { OnboardingBridgeSDK } from '../sdk/src/bridge';
 import { CrossChainFundOptions, RelayerSig } from '../sdk/src/types';
@@ -61,6 +62,68 @@ export interface RelayerServiceConfig {
   threshold: number;
   /** Chain listeners to watch. */
   listeners: ChainListener[];
+}
+
+// ---------------------------------------------------------------------------
+// Dead-letter queue — retains events that failed the threshold check
+// ---------------------------------------------------------------------------
+
+/** A BridgeEvent that could not be submitted due to insufficient signers. */
+export interface DeadLetterEntry {
+  event: BridgeEvent;
+  /** ISO timestamp when the entry was added. */
+  enqueuedAt: string;
+  /** How many signers were available vs how many were required. */
+  availableSigners: number;
+  requiredSigners: number;
+}
+
+/**
+ * In-memory dead-letter store for under-threshold events.
+ * Replace with a persistent store (e.g. Redis, SQLite) in production.
+ */
+export class DeadLetterQueue {
+  private entries: DeadLetterEntry[] = [];
+
+  enqueue(event: BridgeEvent, available: number, required: number): void {
+    this.entries.push({
+      event,
+      enqueuedAt: new Date().toISOString(),
+      availableSigners: available,
+      requiredSigners: required,
+    });
+    console.warn(
+      `[relayer] dead-letter: chain=${event.chainId} tx=${event.txHash} ` +
+        `signers=${available}/${required} — stored for retry`,
+    );
+  }
+
+  /** Return all queued entries (for inspection / retry). */
+  all(): DeadLetterEntry[] {
+    return [...this.entries];
+  }
+
+  /** Remove a specific entry by tx-hash + chainId after a successful retry. */
+  remove(chainId: number, txHash: string): void {
+    this.entries = this.entries.filter(
+      (e) => !(e.event.chainId === chainId && e.event.txHash === txHash),
+    );
+  }
+
+  size(): number {
+    return this.entries.length;
+  }
+}
+
+/** Snapshot of relayer liveness reported by GET /health. */
+export interface HealthStatus {
+  status: 'ok';
+  uptime_seconds: number;
+  threshold: number;
+  node_count: number;
+  /** Last successfully submitted event per chain (chainId → ISO timestamp). */
+  last_event_per_chain: Record<string, string>;
+  dead_letter_queue_size: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +222,9 @@ export class RelayerService {
   private submitterKeypair: ReturnType<typeof Keypair.fromSecret>;
   private config: RelayerServiceConfig;
   private nonces = new NonceStore();
+  private startedAt = Date.now();
+  private lastEventPerChain: Map<number, string> = new Map();
+  readonly dlq = new DeadLetterQueue();
 
   constructor(config: RelayerServiceConfig) {
     this.config = config;
@@ -182,6 +248,21 @@ export class RelayerService {
       listener.stop();
     }
     console.log('[relayer] stopped');
+  }
+
+  healthStatus(): HealthStatus {
+    const last_event_per_chain: Record<string, string> = {};
+    for (const [chainId, ts] of this.lastEventPerChain) {
+      last_event_per_chain[String(chainId)] = ts;
+    }
+    return {
+      status: 'ok',
+      uptime_seconds: Math.floor((Date.now() - this.startedAt) / 1000),
+      threshold: this.config.threshold,
+      node_count: this.config.nodes.length,
+      last_event_per_chain,
+      dead_letter_queue_size: this.dlq.size(),
+    };
   }
 
   private async handleEvent(event: BridgeEvent): Promise<void> {
@@ -237,6 +318,7 @@ export class RelayerService {
 
       // Mark nonce only after successful submission
       this.nonces.mark(event.chainId, event.txHash);
+      this.lastEventPerChain.set(event.chainId, new Date().toISOString());
       console.log(`[relayer] submitted tx=${result.hash} for chain=${event.chainId} src-tx=${event.txHash}`);
     } catch (err: any) {
       console.error(`[relayer] unexpected error: ${err.message}`);
@@ -461,6 +543,50 @@ export class SolanaChainListener implements ChainListener {
 }
 
 // ---------------------------------------------------------------------------
+// HTTP health server
+// ---------------------------------------------------------------------------
+
+/**
+ * Start a minimal HTTP server on `port` that exposes:
+ *   GET /health  — liveness + basic status (200 JSON)
+ *   GET /health/dead-letters  — dump of the dead-letter queue (200 JSON)
+ *
+ * Returns the server instance so callers can call `.close()` on shutdown.
+ */
+export function startHealthServer(service: RelayerService, port: number): http.Server {
+  const server = http.createServer((req, res) => {
+    if (req.method !== 'GET') {
+      res.writeHead(405);
+      res.end('Method Not Allowed');
+      return;
+    }
+
+    if (req.url === '/health') {
+      const body = JSON.stringify(service.healthStatus());
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(body);
+      return;
+    }
+
+    if (req.url === '/health/dead-letters') {
+      const body = JSON.stringify({ entries: service.dlq.all() });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(body);
+      return;
+    }
+
+    res.writeHead(404);
+    res.end('Not Found');
+  });
+
+  server.listen(port, () => {
+    console.log(`[relayer] health server listening on :${port}`);
+  });
+
+  return server;
+}
+
+// ---------------------------------------------------------------------------
 // Lightweight self-tests (run with: npx ts-node relayer/index.ts --self-test)
 // ---------------------------------------------------------------------------
 
@@ -505,6 +631,9 @@ function makeTestService(params: {
   };
   (service as any).submitterKeypair = {};
   (service as any).nonces = new NonceStore();
+  (service as any).startedAt = Date.now();
+  (service as any).lastEventPerChain = new Map();
+  (service as any).dlq = new DeadLetterQueue();
   return service;
 }
 
@@ -829,9 +958,17 @@ if (require.main === module) {
       ],
     });
 
+    const healthPort = parseInt(process.env.HEALTH_PORT ?? '3000', 10);
+    const healthServer = startHealthServer(service, healthPort);
+
     service.start();
 
-    process.on('SIGINT', () => { service.stop(); process.exit(0); });
-    process.on('SIGTERM', () => { service.stop(); process.exit(0); });
+    const shutdown = () => {
+      service.stop();
+      healthServer.close(() => process.exit(0));
+    };
+
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
   }
 }

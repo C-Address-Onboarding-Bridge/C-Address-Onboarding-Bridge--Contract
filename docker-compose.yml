@@ -20,6 +20,7 @@ services:
       REDIS_URL: redis://redis:6379
       STELLAR_RPC_URL: http://soroban:8000/soroban/rpc
       NETWORK_PASSPHRASE: Standalone Network ; February 2017
+      HEALTH_PORT: '3000'
     env_file:
       - .env
     depends_on:
@@ -30,6 +31,12 @@ services:
       soroban:
         condition: service_healthy
     command: npx ts-node-dev --respawn --transpile-only relayer/index.ts
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -sf http://localhost:3000/health | grep -q "\"status\":\"ok\""']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   # -------------------------------------------------------------------
   # Indexer API — Rust event indexer and webhook delivery worker
