@@ -330,6 +330,61 @@ export class RelayerService {
 // Ethereum listener (JSON-RPC polling — no ethers.js required)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Block-number persistence — survives process restarts
+// ---------------------------------------------------------------------------
+
+/**
+ * Persists the last-processed Ethereum block number to a local JSON file so
+ * that EthChainListener resumes from where it left off after a restart,
+ * preventing missed BridgeFund events during any downtime window.
+ *
+ * File format: `{ "fromBlock": "0x1a2b3c" }` (hex string, same unit as
+ * eth_getLogs fromBlock parameter).
+ */
+export class BlockStore {
+  private readonly filePath: string;
+
+  constructor(filePath: string) {
+    this.filePath = filePath;
+  }
+
+  /**
+   * Load the persisted fromBlock value.
+   * Returns `null` when the file does not exist or contains invalid data so
+   * that callers can fall back to `'latest'` on a fresh install.
+   */
+  load(): string | null {
+    try {
+      const raw = fs.readFileSync(this.filePath, 'utf8');
+      const parsed = JSON.parse(raw) as unknown;
+      if (
+        parsed !== null &&
+        typeof parsed === 'object' &&
+        'fromBlock' in (parsed as object) &&
+        typeof (parsed as { fromBlock: unknown }).fromBlock === 'string'
+      ) {
+        return (parsed as { fromBlock: string }).fromBlock;
+      }
+      return null;
+    } catch {
+      // File missing or unreadable — treat as first run
+      return null;
+    }
+  }
+
+  /** Atomically persist the current fromBlock value. */
+  save(fromBlock: string): void {
+    const dir = path.dirname(this.filePath);
+    if (dir && dir !== '.') {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const tmp = this.filePath + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify({ fromBlock }), 'utf8');
+    fs.renameSync(tmp, this.filePath);
+  }
+}
+
 export interface EthListenerConfig {
   /** HTTP JSON-RPC endpoint */
   rpcUrl: string;
@@ -344,21 +399,39 @@ export interface EthListenerConfig {
   chainId: number;
   /** Poll interval in ms */
   pollIntervalMs?: number;
+  /**
+   * Path to a JSON file used to persist the last-processed block number across
+   * restarts.  Defaults to `.eth-block-<chainId>.json` in the current working
+   * directory when not provided.
+   */
+  blockStorePath?: string;
 }
 
 /**
  * Minimal Ethereum log-polling listener.  Decodes a `BridgeFund` log with
  * ABI: `BridgeFund(bytes32 txHash, string target, string asset, uint256 amount)`.
  *
+ * Persists the last-processed block number to a local file so that a restart
+ * resumes from the correct position and never skips events emitted during a
+ * downtime window.
+ *
  * Replace with a WebSocket subscription (eth_subscribe) for lower latency.
  */
 export class EthChainListener implements ChainListener {
   private timer: ReturnType<typeof setInterval> | null = null;
-  private fromBlock: string = 'latest';
+  private fromBlock: string;
   private config: EthListenerConfig;
+  private blockStore: BlockStore;
 
   constructor(config: EthListenerConfig) {
     this.config = config;
+    const storePath = config.blockStorePath ?? `.eth-block-${config.chainId}.json`;
+    this.blockStore = new BlockStore(storePath);
+    // Resume from the last persisted block; fall back to 'latest' on first run.
+    this.fromBlock = this.blockStore.load() ?? 'latest';
+    if (this.fromBlock !== 'latest') {
+      console.log(`[eth-listener] resuming from persisted block ${this.fromBlock}`);
+    }
   }
 
   start(onEvent: (event: BridgeEvent) => void): void {
@@ -373,6 +446,8 @@ export class EthChainListener implements ChainListener {
           // advance fromBlock past the last processed block
           const lastBlock = parseInt(logs[logs.length - 1].blockNumber, 16);
           this.fromBlock = '0x' + (lastBlock + 1).toString(16);
+          // Persist so a restart resumes from here
+          this.blockStore.save(this.fromBlock);
         }
       } catch (err: any) {
         console.error(`[eth-listener] poll error: ${err.message}`);
@@ -467,6 +542,15 @@ export interface SolanaListenerConfig {
   programId: string;
   /** Stellar chain id for Solana (e.g. 101) */
   chainId: number;
+  /**
+   * Initial reconnect delay in ms (doubles on each consecutive failure up to
+   * `maxReconnectDelayMs`).  Defaults to 1 000 ms.
+   */
+  initialReconnectDelayMs?: number;
+  /**
+   * Maximum reconnect back-off delay in ms.  Defaults to 30 000 ms.
+   */
+  maxReconnectDelayMs?: number;
 }
 
 /**
@@ -474,21 +558,48 @@ export interface SolanaListenerConfig {
  * Expects the Solana program to emit a structured log line:
  *   "bridge_fund:<txHash>:<target>:<asset>:<amount>"
  *
+ * Implements reconnect-with-exponential-backoff so that a transient WebSocket
+ * drop (network blip, RPC provider restart) does not permanently halt event
+ * delivery.  The listener keeps re-subscribing until `stop()` is called.
+ *
  * Replace the log parsing with actual Anchor event decoding if using Anchor.
  */
 export class SolanaChainListener implements ChainListener {
   private ws: any = null;
   private config: SolanaListenerConfig;
+  private onEvent: ((event: BridgeEvent) => void) | null = null;
+  private stopped = false;
+  private reconnectDelay: number;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(config: SolanaListenerConfig) {
     this.config = config;
+    this.reconnectDelay = config.initialReconnectDelayMs ?? 1_000;
   }
 
   start(onEvent: (event: BridgeEvent) => void): void {
+    this.onEvent = onEvent;
+    this.stopped = false;
+    this.connect();
+  }
+
+  stop(): void {
+    this.stopped = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.ws) this.ws.close();
+  }
+
+  /** Open (or re-open) the WebSocket and attach handlers. */
+  private connect(): void {
+    if (this.stopped) return;
+
     const WebSocket = (globalThis as any).WebSocket ?? require('ws');
     this.ws = new WebSocket(this.config.wsUrl);
 
     this.ws.onopen = () => {
+      // Reset back-off on a successful connection
+      this.reconnectDelay = this.config.initialReconnectDelayMs ?? 1_000;
+
       const sub = JSON.stringify({
         jsonrpc: '2.0',
         id: 1,
@@ -506,17 +617,29 @@ export class SolanaChainListener implements ChainListener {
         for (const line of logs) {
           if (!line.startsWith('Program log: bridge_fund:')) continue;
           const event = this.decodeLine(line);
-          if (event) onEvent(event);
+          if (event && this.onEvent) this.onEvent(event);
         }
       } catch { /* ignore malformed messages */ }
     };
 
-    this.ws.onerror = (err: any) => console.error('[solana-listener] ws error:', err.message);
-    this.ws.onclose = () => console.warn('[solana-listener] ws closed — reconnect logic omitted for brevity');
-  }
+    this.ws.onerror = (err: any) => console.error('[solana-listener] ws error:', err.message ?? err);
 
-  stop(): void {
-    if (this.ws) this.ws.close();
+    this.ws.onclose = () => {
+      if (this.stopped) return;
+
+      const delay = this.reconnectDelay;
+      const maxDelay = this.config.maxReconnectDelayMs ?? 30_000;
+      console.warn(
+        `[solana-listener] ws closed — reconnecting in ${delay} ms ` +
+        `(next cap: ${Math.min(delay * 2, maxDelay)} ms)`,
+      );
+
+      this.reconnectTimer = setTimeout(() => {
+        // Exponential back-off: double the delay up to the configured maximum
+        this.reconnectDelay = Math.min(delay * 2, maxDelay);
+        this.connect();
+      }, delay);
+    };
   }
 
   /**
