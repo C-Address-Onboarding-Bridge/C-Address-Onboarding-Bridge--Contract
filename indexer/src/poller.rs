@@ -4,6 +4,12 @@ use std::sync::Arc;
 
 const POLL_INTERVAL_MS: u64 = 5000;
 const MAX_EVENTS_PER_POLL: usize = 100;
+/// Default number of ledgers to look back on first run when no persisted
+/// `last_ledger` exists.  Real Soroban RPC servers enforce a retention window
+/// (typically 17280 ledgers ≈ 24 hours on mainnet); requesting from ledger 0
+/// would be rejected.  This default is conservative (≈ 1 hour of ledgers at
+/// ~5 s per ledger) and can be overridden via the `LOOKBACK_LEDGERS` env var.
+const DEFAULT_LOOKBACK_LEDGERS: i64 = 720;
 
 pub async fn run_poller(state: Arc<AppState>) {
     tracing::info!("Starting event poller for contract {}", state.contract_id);
@@ -16,13 +22,58 @@ pub async fn run_poller(state: Arc<AppState>) {
     }
 }
 
+/// Fetch the latest ledger sequence from the RPC using `getLatestLedger`.
+async fn fetch_latest_ledger(state: &AppState) -> Result<i64, Box<dyn std::error::Error>> {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getLatestLedger",
+        "params": []
+    });
+
+    let response = state
+        .webhook_client
+        .post(&state.rpc_url)
+        .json(&request)
+        .send()
+        .await?;
+
+    let body: serde_json::Value = response.json().await?;
+
+    let seq = body
+        .get("result")
+        .and_then(|r| r.get("sequence"))
+        .and_then(|s| s.as_i64())
+        .ok_or("getLatestLedger: missing result.sequence")?;
+
+    Ok(seq)
+}
+
 async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
-    let start_ledger = state
-        .db
-        .get_last_ledger()
-        .await?
-        .map(|l| l + 1)
-        .unwrap_or(0);
+    let start_ledger = match state.db.get_last_ledger().await? {
+        Some(last) => last + 1,
+        None => {
+            // First run — no persisted cursor.  Requesting from ledger 0 would
+            // be rejected by any real (non-quickstart) Soroban RPC endpoint
+            // because it falls outside the node's retention window.
+            // Instead, fetch the current tip and subtract a configurable
+            // lookback so operators get recent events immediately without
+            // having to pre-seed the database.
+            let latest = fetch_latest_ledger(state).await?;
+            let lookback = state.lookback_ledgers;
+            let fallback = (latest - lookback).max(0);
+            tracing::info!(
+                "No persisted ledger cursor — starting from ledger {} \
+                 (latest={} minus lookback={}). \
+                 Set LOOKBACK_LEDGERS=0 to start from the current tip, \
+                 or use POST /api/replay to backfill older history.",
+                fallback,
+                latest,
+                lookback,
+            );
+            fallback
+        }
+    };
 
     let request = serde_json::json!({
         "jsonrpc": "2.0",

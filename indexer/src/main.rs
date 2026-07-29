@@ -18,6 +18,27 @@ pub struct AppState {
     pub rpc_url: String,
     pub contract_id: String,
     pub webhook_client: reqwest::Client,
+    /// Number of ledgers to look back from the RPC tip on first run (no
+    /// persisted `last_ledger`).  Set via `LOOKBACK_LEDGERS` env var
+    /// (default: 720 ≈ 1 hour at ~5 s/ledger).
+    ///
+    /// # Backfill procedure
+    ///
+    /// Soroban RPC nodes retain only a limited history window (≈ 17 280
+    /// ledgers / 24 h on mainnet).  Requesting `startLedger=0` is rejected
+    /// by any real endpoint.  If you need events older than the RPC retains:
+    ///
+    /// 1. Point `SOROBAN_RPC_URL` at an archive node that holds the history
+    ///    you need (e.g. a `stellar-core` instance with full catchup).
+    /// 2. Set `LOOKBACK_LEDGERS` to cover the range you want and start the
+    ///    indexer — it will fast-forward from the historical ledger to the
+    ///    current tip, persisting every event along the way.
+    /// 3. Once caught up, switch `SOROBAN_RPC_URL` back to your normal RPC;
+    ///    the persisted `last_ledger` cursor keeps it in sync from there.
+    ///
+    /// Note: `POST /api/replay` **only re-delivers already-indexed events**
+    /// to webhooks — it does not fetch new history from the chain.
+    pub lookback_ledgers: i64,
 }
 
 #[tokio::main]
@@ -32,6 +53,10 @@ async fn main() {
     let contract_id = std::env::var("CONTRACT_ID").expect("CONTRACT_ID must be set");
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:indexer.db".to_string());
     let listen_addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:3001".to_string());
+    let lookback_ledgers: i64 = std::env::var("LOOKBACK_LEDGERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(poller::DEFAULT_LOOKBACK_LEDGERS);
 
     let database = db::Database::new(&db_url).await;
     database.migrate().await;
@@ -41,6 +66,7 @@ async fn main() {
         rpc_url,
         contract_id,
         webhook_client: reqwest::Client::new(),
+        lookback_ledgers,
     });
 
     let poller_state = Arc::clone(&state);
