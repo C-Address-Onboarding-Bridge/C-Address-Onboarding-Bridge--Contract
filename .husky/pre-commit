@@ -8,7 +8,7 @@ echo "  [1/3] tsc type-check"
 (cd sdk && npx tsc --noEmit)
 
 # ---- ESLint (staged TS files only) ----
-STAGED_TS=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(ts|tsx)$' || true)
+STAGED_TS=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '^sdk/src/.*\.(ts|tsx)$' | sed 's#^sdk/##' || true)
 if [ -n "$STAGED_TS" ]; then
   echo "  [2/3] eslint"
   (cd sdk && npx eslint --max-warnings=0 $STAGED_TS)

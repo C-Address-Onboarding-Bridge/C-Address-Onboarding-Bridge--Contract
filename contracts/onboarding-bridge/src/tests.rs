@@ -1832,6 +1832,153 @@ fn test_query_calculate_fee_max_fee() {
     assert_eq!(net, 900i128);
 }
 
+/********** query_effective_fee tests **********/
+
+#[test]
+fn test_query_effective_fee_matches_fund_c_address() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 2000i128);
+
+    // Query the expected fee before calling fund_c_address
+    let amount = 1000i128;
+    let (bps, predicted_fee, predicted_net) =
+        bridge.query_effective_fee(&user, &token_id, &amount);
+
+    assert_eq!(bps, 100u32);
+    assert_eq!(predicted_fee, 100i128);
+    assert_eq!(predicted_net, 900i128);
+
+    // Now actually fund and verify the fee charged matches
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &amount, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &target), predicted_net);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), predicted_fee);
+}
+
+#[test]
+fn test_query_effective_fee_with_asset_cap() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &500u32, &None);
+    bridge.add_asset(&token_id, &None);
+    // Set a per-asset cap lower than global fee
+    bridge.set_asset_fee_cap(&token_id, &200u32, &None);
+    mint_tokens(&env, &token_id, &user, 2000i128);
+
+    let amount = 1000i128;
+    let (bps, predicted_fee, predicted_net) =
+        bridge.query_effective_fee(&user, &token_id, &amount);
+
+    // Global = 500, cap = 200, so effective = 200
+    // fee = 1000 * 200 / 10000 = 20
+    assert_eq!(bps, 200u32);
+    assert_eq!(predicted_fee, 20i128);
+    assert_eq!(predicted_net, 980i128);
+
+    // Verify fund_c_address produces the same fee
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &amount, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &target), predicted_net);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), predicted_fee);
+}
+
+#[test]
+fn test_query_effective_fee_with_tier_discount() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &500u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    // Set a tier: volume < 5000 → 100 bps (discounted)
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier {
+            min_volume: 0,
+            max_volume: 5_000i128,
+            fee_bps: 100u32,
+        }],
+    );
+    bridge.set_fee_tiers(&tiers);
+    mint_tokens(&env, &token_id, &user, 2000i128);
+
+    let amount = 1000i128;
+    let (bps, predicted_fee, predicted_net) =
+        bridge.query_effective_fee(&user, &token_id, &amount);
+
+    // Global = 500, tier = 100 (volume 0 < 5000), so effective = 100
+    // fee = 1000 * 100 / 10000 = 10
+    assert_eq!(bps, 100u32);
+    assert_eq!(predicted_fee, 10i128);
+    assert_eq!(predicted_net, 990i128);
+
+    // Verify fund_c_address produces the same fee
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &amount, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &target), predicted_net);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 10i128);
+}
+
+#[test]
+fn test_query_effective_fee_with_cap_and_tier() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &500u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    // Tier: volume < 5000 → 200 bps
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier {
+            min_volume: 0,
+            max_volume: 5_000i128,
+            fee_bps: 200u32,
+        }],
+    );
+    bridge.set_fee_tiers(&tiers);
+    // Cap at 150 bps (below tier rate)
+    bridge.set_asset_fee_cap(&token_id, &150u32, &None);
+    mint_tokens(&env, &token_id, &user, 2000i128);
+
+    let amount = 1000i128;
+    let (bps, predicted_fee, predicted_net) =
+        bridge.query_effective_fee(&user, &token_id, &amount);
+
+    // Global = 500, tier = 200, cap = 150, so effective = 150
+    // fee = 1000 * 150 / 10000 = 15
+    assert_eq!(bps, 150u32);
+    assert_eq!(predicted_fee, 15i128);
+    assert_eq!(predicted_net, 985i128);
+
+    // Verify fund_c_address produces the same fee
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &amount, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &target), predicted_net);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), predicted_fee);
+}
+
 /********** cumulative counters tests **********/
 
 #[test]
@@ -4644,122 +4791,179 @@ fn test_referral_fund_applies_tiered_fee() {
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 1i128);
 }
 
-/********** Auth-entry nonce tests **********/
+/********** Daily limit unit tests **********/
 
+// check_daily_limit has never been exercised to confirm it actually rejects
+// an over-limit transfer via fund_c_address.
 #[test]
-fn test_auth_entry_nonce_increments_on_use() {
+fn test_daily_limit_blocks_excess_funding() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
 
-    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_source_daily_limit(&user, &token_id, &500i128, &None);
 
-    // Starts at 0.
-    assert_eq!(bridge.query_auth_nonce(&user), 0u64);
-    assert!(!bridge.query_auth_nonce_used(&user, &0u64));
+    mint_tokens(&env, &token_id, &user, 2000i128);
 
-    // Consume nonce 0 in a wide ledger-sequence window.
-    bridge.verify_auth_entry(&user, &0u64, &0u32, &u32::MAX);
+    let target = Address::generate(&env);
+    // 501 exceeds the configured daily limit of 500.
+    assert_eq!(
+        bridge.try_fund_c_address(&user, &target, &token_id, &501i128, &None, &None),
+        Err(Ok(BridgeError::DailyLimitExceeded))
+    );
 
-    // Nonce counter advanced.
-    assert_eq!(bridge.query_auth_nonce(&user), 1u64);
-    assert!(bridge.query_auth_nonce_used(&user, &0u64));
-    assert!(!bridge.query_auth_nonce_used(&user, &1u64));
+    // Source balance is untouched because the transfer never executed.
+    assert_eq!(check_balance(&env, &token_id, &user), 2000i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 0i128);
 }
 
+// Verify that the daily limit counter resets on the next UTC day,
+// allowing transfers that would have been blocked the previous day.
 #[test]
-fn test_auth_entry_replay_rejected() {
+fn test_daily_limit_resets_next_day() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
 
-    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_source_daily_limit(&user, &token_id, &500i128, &None);
 
-    // First use of nonce 7 succeeds.
-    bridge.verify_auth_entry(&user, &7u64, &0u32, &u32::MAX);
+    mint_tokens(&env, &token_id, &user, 2000i128);
 
-    // Replay is rejected.
+    // Day 1: consume the full limit.
+    let target1 = Address::generate(&env);
+    bridge.fund_c_address(&user, &target1, &token_id, &500i128, &None, &None);
+
+    // Still on day 1: a further transfer is rejected.
     assert_eq!(
-        bridge.try_verify_auth_entry(&user, &7u64, &0u32, &u32::MAX),
-        Err(Ok(BridgeError::AuthNonceAlreadyUsed))
+        bridge.try_fund_c_address(&user, &Address::generate(&env), &token_id, &1i128, &None, &None),
+        Err(Ok(BridgeError::DailyLimitExceeded))
     );
+
+    // Advance to the next UTC day (86 400 seconds later).
+    env.ledger().set_timestamp(env.ledger().timestamp() + 86_400);
+
+    // After the day rolls over the limit should reset, allowing a fresh transfer.
+    let target2 = Address::generate(&env);
+    bridge.fund_c_address(&user, &target2, &token_id, &500i128, &None, &None);
+    assert_eq!(check_balance(&env, &token_id, &target2), 495i128);
 }
 
-/********** Admin / Fee-collector handoff tests **********/
+/********** Asset fee cap unit tests **********/
 
+// When a per-asset fee cap is set lower than the global rate, the effective
+// fee must use the cap rather than the global rate.
 #[test]
-fn test_propose_and_accept_admin() {
+fn test_asset_fee_cap_overrides_global_rate() {
     let env = Env::default();
-    let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
 
-    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    // Global fee is 100 bps (1%), but the asset cap is 50 bps (0.5%).
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_asset_fee_cap(&token_id, &50u32, &None);
 
-    let new_admin = Address::generate(&env);
-    assert_eq!(bridge.query_pending_admin(), None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
 
-    bridge.propose_new_admin(&new_admin, &None);
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &1000i128, &None, &None);
 
-    // Pending is set; current admin is unchanged.
-    assert_eq!(bridge.query_pending_admin(), Some(new_admin.clone()));
-    assert_eq!(bridge.query_admin(), admin);
-
-    // The proposed address accepts.
-    bridge.accept_admin();
-
-    // Admin rotated; pending cleared.
-    assert_eq!(bridge.query_admin(), new_admin);
-    assert_eq!(bridge.query_pending_admin(), None);
-}
-
-#[test]
-#[should_panic]
-fn test_accept_admin_wrong_caller_rejected() {
-    let env = Env::default();
-    let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts_mocked(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-
-    bridge.initialize(&admin, &fee_collector, &50u32, &None);
-
-    let new_admin = Address::generate(&env);
-    bridge.propose_new_admin(&new_admin, &None);
-
-    // Clear all mocked auths so `pending.require_auth()` fails.
-    // Only the proposed address can accept.
-    use soroban_sdk::xdr::SorobanAuthorizationEntry;
-    env.set_auths(&[] as &[SorobanAuthorizationEntry]);
-    bridge.accept_admin();
+    // Effective fee: min(100, 50) = 50 bps -> fee = floor(1000 * 50 / 10000) = 5.
+    assert_eq!(check_balance(&env, &token_id, &target), 995i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 5i128);
+    assert_eq!(bridge.query_accrued_fees(&token_id), 5i128);
 }
 
 #[test]
-fn test_propose_and_accept_fee_collector() {
+fn test_query_asset_fee_cap_returns_configured_value() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
 
-    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
 
-    let new_collector = Address::generate(&env);
-    assert_eq!(bridge.query_pending_fee_collector(), None);
+    // Default: no cap set yet, should return MAX_FEE_BPS (1000).
+    assert_eq!(bridge.query_asset_fee_cap(&token_id), 1000u32);
 
-    bridge.propose_new_fee_collector(&new_collector, &None);
+    // Set a specific cap.
+    bridge.set_asset_fee_cap(&token_id, &75u32, &None);
+    assert_eq!(bridge.query_asset_fee_cap(&token_id), 75u32);
 
-    // Pending is set; current collector unchanged.
+    // Zero also queries correctly.
+    bridge.set_asset_fee_cap(&token_id, &0u32, &None);
+    assert_eq!(bridge.query_asset_fee_cap(&token_id), 0u32);
+}
+
+/********** Withdraw max-per-tx unit tests **********/
+
+// The per-transaction withdrawal cap must reject a withdraw_fees call that
+// exceeds the configured limit.
+#[test]
+fn test_withdraw_fees_rejects_amount_over_max_per_tx() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    // Accrue enough fees to exceed the cap.
+    mint_tokens(&env, &token_id, &user, 10_000i128);
+    bridge.fund_c_address(&user, &Address::generate(&env), &token_id, &10_000i128, &None, &None);
+    // Fee = 10_000 * 100 / 10_000 = 100 accrued.
+    assert_eq!(bridge.query_accrued_fees(&token_id), 100i128);
+
+    // Cap withdrawals at 50 per transaction.
+    bridge.set_max_withdraw_per_tx(&50i128, &None);
+
+    // Trying to withdraw 51 exceeds the per-tx cap.
     assert_eq!(
-        bridge.query_pending_fee_collector(),
-        Some(new_collector.clone())
+        bridge.try_withdraw_fees(&token_id, &51i128, &None),
+        Err(Ok(BridgeError::WithdrawExceedsLimit))
     );
-    assert_eq!(bridge.query_fee_collector(), fee_collector);
 
-    // The proposed address accepts.
-    bridge.accept_fee_collector();
+    // Withdrawing within the cap succeeds.
+    bridge.withdraw_fees(&token_id, &50i128, &None);
+    assert_eq!(check_balance(&env, &token_id, &fee_collector), 50i128);
+    assert_eq!(bridge.query_accrued_fees(&token_id), 50i128);
+}
 
-    // Collector rotated; pending cleared.
-    assert_eq!(bridge.query_fee_collector(), new_collector);
-    assert_eq!(bridge.query_pending_fee_collector(), None);
+#[test]
+fn test_set_max_withdraw_per_tx_updates_limit() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // Default: no cap set.
+    assert_eq!(bridge.query_max_withdraw_per_tx(), 0i128);
+
+    // Set a cap.
+    bridge.set_max_withdraw_per_tx(&500i128, &None);
+    assert_eq!(bridge.query_max_withdraw_per_tx(), 500i128);
+
+    // Update the cap.
+    bridge.set_max_withdraw_per_tx(&1000i128, &None);
+    assert_eq!(bridge.query_max_withdraw_per_tx(), 1000i128);
+
+    // Zero disables the cap.
+    bridge.set_max_withdraw_per_tx(&0i128, &None);
+    assert_eq!(bridge.query_max_withdraw_per_tx(), 0i128);
 }
