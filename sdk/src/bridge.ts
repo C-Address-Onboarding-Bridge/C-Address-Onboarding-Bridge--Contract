@@ -38,6 +38,7 @@ import {
   PaginationOptions,
   CostEstimate,
   TimelockEntry,
+  FundCTimelockedOptions,
 } from './types';
 import {
   type ObservabilityHooks,
@@ -56,7 +57,7 @@ import {
  * size and submits one transaction per chunk.
  */
 export const BATCH_TX_LIMIT = 100;
-import { assertAccountAddress, assertContractAddress } from './validate';
+import { assertAccountAddress, assertContractAddress, assertRelayerPubkey } from './validate';
 import { withRpcRetry } from './retry';
 import {
   SorobanRpc,
@@ -684,7 +685,7 @@ export class OnboardingBridgeSDK {
    */
   async fundCAddressWithSwap(
     options: FundCAddressWithSwapOptions,
-    sourceKeypair: any,
+    sourceKeypair: Keypair,
   ): Promise<TransactionResult> {
     return withTransactionHooks(
       this.hooks,
@@ -2205,6 +2206,7 @@ export class OnboardingBridgeSDK {
       { pubkey: options.pubkey },
       async () => {
         try {
+          assertRelayerPubkey(options.pubkey, 'pubkey');
           const adminAccount = await withRpcHook(
             this.hooks,
             'getAccount',
@@ -2257,6 +2259,7 @@ export class OnboardingBridgeSDK {
       { pubkey: options.pubkey },
       async () => {
         try {
+          assertRelayerPubkey(options.pubkey, 'pubkey');
           const adminAccount = await withRpcHook(
             this.hooks,
             'getAccount',
