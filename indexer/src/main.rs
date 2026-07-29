@@ -10,6 +10,7 @@ use axum::{
     Json, Router,
 };
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -43,14 +44,21 @@ async fn main() {
         webhook_client: reqwest::Client::new(),
     });
 
+    // Cancellation token shared across all background tasks. When triggered,
+    // the poller and webhook worker finish their current iteration and exit
+    // cleanly before the axum server drains in-flight HTTP requests.
+    let token = CancellationToken::new();
+
     let poller_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        poller::run_poller(poller_state).await;
+    let poller_token = token.clone();
+    let poller_handle = tokio::spawn(async move {
+        poller::run_poller(poller_state, poller_token).await;
     });
 
     let webhook_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        webhook::run_delivery_worker(webhook_state).await;
+    let webhook_token = token.clone();
+    let webhook_handle = tokio::spawn(async move {
+        webhook::run_delivery_worker(webhook_state, webhook_token).await;
     });
 
     let app = Router::new()
@@ -67,7 +75,38 @@ async fn main() {
 
     tracing::info!("Indexer listening on {}", listen_addr);
     let listener = tokio::net::TcpListener::bind(&listen_addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+
+    // Shutdown signal: wait for SIGTERM or SIGINT, then cancel background tasks.
+    let shutdown_token = token.clone();
+    let shutdown_signal = async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+            let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
+                _ = sigint.recv()  => tracing::info!("Received SIGINT"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.expect("failed to listen for ctrl-c");
+            tracing::info!("Received ctrl-c");
+        }
+
+        // Signal background tasks to stop after their current iteration.
+        shutdown_token.cancel();
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await
+        .unwrap();
+
+    // Wait for background tasks to finish their current iteration.
+    let _ = tokio::join!(poller_handle, webhook_handle);
+    tracing::info!("Indexer shut down cleanly");
 }
 
 async fn health() -> &'static str {
