@@ -1044,6 +1044,32 @@ describe('OnboardingBridgeSDK', () => {
       expect(result.status).toBe('failed');
       expect(result.error).toBe('RPC down');
     });
+
+    it('rejects malformed pubkey before any RPC call', async () => {
+      const badSig = { pubkey: 'tooshort', signature: 'b'.repeat(128) };
+
+      const result = await sdk.fundCrosschain(
+        { chainId: 1, txHash: 'ab'.repeat(32), target: MOCK_ADDRESS, asset: MOCK_ASSET, amount: '500', sigs: [badSig] },
+        mockKeypair,
+      );
+
+      expect(result.status).toBe('failed');
+      expect(result.error).toMatch(/pubkey must be a 64-character hex string/);
+      expect(mockProvider.getAccount).not.toHaveBeenCalled();
+    });
+
+    it('rejects malformed signature before any RPC call', async () => {
+      const badSig = { pubkey: 'a'.repeat(64), signature: 'tooshort' };
+
+      const result = await sdk.fundCrosschain(
+        { chainId: 1, txHash: 'ab'.repeat(32), target: MOCK_ADDRESS, asset: MOCK_ASSET, amount: '500', sigs: [badSig] },
+        mockKeypair,
+      );
+
+      expect(result.status).toBe('failed');
+      expect(result.error).toMatch(/signature must be a 128-character hex string/);
+      expect(mockProvider.getAccount).not.toHaveBeenCalled();
+    });
   });
 
   describe('addRelayer', () => {
@@ -1374,12 +1400,15 @@ describe('Error handling - invalid inputs', () => {
     expect(result.status).toBe('pending');
   });
 
-  it('batchFundCAddresses passes mismatched targets and amounts to contract (no client-side validation)', async () => {
+  it('batchFundCAddresses rejects mismatched targets and amounts before RPC', async () => {
     const results = await sdk.batchFundCAddresses(
       { source: MOCK_ADDRESS, targets: [MOCK_ASSET, MOCK_ASSET], amounts: ['100'], asset: MOCK_ASSET },
       mockKeypair,
     );
-    expect(results[0].status).toBe('pending');
+    expect(results).toHaveLength(1);
+    expect(results[0].status).toBe('failed');
+    expect(results[0].error).toMatch(/targets and amounts must have the same length/);
+    expect(mockProvider.getAccount).not.toHaveBeenCalled();
   });
 
   it('batchFundCAddresses passes empty targets array to contract (no client-side validation)', async () => {
@@ -1420,6 +1449,33 @@ describe('Error handling - invalid inputs', () => {
   it('getAllBalances rejects invalid asset in list', async () => {
     await expect(sdk.getAllBalances(['invalid', MOCK_ASSET]))
       .rejects.toThrow(/Invalid contract address for "assets\[0\]"/);
+  });
+
+  it('upgrade rejects newWasmHash shorter than 64 hex chars', async () => {
+    await expect(sdk.upgrade({ newWasmHash: 'ab12' }, mockKeypair)).rejects.toThrow(
+      /newWasmHash must be a 64-character hex string/,
+    );
+    expect(mockProvider.getAccount).not.toHaveBeenCalled();
+  });
+
+  it('upgrade rejects newWasmHash longer than 64 hex chars', async () => {
+    await expect(sdk.upgrade({ newWasmHash: 'a'.repeat(128) }, mockKeypair)).rejects.toThrow(
+      /newWasmHash must be a 64-character hex string/,
+    );
+    expect(mockProvider.getAccount).not.toHaveBeenCalled();
+  });
+
+  it('upgrade rejects newWasmHash with non-hex characters', async () => {
+    await expect(sdk.upgrade({ newWasmHash: 'g'.repeat(64) }, mockKeypair)).rejects.toThrow(
+      /newWasmHash must be a 64-character hex string/,
+    );
+    expect(mockProvider.getAccount).not.toHaveBeenCalled();
+  });
+
+  it('upgrade accepts a valid 64-char hex hash', async () => {
+    const result = await sdk.upgrade({ newWasmHash: 'ab'.repeat(32) }, mockKeypair);
+    expect(result.status).toBe('pending');
+    expect(result.hash).toBe('h');
   });
 });
 
