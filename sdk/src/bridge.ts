@@ -32,8 +32,6 @@ import {
   TransactionResult,
   CrossChainFundOptions,
   RelayerManagementOptions,
-  CreateCOptions,
-  CreateCAddressResult,
   FundCAddressWithSwapOptions,
   FundCTimelockedOptions,
   PaginatedResult,
@@ -978,6 +976,7 @@ export class OnboardingBridgeSDK {
               this.contract.call(
                 'withdraw_fees',
                 ...this.toScVals([options.asset, options.amount]),
+                options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' }),
               ),
             )
             .setTimeout(30)
@@ -1061,6 +1060,7 @@ export class OnboardingBridgeSDK {
               this.contract.call(
                 'reclaim_tokens',
                 ...this.toScVals([options.asset, options.amount, options.to]),
+                options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' }),
               ),
             )
             .setTimeout(30)
@@ -1888,13 +1888,16 @@ export class OnboardingBridgeSDK {
 
           const wasmHashBytes = Buffer.from(options.newWasmHash, 'hex');
           const wasmHashScVal = xdr.ScVal.scvBytes(wasmHashBytes);
+          const nonceScVal = options.nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
 
           const tx = new TransactionBuilder(adminAccount, {
             fee: BASE_FEE,
             networkPassphrase: this.networkPassphrase,
           })
             .addOperation(
-              this.contract.call('upgrade', wasmHashScVal),
+              this.contract.call('upgrade', wasmHashScVal, nonceScVal),
             )
             .setTimeout(30)
             .build();
@@ -2358,163 +2361,6 @@ export class OnboardingBridgeSDK {
     }
     const scVal = (result as any).results?.[0]?.retval;
     return scVal ? Number(scValToNative(scVal)) : 0;
-  }
-
-  /**
-   * Create a new Soroban smart-contract account (C-address).
-   *
-   * Calls the bridge contract's `create_contract` helper which deploys a new
-   * account contract and derives its C-address from the deployer's address and
-   * an optional salt.  If `options.initialFunds` is provided, a `fund_c_address`
-   * call is made immediately after creation so the new account has a starting
-   * balance.
-   *
-   * @param options - Deployer keypair, optional deterministic salt, and optional
-   *                  initial funding parameters.
-   *
-   * @returns A {@link CreateCAddressResult} with the new C-address and creation tx hash.
-   *
-   * @throws {Error} If contract creation or the subsequent fund call fails.
-   *
-   * @example
-   * ```ts
-   * const { cAddress, txHash } = await sdk.createCAddress({
-   *   deployerKeypair: keypair,
-   *   initialFunds: { asset: 'CD...usdc', amount: '10000000' },
-   * });
-   * console.log('New C-address:', cAddress);
-   * ```
-   */
-  async createCAddress(
-    options: CreateCOptions,
-  ): Promise<CreateCAddressResult> {
-    return withTransactionHooks(
-      this.hooks,
-      'createCAddress',
-      { salt: options.salt, hasInitialFunds: !!options.initialFunds },
-      async () => {
-        const deployerKeypair = options.deployerKeypair;
-        const deployerAccount = await withRpcHook(
-          this.hooks,
-          'getAccount',
-          { address: deployerKeypair.publicKey() },
-          () => this.provider.getAccount(deployerKeypair.publicKey()),
-        );
-
-        const saltBytes = options.salt
-          ? Buffer.from(options.salt, 'hex')
-          : Buffer.from(
-              Array.from({ length: 32 }, () =>
-                Math.floor(Math.random() * 256),
-              ),
-            );
-        const saltScVal = xdr.ScVal.scvBytes(saltBytes);
-
-        const deployerAddress = new Address(deployerKeypair.publicKey());
-
-        const txBuilder = new TransactionBuilder(deployerAccount, {
-          fee: BASE_FEE,
-          networkPassphrase: this.networkPassphrase,
-        });
-
-        txBuilder.addOperation(
-          this.contract.call(
-            'create_contract',
-            deployerAddress.toScVal(),
-            saltScVal,
-          ),
-        );
-
-        const deployTx = txBuilder.setTimeout(30).build();
-        const preparedDeployTx = await withRpcHook(
-          this.hooks,
-          'prepareTransaction',
-          { contractMethod: 'create_contract' },
-          () => this.provider.prepareTransaction(deployTx),
-        );
-        preparedDeployTx.sign(deployerKeypair);
-
-        const deployResponse = await withRpcHook(
-          this.hooks,
-          'sendTransaction',
-          { contractMethod: 'create_contract' },
-          () => this.provider.sendTransaction(preparedDeployTx),
-        );
-        if (deployResponse.status === 'ERROR') {
-          throw new Error(`Failed to create C-address: ${deployResponse.status}`);
-        }
-
-        let txResult = await withRpcHook(
-          this.hooks,
-          'getTransaction',
-          { hash: deployResponse.hash },
-          () => this.provider.getTransaction(deployResponse.hash),
-        );
-        while (txResult.status === 'NOT_FOUND') {
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-          txResult = await withRpcHook(
-            this.hooks,
-            'getTransaction',
-            { hash: deployResponse.hash },
-            () => this.provider.getTransaction(deployResponse.hash),
-          );
-        }
-
-        if (txResult.status !== 'SUCCESS') {
-          throw new Error(`C-address creation failed: ${txResult.status}`);
-        }
-
-        const returnVal = (txResult as any).returnValue;
-        const cAddress: string = returnVal
-          ? scValToNative(returnVal).toString()
-          : '';
-
-        if (options.initialFunds && cAddress) {
-          const fundAccount = await withRpcHook(
-            this.hooks,
-            'getAccount',
-            { address: deployerKeypair.publicKey() },
-            () => this.provider.getAccount(deployerKeypair.publicKey()),
-          );
-          const fundTx = new TransactionBuilder(fundAccount, {
-            fee: BASE_FEE,
-            networkPassphrase: this.networkPassphrase,
-          })
-            .addOperation(
-              this.contract.call(
-                'fund_c_address',
-                ...this.toScVals([
-                  deployerKeypair.publicKey(),
-                  cAddress,
-                  options.initialFunds.asset,
-                  options.initialFunds.amount,
-                ]),
-              ),
-            )
-            .setTimeout(30)
-            .build();
-
-          const preparedFundTx = await withRpcHook(
-            this.hooks,
-            'prepareTransaction',
-            { contractMethod: 'fund_c_address' },
-            () => this.provider.prepareTransaction(fundTx),
-          );
-          preparedFundTx.sign(deployerKeypair);
-          await withRpcHook(
-            this.hooks,
-            'sendTransaction',
-            { contractMethod: 'fund_c_address' },
-            () => this.provider.sendTransaction(preparedFundTx),
-          );
-        }
-
-        return {
-          cAddress,
-          txHash: deployResponse.hash,
-        };
-      },
-    );
   }
 
   /**
