@@ -129,12 +129,22 @@ fn parse_contract_event(
         }
     }
 
-    let id = format!(
-        "{}-{}-{}",
-        ledger,
-        tx_hash.get(..8).unwrap_or("unknown"),
-        uuid::Uuid::new_v4().to_string().get(..8).unwrap_or("rand")
-    );
+    // Deterministic ID: sha256(ledger || tx_hash || event_type) encoded as hex.
+    // Using a content-derived ID ensures that re-indexing the same on-chain event
+    // always produces the same id, which lets `INSERT OR IGNORE` be the sole
+    // deduplication mechanism rather than a UUID that varies per call.
+    let id = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        ledger.hash(&mut hasher);
+        tx_hash.hash(&mut hasher);
+        event_type.as_str().hash(&mut hasher);
+        // Include the first topic so two distinct event types on the same tx are
+        // differentiated even when ledger and tx_hash are identical.
+        first_topic.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    };
 
     Some(IndexedEvent {
         id,
@@ -145,4 +155,160 @@ fn parse_contract_event(
         timestamp,
         data: serde_json::Value::Object(data),
     })
+}
+
+/// Public-for-tests re-export of `parse_contract_event` so that `db.rs` tests
+/// and external test modules can call it without making the private function
+/// `pub` in the production API surface.
+#[cfg(test)]
+pub(crate) fn parse_contract_event_for_test(
+    raw: &serde_json::Value,
+    contract_id: &str,
+) -> Option<IndexedEvent> {
+    parse_contract_event(raw, contract_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper: build a minimal raw event JSON with the given topics.
+    fn raw_event(topics: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "topic": topics,
+            "ledger": 10,
+            "txHash": "cafebabe00000000",
+            "createdAt": "2024-06-01T12:00:00Z",
+            "value": null
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 4 — edge cases in parse_contract_event / BridgeEventType
+    // -----------------------------------------------------------------------
+
+    /// An empty topic array must return None (no event type to determine).
+    #[test]
+    fn test_parse_returns_none_for_empty_topics() {
+        let raw = raw_event(serde_json::json!([]));
+        assert!(
+            parse_contract_event(&raw, "CONTRACT_A").is_none(),
+            "empty topics must yield None"
+        );
+    }
+
+    /// A first topic that is not a known bridge event name must return None.
+    #[test]
+    fn test_parse_returns_none_for_unrecognized_topic() {
+        let raw = raw_event(serde_json::json!(["UnknownEventXYZ"]));
+        assert!(
+            parse_contract_event(&raw, "CONTRACT_A").is_none(),
+            "unrecognized topic must yield None"
+        );
+    }
+
+    /// Missing `ledger` field defaults to 0 without panicking.
+    #[test]
+    fn test_parse_defaults_ledger_to_zero_when_missing() {
+        let raw = serde_json::json!({
+            "topic": ["CAddressFunded"],
+            "txHash": "aabbccdd",
+            "createdAt": "2024-01-01T00:00:00Z"
+        });
+        let event = parse_contract_event(&raw, "C1").expect("must parse");
+        assert_eq!(event.ledger_sequence, 0, "missing ledger must default to 0");
+    }
+
+    /// Missing `txHash` field defaults to empty string without panicking.
+    #[test]
+    fn test_parse_defaults_tx_hash_to_empty_when_missing() {
+        let raw = serde_json::json!({
+            "topic": ["CAddressFunded"],
+            "ledger": 5
+        });
+        let event = parse_contract_event(&raw, "C1").expect("must parse");
+        assert_eq!(event.tx_hash, "", "missing txHash must default to empty string");
+    }
+
+    /// Missing `createdAt` field must not panic; a fallback timestamp is used.
+    #[test]
+    fn test_parse_uses_fallback_timestamp_when_created_at_missing() {
+        let raw = serde_json::json!({
+            "topic": ["FeesWithdrawn"],
+            "ledger": 99,
+            "txHash": "1234"
+        });
+        let event = parse_contract_event(&raw, "C1").expect("must parse");
+        // The fallback is chrono::Utc::now().to_rfc3339(); just assert it's non-empty.
+        assert!(!event.timestamp.is_empty(), "fallback timestamp must be non-empty");
+    }
+
+    /// topics[1] is extracted into `data["source"]`.
+    #[test]
+    fn test_parse_extracts_source_from_topics_index_1() {
+        let raw = raw_event(serde_json::json!(["CAddressFunded", "GSOURCEADDR", "CTARGETADDR"]));
+        let event = parse_contract_event(&raw, "C1").expect("must parse");
+        assert_eq!(
+            event.data["source"].as_str(),
+            Some("GSOURCEADDR"),
+            "topics[1] must be stored as data.source"
+        );
+    }
+
+    /// topics[2] is extracted into `data["target"]`.
+    #[test]
+    fn test_parse_extracts_target_from_topics_index_2() {
+        let raw = raw_event(serde_json::json!(["CAddressFunded", "GSOURCE", "CTARGET"]));
+        let event = parse_contract_event(&raw, "C1").expect("must parse");
+        assert_eq!(
+            event.data["target"].as_str(),
+            Some("CTARGET"),
+            "topics[2] must be stored as data.target"
+        );
+    }
+
+    /// When only one topic is present, `data["source"]` and `data["target"]`
+    /// must be absent (no index-out-of-bounds or spurious entries).
+    #[test]
+    fn test_parse_no_source_target_when_only_one_topic() {
+        let raw = raw_event(serde_json::json!(["FeesWithdrawn"]));
+        let event = parse_contract_event(&raw, "C1").expect("must parse");
+        assert!(
+            event.data["source"].is_null(),
+            "source must be absent for single-topic event"
+        );
+        assert!(
+            event.data["target"].is_null(),
+            "target must be absent for single-topic event"
+        );
+    }
+
+    /// Deterministic ID: same raw input → same id on repeated calls.
+    #[test]
+    fn test_parse_deterministic_id_same_input_same_id() {
+        let raw = raw_event(serde_json::json!(["CAddressFunded", "GSRC", "CTGT"]));
+        let id1 = parse_contract_event(&raw, "C1").unwrap().id;
+        let id2 = parse_contract_event(&raw, "C1").unwrap().id;
+        assert_eq!(id1, id2, "IDs must be identical for the same raw event");
+    }
+
+    /// Deterministic ID: different tx_hash → different id.
+    #[test]
+    fn test_parse_deterministic_id_different_tx_hash_different_id() {
+        let raw1 = serde_json::json!({
+            "topic": ["CAddressFunded"],
+            "ledger": 10,
+            "txHash": "aaaa0000",
+            "createdAt": "2024-01-01T00:00:00Z"
+        });
+        let raw2 = serde_json::json!({
+            "topic": ["CAddressFunded"],
+            "ledger": 10,
+            "txHash": "bbbb1111",
+            "createdAt": "2024-01-01T00:00:00Z"
+        });
+        let id1 = parse_contract_event(&raw1, "C1").unwrap().id;
+        let id2 = parse_contract_event(&raw2, "C1").unwrap().id;
+        assert_ne!(id1, id2, "different tx_hash must produce different IDs");
+    }
 }

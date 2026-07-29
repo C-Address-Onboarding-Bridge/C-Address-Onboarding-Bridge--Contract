@@ -46,8 +46,19 @@ Everything else can remain blank until you need it.
 ## 2. Install Dependencies
 
 ```bash
-# TypeScript SDK
+# Install all workspace packages (SDK + relayer) from the repo root
+npm install
+```
+
+This installs both `sdk/` and `relayer/` workspaces in one step. If you need
+to install a single workspace in isolation:
+
+```bash
+# SDK only
 cd sdk && npm install && cd ..
+
+# Relayer only
+cd relayer && npm install && cd ..
 ```
 
 ---
@@ -151,6 +162,57 @@ cd sdk && npm test
 
 ```bash
 cargo test -p onboarding-bridge --features testutils && (cd sdk && npm test)
+```
+
+---
+
+## Running the Relayer
+
+The relayer is a TypeScript workspace package under `relayer/`. After `npm install` from the repo root its dependencies are ready.
+
+### Start the relayer
+
+```bash
+# From the repo root — starts relayer/index.ts via the workspace script
+npm run start --workspace=relayer
+
+# Or change into the relayer directory
+cd relayer && npm start
+```
+
+Required environment variables (see section 8):
+
+```bash
+export CONTRACT_ID="C..."
+export STELLAR_RPC_URL="https://soroban-testnet.stellar.org"
+export NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+export RELAYER_SECRET_KEY="S..."          # Stellar keypair that pays Soroban fees
+export RELAYER_PRIVATE_KEYS="<hex-seed>"  # Comma-separated Ed25519 seeds for signing
+export THRESHOLD=1
+# Optional chain listeners:
+export ETH_RPC_URL="https://eth-mainnet.example.com"
+export ETH_BRIDGE_CONTRACT="0x..."
+export ETH_EVENT_TOPIC="0x..."
+export SOLANA_WS_URL="wss://api.mainnet-beta.solana.com"
+export SOLANA_PROGRAM_ID="<base58-program-id>"
+```
+
+### Run the relayer self-tests
+
+```bash
+npm run self-test --workspace=relayer
+
+# Or directly:
+cd relayer && npx ts-node index.ts --self-test
+```
+
+### Type-check the relayer
+
+```bash
+npm run typecheck --workspace=relayer
+
+# Or directly:
+cd relayer && npx tsc --noEmit
 ```
 
 ---
