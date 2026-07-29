@@ -3,6 +3,7 @@ use crate::{
     CRITICAL_ENTRY_TTL_THRESHOLD, MAX_ALLOWED_TTL,
 };
 
+use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::{
@@ -1722,6 +1723,69 @@ fn test_swap_deadline_in_future_passes() {
         &Some(3_000u64),
     );
     assert_eq!(check_balance(&env, &target_token_id, &target), 500i128);
+}
+
+#[test]
+fn test_swap_slippage_exceeded_fails() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &target_token_id, &1i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+
+    // min_target_amount (600) > actual output (500 * 1 = 500) → slippage exceeded.
+    // The pool returns 500 without transferring when min_amount_out isn't met;
+    // the bridge then detects 500 < 600 and rejects.
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target,
+            &source_token_id,
+            &target_token_id,
+            &500i128,
+            &600i128,
+            &swap_route,
+            &None,
+            &None,
+        ),
+        Err(Ok(BridgeError::SlippageExceeded))
+    );
+}
+
+#[test]
+fn test_swap_pool_call_failure_reverts() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+
+    // A pool with rate=0 computes amount_out = amount_in * 0 = 0.
+    // The bridge treats zero output as SwapFailed.
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &target_token_id, &0i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target,
+            &source_token_id,
+            &target_token_id,
+            &500i128,
+            &1i128,
+            &swap_route,
+            &None,
+            &None,
+        ),
+        Err(Ok(BridgeError::SwapFailed))
+    );
 }
 
 /********** query_calculate_fee tests **********/
@@ -4215,6 +4279,253 @@ fn test_meta_fund_rejects_unregistered_source() {
         bridge.try_execute_meta_fund(&params, &pubkey, &bogus_signature),
         Err(Ok(BridgeError::MetaTxPubkeySourceMismatch))
     );
+}
+
+/// Replicates the contract's payload-hash construction for `execute_meta_fund`
+/// so tests can produce valid Ed25519 signatures.
+fn build_meta_fund_payload_hash(
+    env: &Env,
+    source: &Address,
+    target: &Address,
+    asset: &Address,
+    amount: i128,
+    nonce: u64,
+    deadline: u64,
+) -> BytesN<32> {
+    let domain = Bytes::from_slice(env, b"meta_fund");
+
+    let mut addr_buf = [0u8; 64];
+
+    let src_str = source.clone().to_string();
+    let slen = src_str.len() as usize;
+    src_str.copy_into_slice(&mut addr_buf[..slen]);
+    let src_raw = Bytes::from_slice(env, &addr_buf[..slen]);
+    let src_hash: BytesN<32> = env.crypto().sha256(&src_raw).into();
+
+    let tgt_str = target.clone().to_string();
+    let tlen = tgt_str.len() as usize;
+    tgt_str.copy_into_slice(&mut addr_buf[..tlen]);
+    let tgt_raw = Bytes::from_slice(env, &addr_buf[..tlen]);
+    let tgt_hash: BytesN<32> = env.crypto().sha256(&tgt_raw).into();
+
+    let ast_str = asset.clone().to_string();
+    let alen = ast_str.len() as usize;
+    ast_str.copy_into_slice(&mut addr_buf[..alen]);
+    let ast_raw = Bytes::from_slice(env, &addr_buf[..alen]);
+    let ast_hash: BytesN<32> = env.crypto().sha256(&ast_raw).into();
+
+    let mut payload = Bytes::new(env);
+    payload.append(&domain);
+    payload.append(&src_hash.into());
+    payload.append(&tgt_hash.into());
+    payload.append(&ast_hash.into());
+    payload.extend_from_array(&amount.to_be_bytes());
+    payload.extend_from_array(&nonce.to_be_bytes());
+    payload.extend_from_array(&deadline.to_be_bytes());
+
+    env.crypto().sha256(&payload).into()
+}
+
+fn sign_meta_fund_payload(
+    env: &Env,
+    signing_key: &SigningKey,
+    payload_hash: &BytesN<32>,
+) -> BytesN<64> {
+    let hash_bytes: Bytes = payload_hash.clone().into();
+    let mut hash_arr = [0u8; 32];
+    for i in 0..32 {
+        hash_arr[i] = hash_bytes.get(i as u32).unwrap();
+    }
+    let sig = signing_key.sign(&hash_arr);
+    BytesN::from_array(env, &sig.to_bytes())
+}
+
+#[test]
+fn test_meta_fund_happy_path() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+
+    // Deterministic keypair (seed = 0x42…) so the signature is reproducible.
+    let mut seed = [0x42u8; 32];
+    let signing_key = SigningKey::from_bytes(&seed);
+    let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+    bridge.register_meta_signer(&user, &pubkey);
+
+    let amount: i128 = 500;
+    let nonce: u64 = 0;
+    let deadline: u64 = 2_000_000;
+
+    let payload_hash = build_meta_fund_payload_hash(
+        &env, &user, &target, &token_id, amount, nonce, deadline,
+    );
+    let signature = sign_meta_fund_payload(&env, &signing_key, &payload_hash);
+
+    let params = MetaFundParams {
+        source: user.clone(),
+        target: target.clone(),
+        asset: token_id.clone(),
+        amount,
+        nonce,
+        deadline,
+    };
+
+    bridge.execute_meta_fund(&params, &pubkey, &signature);
+
+    // 500 * 100 / 10000 = 5 fee → net 495 to target
+    assert_eq!(check_balance(&env, &token_id, &target), 495i128);
+    assert_eq!(check_balance(&env, &token_id, &user), 500i128);
+}
+
+#[test]
+fn test_meta_fund_expired_deadline_fails() {
+    let env = Env::default();
+    env.ledger().set_timestamp(2_000);
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+
+    let mut seed = [0x42u8; 32];
+    let signing_key = SigningKey::from_bytes(&seed);
+    let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+    bridge.register_meta_signer(&user, &pubkey);
+
+    let amount: i128 = 500;
+    let nonce: u64 = 0;
+    let deadline: u64 = 1_999; // already passed (ledger timestamp = 2_000)
+
+    let payload_hash = build_meta_fund_payload_hash(
+        &env, &user, &target, &token_id, amount, nonce, deadline,
+    );
+    let signature = sign_meta_fund_payload(&env, &signing_key, &payload_hash);
+
+    let params = MetaFundParams {
+        source: user.clone(),
+        target,
+        asset: token_id.clone(),
+        amount,
+        nonce,
+        deadline,
+    };
+
+    assert_eq!(
+        bridge.try_execute_meta_fund(&params, &pubkey, &signature),
+        Err(Ok(BridgeError::MetaTxExpired))
+    );
+}
+
+#[test]
+fn test_meta_fund_nonce_replay_rejected() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 2000i128);
+
+    let target1 = Address::generate(&env);
+    let target2 = Address::generate(&env);
+
+    let mut seed = [0x7Fu8; 32];
+    let signing_key = SigningKey::from_bytes(&seed);
+    let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+    bridge.register_meta_signer(&user, &pubkey);
+
+    let amount: i128 = 500;
+    let nonce: u64 = 42;
+    let deadline: u64 = 2_000_000;
+
+    let payload_hash = build_meta_fund_payload_hash(
+        &env, &user, &target1, &token_id, amount, nonce, deadline,
+    );
+    let signature = sign_meta_fund_payload(&env, &signing_key, &payload_hash);
+
+    let params = MetaFundParams {
+        source: user.clone(),
+        target: target1.clone(),
+        asset: token_id.clone(),
+        amount,
+        nonce,
+        deadline,
+    };
+
+    // First use succeeds.
+    bridge.execute_meta_fund(&params, &pubkey, &signature);
+    assert_eq!(check_balance(&env, &token_id, &target1), 500i128);
+
+    // Replay with same (source, nonce) must be rejected.
+    let params2 = MetaFundParams {
+        source: user.clone(),
+        target: target2,
+        asset: token_id.clone(),
+        amount,
+        nonce,
+        deadline,
+    };
+
+    assert_eq!(
+        bridge.try_execute_meta_fund(&params2, &pubkey, &signature),
+        Err(Ok(BridgeError::MetaTxNonceAlreadyUsed))
+    );
+}
+
+#[test]
+#[should_panic]
+fn test_meta_fund_invalid_signature_fails() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+
+    let mut seed = [0x42u8; 32];
+    let signing_key = SigningKey::from_bytes(&seed);
+    let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+    bridge.register_meta_signer(&user, &pubkey);
+
+    let amount: i128 = 500;
+    let nonce: u64 = 0;
+    let deadline: u64 = 2_000_000;
+
+    // A signature that is corrupt: all zeros, not produced by the registered key.
+    // The Ed25519 host function traps on invalid signatures rather than returning
+    // an error, hence `#[should_panic]`.
+    let forged_signature = BytesN::from_array(&env, &[0u8; 64]);
+
+    let params = MetaFundParams {
+        source: user.clone(),
+        target,
+        asset: token_id.clone(),
+        amount,
+        nonce,
+        deadline,
+    };
+
+    bridge.execute_meta_fund(&params, &pubkey, &forged_signature);
 }
 
 /********** Batch fund minimum-amount enforcement **********/
