@@ -207,4 +207,152 @@ describe('CachedContractClient', () => {
       expect(typeof client[method]).toBe('function');
     }
   });
+
+  it('caches getFeeCollector result and avoids a second RPC call', async () => {
+    const FEE_COLLECTOR = 'GCCD6AJOYZCUAQLXX32ZJF2NKFFAU6TYPVWLZSE3GGSOOD5GVPJGZZ5B';
+    (scValToNative as jest.Mock).mockReturnValue(FEE_COLLECTOR);
+    mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+    const first = await wrapper.getFeeCollector();
+    const second = await wrapper.getFeeCollector();
+
+    expect(first).toBe(FEE_COLLECTOR);
+    expect(second).toBe(FEE_COLLECTOR);
+    expect(mockProvider.simulateTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('expires getFeeCollector after TTL and refreshes via new RPC call', async () => {
+    const feeCollWrapper = new CachedContractClient(CONFIG, {
+      provider: cache,
+      ttlMs: { getFeeCollector: 1000 },
+    });
+    const now = Date.now();
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    (scValToNative as jest.Mock)
+      .mockReturnValueOnce('GCCD6AJOYZCUAQLXX32ZJF2NKFFAU6TYPVWLZSE3GGSOOD5GVPJGZZ5B')
+      .mockReturnValueOnce('GDJZ6Y2Z5AM6ZAUOVGQ3XK6YKP6SAJSE3ZGJHNUZFXZMNZ5NRX5NHJY3');
+    mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+    const first = await feeCollWrapper.getFeeCollector();
+    expect(first).toBe('GCCD6AJOYZCUAQLXX32ZJF2NKFFAU6TYPVWLZSE3GGSOOD5GVPJGZZ5B');
+
+    nowSpy.mockImplementation(() => now + 1100);
+    const second = await feeCollWrapper.getFeeCollector();
+
+    expect(second).toBe('GDJZ6Y2Z5AM6ZAUOVGQ3XK6YKP6SAJSE3ZGJHNUZFXZMNZ5NRX5NHJY3');
+    expect(mockProvider.simulateTransaction).toHaveBeenCalledTimes(2);
+    nowSpy.mockRestore();
+  });
+
+  it('caches getAdmin result and avoids a second RPC call', async () => {
+    const ADMIN = 'GAHJZ6Y2Z5AM6ZAUOVGQ3XK6YKP6SAJSE3ZGJHNUZFXZMNZ5NRX5NHJY3';
+    (scValToNative as jest.Mock).mockReturnValue(ADMIN);
+    mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+    const first = await wrapper.getAdmin();
+    const second = await wrapper.getAdmin();
+
+    expect(first).toBe(ADMIN);
+    expect(second).toBe(ADMIN);
+    expect(mockProvider.simulateTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('expires getAdmin after TTL and refreshes via new RPC call', async () => {
+    const adminWrapper = new CachedContractClient(CONFIG, {
+      provider: cache,
+      ttlMs: { getAdmin: 1000 },
+    });
+    const now = Date.now();
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    (scValToNative as jest.Mock)
+      .mockReturnValueOnce('GAHJZ6Y2Z5AM6ZAUOVGQ3XK6YKP6SAJSE3ZGJHNUZFXZMNZ5NRX5NHJY3')
+      .mockReturnValueOnce('GDJZ6Y2Z5AM6ZAUOVGQ3XK6YKP6SAJSE3ZGJHNUZFXZMNZ5NRX5NHJY3');
+    mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+    const first = await adminWrapper.getAdmin();
+    expect(first).toBe('GAHJZ6Y2Z5AM6ZAUOVGQ3XK6YKP6SAJSE3ZGJHNUZFXZMNZ5NRX5NHJY3');
+
+    nowSpy.mockImplementation(() => now + 1100);
+    const second = await adminWrapper.getAdmin();
+
+    expect(second).toBe('GDJZ6Y2Z5AM6ZAUOVGQ3XK6YKP6SAJSE3ZGJHNUZFXZMNZ5NRX5NHJY3');
+    expect(mockProvider.simulateTransaction).toHaveBeenCalledTimes(2);
+    nowSpy.mockRestore();
+  });
+
+  it('caches isInitialized result and avoids a second RPC call', async () => {
+    (scValToNative as jest.Mock).mockReturnValue(true);
+    mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+    const first = await wrapper.isInitialized();
+    const second = await wrapper.isInitialized();
+
+    expect(first).toBe(true);
+    expect(second).toBe(true);
+    expect(mockProvider.simulateTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('caches isInitialized false and correctly reuses the cached value', async () => {
+    (scValToNative as jest.Mock).mockReturnValue(false);
+    mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+    const first = await wrapper.isInitialized();
+    const second = await wrapper.isInitialized();
+
+    expect(first).toBe(false);
+    expect(second).toBe(false);
+    expect(mockProvider.simulateTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('expires isInitialized after TTL and refreshes via new RPC call', async () => {
+    const initWrapper = new CachedContractClient(CONFIG, {
+      provider: cache,
+      ttlMs: { isInitialized: 1000 },
+    });
+    const now = Date.now();
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    (scValToNative as jest.Mock)
+      .mockReturnValueOnce(true)
+      .mockReturnValueOnce(false);
+    mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+    const first = await initWrapper.isInitialized();
+    expect(first).toBe(true);
+
+    nowSpy.mockImplementation(() => now + 1100);
+    const second = await initWrapper.isInitialized();
+
+    expect(second).toBe(false);
+    expect(mockProvider.simulateTransaction).toHaveBeenCalledTimes(2);
+    nowSpy.mockRestore();
+  });
+
+  it('clears all cached entries when invalidateCache is called with no arguments', async () => {
+    await cache.set('getFee', 100);
+    await cache.set('getFeeCollector', 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF');
+    await cache.set('getAdmin', 'GAHJZ6Y2Z5AM6ZAUOVGQ3XK6YKP6SAJSE3ZGJHNUZFXZMNZ5NRX5NHJY3');
+    await cache.set('isInitialized', true);
+
+    await wrapper.invalidateCache();
+
+    expect(await cache.get('getFee')).toBeUndefined();
+    expect(await cache.get('getFeeCollector')).toBeUndefined();
+    expect(await cache.get('getAdmin')).toBeUndefined();
+    expect(await cache.get('isInitialized')).toBeUndefined();
+  });
+
+  it('deletes only the specified keys when invalidateCache is called with an array', async () => {
+    await cache.set('getFee', 100);
+    await cache.set('getFeeCollector', 'GCCD6AJOYZCUAQLXX32ZJF2NKFFAU6TYPVWLZSE3GGSOOD5GVPJGZZ5B');
+    await cache.set('getAdmin', 'GAHJZ6Y2Z5AM6ZAUOVGQ3XK6YKP6SAJSE3ZGJHNUZFXZMNZ5NRX5NHJY3');
+    await cache.set('isInitialized', true);
+
+    await wrapper.invalidateCache(['getFee', 'getFeeCollector']);
+
+    expect(await cache.get('getFee')).toBeUndefined();
+    expect(await cache.get('getFeeCollector')).toBeUndefined();
+    // Untouched keys remain
+    expect(await cache.get('getAdmin')).toBe('GAHJZ6Y2Z5AM6ZAUOVGQ3XK6YKP6SAJSE3ZGJHNUZFXZMNZ5NRX5NHJY3');
+    expect(await cache.get('isInitialized')).toBe(true);
+  });
 });
