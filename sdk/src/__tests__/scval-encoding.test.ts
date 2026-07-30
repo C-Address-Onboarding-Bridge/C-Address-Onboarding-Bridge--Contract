@@ -67,4 +67,29 @@ describe('toScVals / toSingleScVal encoding', () => {
     expect(scValToNative(results[3])).toBe(true);
     expect(scValToNative(results[4])).toBe('symbol');
   });
+
+  it('encodes negative numbers as i128', () => {
+    const result = toSingleScVal(-42);
+    expect(scValToNative(result).toString()).toBe('-42');
+  });
+
+  it('encodes zero as i128', () => {
+    const result = toSingleScVal(0);
+    expect(scValToNative(result).toString()).toBe('0');
+  });
+
+  it('encodes empty string as Symbol', () => {
+    const result = toSingleScVal('');
+    expect(scValToNative(result)).toBe('');
+  });
+
+  it('encodes nested arrays correctly', () => {
+    const result = toSingleScVal([['nested', 'array'], 'top-level']);
+    const native = scValToNative(result) as any[];
+    expect(native).toHaveLength(2);
+    expect(native[0]).toHaveLength(2);
+    expect(native[0][0]).toBe('nested');
+    expect(native[0][1]).toBe('array');
+    expect(native[1]).toBe('top-level');
+  });
 });
