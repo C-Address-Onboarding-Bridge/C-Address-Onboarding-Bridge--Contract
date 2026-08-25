@@ -433,6 +433,70 @@ fn clear_pending_admin(env: &Env) {
 fn save_pending_fee_collector(env: &Env, addr: &Address) {
     env.storage().instance().set(&DataKey::PendingFeeCollector, addr);
 }
+
+fn read_pending_fee_collector(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::PendingFeeCollector)
+}
+
+fn clear_pending_fee_collector(env: &Env) {
+    env.storage().instance().remove(&DataKey::PendingFeeCollector);
+}
+
+fn save_max_withdraw_per_tx(env: &Env, amount: i128) {
+    env.storage().instance().set(&DataKey::MaxWithdrawPerTx, &amount);
+}
+
+fn read_max_withdraw_per_tx(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxWithdrawPerTx)
+        .unwrap_or(0)
+}
+
+fn read_bridge_config(env: &Env) -> BridgeConfigData {
+    env.storage()
+        .instance()
+        .get(&DataKey::BridgeConfig)
+        .unwrap_or(BridgeConfigData {
+            admin: read_admin(env),
+            fee_collector: read_fee_collector(env),
+            fee_bps: read_fee_bps(env),
+        })
+}
+
+fn save_bridge_config(env: &Env, cfg: &BridgeConfigData) {
+    env.storage()
+        .instance()
+        .set(&DataKey::BridgeConfig, cfg);
+}
+
+fn read_max_instance_ttl(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxInstanceTtl)
+        .unwrap_or(MAX_ALLOWED_TTL)
+}
+
+fn read_max_persistent_ttl(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxPersistentTtl)
+        .unwrap_or(MAX_ALLOWED_TTL)
+}
+
+fn extend_instance_ttl(env: &Env) {
+    let max_ttl = read_max_instance_ttl(env);
+    let threshold = max_ttl / 4;
+    env.storage().instance().extend_ttl(threshold, max_ttl);
+}
+
+fn next_timelock_id(env: &Env) -> u64 {
+    let id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TimelockId)
+        .unwrap_or(0u64);
+    env.storage()
         .instance()
         .set(&DataKey::TimelockId, &(id + 1));
     id
@@ -450,7 +514,57 @@ fn read_timelock_entry(env: &Env, id: u64) -> Option<TimelockEntry> {
 
 fn increment_user_deposit(env: &Env, source: &Address, asset: &Address, amount: i128) -> Result<(), BridgeError> {
     let key = DataKey::UserDeposit(source.clone(), asset.clone());
-    let current: i1 (&DataKey::FeeBps, fee_bps);
+    let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+    let updated = safe_math::safe_add(current, amount)?;
+    env.storage()
+        .persistent()
+        .set(&key, &updated);
+    Ok(())
+}
+
+#[inline(never)]
+fn save_admin(env: &Env, admin: &Address) {
+    env.storage().instance().set(&DataKey::Admin, admin);
+}
+
+#[inline(never)]
+fn read_admin(env: &Env) -> Address {
+    env.storage().instance().get(&DataKey::Admin).unwrap()
+}
+
+#[inline(never)]
+fn save_fee_collector(env: &Env, addr: &Address) {
+    env.storage().instance().set(&DataKey::FeeCollector, addr);
+}
+
+#[inline(never)]
+fn read_fee_collector(env: &Env) -> Address {
+    env.storage()
+        .instance()
+        .get(&DataKey::FeeCollector)
+        .unwrap()
+}
+
+fn read_config(env: &Env) -> BridgeConfig {
+    env.storage()
+        .instance()
+        .get(&DataKey::Config)
+        .unwrap_or(BridgeConfig {
+            fee_bps: 0,
+            paused: false,
+            allowlist_mode: false,
+        })
+}
+
+fn save_config(env: &Env, config: &BridgeConfig) {
+    env.storage().instance().set(&DataKey::Config, config);
+}
+
+fn save_fee_bps(env: &Env, fee_bps: &u32) {
+    let mut config = read_config(env);
+    config.fee_bps = *fee_bps;
+    save_config(env, &config);
+    env.storage().instance().set(&DataKey::FeeBps, fee_bps);
 }
 
 fn read_fee_bps(env: &Env) -> u32 {
@@ -505,7 +619,105 @@ fn check_not_deactivated(env: &Env) -> Result<(), BridgeError> {
         return Err(BridgeError::ContractDeactivated);
     }
     Ok(())
-}ed);
+}
+
+fn check_not_paused(env: &Env) -> Result<(), BridgeError> {
+    check_not_deactivated(env)?;
+    if read_paused(env) {
+        return Err(BridgeError::ContractPaused);
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn calculate_fee(amount: i128, fee_bps: u32) -> Result<i128, BridgeError> {
+    if fee_bps == 0 {
+        return Ok(0);
+    }
+    let bps = fee_bps as i128;
+    let product = safe_math::safe_mul(amount, bps)?;
+    safe_math::safe_div(product, FEE_DENOMINATOR)
+}
+
+fn is_blocked(env: &Env, addr: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Blocked(addr.clone()))
+        .unwrap_or(false)
+}
+
+fn is_allowlisted(env: &Env, addr: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Allowlisted(addr.clone()))
+        .unwrap_or(false)
+}
+
+fn allowlist_mode(env: &Env) -> bool {
+    read_config(env).allowlist_mode
+}
+
+fn set_allowlist_mode_flag(env: &Env, enabled: bool) {
+    let mut config = read_config(env);
+    config.allowlist_mode = enabled;
+    save_config(env, &config);
+    env.storage()
+        .instance()
+        .set(&DataKey::AllowlistMode, &enabled);
+}
+
+fn check_access(env: &Env, target: &Address) -> Result<(), BridgeError> {
+    if is_blocked(env, target) {
+        return Err(BridgeError::AddressBlocked);
+    }
+    if allowlist_mode(env) && !is_allowlisted(env, target) {
+        return Err(BridgeError::AddressNotAllowlisted);
+    }
+    Ok(())
+}
+
+#[inline(never)]
+fn read_whitelist(env: &Env) -> Map<Address, bool> {
+    env.storage()
+        .instance()
+        .get(&DataKey::AssetWhitelist)
+        .unwrap_or_else(|| Map::new(env))
+}
+
+#[inline(never)]
+fn save_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
+    env.storage()
+        .instance()
+        .set(&DataKey::AssetWhitelist, whitelist);
+}
+
+fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError> {
+    if !read_whitelist(env).get(asset.clone()).unwrap_or(false) {
+        return Err(BridgeError::AssetNotWhitelisted);
+    }
+    Ok(())
+}
+
+// fund_c_address_with_swap must not invoke arbitrary caller-supplied pool
+// addresses. Mirrors the asset whitelist pattern above.
+#[inline(never)]
+fn read_pool_whitelist(env: &Env) -> Map<Address, bool> {
+    env.storage()
+        .instance()
+        .get(&DataKey::PoolWhitelist)
+        .unwrap_or_else(|| Map::new(env))
+}
+
+#[inline(never)]
+fn save_pool_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PoolWhitelist, whitelist);
+}
+
+fn check_pool_whitelisted(env: &Env, pool: &Address) -> Result<(), BridgeError> {
+    if !read_pool_whitelist(env).get(pool.clone()).unwrap_or(false) {
+        return Err(BridgeError::PoolNotWhitelisted);
     }
     Ok(())
 }
@@ -608,7 +820,47 @@ fn increment_total_fees_collected(env: &Env, asset: &Address, amount: i128) -> R
 
 /// Atomically update all three counters in a single storage read+write
 fn update_asset_counters(env: &Env, asset: &Address, fees: i128, bridged: i128) -> Result<(), BridgeError> {
-=exers can track usage.
+    let mut c = read_asset_counters(env, asset);
+    c.accrued_fees = safe_math::safe_add(c.accrued_fees, fees)?;
+    c.total_bridged = safe_math::safe_add(c.total_bridged, bridged)?;
+    c.total_fees_collected = safe_math::safe_add(c.total_fees_collected, fees)?;
+    save_asset_counters(env, asset, &c);
+    Ok(())
+}
+
+fn read_nonce(env: &Env, caller: &Address) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Nonce(caller.clone()))
+        .unwrap_or(0)
+}
+
+/// If `nonce` is `Some(n)`, verify it equals the caller's current nonce then increment.
+/// If `None`, no check is performed (standard Stellar tx path — replay prevented by sequence number).
+fn consume_nonce(env: &Env, caller: &Address, nonce: Option<u64>) -> Result<(), BridgeError> {
+    if let Some(n) = nonce {
+        let stored = read_nonce(env, caller);
+        if n != stored {
+            return Err(BridgeError::DuplicateNonce);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Nonce(caller.clone()), &(stored + 1));
+    }
+    Ok(())
+}
+
+// --- Issue #95: Replay protection for Soroban authorization entries ---
+//
+// An "auth nonce" is a monotonically increasing u64 counter per source address.
+// A caller commits to a specific nonce **and** a ledger-sequence window
+// [valid_after_ledger, valid_before_ledger).  The contract:
+//   1. Binds the nonce to the current contract ID (implicitly — stored under this
+//      contract's own persistent storage, keyed by source address).
+//   2. Checks that the current ledger sequence is within the caller-supplied window.
+//   3. Records the (source, nonce) pair as used, preventing replay in any future
+//      transaction regardless of ledger sequence.
+//   4. Emits `AuthUsed(source, nonce)` so off-chain indexers can track usage.
 
 fn read_auth_nonce(env: &Env, source: &Address) -> u64 {
     env.storage()

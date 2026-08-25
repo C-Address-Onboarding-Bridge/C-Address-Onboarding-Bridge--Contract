@@ -17,6 +17,24 @@ use soroban_sdk::{
     contract, contractimpl, testutils::Address as _, Address, Env, IntoVal, String as SorobanString,
 };
 
+// A minimal token stand-in; the contract only needs transfer/balance/mint.
+#[contract]
+struct SmokeToken;
+
+#[contractimpl]
+impl SmokeToken {
+    pub fn initialize(env: Env, admin: Address, decimals: u32, name: SorobanString, symbol: SorobanString) {
+        env.storage().instance().set(&"admin", &admin);
+        env.storage().instance().set(&"decimals", &decimals);
+        env.storage().instance().set(&"name", &name);
+        env.storage().instance().set(&"symbol", &symbol);
+    }
+
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let balance: i128 = env.storage().persistent().get(&to).unwrap_or(0);
+        env.storage().persistent().set(&to, &(balance + amount));
+    }
+
     pub fn balance(env: Env, id: Address) -> i128 {
         env.storage().persistent().get(&id).unwrap_or(0)
     }
@@ -88,7 +106,32 @@ fn smoke_rejects_double_initialization() {
 
     let result = f
         .bridge
-        .try_initialize(
+        .try_initialize(&f.admin, &f.fee_collector, &50u32, &None);
+
+    assert_eq!(result, Err(Ok(BridgeError::AlreadyInitialized)));
+}
+
+/// The core happy path: funding moves the amount out of the source and splits
+/// it between the target and the fee collector.
+#[test]
+fn smoke_funds_target_and_collects_fee() {
+    let f = deploy();
+    let target = Address::generate(&f.env);
+    let token_client = SmokeTokenClient::new(&f.env, &f.token);
+
+    let amount = 100_000i128;
+    f.bridge
+        .fund_c_address(&f.user, &target, &f.token, &amount, &None, &None);
+
+    // 50 bps of 100_000 = 500.
+    let expected_fee = 500i128;
+    assert_eq!(token_client.balance(&target), amount - expected_fee);
+    assert_eq!(token_client.balance(&f.fee_collector), expected_fee);
+    assert_eq!(token_client.balance(&f.user), 1_000_000 - amount);
+}
+
+/// Accounting totals must agree with what actually moved.
+#[test]
 fn smoke_tracks_totals_after_funding() {
     let f = deploy();
     let target = Address::generate(&f.env);
