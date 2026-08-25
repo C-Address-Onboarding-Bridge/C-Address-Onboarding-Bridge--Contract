@@ -60,7 +60,7 @@ impl BenchToken {
             panic!("insufficient balance");
         }
         let to_bal = Self::balance(e.clone(), to.clone());
-        e.storage()
+        e.storage)
             .persistent()
             .set(&(TDataKey::Balance, from), &(from_bal - amount));
         e.storage()
@@ -130,35 +130,7 @@ fn bench_fund_c_address(amount: i128, variant: &'static str) -> BenchResult {
     let target = Address::generate(&env);
 
     env.budget().reset_default();
-    env.budget().reset_tracker();
-
-    bridge.fund_c_address(&user, &target, &token_id, &amount, &None, &None);
-
-    let cpu = env.budget().cpu_instruction_cost();
-    let mem = env.budget().memory_bytes_cost();
-
-    BenchResult {
-        function_name: "fund_c_address",
-        variant,
-        cpu_insns: cpu,
-        mem_bytes: mem,
-    }
-}
-
-fn bench_batch_fund(batch_size: u32) -> BenchResult {
-    let (env, bridge_id, token_id, admin, fee_collector) = setup_env();
-    let bridge = onboarding_bridge::OnboardingBridgeClient::new(&env, &bridge_id);
-    let token = BenchTokenClient::new(&env, &token_id);
-
-    bridge.initialize(&admin, &fee_collector, &100u32, &None);
-    bridge.add_asset(&token_id, &None);
-
-    let user = Address::generate(&env);
-    token.mint(&user, &(1000i128 * batch_size as i128 * 2));
-
-    let mut targets = Vec::new(&env);
-    let mut amounts = Vec::new(&env);
-    for _ in 0..batch_size {
+   ]
         targets.push_back(Address::generate(&env));
         amounts.push_back(1000i128);
     }
@@ -285,31 +257,6 @@ fn bench_query_balance() -> BenchResult {
         mem_bytes: mem,
     }
 }
-
-fn bench_query_total_bridged() -> BenchResult {
-    let (env, bridge_id, token_id, admin, fee_collector) = setup_env();
-    let bridge = onboarding_bridge::OnboardingBridgeClient::new(&env, &bridge_id);
-
-    bridge.initialize(&admin, &fee_collector, &100u32, &None);
-
-    env.budget().reset_default();
-    env.budget().reset_tracker();
-
-    bridge.query_total_bridged(&token_id);
-
-    let cpu = env.budget().cpu_instruction_cost();
-    let mem = env.budget().memory_bytes_cost();
-
-    BenchResult {
-        function_name: "query_total_bridged",
-        variant: "default",
-        cpu_insns: cpu,
-        mem_bytes: mem,
-    }
-}
-
-// ── Second-sprint feature benchmarks ──────────────────────────────────────────
-
 fn bench_fund_c_address_timelocked() -> BenchResult {
     let (env, bridge_id, token_id, admin, fee_collector) = setup_env();
     let bridge = onboarding_bridge::OnboardingBridgeClient::new(&env, &bridge_id);
@@ -370,29 +317,7 @@ fn bench_commit_fund() -> BenchResult {
     let user = Address::generate(&env);
     let target = Address::generate(&env);
     let mut preimage = soroban_sdk::Bytes::new(&env);
-    preimage.extend_from_array(&10_000i128.to_be_bytes());
-    preimage.extend_from_array(&1u64.to_be_bytes());
-    let amount_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-    let deadline = env.ledger().timestamp() + 86_400;
-
-    env.budget().reset_default();
-    env.budget().reset_tracker();
-
-    bridge.commit_fund(&user, &target, &token_id, &amount_hash, &deadline);
-
-    let cpu = env.budget().cpu_instruction_cost();
-    let mem = env.budget().memory_bytes_cost();
-
-    BenchResult { function_name: "commit_fund", variant: "default", cpu_insns: cpu, mem_bytes: mem }
-}
-
-fn bench_reveal_fund() -> BenchResult {
-    let (env, bridge_id, token_id, admin, fee_collector) = setup_env();
-    let bridge = onboarding_bridge::OnboardingBridgeClient::new(&env, &bridge_id);
-    let token = BenchTokenClient::new(&env, &token_id);
-
-    bridge.initialize(&admin, &fee_collector, &100u32, &None);
-    bridge.add_asset(&token_id, &None);
+    preimage.extend_from_arr;
 
     let user = Address::generate(&env);
     let target = Address::generate(&env);
@@ -510,17 +435,4 @@ mod bench_tests {
             bench_query_fee_bps(),
             bench_query_balance(),
             bench_query_total_bridged(),
-            // Second-sprint features
-            bench_fund_c_address_timelocked(),
-            bench_claim_timelocked(),
-            bench_commit_fund(),
-            bench_reveal_fund(),
-            bench_tiered_fee_lookup(),
-        ];
-
-        for r in &results {
-            assert!(r.cpu_insns > 0, "{}/{} should use CPU", r.function_name, r.variant);
-            assert!(r.mem_bytes > 0, "{}/{} should use memory", r.function_name, r.variant);
-        }
-    }
-}
+            // Second-sp

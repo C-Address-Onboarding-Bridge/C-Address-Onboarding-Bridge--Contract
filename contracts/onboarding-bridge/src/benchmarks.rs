@@ -145,31 +145,7 @@ fn bench_fund_amount(amount: i128) {
     });
 }
 
-#[test]
-fn bench_fund_c_address_small()  { bench_fund_amount(100); }
-#[test]
-fn bench_fund_c_address_medium() { bench_fund_amount(1_000_000); }
-#[test]
-fn bench_fund_c_address_large()  { bench_fund_amount(1_000_000_000); }
-
-// ── batch_fund_c_address ───────────────────────────────────────────────────────
-
-fn bench_batch(size: u32) {
-    let (env, bridge_id, token_id, _admin, _fee_collector) = initialized_setup();
-    let bridge = crate::OnboardingBridgeClient::new(&env, &bridge_id);
-    let user = Address::generate(&env);
-    let total = 1_000i128 * size as i128;
-    mint(&env, &token_id, &user, total * 2);
-
-    let mut targets: Vec<Address> = Vec::new(&env);
-    let mut amounts: Vec<i128> = Vec::new(&env);
-    for _ in 0..size {
-        targets.push_back(Address::generate(&env));
-        amounts.push_back(1_000i128);
-    }
-
-    measure(&env, &format!("batch_fund_c_address/size={size}"), || {
-        bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None);
+#[test]ser, &targets, &amounts, &token_id, &None, &None);
     });
 }
 
@@ -261,28 +237,7 @@ fn bench_admin_setters() {
     measure(&env, "unpause",            &|| { bridge.unpause(&None); });
     measure(&env, "set_max_withdraw_per_tx", &|| { bridge.set_max_withdraw_per_tx(&500i128, &None); });
     measure(&env, "set_source_daily_limit", &|| { bridge.set_source_daily_limit(&new_addr, &token_id, &10_000i128, &None); });
-    measure(&env, "set_asset_fee_cap",  &|| { bridge.set_asset_fee_cap(&token_id, &50u32, &None); });
-}
-
-// ── fund_c_address_timelocked / claim_timelocked ──────────────────────────────
-
-#[test]
-fn bench_fund_c_address_timelocked() {
-    let (env, bridge_id, token_id, _admin, _fee_collector) = initialized_setup();
-    let bridge = crate::OnboardingBridgeClient::new(&env, &bridge_id);
-    let user = Address::generate(&env);
-    let target = Address::generate(&env);
-    let amount = 10_000i128;
-    mint(&env, &token_id, &user, amount * 2);
-    let release_time = env.ledger().timestamp() + 365 * 86_400u64; // 1 year from now
-
-    measure(&env, "fund_c_address_timelocked", || {
-        bridge.fund_c_address_timelocked(
-            &user, &target, &token_id, &amount, &release_time, &0u64, &None, &None,
-        );
-    });
-}
-
+    measure(&env, "
 #[test]
 fn bench_claim_timelocked() {
     let (env, bridge_id, token_id, _admin, _fee_collector) = initialized_setup();
@@ -367,37 +322,6 @@ fn bench_fund_c_address_crosschain() {
             signature: sig,
         }],
     );
-
-    measure(&env, "fund_c_address_crosschain", || {
-        bridge.fund_c_address_crosschain(&chain_id, &tx_hash, &target, &token_id, &10_000i128, &sigs);
-    });
-
-    let _ = admin;
-}
-
-// ── commit_fund / reveal_fund ─────────────────────────────────────────────────
-
-#[test]
-fn bench_commit_fund() {
-    let (env, bridge_id, token_id, _admin, _fee_collector) = initialized_setup();
-    let bridge = crate::OnboardingBridgeClient::new(&env, &bridge_id);
-    let user = Address::generate(&env);
-    let target = Address::generate(&env);
-
-    use soroban_sdk::Bytes;
-    let mut preimage = Bytes::new(&env);
-    preimage.extend_from_array(&10_000i128.to_be_bytes());
-    preimage.extend_from_array(&1u64.to_be_bytes());
-    let amount_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
-    let deadline = env.ledger().timestamp() + 86_400;
-
-    measure(&env, "commit_fund", || {
-        bridge.commit_fund(&user, &target, &token_id, &amount_hash, &deadline);
-    });
-}
-
-#[test]
-fn bench_reveal_fund() {
     let (env, bridge_id, token_id, _admin, _fee_collector) = initialized_setup();
     let bridge = crate::OnboardingBridgeClient::new(&env, &bridge_id);
     let user = Address::generate(&env);
@@ -544,38 +468,7 @@ fn bench_tiered_fee_lookup() {
             crate::FeeTier { min_volume: 1_001i128, max_volume: 10_000i128, fee_bps: 25u32 },
             crate::FeeTier { min_volume: 10_001i128, max_volume: 1_000_000i128, fee_bps: 50u32 },
         ],
-    );
-    bridge.set_fee_tiers(&tiers);
-    mint(&env, &token_id, &user, 1_000_000i128 * 2);
-
-    // Fund once to build volume so the tiered lookup activates.
-    bridge.fund_c_address(&user, &Address::generate(&env), &token_id, &10_000i128, &None, &None);
-
-    measure(&env, "fund_c_address/tiered_fee", || {
-        bridge.fund_c_address(&user, &Address::generate(&env), &token_id, &10_000i128, &None, &None);
-    });
-
-    let _ = (admin, fee_collector);
-}
-
-// ═══ Minimal swap pool for bench_fund_c_address_with_swap ═════════════════════
-
-#[contracttype]
-pub enum SwapPoolKey {
-    InputToken,
-    OutputToken,
-    Rate,
-}
-
-#[contract]
-pub struct SwapPool;
-
-#[contractimpl]
-impl SwapPool {
-    pub fn initialize(e: Env, input_token: Address, output_token: Address, rate: i128) {
-        e.storage().instance().set(&SwapPoolKey::InputToken, &input_token);
-        e.storage().instance().set(&SwapPoolKey::OutputToken, &output_token);
-        e.storage().instance().set(&SwapPoolKey::Rate, &rate);
+    );nce().set(&SwapPoolKey::Rate, &rate);
     }
 
     pub fn swap(e: Env, min_amount_out: i128, to: Address) -> i128 {
