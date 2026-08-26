@@ -4,40 +4,6 @@
 
 A Soroban smart contract + TypeScript SDK that lets anyone fund a Soroban smart account (C-address) directly — from a CEX withdrawal, a credit card, or an existing G-address — without the user needing to understand the underlying account model.
 
----
-
-## 📚 This repository is a learning exercise set
-
-86 contract functions have had their bodies **intentionally replaced with
-`todo!("implement: …")`** so contributors can implement them as guided exercises.
-Signatures, generics, and doc comments are all intact — and the doc comments on
-this contract are thorough, documenting arguments, authorization requirements,
-and every error condition.
-
-**This is deliberate — the contract is not broken.** `cargo check` passes;
-`todo!()` type-checks against any return type.
-
-Each stub has a corresponding issue. Pick one from the
-[issue tracker](../../issues), implement that single function, and open a PR.
-
-### Start here if you want fast feedback
-
-The **test target does not currently compile** — 19 pre-existing errors from
-soroban-sdk API drift and stale call signatures, tracked in issues #406–#412.
-Until those land, `cargo check` is the only verification available:
-
-```bash
-cargo check
-```
-
-Those seven issues are the critical path for this whole repository. If you want
-your work to be verifiable, start with one of them.
-
-The original implementations remain in git history if you need to check your
-work after submitting.
-
----
-
 ## Architecture
 
 ```mermaid
