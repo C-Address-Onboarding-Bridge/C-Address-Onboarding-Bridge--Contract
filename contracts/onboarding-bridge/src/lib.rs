@@ -156,13 +156,21 @@ pub enum BridgeError {
     /// An address's strkey representation exceeds `MAX_STRKEY_LEN` (64) bytes.
     InvalidAddress = 42,
     /// The same relayer pubkey appeared more than once in `sigs`.
-    DuplicateRelayerSignature = 41,
+    DuplicateRelayerSignature = 45,
     /// A pool address in `swap_route` is not on the swap-pool whitelist.
-    PoolNotWhitelisted = 42,
+    PoolNotWhitelisted = 46,
     /// `swap_route` contained more than one hop; multi-hop swaps are not supported.
     MultiHopNotSupported = 43,
     /// A mutating call was re-entered while another call was already in progress.
     Reentrant = 44,
+    /// `tiers.len()` exceeds `MAX_FEE_TIERS`.
+    TooManyFeeTiers = 47,
+    /// A requested TTL is below `MIN_ALLOWED_TTL` or above the configured maximum.
+    InvalidTtl = 48,
+    /// The supplied pubkey is not the registered meta-signer for `source`.
+    MetaTxPubkeySourceMismatch = 49,
+    // Next free discriminant: 50. Always take the next unused value here and
+    // never renumber an existing variant — clients match on these values.
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +235,9 @@ pub enum DataKey {
     Commitment(u64),
     // Issue #35: EIP-712-style meta-transaction used nonces
     MetaTxNonce(Address, u64),
+    // Registry binding a source address to the one Ed25519 pubkey it will
+    // accept meta-transaction signatures from.
+    MetaSigner(Address),
     Deactivated,
     // Admin-managed whitelist of DEX pool addresses usable in `swap_route`.
     PoolWhitelist,
