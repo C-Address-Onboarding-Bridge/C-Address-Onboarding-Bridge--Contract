@@ -5056,3 +5056,81 @@ fn test_query_auth_nonce_used_boundary_values() {
     });
     assert!(bridge.query_auth_nonce_used(&user, &u64::MAX));
 }
+
+/********** query_auth_nonce **********/
+//
+// query_auth_nonce(source) returns the lowest nonce that has not yet been
+// consumed for `source`. It has no documented error conditions (it always
+// returns a u64), so coverage here focuses on the success path (starts at
+// zero, advances by one after sequential use), the documented "lowest
+// unused" boundary when nonces are consumed out of order, and per-source
+// isolation.
+
+#[test]
+fn test_query_auth_nonce_starts_at_zero_for_unused_source() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // No auth nonce has ever been consumed for `user`.
+    assert_eq!(bridge.query_auth_nonce(&user), 0u64);
+}
+
+#[test]
+fn test_query_auth_nonce_advances_after_sequential_use() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    env.as_contract(&bridge_id, || {
+        crate::mark_auth_nonce_used(&env, &user, 0u64);
+    });
+    assert_eq!(bridge.query_auth_nonce(&user), 1u64);
+
+    env.as_contract(&bridge_id, || {
+        crate::mark_auth_nonce_used(&env, &user, 1u64);
+    });
+    assert_eq!(bridge.query_auth_nonce(&user), 2u64);
+}
+
+#[test]
+fn test_query_auth_nonce_reflects_highest_consumed_plus_one() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // Consume nonce 5 directly, out of order (0..4 were never used). The
+    // documented "next unused" value must jump straight to 6.
+    env.as_contract(&bridge_id, || {
+        crate::mark_auth_nonce_used(&env, &user, 5u64);
+    });
+    assert_eq!(bridge.query_auth_nonce(&user), 6u64);
+}
+
+#[test]
+fn test_query_auth_nonce_is_scoped_per_source() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let other = Address::generate(&env);
+    env.as_contract(&bridge_id, || {
+        crate::mark_auth_nonce_used(&env, &user, 0u64);
+    });
+
+    // Advancing `user`'s counter must leave an unrelated source untouched.
+    assert_eq!(bridge.query_auth_nonce(&user), 1u64);
+    assert_eq!(bridge.query_auth_nonce(&other), 0u64);
+}
