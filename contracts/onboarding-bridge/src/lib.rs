@@ -1742,7 +1742,8 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_minimum_amount(env: Env) -> Result<i128, BridgeError> {
-        todo!("implement: query_minimum_amount")
+        check_initialized(&env)?;
+        Ok(read_minimum_amount(&env))
     }
 
     /// Withdraws accrued protocol fees to the fee collector.

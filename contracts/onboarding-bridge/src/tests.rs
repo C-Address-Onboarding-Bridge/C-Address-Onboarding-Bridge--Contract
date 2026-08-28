@@ -5076,3 +5076,78 @@ fn test_query_meta_tx_nonce_used_is_scoped_per_source() {
     assert_eq!(bridge.query_meta_tx_nonce_used(&user, &nonce), true);
     assert_eq!(bridge.query_meta_tx_nonce_used(&other_user, &nonce), false);
 }
+
+/********** query_minimum_amount unit tests **********/
+
+#[test]
+fn test_query_minimum_amount_defaults_to_zero() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // No minimum configured yet -> 0 (no minimum enforced).
+    assert_eq!(bridge.query_minimum_amount(), 0i128);
+}
+
+#[test]
+fn test_query_minimum_amount_reflects_set_minimum_amount() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    bridge.set_minimum_amount(&100i128, &None);
+    assert_eq!(bridge.query_minimum_amount(), 100i128);
+
+    // Updating again overwrites the previous value.
+    bridge.set_minimum_amount(&1i128, &None);
+    assert_eq!(bridge.query_minimum_amount(), 1i128);
+
+    // Explicitly restoring to zero disables the minimum again.
+    bridge.set_minimum_amount(&0i128, &None);
+    assert_eq!(bridge.query_minimum_amount(), 0i128);
+}
+
+#[test]
+fn test_query_minimum_amount_without_initialize_fails() {
+    let env = Env::default();
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_query_minimum_amount(),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_query_minimum_amount_boundary_enforced_by_fund_c_address() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    bridge.set_minimum_amount(&200i128, &None);
+    assert_eq!(bridge.query_minimum_amount(), 200i128);
+
+    let target = Address::generate(&env);
+
+    // Strictly below the configured minimum is rejected.
+    assert_eq!(
+        bridge.try_fund_c_address(&user, &target, &token_id, &199i128, &None, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+
+    // Exactly at the minimum boundary succeeds.
+    bridge.fund_c_address(&user, &target, &token_id, &200i128, &None, &None);
+    assert_eq!(check_balance(&env, &token_id, &target), 200i128);
+}
