@@ -1625,7 +1625,24 @@ impl OnboardingBridge {
     /// // assert_eq!(bridge.query_fee_bps(), 200u32);
     /// ```
     pub fn set_fee_bps(env: Env, new_fee_bps: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: set_fee_bps")
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        if new_fee_bps > MAX_FEE_BPS {
+            return Err(BridgeError::FeeTooHigh);
+        }
+
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+
+        let old_fee_bps = read_fee_bps(&env);
+        save_fee_bps(&env, &new_fee_bps);
+
+        env.events()
+            .publish(("FeeBpsChanged", old_fee_bps, new_fee_bps), (admin,));
+
+        extend_instance_ttl(&env);
+        Ok(())
     }
 
     /// Sets a maximum daily transfer limit for a specific `(source, asset)` pair.
