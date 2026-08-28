@@ -337,17 +337,8 @@ fn bench_fund_c_address_crosschain() {
     let nonce_hash: BytesN<32> = env.crypto().sha256(&nonce_pre).into();
 
     let mut addr_buf = [0u8; 64];
-    let tstr = target.to_string();
-    let tlen = tstr.len();
-    tstr.copy_into_slice(&mut addr_buf[..tlen]);
-    let target_hash: BytesN<32> =
-        env.crypto().sha256(&Bytes::from_slice(&env, &addr_buf[..tlen])).into();
-
-    let astr = token_id.to_string();
-    let alen = astr.len();
-    astr.copy_into_slice(&mut addr_buf[..alen]);
-    let asset_hash: BytesN<32> =
-        env.crypto().sha256(&Bytes::from_slice(&env, &addr_buf[..alen])).into();
+    let target_hash = hash_address(&env, &mut addr_buf, &target);
+    let asset_hash = hash_address(&env, &mut addr_buf, &token_id);
 
     let mut payload = Bytes::new(&env);
     payload.extend_from_array(&chain_id.to_be_bytes());
@@ -374,6 +365,17 @@ fn bench_fund_c_address_crosschain() {
     });
 
     let _ = admin;
+}
+
+/// Copies a Soroban `Address`'s strkey into `buf` and returns its SHA-256 hash,
+/// matching the contract's on-chain address-hashing scheme.
+fn hash_address(env: &Env, buf: &mut [u8; 64], addr: &Address) -> BytesN<32> {
+    let s = addr.to_string();
+    let len = s.len() as usize;
+    s.copy_into_slice(&mut buf[..len]);
+    env.crypto()
+        .sha256(&Bytes::from_slice(env, &buf[..len]))
+        .into()
 }
 
 // ── commit_fund / reveal_fund ─────────────────────────────────────────────────
@@ -484,20 +486,9 @@ fn bench_execute_meta_fund() {
     let domain = Bytes::from_slice(&env, b"meta_fund");
     let mut addr_buf = [0u8; 64];
 
-    let src_str = source.to_string();
-    let slen = src_str.len();
-    src_str.copy_into_slice(&mut addr_buf[..slen]);
-    let src_hash: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, &addr_buf[..slen])).into();
-
-    let tgt_str = target.to_string();
-    let tlen = tgt_str.len();
-    tgt_str.copy_into_slice(&mut addr_buf[..tlen]);
-    let tgt_hash: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, &addr_buf[..tlen])).into();
-
-    let ast_str = token_id.to_string();
-    let alen = ast_str.len();
-    ast_str.copy_into_slice(&mut addr_buf[..alen]);
-    let ast_hash: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, &addr_buf[..alen])).into();
+    let src_hash = hash_address(&env, &mut addr_buf, &source);
+    let tgt_hash = hash_address(&env, &mut addr_buf, &target);
+    let ast_hash = hash_address(&env, &mut addr_buf, &token_id);
 
     let nonce = 1u64;
     let deadline = env.ledger().timestamp() + 86_400;
