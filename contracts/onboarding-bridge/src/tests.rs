@@ -4967,3 +4967,112 @@ fn test_set_max_withdraw_per_tx_updates_limit() {
     bridge.set_max_withdraw_per_tx(&0i128, &None);
     assert_eq!(bridge.query_max_withdraw_per_tx(), 0i128);
 }
+
+/********** query_meta_tx_nonce_used unit tests **********/
+
+#[test]
+fn test_query_meta_tx_nonce_used_false_before_use() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+
+    // A nonce that has never been consumed reports as unused, including at
+    // the documented boundaries (zero and the max representable nonce).
+    assert_eq!(bridge.query_meta_tx_nonce_used(&user, &0u64), false);
+    assert_eq!(bridge.query_meta_tx_nonce_used(&user, &u64::MAX), false);
+}
+
+#[test]
+fn test_query_meta_tx_nonce_used_true_after_execute_meta_fund() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+
+    let seed = [0x11u8; 32];
+    let signing_key = SigningKey::from_bytes(&seed);
+    let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+    bridge.register_meta_signer(&user, &pubkey);
+
+    let amount: i128 = 500;
+    let nonce: u64 = 7;
+    let deadline: u64 = 2_000_000;
+
+    let payload_hash = build_meta_fund_payload_hash(
+        &env, &user, &target, &token_id, amount, nonce, deadline,
+    );
+    let signature = sign_meta_fund_payload(&env, &signing_key, &payload_hash);
+
+    let params = MetaFundParams {
+        source: user.clone(),
+        target,
+        asset: token_id.clone(),
+        amount,
+        nonce,
+        deadline,
+    };
+
+    // Unused before the meta-tx executes.
+    assert_eq!(bridge.query_meta_tx_nonce_used(&user, &nonce), false);
+
+    bridge.execute_meta_fund(&params, &pubkey, &signature);
+
+    // Used once the meta-tx has been consumed.
+    assert_eq!(bridge.query_meta_tx_nonce_used(&user, &nonce), true);
+}
+
+#[test]
+fn test_query_meta_tx_nonce_used_is_scoped_per_source() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let other_user = Address::generate(&env);
+    let target = Address::generate(&env);
+
+    let seed = [0x22u8; 32];
+    let signing_key = SigningKey::from_bytes(&seed);
+    let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+    bridge.register_meta_signer(&user, &pubkey);
+
+    let amount: i128 = 100;
+    let nonce: u64 = 3;
+    let deadline: u64 = 2_000_000;
+
+    let payload_hash = build_meta_fund_payload_hash(
+        &env, &user, &target, &token_id, amount, nonce, deadline,
+    );
+    let signature = sign_meta_fund_payload(&env, &signing_key, &payload_hash);
+
+    let params = MetaFundParams {
+        source: user.clone(),
+        target,
+        asset: token_id.clone(),
+        amount,
+        nonce,
+        deadline,
+    };
+
+    bridge.execute_meta_fund(&params, &pubkey, &signature);
+
+    // The same nonce value is untouched for a different source address —
+    // usage is scoped to (source, nonce), not the nonce alone.
+    assert_eq!(bridge.query_meta_tx_nonce_used(&user, &nonce), true);
+    assert_eq!(bridge.query_meta_tx_nonce_used(&other_user, &nonce), false);
+}
