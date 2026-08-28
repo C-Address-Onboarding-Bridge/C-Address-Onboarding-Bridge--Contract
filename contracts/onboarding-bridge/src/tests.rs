@@ -5205,3 +5205,58 @@ fn test_query_pending_admin_cleared_after_accept() {
     assert_eq!(bridge.query_admin(), candidate);
     assert_eq!(bridge.query_pending_admin(), None);
 }
+
+/********** query_pending_fee_collector unit tests **********/
+
+#[test]
+fn test_query_pending_fee_collector_defaults_to_none() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // No fee-collector handoff has been proposed yet.
+    assert_eq!(bridge.query_pending_fee_collector(), None);
+}
+
+#[test]
+fn test_query_pending_fee_collector_reflects_proposal() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let candidate = Address::generate(&env);
+    bridge.propose_new_fee_collector(&candidate, &None);
+    assert_eq!(bridge.query_pending_fee_collector(), Some(candidate.clone()));
+
+    // A later proposal overwrites the previously pending candidate.
+    let other_candidate = Address::generate(&env);
+    bridge.propose_new_fee_collector(&other_candidate, &None);
+    assert_eq!(bridge.query_pending_fee_collector(), Some(other_candidate));
+}
+
+#[test]
+fn test_query_pending_fee_collector_cleared_after_accept() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let candidate = Address::generate(&env);
+    bridge.propose_new_fee_collector(&candidate, &None);
+    assert_eq!(bridge.query_pending_fee_collector(), Some(candidate.clone()));
+
+    bridge.accept_fee_collector();
+
+    // Accepting promotes the candidate to fee collector and clears the
+    // pending slot back to None.
+    assert_eq!(bridge.query_fee_collector(), candidate);
+    assert_eq!(bridge.query_pending_fee_collector(), None);
+}

@@ -1695,9 +1695,7 @@ impl OnboardingBridge {
     }
 
     pub fn query_pending_fee_collector(env: Env) -> Option<Address> {
-
-        todo!("implement: query_pending_fee_collector")
-
+        read_pending_fee_collector(&env)
     }
 
     pub fn set_admin(env: Env, new_admin: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
