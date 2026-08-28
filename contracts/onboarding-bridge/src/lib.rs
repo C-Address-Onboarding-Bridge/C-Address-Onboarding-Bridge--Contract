@@ -1569,7 +1569,16 @@ impl OnboardingBridge {
         limit_amount: i128,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: set_source_daily_limit")
+        check_initialized(&env)?;
+
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+
+        save_source_daily_limit(&env, &source, &asset, limit_amount);
+        extend_instance_ttl(&env);
+
+        Ok(())
     }
 
     /// Returns the daily transfer limit for a `(source, asset)` pair.
