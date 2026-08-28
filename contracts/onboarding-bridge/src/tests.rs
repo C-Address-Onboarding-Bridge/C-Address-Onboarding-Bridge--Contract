@@ -4967,3 +4967,169 @@ fn test_set_max_withdraw_per_tx_updates_limit() {
     bridge.set_max_withdraw_per_tx(&0i128, &None);
     assert_eq!(bridge.query_max_withdraw_per_tx(), 0i128);
 }
+
+/********** verify_auth_entry tests **********/
+
+#[test]
+fn test_verify_auth_entry_success() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(1_000);
+
+    bridge.verify_auth_entry(&user, &7u64, &900u32, &1_100u32);
+
+    assert!(bridge.query_auth_nonce_used(&user, &7u64));
+}
+
+#[test]
+fn test_verify_auth_entry_not_initialized() {
+    let env = Env::default();
+    let (_admin, user, _fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &1u64, &0u32, &100u32),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_verify_auth_entry_paused() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+    env.ledger().set_sequence_number(1_000);
+
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &1u64, &900u32, &1_100u32),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_verify_auth_entry_expired_before_window() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(500);
+
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &1u64, &900u32, &1_100u32),
+        Err(Ok(BridgeError::AuthNonceExpired))
+    );
+}
+
+#[test]
+fn test_verify_auth_entry_expired_at_upper_boundary() {
+    // valid_before_ledger is an exclusive upper bound, so sequence == valid_before
+    // must be rejected.
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(1_100);
+
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &1u64, &900u32, &1_100u32),
+        Err(Ok(BridgeError::AuthNonceExpired))
+    );
+}
+
+#[test]
+fn test_verify_auth_entry_boundary_lower_inclusive() {
+    // valid_after_ledger is an inclusive lower bound, so sequence == valid_after
+    // must succeed.
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(900);
+
+    bridge.verify_auth_entry(&user, &1u64, &900u32, &1_100u32);
+    assert!(bridge.query_auth_nonce_used(&user, &1u64));
+}
+
+#[test]
+fn test_verify_auth_entry_boundary_upper_last_valid() {
+    // sequence == valid_before - 1 is the last ledger the window still covers.
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(1_099);
+
+    bridge.verify_auth_entry(&user, &1u64, &900u32, &1_100u32);
+    assert!(bridge.query_auth_nonce_used(&user, &1u64));
+}
+
+#[test]
+fn test_verify_auth_entry_already_used() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(1_000);
+
+    bridge.verify_auth_entry(&user, &5u64, &900u32, &1_100u32);
+
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &5u64, &900u32, &1_100u32),
+        Err(Ok(BridgeError::AuthNonceAlreadyUsed))
+    );
+}
+
+#[test]
+fn test_verify_auth_entry_different_nonces_independent() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(1_000);
+
+    bridge.verify_auth_entry(&user, &1u64, &900u32, &1_100u32);
+    // A different nonce for the same source is unaffected by the first call.
+    bridge.verify_auth_entry(&user, &2u64, &900u32, &1_100u32);
+
+    assert!(bridge.query_auth_nonce_used(&user, &1u64));
+    assert!(bridge.query_auth_nonce_used(&user, &2u64));
+    assert!(!bridge.query_auth_nonce_used(&user, &3u64));
+}
+
+#[test]
+fn test_verify_auth_entry_emits_event() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(1_000);
+
+    bridge.verify_auth_entry(&user, &9u64, &900u32, &1_100u32);
+
+    let events = env.events().all();
+    let (contract_id, _topics, _data) = &events.get(events.len() - 1).unwrap();
+    assert_eq!(contract_id, &bridge_id);
+}
