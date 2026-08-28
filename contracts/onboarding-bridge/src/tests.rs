@@ -5187,3 +5187,103 @@ fn test_query_timelocked_boundary_first_id() {
         Err(Ok(BridgeError::TimelockNotFound))
     );
 }
+
+/********** query_source_daily_limit coverage **********/
+//
+// `query_source_daily_limit` had no test naming it directly anywhere in the
+// suite. These cover the documented default-zero ("unrestricted") boundary,
+// the success path reading back a configured value, that limits are scoped
+// per-asset, and the NotInitialized guard.
+
+#[test]
+fn test_query_source_daily_limit_defaults_to_zero() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    // No limit has ever been configured for this (source, asset) pair; the
+    // docs say this means "unrestricted", represented as 0.
+    assert_eq!(bridge.query_source_daily_limit(&user, &token_id), 0i128);
+}
+
+#[test]
+fn test_query_source_daily_limit_returns_configured_value() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    bridge.set_source_daily_limit(&user, &token_id, &12_345i128, &None);
+    assert_eq!(
+        bridge.query_source_daily_limit(&user, &token_id),
+        12_345i128
+    );
+}
+
+#[test]
+fn test_query_source_daily_limit_zero_disables_limit() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    bridge.set_source_daily_limit(&user, &token_id, &500i128, &None);
+    assert_eq!(bridge.query_source_daily_limit(&user, &token_id), 500i128);
+
+    // Boundary: explicitly resetting the limit to 0 must read back as
+    // unrestricted again, matching the "0 == unrestricted" convention.
+    bridge.set_source_daily_limit(&user, &token_id, &0i128, &None);
+    assert_eq!(bridge.query_source_daily_limit(&user, &token_id), 0i128);
+}
+
+#[test]
+fn test_query_source_daily_limit_is_per_asset() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    let other_token_id = env.register(TestToken, ());
+    init_token(&env, &other_token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.add_asset(&other_token_id, &None);
+
+    bridge.set_source_daily_limit(&user, &token_id, &1_000i128, &None);
+
+    // A limit configured for one asset must not leak into the query for a
+    // different asset on the same source.
+    assert_eq!(bridge.query_source_daily_limit(&user, &token_id), 1_000i128);
+    assert_eq!(
+        bridge.query_source_daily_limit(&user, &other_token_id),
+        0i128
+    );
+}
+
+#[test]
+fn test_query_source_daily_limit_not_initialized() {
+    let env = Env::default();
+    let (_admin, user, _fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_query_source_daily_limit(&user, &token_id),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
