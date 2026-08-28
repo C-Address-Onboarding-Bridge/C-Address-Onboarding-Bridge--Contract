@@ -5158,3 +5158,80 @@ fn test_cancel_upgrade_non_admin_panics() {
     env.set_auths(&[] as &[SorobanAuthorizationEntry]);
     bridge.cancel_upgrade(&None);
 }
+
+/********** extend_commitment_ttl unit tests **********/
+
+fn setup_commitment_for_ttl(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, u64) {
+    let (bridge_id, token_id) = register_all_contracts_mocked(env);
+    let bridge = create_bridge_client(env, &bridge_id);
+    let (admin, user, fee_collector) = create_test_users(env);
+    init_token(env, &token_id, &admin);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    let target = Address::generate(env);
+    let amount_hash = BytesN::from_array(env, &[7u8; 32]);
+    let id = bridge.commit_fund(&user, &target, &token_id, &amount_hash, &10_000u64);
+    (bridge, bridge_id, id)
+}
+
+#[test]
+fn test_extend_commitment_ttl_extends_entry() {
+    let env = Env::default();
+    let (bridge, bridge_id, id) = setup_commitment_for_ttl(&env);
+
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    bridge.extend_commitment_ttl(&id, &200_000u32);
+
+    let key = DataKey::Commitment(id);
+    let ttl = env.as_contract(&bridge_id, || env.storage().persistent().get_ttl(&key));
+    assert!(ttl >= 200_000);
+}
+
+#[test]
+fn test_extend_commitment_ttl_not_initialized() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_extend_commitment_ttl(&0u64, &1_000u32),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_extend_commitment_ttl_commitment_not_found() {
+    let env = Env::default();
+    let (bridge, _bridge_id, _id) = setup_commitment_for_ttl(&env);
+
+    assert_eq!(
+        bridge.try_extend_commitment_ttl(&999_999u64, &1_000u32),
+        Err(Ok(BridgeError::CommitmentNotFound))
+    );
+}
+
+#[test]
+fn test_extend_commitment_ttl_caps_at_max_allowed() {
+    let env = Env::default();
+    let (bridge, bridge_id, id) = setup_commitment_for_ttl(&env);
+
+    // Request far beyond the documented cap; the stored TTL must never exceed it.
+    bridge.extend_commitment_ttl(&id, &(MAX_ALLOWED_TTL + 500_000));
+
+    let key = DataKey::Commitment(id);
+    let ttl = env.as_contract(&bridge_id, || env.storage().persistent().get_ttl(&key));
+    assert!(ttl <= MAX_ALLOWED_TTL);
+}
+
+#[test]
+#[should_panic]
+fn test_extend_commitment_ttl_non_admin_panics() {
+    let env = Env::default();
+    let (bridge, _bridge_id, id) = setup_commitment_for_ttl(&env);
+
+    // Clear all mocked auths so extend_commitment_ttl runs without the admin's authorization.
+    use soroban_sdk::xdr::SorobanAuthorizationEntry;
+    env.set_auths(&[] as &[SorobanAuthorizationEntry]);
+    bridge.extend_commitment_ttl(&id, &1_000u32);
+}
