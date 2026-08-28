@@ -5053,3 +5053,108 @@ fn test_accept_fee_collector_without_authorization_panics() {
     env.set_auths(&[] as &[SorobanAuthorizationEntry]);
     bridge.accept_fee_collector();
 }
+
+/********** cancel_upgrade unit tests **********/
+
+#[test]
+fn test_cancel_upgrade_success() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+    bridge.schedule_upgrade(&wasm_hash, &None);
+    assert!(bridge.query_pending_upgrade().is_some());
+
+    bridge.cancel_upgrade(&None);
+
+    assert!(bridge.query_pending_upgrade().is_none());
+}
+
+#[test]
+fn test_cancel_upgrade_not_initialized() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_cancel_upgrade(&None),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_cancel_upgrade_not_scheduled() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // No schedule_upgrade call preceded this, so there is nothing to cancel.
+    assert_eq!(
+        bridge.try_cancel_upgrade(&None),
+        Err(Ok(BridgeError::UpgradeNotScheduled))
+    );
+}
+
+#[test]
+fn test_cancel_upgrade_duplicate_nonce_rejected() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+    // Consumes the admin's nonce 0, advancing it to 1.
+    bridge.schedule_upgrade(&wasm_hash, &Some(0u64));
+
+    // Replaying nonce 0 on cancel_upgrade is rejected; the admin's nonce is now 1.
+    assert_eq!(
+        bridge.try_cancel_upgrade(&Some(0u64)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+}
+
+#[test]
+fn test_cancel_upgrade_twice_fails_second_time() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+    bridge.schedule_upgrade(&wasm_hash, &None);
+
+    bridge.cancel_upgrade(&None);
+
+    // The pending upgrade was cleared by the first cancellation, so a second
+    // cancel_upgrade (mirroring what execute_upgrade would see) has nothing left to cancel.
+    assert_eq!(
+        bridge.try_cancel_upgrade(&None),
+        Err(Ok(BridgeError::UpgradeNotScheduled))
+    );
+}
+
+#[test]
+#[should_panic]
+fn test_cancel_upgrade_non_admin_panics() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let wasm_hash = BytesN::from_array(&env, &[9u8; 32]);
+    bridge.schedule_upgrade(&wasm_hash, &None);
+
+    // Clear all mocked auths so cancel_upgrade runs without the admin's authorization.
+    use soroban_sdk::xdr::SorobanAuthorizationEntry;
+    env.set_auths(&[] as &[SorobanAuthorizationEntry]);
+    bridge.cancel_upgrade(&None);
+}

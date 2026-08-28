@@ -2306,7 +2306,30 @@ impl OnboardingBridge {
         new_wasm_hash: BytesN<32>,
         nonce: Option<u64>,
     ) -> Result<u32, BridgeError> {
-        todo!("implement: schedule_upgrade")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_deactivated(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+
+        let executable_after_ledger = env
+            .ledger()
+            .sequence()
+            .saturating_add(UPGRADE_TIMELOCK_LEDGERS);
+
+        let pending = PendingUpgrade {
+            new_wasm_hash: new_wasm_hash.clone(),
+            executable_after_ledger,
+        };
+        save_pending_upgrade(&env, &pending);
+
+        env.events().publish(
+            ("UpgradeScheduled",),
+            (new_wasm_hash, executable_after_ledger, admin),
+        );
+        Ok(executable_after_ledger)
     }
 
     /// Executes a previously scheduled upgrade once its timelock has elapsed.
@@ -2371,7 +2394,24 @@ impl OnboardingBridge {
     ///
     /// * `("UpgradeCancelled",)` — data: `(cancelled_wasm_hash, admin)`
     pub fn cancel_upgrade(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: cancel_upgrade")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_deactivated(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+
+        let pending = read_pending_upgrade(&env)
+            .ok_or(BridgeError::UpgradeNotScheduled)?;
+
+        clear_pending_upgrade(&env);
+
+        env.events().publish(
+            ("UpgradeCancelled",),
+            (pending.new_wasm_hash, admin),
+        );
+        Ok(())
     }
 
     /// Returns the pending scheduled upgrade, if any.
@@ -2379,7 +2419,7 @@ impl OnboardingBridge {
     /// Returns `None` if no upgrade has been scheduled or if a previous
     /// upgrade has already been executed or cancelled.
     pub fn query_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
-        todo!("implement: query_pending_upgrade")
+        read_pending_upgrade(&env)
     }
 
     /// Migrates the contract state to a new contract address in case of emergency.
