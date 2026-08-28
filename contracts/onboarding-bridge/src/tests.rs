@@ -53,6 +53,23 @@ fn check_balance(env: &Env, token_id: &Address, addr: &Address) -> i128 {
     token.balance(addr)
 }
 
+/// Advances the ledger's timestamp to `timestamp`.
+///
+/// soroban-sdk 22 mutates ledger state through `testutils::Ledger` trait
+/// methods (`set_timestamp` / `set_sequence_number`) rather than inherent
+/// methods on `env.ledger()`. Centralizing the call here means the many
+/// time-dependent tests below (and the benchmarks) don't each need to
+/// import that trait or hand-roll the read-then-write.
+pub(crate) fn advance_ledger_time(env: &Env, timestamp: u64) {
+    env.ledger().set_timestamp(timestamp);
+}
+
+/// Advances the ledger's sequence number to `sequence`. See
+/// [`advance_ledger_time`] for why this indirection exists.
+pub(crate) fn advance_ledger_sequence(env: &Env, sequence: u32) {
+    env.ledger().set_sequence_number(sequence);
+}
+
 #[test]
 fn test_initialize() {
     let env = Env::default();
@@ -959,7 +976,7 @@ fn test_reclaim_cannot_drain_active_timelocks() {
 
     // Once claimed, the timelocked amount leaves the contract balance and is
     // no longer ring-fenced: freshly accidental tokens are reclaimable again.
-    env.ledger().set_timestamp(release_time + 1);
+    advance_ledger_time(&env, release_time + 1);
     bridge.claim_timelocked(&id);
     mint_tokens(&env, &token_id, &bridge.address, 50i128);
     bridge.reclaim_tokens(&token_id, &50i128, &destination, &None);
@@ -2677,7 +2694,7 @@ mod timelocked_tests {
             &None,
         );
 
-        env.ledger().set_timestamp(release_time + 1);
+        advance_ledger_time(&env, release_time + 1);
         bridge.claim_timelocked(&id);
 
         assert_eq!(check_balance(&env, &token_id, &target), 495i128);
@@ -2771,7 +2788,7 @@ mod timelocked_tests {
             &None,
         );
 
-        env.ledger().set_timestamp(release_time + 1);
+        advance_ledger_time(&env, release_time + 1);
         bridge.claim_timelocked(&id);
 
         assert_eq!(
@@ -2849,8 +2866,7 @@ mod commit_reveal_tests {
 
     /// Advances the ledger past the commit-reveal minimum delay.
     fn advance_past_min_delay(env: &Env) {
-        let seq = env.ledger().sequence();
-        env.ledger().set_sequence_number(seq + MIN_DELAY_LEDGERS);
+        advance_ledger_sequence(env, env.ledger().sequence() + MIN_DELAY_LEDGERS);
     }
 
     #[test]
@@ -4848,7 +4864,7 @@ fn test_daily_limit_resets_next_day() {
     );
 
     // Advance to the next UTC day (86 400 seconds later).
-    env.ledger().set_timestamp(env.ledger().timestamp() + 86_400);
+    advance_ledger_time(&env, env.ledger().timestamp() + 86_400);
 
     // After the day rolls over the limit should reset, allowing a fresh transfer.
     let target2 = Address::generate(&env);
