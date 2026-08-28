@@ -1627,7 +1627,19 @@ impl OnboardingBridge {
         max_fee_bps: u32,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: set_asset_fee_cap")
+        check_initialized(&env)?;
+        if max_fee_bps > MAX_FEE_BPS {
+            return Err(BridgeError::FeeTooHigh);
+        }
+
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+
+        save_asset_fee_cap(&env, &asset, max_fee_bps);
+        extend_instance_ttl(&env);
+
+        Ok(())
     }
 
     /// Returns the fee cap configured for `asset`.
