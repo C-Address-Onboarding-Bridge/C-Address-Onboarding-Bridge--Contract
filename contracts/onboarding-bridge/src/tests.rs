@@ -2830,6 +2830,8 @@ mod timelocked_tests {
             &500i128,
             &release_time,
             &0u64,
+            &None,
+            &None,
         );
 
         assert_eq!(check_balance(&env, &loyalty_token_id, &user), 4i128);
