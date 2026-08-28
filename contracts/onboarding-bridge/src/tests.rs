@@ -1,6 +1,6 @@
 use crate::{
     BridgeError, DataKey, FeeTier, MetaFundParams, OnboardingBridge,
-    CRITICAL_ENTRY_TTL_THRESHOLD, MAX_ALLOWED_TTL,
+    CRITICAL_ENTRY_TTL_THRESHOLD, MAX_ALLOWED_TTL, UPGRADE_TIMELOCK_LEDGERS,
 };
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -5128,6 +5128,140 @@ fn test_verify_auth_entry_emits_event() {
     env.ledger().set_sequence_number(1_000);
 
     bridge.verify_auth_entry(&user, &9u64, &900u32, &1_100u32);
+
+    let events = env.events().all();
+    let (contract_id, _topics, _data) = &events.get(events.len() - 1).unwrap();
+    assert_eq!(contract_id, &bridge_id);
+}
+
+/********** schedule_upgrade tests **********/
+
+#[test]
+fn test_schedule_upgrade_success() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(1_000);
+
+    let new_hash = BytesN::from_array(&env, &[7; 32]);
+    let executable_after = bridge.schedule_upgrade(&new_hash, &None);
+
+    assert_eq!(executable_after, 1_000 + UPGRADE_TIMELOCK_LEDGERS);
+
+    let pending = bridge.query_pending_upgrade().expect("pending upgrade set");
+    assert_eq!(pending.new_wasm_hash, new_hash);
+    assert_eq!(pending.executable_after_ledger, executable_after);
+}
+
+#[test]
+fn test_schedule_upgrade_not_initialized() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    let new_hash = BytesN::from_array(&env, &[1; 32]);
+    assert_eq!(
+        bridge.try_schedule_upgrade(&new_hash, &None),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_schedule_upgrade_duplicate_nonce() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let new_hash = BytesN::from_array(&env, &[1; 32]);
+    // Passing a non-zero nonce on the first call mismatches the expected
+    // starting value.
+    assert_eq!(
+        bridge.try_schedule_upgrade(&new_hash, &Some(1u64)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+}
+
+#[test]
+fn test_schedule_upgrade_nonce_replay_rejected() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let hash1 = BytesN::from_array(&env, &[1; 32]);
+    bridge.schedule_upgrade(&hash1, &Some(0u64));
+
+    let hash2 = BytesN::from_array(&env, &[2; 32]);
+    assert_eq!(
+        bridge.try_schedule_upgrade(&hash2, &Some(0u64)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+}
+
+#[test]
+fn test_schedule_upgrade_none_skips_nonce_check() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let hash1 = BytesN::from_array(&env, &[1; 32]);
+    bridge.schedule_upgrade(&hash1, &None);
+
+    // Calling again with None still succeeds since the nonce check is skipped.
+    let hash2 = BytesN::from_array(&env, &[2; 32]);
+    bridge.schedule_upgrade(&hash2, &None);
+
+    let pending = bridge.query_pending_upgrade().expect("pending upgrade set");
+    assert_eq!(pending.new_wasm_hash, hash2);
+}
+
+#[test]
+fn test_schedule_upgrade_timelock_boundary() {
+    // The upgrade should not be executable one ledger before the timelock
+    // elapses, but should become executable exactly at the boundary.
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(2_000);
+
+    let new_hash = BytesN::from_array(&env, &[3; 32]);
+    let executable_after = bridge.schedule_upgrade(&new_hash, &None);
+
+    env.ledger().set_sequence_number(executable_after - 1);
+    assert_eq!(
+        bridge.try_execute_upgrade(&new_hash, &None),
+        Err(Ok(BridgeError::UpgradeTimelockActive))
+    );
+
+    env.ledger().set_sequence_number(executable_after);
+    bridge.execute_upgrade(&new_hash, &None);
+}
+
+#[test]
+fn test_schedule_upgrade_emits_event() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let new_hash = BytesN::from_array(&env, &[4; 32]);
+    bridge.schedule_upgrade(&new_hash, &None);
 
     let events = env.events().all();
     let (contract_id, _topics, _data) = &events.get(events.len() - 1).unwrap();
