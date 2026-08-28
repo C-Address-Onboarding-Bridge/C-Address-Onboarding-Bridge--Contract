@@ -2993,7 +2993,13 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn add_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
-        todo!("implement: add_relayer")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        read_admin(&env).require_auth();
+        extend_instance_ttl(&env);
+        add_relayer(&env, &pubkey);
+        Ok(())
     }
 
     /// Removes a relayer from the trusted set.
@@ -3334,7 +3340,26 @@ impl OnboardingBridge {
     ///
     /// * `("RelayerTtlExtended",)` — data: `(admin, pubkey, actual_ttl)`
     pub fn extend_relayer_ttl(env: Env, pubkey: BytesN<32>, ttl: u32) -> Result<(), BridgeError> {
-        todo!("implement: extend_relayer_ttl")
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let key = DataKey::Relayer(pubkey.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(BridgeError::NotRelayer);
+        }
+        let max_ttl = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        let threshold = max_ttl / 4;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, max_ttl);
+        env.events()
+            .publish(("RelayerTtlExtended",), (admin, pubkey, max_ttl));
+        Ok(())
     }
 
     /// Extends the persistent-storage TTL for all per-`(source, asset)` and

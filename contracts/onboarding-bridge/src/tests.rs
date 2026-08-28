@@ -5235,3 +5235,83 @@ fn test_extend_commitment_ttl_non_admin_panics() {
     env.set_auths(&[] as &[SorobanAuthorizationEntry]);
     bridge.extend_commitment_ttl(&id, &1_000u32);
 }
+
+/********** extend_relayer_ttl unit tests **********/
+
+fn setup_relayer_for_ttl(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, BytesN<32>) {
+    let (bridge_id, _) = register_all_contracts_mocked(env);
+    let bridge = create_bridge_client(env, &bridge_id);
+    let (admin, _user, fee_collector) = create_test_users(env);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let pubkey = BytesN::from_array(env, &[7u8; 32]);
+    bridge.add_relayer(&pubkey);
+    (bridge, bridge_id, pubkey)
+}
+
+#[test]
+fn test_extend_relayer_ttl_extends_entry() {
+    let env = Env::default();
+    let (bridge, bridge_id, pubkey) = setup_relayer_for_ttl(&env);
+
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    bridge.extend_relayer_ttl(&pubkey, &200_000u32);
+
+    let key = DataKey::Relayer(pubkey);
+    let ttl = env.as_contract(&bridge_id, || env.storage().persistent().get_ttl(&key));
+    assert!(ttl >= 200_000);
+}
+
+#[test]
+fn test_extend_relayer_ttl_not_initialized() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let pubkey = BytesN::from_array(&env, &[7u8; 32]);
+
+    assert_eq!(
+        bridge.try_extend_relayer_ttl(&pubkey, &1_000u32),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_extend_relayer_ttl_not_relayer() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // This pubkey was never registered with add_relayer.
+    let pubkey = BytesN::from_array(&env, &[42u8; 32]);
+    assert_eq!(
+        bridge.try_extend_relayer_ttl(&pubkey, &1_000u32),
+        Err(Ok(BridgeError::NotRelayer))
+    );
+}
+
+#[test]
+fn test_extend_relayer_ttl_caps_at_max_allowed() {
+    let env = Env::default();
+    let (bridge, bridge_id, pubkey) = setup_relayer_for_ttl(&env);
+
+    // Request far beyond the documented cap; the stored TTL must never exceed it.
+    bridge.extend_relayer_ttl(&pubkey, &(MAX_ALLOWED_TTL + 500_000));
+
+    let key = DataKey::Relayer(pubkey);
+    let ttl = env.as_contract(&bridge_id, || env.storage().persistent().get_ttl(&key));
+    assert!(ttl <= MAX_ALLOWED_TTL);
+}
+
+#[test]
+#[should_panic]
+fn test_extend_relayer_ttl_non_admin_panics() {
+    let env = Env::default();
+    let (bridge, _bridge_id, pubkey) = setup_relayer_for_ttl(&env);
+
+    // Clear all mocked auths so extend_relayer_ttl runs without the admin's authorization.
+    use soroban_sdk::xdr::SorobanAuthorizationEntry;
+    env.set_auths(&[] as &[SorobanAuthorizationEntry]);
+    bridge.extend_relayer_ttl(&pubkey, &1_000u32);
+}
