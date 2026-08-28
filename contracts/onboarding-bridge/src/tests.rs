@@ -4700,7 +4700,7 @@ fn test_extend_persistent_ttl_extends_asset_keys() {
         &None,
         &None,
     );
-    bridge.set_asset_fee_cap(&token_id, &1000u32);
+    bridge.set_asset_fee_cap(&token_id, &1000u32, &None);
 
     env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
     bridge.extend_persistent_ttl(&token_id, &200_000u32);
