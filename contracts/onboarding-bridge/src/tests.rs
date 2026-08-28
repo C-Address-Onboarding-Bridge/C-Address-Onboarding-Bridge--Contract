@@ -5287,3 +5287,119 @@ fn test_query_source_daily_limit_not_initialized() {
         Err(Ok(BridgeError::NotInitialized))
     );
 }
+
+/********** query_pending_upgrade coverage **********/
+//
+// `query_pending_upgrade` had no test naming it directly anywhere in the
+// suite. These cover: `None` before anything is scheduled, `Some` with the
+// exact scheduled fields, `None` again after both `execute_upgrade` and
+// `cancel_upgrade` (the two documented ways a pending upgrade clears), and
+// the boundary of re-scheduling before the first entry is consumed.
+
+#[test]
+fn test_query_pending_upgrade_none_before_scheduling() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert_eq!(bridge.query_pending_upgrade(), None);
+}
+
+#[test]
+fn test_query_pending_upgrade_returns_scheduled_entry() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(1_000);
+
+    let new_hash = BytesN::from_array(&env, &[0xABu8; 32]);
+    let unlock_ledger = bridge.schedule_upgrade(&new_hash, &None);
+
+    let pending = bridge.query_pending_upgrade();
+    assert_eq!(
+        pending,
+        Some(crate::PendingUpgrade {
+            new_wasm_hash: new_hash,
+            executable_after_ledger: unlock_ledger,
+        })
+    );
+    assert_eq!(unlock_ledger, 1_000 + crate::UPGRADE_TIMELOCK_LEDGERS);
+}
+
+#[test]
+fn test_query_pending_upgrade_none_after_execute() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    env.mock_all_auths();
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(1_000);
+
+    // Uploading a real compiled wasm costs far more than the default test
+    // budget allows; lift the limit so the test exercises logic, not gas.
+    env.cost_estimate().budget().reset_unlimited();
+    let wasm_bytes = Bytes::from_slice(&env, V2_WASM);
+    let wasm_hash: BytesN<32> = env.deployer().upload_contract_wasm(wasm_bytes);
+
+    let unlock_ledger = bridge.schedule_upgrade(&wasm_hash, &None);
+
+    // Boundary: execution only becomes valid once the sequence reaches the
+    // unlock ledger.
+    env.ledger().set_sequence_number(unlock_ledger);
+    bridge.execute_upgrade(&wasm_hash, &None);
+
+    assert_eq!(bridge.query_pending_upgrade(), None);
+}
+
+#[test]
+fn test_query_pending_upgrade_none_after_cancel() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(1_000);
+
+    let new_hash = BytesN::from_array(&env, &[0xEFu8; 32]);
+    bridge.schedule_upgrade(&new_hash, &None);
+    assert!(bridge.query_pending_upgrade().is_some());
+
+    bridge.cancel_upgrade(&None);
+    assert_eq!(bridge.query_pending_upgrade(), None);
+}
+
+#[test]
+fn test_query_pending_upgrade_updates_on_reschedule() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.ledger().set_sequence_number(1_000);
+
+    let first_hash = BytesN::from_array(&env, &[0x11u8; 32]);
+    bridge.schedule_upgrade(&first_hash, &None);
+
+    // Boundary: scheduling a second upgrade before the first is
+    // executed/cancelled overwrites the pending entry rather than erroring.
+    let second_hash = BytesN::from_array(&env, &[0x22u8; 32]);
+    let unlock_ledger = bridge.schedule_upgrade(&second_hash, &None);
+
+    assert_eq!(
+        bridge.query_pending_upgrade(),
+        Some(crate::PendingUpgrade {
+            new_wasm_hash: second_hash,
+            executable_after_ledger: unlock_ledger,
+        })
+    );
+}
