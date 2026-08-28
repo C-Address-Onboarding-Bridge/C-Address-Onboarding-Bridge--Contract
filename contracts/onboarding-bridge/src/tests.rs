@@ -5063,3 +5063,83 @@ fn test_query_fee_tiers_boundary_max_volume_is_i128_max() {
     assert_eq!(tier.max_volume, i128::MAX);
     assert_ne!(tier.max_volume, i128::MAX - 1);
 }
+
+// -----------------------------------------------------------------------
+// query_is_pool_whitelisted
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_query_is_pool_whitelisted_uninitialized() {
+    let env = Env::default();
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let pool = Address::generate(&env);
+
+    assert_eq!(
+        bridge.try_query_is_pool_whitelisted(&pool),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_query_is_pool_whitelisted_false_by_default() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let pool = Address::generate(&env);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // A pool that was never added is not whitelisted.
+    assert!(!bridge.query_is_pool_whitelisted(&pool));
+}
+
+#[test]
+fn test_query_is_pool_whitelisted_true_after_add() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let pool = Address::generate(&env);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.add_swap_pool(&pool, &None);
+
+    assert!(bridge.query_is_pool_whitelisted(&pool));
+}
+
+#[test]
+fn test_query_is_pool_whitelisted_false_after_remove() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let pool = Address::generate(&env);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.add_swap_pool(&pool, &None);
+    assert!(bridge.query_is_pool_whitelisted(&pool));
+
+    // Boundary: the whitelist state transition back to "not whitelisted"
+    // after explicit removal.
+    bridge.remove_swap_pool(&pool, &None);
+    assert!(!bridge.query_is_pool_whitelisted(&pool));
+}
+
+#[test]
+fn test_query_is_pool_whitelisted_is_per_address() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let pool_a = Address::generate(&env);
+    let pool_b = Address::generate(&env);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.add_swap_pool(&pool_a, &None);
+
+    // Whitelisting one pool must not leak into another address's status.
+    assert!(bridge.query_is_pool_whitelisted(&pool_a));
+    assert!(!bridge.query_is_pool_whitelisted(&pool_b));
+}
