@@ -5313,3 +5313,50 @@ fn test_safe_sub_boundary_max_minus_max() {
 fn test_safe_sub_boundary_min_minus_min() {
     assert_eq!(crate::safe_math::safe_sub(i128::MIN, i128::MIN), Ok(0i128));
 }
+
+/********** safe_div tests **********/
+
+#[test]
+fn test_safe_div_success() {
+    assert_eq!(crate::safe_math::safe_div(10i128, 2i128), Ok(5i128));
+    assert_eq!(crate::safe_math::safe_div(-9i128, 3i128), Ok(-3i128));
+}
+
+#[test]
+fn test_safe_div_truncates_toward_zero() {
+    assert_eq!(crate::safe_math::safe_div(7i128, 2i128), Ok(3i128));
+    assert_eq!(crate::safe_math::safe_div(-7i128, 2i128), Ok(-3i128));
+}
+
+#[test]
+fn test_safe_div_zero_numerator() {
+    assert_eq!(crate::safe_math::safe_div(0i128, 5i128), Ok(0i128));
+}
+
+#[test]
+fn test_safe_div_by_zero_error() {
+    assert_eq!(
+        crate::safe_math::safe_div(10i128, 0i128),
+        Err(BridgeError::Overflow)
+    );
+}
+
+#[test]
+fn test_safe_div_min_by_negative_one_overflow_error() {
+    // i128::MIN / -1 overflows the representable range.
+    assert_eq!(
+        crate::safe_math::safe_div(i128::MIN, -1i128),
+        Err(BridgeError::Overflow)
+    );
+}
+
+#[test]
+fn test_safe_div_boundary_min_by_one() {
+    // i128::MIN / 1 is exactly representable and must not overflow.
+    assert_eq!(crate::safe_math::safe_div(i128::MIN, 1i128), Ok(i128::MIN));
+}
+
+#[test]
+fn test_safe_div_boundary_max_by_one() {
+    assert_eq!(crate::safe_math::safe_div(i128::MAX, 1i128), Ok(i128::MAX));
+}
