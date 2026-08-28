@@ -4967,3 +4967,92 @@ fn test_set_max_withdraw_per_tx_updates_limit() {
     bridge.set_max_withdraw_per_tx(&0i128, &None);
     assert_eq!(bridge.query_max_withdraw_per_tx(), 0i128);
 }
+
+/********** query_auth_nonce_used **********/
+//
+// query_auth_nonce_used(source, nonce) reports whether a specific auth-entry
+// nonce has already been consumed for `source`. It has no documented error
+// conditions (it always returns a bool), so coverage here focuses on the
+// success path, the "not yet used" default, isolation between nonces, per-
+// source scoping, and the u64 boundary values (0 and u64::MAX).
+
+#[test]
+fn test_query_auth_nonce_used_false_for_never_used_nonce() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // Nothing has been consumed yet for `user`, at any nonce.
+    assert!(!bridge.query_auth_nonce_used(&user, &0u64));
+    assert!(!bridge.query_auth_nonce_used(&user, &42u64));
+}
+
+#[test]
+fn test_query_auth_nonce_used_true_after_consumption() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // Directly mark nonce 5 as consumed for `user`, bypassing
+    // verify_auth_entry (which is exercised elsewhere).
+    env.as_contract(&bridge_id, || {
+        crate::mark_auth_nonce_used(&env, &user, 5u64);
+    });
+
+    assert!(bridge.query_auth_nonce_used(&user, &5u64));
+    // A neighboring nonce that was never consumed must stay false.
+    assert!(!bridge.query_auth_nonce_used(&user, &4u64));
+    assert!(!bridge.query_auth_nonce_used(&user, &6u64));
+}
+
+#[test]
+fn test_query_auth_nonce_used_is_scoped_per_source() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let other = Address::generate(&env);
+    env.as_contract(&bridge_id, || {
+        crate::mark_auth_nonce_used(&env, &user, 3u64);
+    });
+
+    // Consuming nonce 3 for `user` must not mark it used for a different source.
+    assert!(bridge.query_auth_nonce_used(&user, &3u64));
+    assert!(!bridge.query_auth_nonce_used(&other, &3u64));
+}
+
+#[test]
+fn test_query_auth_nonce_used_boundary_values() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // The lower (0) and upper (u64::MAX) bounds of the nonce space must be
+    // independently addressable and default to unused.
+    assert!(!bridge.query_auth_nonce_used(&user, &0u64));
+    assert!(!bridge.query_auth_nonce_used(&user, &u64::MAX));
+
+    env.as_contract(&bridge_id, || {
+        crate::mark_auth_nonce_used(&env, &user, 0u64);
+    });
+    assert!(bridge.query_auth_nonce_used(&user, &0u64));
+    // Marking the lower bound used must not affect the upper bound.
+    assert!(!bridge.query_auth_nonce_used(&user, &u64::MAX));
+
+    env.as_contract(&bridge_id, || {
+        crate::mark_auth_nonce_used(&env, &user, u64::MAX);
+    });
+    assert!(bridge.query_auth_nonce_used(&user, &u64::MAX));
+}
