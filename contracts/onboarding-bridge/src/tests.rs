@@ -5235,3 +5235,105 @@ fn test_propose_new_fee_collector_then_accept_completes_handoff() {
     // The pending slot is cleared once the handoff is accepted.
     assert_eq!(bridge.query_pending_fee_collector(), None);
 }
+
+/********** propose_new_admin **********/
+//
+// propose_new_admin starts the two-step admin handoff: it records
+// `new_admin` as pending without touching the active admin until
+// accept_admin is called by the proposed address. This path exists
+// specifically to avoid accidentally transferring control to an unusable
+// key (unlike the one-step set_admin), so it shares the same guard rails
+// (NotInitialized, ContractPaused, DuplicateNonce) as the rest of the
+// admin-mutation surface.
+
+#[test]
+fn test_propose_new_admin_sets_pending_without_changing_active() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_admin = Address::generate(&env);
+
+    assert_eq!(bridge.query_pending_admin(), None);
+
+    bridge.propose_new_admin(&new_admin, &None);
+
+    // The proposal is recorded as pending, but the active admin is
+    // untouched until accept_admin is called.
+    assert_eq!(bridge.query_pending_admin(), Some(new_admin));
+    assert_eq!(bridge.query_admin(), admin);
+}
+
+#[test]
+fn test_propose_new_admin_not_initialized() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_propose_new_admin(&Address::generate(&env), &None),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_propose_new_admin_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+
+    assert_eq!(
+        bridge.try_propose_new_admin(&Address::generate(&env), &None),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_propose_new_admin_duplicate_nonce_rejected() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // Admin's sequential nonce starts at 0; supplying anything else fails.
+    assert_eq!(
+        bridge.try_propose_new_admin(&Address::generate(&env), &Some(5u64)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+
+    // The correct nonce (0) is accepted and advances the counter.
+    bridge.propose_new_admin(&Address::generate(&env), &Some(0u64));
+    assert_eq!(bridge.query_nonce(&admin), 1u64);
+
+    // Replaying nonce 0 is now rejected.
+    assert_eq!(
+        bridge.try_propose_new_admin(&Address::generate(&env), &Some(0u64)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+}
+
+#[test]
+fn test_propose_new_admin_then_accept_completes_handoff() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_admin = Address::generate(&env);
+
+    bridge.propose_new_admin(&new_admin, &None);
+    bridge.accept_admin();
+
+    assert_eq!(bridge.query_admin(), new_admin);
+    // The pending slot is cleared once the handoff is accepted.
+    assert_eq!(bridge.query_pending_admin(), None);
+}
