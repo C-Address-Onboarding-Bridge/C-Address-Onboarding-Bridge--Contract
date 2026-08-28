@@ -4967,3 +4967,89 @@ fn test_set_max_withdraw_per_tx_updates_limit() {
     bridge.set_max_withdraw_per_tx(&0i128, &None);
     assert_eq!(bridge.query_max_withdraw_per_tx(), 0i128);
 }
+
+/********** accept_fee_collector unit tests **********/
+
+#[test]
+fn test_accept_fee_collector_success() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_collector = Address::generate(&env);
+    bridge.propose_new_fee_collector(&new_collector, &None);
+    assert_eq!(bridge.query_pending_fee_collector(), Some(new_collector.clone()));
+
+    bridge.accept_fee_collector();
+
+    assert_eq!(bridge.query_fee_collector(), new_collector);
+    // The pending handoff is cleared once accepted.
+    assert_eq!(bridge.query_pending_fee_collector(), None);
+}
+
+#[test]
+fn test_accept_fee_collector_without_pending_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // No propose_new_fee_collector call preceded this, so there is nothing to accept.
+    assert_eq!(
+        bridge.try_accept_fee_collector(),
+        Err(Ok(BridgeError::Unauthorized))
+    );
+}
+
+#[test]
+fn test_accept_fee_collector_not_initialized() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_accept_fee_collector(),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_accept_fee_collector_while_paused_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_collector = Address::generate(&env);
+    bridge.propose_new_fee_collector(&new_collector, &None);
+    bridge.pause(&None);
+
+    assert_eq!(
+        bridge.try_accept_fee_collector(),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+#[should_panic]
+fn test_accept_fee_collector_without_authorization_panics() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_collector = Address::generate(&env);
+    bridge.propose_new_fee_collector(&new_collector, &None);
+
+    // Clear all mocked auths so accept_fee_collector runs without the
+    // pending collector's authorization.
+    use soroban_sdk::xdr::SorobanAuthorizationEntry;
+    env.set_auths(&[] as &[SorobanAuthorizationEntry]);
+    bridge.accept_fee_collector();
+}

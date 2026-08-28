@@ -1686,18 +1686,40 @@ impl OnboardingBridge {
     /// operations because it proves the proposed collector controls the key
     /// before the role is moved.
     pub fn propose_new_fee_collector(env: Env, new_collector: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: propose_new_fee_collector")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+        save_pending_fee_collector(&env, &new_collector);
+        env.events()
+            .publish(("FeeCollectorTransferProposed", admin, new_collector), ());
+        Ok(())
     }
 
     /// Accepts a pending fee-collector handoff.
     pub fn accept_fee_collector(env: Env) -> Result<(), BridgeError> {
-        todo!("implement: accept_fee_collector")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let pending = read_pending_fee_collector(&env).ok_or(BridgeError::Unauthorized)?;
+        pending.require_auth();
+        extend_instance_ttl(&env);
+        let old_collector = read_fee_collector(&env);
+        save_fee_collector(&env, &pending);
+        let mut config = read_bridge_config(&env);
+        config.fee_collector = pending.clone();
+        save_bridge_config(&env, &config);
+        clear_pending_fee_collector(&env);
+        env.events()
+            .publish(("FeeCollectorTransferred", old_collector, pending), ());
+        Ok(())
     }
 
     pub fn query_pending_fee_collector(env: Env) -> Option<Address> {
-
-        todo!("implement: query_pending_fee_collector")
-
+        read_pending_fee_collector(&env)
     }
 
     pub fn set_admin(env: Env, new_admin: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
