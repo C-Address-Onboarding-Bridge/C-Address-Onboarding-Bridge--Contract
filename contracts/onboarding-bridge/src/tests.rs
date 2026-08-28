@@ -729,6 +729,154 @@ fn test_upgrade_non_admin_rejected() {
     bridge.upgrade(&wasm_hash, &None);
 }
 
+/********** Timelocked upgrade tests (execute_upgrade) **********/
+
+#[test]
+fn test_execute_upgrade_succeeds_at_timelock_boundary_and_clears_pending() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // Uploading a real compiled wasm costs far more than the default test
+    // budget allows; lift the limit so the test exercises logic, not gas.
+    env.cost_estimate().budget().reset_unlimited();
+    let wasm_bytes = Bytes::from_slice(&env, V2_WASM);
+    let wasm_hash: BytesN<32> = env.deployer().upload_contract_wasm(wasm_bytes);
+
+    let executable_after_ledger = bridge.schedule_upgrade(&wasm_hash, &None);
+    assert_eq!(
+        bridge.query_pending_upgrade(),
+        Some(crate::PendingUpgrade {
+            new_wasm_hash: wasm_hash.clone(),
+            executable_after_ledger,
+        })
+    );
+
+    // Exactly at the boundary: docs specify `sequence >= scheduled + timelock`,
+    // so landing exactly on `executable_after_ledger` must already succeed.
+    advance_ledger_sequence(&env, executable_after_ledger);
+    bridge.execute_upgrade(&wasm_hash, &None);
+
+    // The pending record is cleared before the wasm swap, so a second
+    // execute now reports "not scheduled" rather than replaying the upgrade.
+    assert_eq!(bridge.query_pending_upgrade(), None);
+    assert_eq!(
+        bridge.try_execute_upgrade(&wasm_hash, &None),
+        Err(Ok(BridgeError::UpgradeNotScheduled))
+    );
+
+    assert_eq!(count_events_with_topic(&env, &bridge_id, "ContractUpgraded"), 1);
+}
+
+#[test]
+fn test_execute_upgrade_not_initialized_fails() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_execute_upgrade(&BytesN::from_array(&env, &[0u8; 32]), &None),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_execute_upgrade_not_scheduled_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert_eq!(
+        bridge.try_execute_upgrade(&BytesN::from_array(&env, &[1u8; 32]), &None),
+        Err(Ok(BridgeError::UpgradeNotScheduled))
+    );
+}
+
+#[test]
+fn test_execute_upgrade_hash_mismatch_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let scheduled_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let wrong_hash = BytesN::from_array(&env, &[2u8; 32]);
+    let executable_after_ledger = bridge.schedule_upgrade(&scheduled_hash, &None);
+    advance_ledger_sequence(&env, executable_after_ledger);
+
+    // Never reaches the wasm swap, so a synthetic (non-uploaded) hash is fine here.
+    assert_eq!(
+        bridge.try_execute_upgrade(&wrong_hash, &None),
+        Err(Ok(BridgeError::UpgradeHashMismatch))
+    );
+}
+
+#[test]
+fn test_execute_upgrade_before_timelock_elapses_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let wasm_hash = BytesN::from_array(&env, &[1u8; 32]);
+    bridge.schedule_upgrade(&wasm_hash, &None);
+
+    // No ledgers have elapsed since scheduling.
+    assert_eq!(
+        bridge.try_execute_upgrade(&wasm_hash, &None),
+        Err(Ok(BridgeError::UpgradeTimelockActive))
+    );
+}
+
+#[test]
+fn test_execute_upgrade_one_ledger_before_boundary_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let wasm_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let executable_after_ledger = bridge.schedule_upgrade(&wasm_hash, &None);
+    advance_ledger_sequence(&env, executable_after_ledger - 1);
+
+    assert_eq!(
+        bridge.try_execute_upgrade(&wasm_hash, &None),
+        Err(Ok(BridgeError::UpgradeTimelockActive))
+    );
+}
+
+#[test]
+fn test_execute_upgrade_duplicate_nonce_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let wasm_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let executable_after_ledger = bridge.schedule_upgrade(&wasm_hash, &None);
+    advance_ledger_sequence(&env, executable_after_ledger);
+
+    // The admin's nonce is still 0; passing 1 must be rejected.
+    assert_eq!(
+        bridge.try_execute_upgrade(&wasm_hash, &Some(1u64)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+}
+
 // --------- Blocklist / Allowlist Tests ---------
 
 fn setup_bridge(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, Address, Address) {
