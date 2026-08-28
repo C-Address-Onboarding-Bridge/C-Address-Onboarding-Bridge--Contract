@@ -1716,7 +1716,21 @@ impl OnboardingBridge {
 
     /// Accepts a pending admin handoff.
     pub fn accept_admin(env: Env) -> Result<(), BridgeError> {
-        todo!("implement: accept_admin")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let pending = read_pending_admin(&env).ok_or(BridgeError::Unauthorized)?;
+        pending.require_auth();
+        extend_instance_ttl(&env);
+        let old_admin = read_admin(&env);
+        save_admin(&env, &pending);
+        let mut config = read_bridge_config(&env);
+        config.admin = pending.clone();
+        save_bridge_config(&env, &config);
+        clear_pending_admin(&env);
+        env.events()
+            .publish(("AdminTransferred", old_admin, pending), ());
+        Ok(())
     }
 
     pub fn query_pending_admin(env: Env) -> Option<Address> {

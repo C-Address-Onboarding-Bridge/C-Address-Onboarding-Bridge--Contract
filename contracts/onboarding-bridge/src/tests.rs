@@ -4967,3 +4967,108 @@ fn test_set_max_withdraw_per_tx_updates_limit() {
     bridge.set_max_withdraw_per_tx(&0i128, &None);
     assert_eq!(bridge.query_max_withdraw_per_tx(), 0i128);
 }
+
+/********** accept_admin tests **********/
+
+#[test]
+fn test_accept_admin_transfers_control() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_admin = Address::generate(&env);
+    bridge.propose_new_admin(&new_admin, &None);
+
+    bridge.accept_admin();
+
+    assert_eq!(bridge.query_admin(), new_admin);
+    assert_eq!(bridge.query_pending_admin(), None);
+}
+
+#[test]
+fn test_accept_admin_emits_event() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_admin = Address::generate(&env);
+    bridge.propose_new_admin(&new_admin, &None);
+    bridge.accept_admin();
+
+    let events = env.events().all();
+    let (contract_id, _topics, _data) = &events.get(events.len() - 1).unwrap();
+    assert_eq!(contract_id, &bridge_id);
+}
+
+// accept_admin's doc comment doesn't spell out an # Errors section, but the
+// implementation is only reachable through the same NotInitialized /
+// ContractPaused gate every other admin setter uses, plus an Unauthorized
+// bounce when there is no pending handoff to accept.
+#[test]
+fn test_accept_admin_without_pending_proposal_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert_eq!(
+        bridge.try_accept_admin(),
+        Err(Ok(BridgeError::Unauthorized))
+    );
+}
+
+#[test]
+fn test_accept_admin_before_initialize_fails() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_accept_admin(),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_accept_admin_while_paused_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_admin = Address::generate(&env);
+    bridge.propose_new_admin(&new_admin, &None);
+    bridge.pause(&None);
+
+    assert_eq!(
+        bridge.try_accept_admin(),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+// Boundary: the pending slot is cleared on acceptance, so a second accept
+// has nothing left to consume and must fail the same way as "never proposed".
+#[test]
+fn test_accept_admin_cannot_be_reused_after_acceptance() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_admin = Address::generate(&env);
+    bridge.propose_new_admin(&new_admin, &None);
+    bridge.accept_admin();
+
+    assert_eq!(
+        bridge.try_accept_admin(),
+        Err(Ok(BridgeError::Unauthorized))
+    );
+}
