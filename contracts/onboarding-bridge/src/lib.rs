@@ -1720,9 +1720,7 @@ impl OnboardingBridge {
     }
 
     pub fn query_pending_admin(env: Env) -> Option<Address> {
-
-        todo!("implement: query_pending_admin")
-
+        read_pending_admin(&env)
     }
 
     pub fn set_minimum_amount(env: Env, amount: i128, nonce: Option<u64>) -> Result<(), BridgeError> {

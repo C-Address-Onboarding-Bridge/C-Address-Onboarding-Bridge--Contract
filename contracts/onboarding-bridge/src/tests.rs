@@ -5151,3 +5151,57 @@ fn test_query_minimum_amount_boundary_enforced_by_fund_c_address() {
     bridge.fund_c_address(&user, &target, &token_id, &200i128, &None, &None);
     assert_eq!(check_balance(&env, &token_id, &target), 200i128);
 }
+
+/********** query_pending_admin unit tests **********/
+
+#[test]
+fn test_query_pending_admin_defaults_to_none() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // No admin handoff has been proposed yet.
+    assert_eq!(bridge.query_pending_admin(), None);
+}
+
+#[test]
+fn test_query_pending_admin_reflects_proposal() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let candidate = Address::generate(&env);
+    bridge.propose_new_admin(&candidate, &None);
+    assert_eq!(bridge.query_pending_admin(), Some(candidate.clone()));
+
+    // A later proposal overwrites the previously pending candidate.
+    let other_candidate = Address::generate(&env);
+    bridge.propose_new_admin(&other_candidate, &None);
+    assert_eq!(bridge.query_pending_admin(), Some(other_candidate));
+}
+
+#[test]
+fn test_query_pending_admin_cleared_after_accept() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let candidate = Address::generate(&env);
+    bridge.propose_new_admin(&candidate, &None);
+    assert_eq!(bridge.query_pending_admin(), Some(candidate.clone()));
+
+    bridge.accept_admin();
+
+    // Accepting promotes the candidate to admin and clears the pending slot.
+    assert_eq!(bridge.query_admin(), candidate);
+    assert_eq!(bridge.query_pending_admin(), None);
+}
