@@ -4884,6 +4884,122 @@ fn test_extend_persistent_ttl_extends_asset_keys() {
     }
 }
 
+/********** extend_source_persistent_ttl tests **********/
+
+#[test]
+fn test_extend_source_persistent_ttl_extends_source_keys() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_source_daily_limit(&user, &token_id, &10_000i128, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    bridge.fund_c_address(
+        &user,
+        &Address::generate(&env),
+        &token_id,
+        &500i128,
+        &Some(0u64),
+        &None,
+    );
+
+    let seq = env.ledger().sequence();
+    bridge.verify_auth_entry(&user, &0u64, &0u32, &(seq + 100));
+
+    // The daily-usage key is scoped by calendar day, derived the same way
+    // `check_daily_limit` derives it internally.
+    let day = env.ledger().timestamp() / 86_400;
+
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    bridge.extend_source_persistent_ttl(&user, &token_id, &200_000u32);
+
+    let expected_keys = [
+        DataKey::SourceDailyLimit(user.clone(), token_id.clone()),
+        DataKey::DailyUsage(user.clone(), token_id.clone(), day),
+        DataKey::UserDeposit(user.clone(), token_id.clone()),
+        DataKey::SourceBridgedVolume(user.clone()),
+        DataKey::Nonce(user.clone()),
+        DataKey::AuthNonce(user.clone()),
+    ];
+    for key in expected_keys.iter() {
+        let ttl = env.as_contract(&bridge_id, || env.storage().persistent().get_ttl(key));
+        assert!(ttl >= 200_000);
+    }
+
+    assert_eq!(
+        count_events_with_topic(&env, &bridge_id, "SourcePersistentTtlExtended"),
+        1
+    );
+}
+
+#[test]
+fn test_extend_source_persistent_ttl_not_initialized_fails() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let source = Address::generate(&env);
+    let asset = Address::generate(&env);
+
+    assert_eq!(
+        bridge.try_extend_source_persistent_ttl(&source, &asset, &200_000u32),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_extend_source_persistent_ttl_skips_missing_keys() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // This (source, asset) pair has never touched storage; none of the six
+    // keys exist, so the call must succeed rather than erroring on a
+    // missing entry, mirroring `extend_persistent_ttl`.
+    let source = Address::generate(&env);
+    let asset = Address::generate(&env);
+    bridge.extend_source_persistent_ttl(&source, &asset, &200_000u32);
+}
+
+#[test]
+fn test_extend_source_persistent_ttl_caps_at_max_allowed_ttl() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    bridge.fund_c_address(
+        &user,
+        &Address::generate(&env),
+        &token_id,
+        &500i128,
+        &None,
+        &None,
+    );
+
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    // Requesting far beyond the hard ceiling must silently clamp to
+    // `MAX_ALLOWED_TTL` rather than erroring or exceeding it.
+    bridge.extend_source_persistent_ttl(&user, &token_id, &(MAX_ALLOWED_TTL * 10));
+
+    let ttl = env.as_contract(&bridge_id, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::UserDeposit(user.clone(), token_id.clone()))
+    });
+    assert!(ttl <= MAX_ALLOWED_TTL);
+}
+
 #[test]
 fn test_set_max_ttl_updates_config() {
     let env = Env::default();
