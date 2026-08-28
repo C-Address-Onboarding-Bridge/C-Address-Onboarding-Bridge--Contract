@@ -5267,3 +5267,49 @@ fn test_schedule_upgrade_emits_event() {
     let (contract_id, _topics, _data) = &events.get(events.len() - 1).unwrap();
     assert_eq!(contract_id, &bridge_id);
 }
+
+/********** safe_sub tests **********/
+
+#[test]
+fn test_safe_sub_success() {
+    assert_eq!(crate::safe_math::safe_sub(10i128, 3i128), Ok(7i128));
+    assert_eq!(crate::safe_math::safe_sub(-5i128, -5i128), Ok(0i128));
+}
+
+#[test]
+fn test_safe_sub_negative_result() {
+    assert_eq!(crate::safe_math::safe_sub(3i128, 10i128), Ok(-7i128));
+}
+
+#[test]
+fn test_safe_sub_zero_identity() {
+    assert_eq!(crate::safe_math::safe_sub(42i128, 0i128), Ok(42i128));
+}
+
+#[test]
+fn test_safe_sub_underflow_error() {
+    // i128::MIN - 1 underflows the representable range.
+    assert_eq!(
+        crate::safe_math::safe_sub(i128::MIN, 1i128),
+        Err(BridgeError::Overflow)
+    );
+}
+
+#[test]
+fn test_safe_sub_overflow_error() {
+    // i128::MAX - (-1) overflows the representable range.
+    assert_eq!(
+        crate::safe_math::safe_sub(i128::MAX, -1i128),
+        Err(BridgeError::Overflow)
+    );
+}
+
+#[test]
+fn test_safe_sub_boundary_max_minus_max() {
+    assert_eq!(crate::safe_math::safe_sub(i128::MAX, i128::MAX), Ok(0i128));
+}
+
+#[test]
+fn test_safe_sub_boundary_min_minus_min() {
+    assert_eq!(crate::safe_math::safe_sub(i128::MIN, i128::MIN), Ok(0i128));
+}
