@@ -5134,3 +5134,104 @@ fn test_query_auth_nonce_is_scoped_per_source() {
     assert_eq!(bridge.query_auth_nonce(&user), 1u64);
     assert_eq!(bridge.query_auth_nonce(&other), 0u64);
 }
+
+/********** propose_new_fee_collector **********/
+//
+// propose_new_fee_collector starts the two-step fee-collector handoff: it
+// records `new_collector` as pending without touching the active fee
+// collector until accept_fee_collector is called by the proposed address.
+// It shares the standard admin-mutation guard rails (NotInitialized,
+// ContractPaused, DuplicateNonce) used throughout the contract's other
+// setters such as set_fee_collector.
+
+#[test]
+fn test_propose_new_fee_collector_sets_pending_without_changing_active() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_collector = Address::generate(&env);
+
+    assert_eq!(bridge.query_pending_fee_collector(), None);
+
+    bridge.propose_new_fee_collector(&new_collector, &None);
+
+    // The proposal is recorded as pending, but the active collector is
+    // untouched until accept_fee_collector is called.
+    assert_eq!(bridge.query_pending_fee_collector(), Some(new_collector));
+    assert_eq!(bridge.query_fee_collector(), fee_collector);
+}
+
+#[test]
+fn test_propose_new_fee_collector_not_initialized() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_propose_new_fee_collector(&Address::generate(&env), &None),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_propose_new_fee_collector_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+
+    assert_eq!(
+        bridge.try_propose_new_fee_collector(&Address::generate(&env), &None),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_propose_new_fee_collector_duplicate_nonce_rejected() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // Admin's sequential nonce starts at 0; supplying anything else fails.
+    assert_eq!(
+        bridge.try_propose_new_fee_collector(&Address::generate(&env), &Some(5u64)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+
+    // The correct nonce (0) is accepted and advances the counter.
+    bridge.propose_new_fee_collector(&Address::generate(&env), &Some(0u64));
+    assert_eq!(bridge.query_nonce(&admin), 1u64);
+
+    // Replaying nonce 0 is now rejected.
+    assert_eq!(
+        bridge.try_propose_new_fee_collector(&Address::generate(&env), &Some(0u64)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+}
+
+#[test]
+fn test_propose_new_fee_collector_then_accept_completes_handoff() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_collector = Address::generate(&env);
+
+    bridge.propose_new_fee_collector(&new_collector, &None);
+    bridge.accept_fee_collector();
+
+    assert_eq!(bridge.query_fee_collector(), new_collector);
+    // The pending slot is cleared once the handoff is accepted.
+    assert_eq!(bridge.query_pending_fee_collector(), None);
+}
