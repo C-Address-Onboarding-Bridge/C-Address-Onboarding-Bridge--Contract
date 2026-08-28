@@ -5070,3 +5070,120 @@ fn test_remove_relayer_not_initialized() {
         Err(Ok(BridgeError::NotInitialized))
     );
 }
+
+/********** query_timelocked coverage **********/
+//
+// `query_timelocked` had no test naming it directly anywhere in the suite.
+// These cover the success path (including that every field round-trips and
+// that `claimed` reflects a subsequent claim), the documented
+// `TimelockNotFound` error, and the boundary of the first-ever entry ID.
+
+#[test]
+fn test_query_timelocked_returns_entry_fields() {
+    let env = Env::default();
+    env.ledger().set_timestamp(10_000);
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 5_000i128);
+
+    let target = Address::generate(&env);
+    let release_time = 10_500u64;
+    let cliff_time = 10_200u64;
+
+    let id = bridge.fund_c_address_timelocked(
+        &user,
+        &target,
+        &token_id,
+        &750i128,
+        &release_time,
+        &cliff_time,
+        &None,
+        &None,
+    );
+
+    let entry = bridge.query_timelocked(&id);
+    assert_eq!(entry.source, user);
+    assert_eq!(entry.target, target);
+    assert_eq!(entry.asset, token_id);
+    assert_eq!(entry.amount, 750i128);
+    assert_eq!(entry.release_time, release_time);
+    assert_eq!(entry.cliff_time, cliff_time);
+    assert!(!entry.claimed);
+}
+
+#[test]
+fn test_query_timelocked_reflects_claimed_flag() {
+    let env = Env::default();
+    env.ledger().set_timestamp(20_000);
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 5_000i128);
+
+    let target = Address::generate(&env);
+    let release_time = 20_100u64;
+
+    let id = bridge.fund_c_address_timelocked(
+        &user, &target, &token_id, &400i128, &release_time, &0u64, &None, &None,
+    );
+
+    env.ledger().set_timestamp(release_time + 1);
+    bridge.claim_timelocked(&id);
+
+    let entry = bridge.query_timelocked(&id);
+    assert!(entry.claimed);
+}
+
+#[test]
+fn test_query_timelocked_unknown_id_fails_directly() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+
+    assert_eq!(
+        bridge.try_query_timelocked(&0u64),
+        Err(Ok(BridgeError::TimelockNotFound))
+    );
+}
+
+#[test]
+fn test_query_timelocked_boundary_first_id() {
+    let env = Env::default();
+    env.ledger().set_timestamp(30_000);
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1_000i128);
+
+    let target = Address::generate(&env);
+    // The very first timelock entry created must be queryable at whatever
+    // ID the contract assigns it (boundary: first-ever entry).
+    let id = bridge.fund_c_address_timelocked(
+        &user, &target, &token_id, &200i128, &30_100u64, &0u64, &None, &None,
+    );
+
+    let entry = bridge.query_timelocked(&id);
+    assert_eq!(entry.amount, 200i128);
+
+    // The next sequential ID must not yet exist.
+    assert_eq!(
+        bridge.try_query_timelocked(&(id + 1)),
+        Err(Ok(BridgeError::TimelockNotFound))
+    );
+}
