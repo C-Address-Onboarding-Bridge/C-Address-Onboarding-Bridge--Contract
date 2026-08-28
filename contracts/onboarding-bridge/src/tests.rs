@@ -4967,3 +4967,99 @@ fn test_set_max_withdraw_per_tx_updates_limit() {
     bridge.set_max_withdraw_per_tx(&0i128, &None);
     assert_eq!(bridge.query_max_withdraw_per_tx(), 0i128);
 }
+
+// -----------------------------------------------------------------------
+// query_fee_tiers
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_query_fee_tiers_uninitialized() {
+    let env = Env::default();
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_query_fee_tiers(),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_query_fee_tiers_default_synthetic_tier() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &75u32, &None);
+
+    // No tiers configured yet: a single synthetic tier covering the full
+    // volume range at the current global fee rate is returned.
+    let tiers = bridge.query_fee_tiers();
+    assert_eq!(tiers.len(), 1);
+    let tier = tiers.get(0).unwrap();
+    assert_eq!(tier.min_volume, 0i128);
+    assert_eq!(tier.max_volume, i128::MAX);
+    assert_eq!(tier.fee_bps, 75u32);
+}
+
+#[test]
+fn test_query_fee_tiers_default_tracks_global_fee_changes() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.set_fee_bps(&200u32, &None);
+
+    // The synthetic default tier reflects the current global rate, not the
+    // rate at initialization time.
+    let tiers = bridge.query_fee_tiers();
+    assert_eq!(tiers.len(), 1);
+    assert_eq!(tiers.get(0).unwrap().fee_bps, 200u32);
+}
+
+#[test]
+fn test_query_fee_tiers_returns_configured_tiers() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let mut tiers = Vec::new(&env);
+    tiers.push_back(FeeTier {
+        min_volume: 0,
+        max_volume: 999,
+        fee_bps: 100,
+    });
+    tiers.push_back(FeeTier {
+        min_volume: 1000,
+        max_volume: i128::MAX,
+        fee_bps: 25,
+    });
+    bridge.set_fee_tiers(&tiers);
+
+    // Once tiers are explicitly configured, the query returns exactly what
+    // was set rather than the synthetic fallback.
+    let queried = bridge.query_fee_tiers();
+    assert_eq!(queried, tiers);
+}
+
+#[test]
+fn test_query_fee_tiers_boundary_max_volume_is_i128_max() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // The documentation guarantees the synthetic tier's upper bound is
+    // exactly i128::MAX, not merely "very large".
+    let tier = bridge.query_fee_tiers().get(0).unwrap();
+    assert_eq!(tier.max_volume, i128::MAX);
+    assert_ne!(tier.max_volume, i128::MAX - 1);
+}
