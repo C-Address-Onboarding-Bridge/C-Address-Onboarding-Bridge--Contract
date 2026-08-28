@@ -13,11 +13,12 @@
 extern crate std;
 use std::{format, println};
 
+use crate::tests::swap_pool_contract::{SwapPool, SwapPoolClient};
 use crate::OnboardingBridge;
 
 use soroban_sdk::{
     contract, contractimpl, contracttype,
-    testutils::Address as _,
+    testutils::{Address as _, Ledger as _},
     Address, Bytes, BytesN, Env, Vec,
 };
 
@@ -443,8 +444,7 @@ fn bench_fund_c_address_with_swap() {
 
     // Deploy a minimal swap pool.
     let pool_id = env.register(SwapPool, ());
-    crate::benchmarks::SwapPoolClient::new(&env, &pool_id)
-        .initialize(&src_token_id, &dst_token_id, &1i128);
+    SwapPoolClient::new(&env, &pool_id).initialize(&src_token_id, &dst_token_id, &1i128);
 
     // Fund the swap pool with destination tokens.
     mint(&env, &dst_token_id, &pool_id, 10_000i128);
@@ -556,40 +556,4 @@ fn bench_tiered_fee_lookup() {
     });
 
     let _ = (admin, fee_collector);
-}
-
-// ═══ Minimal swap pool for bench_fund_c_address_with_swap ═════════════════════
-
-#[contracttype]
-pub enum SwapPoolKey {
-    InputToken,
-    OutputToken,
-    Rate,
-}
-
-#[contract]
-pub struct SwapPool;
-
-#[contractimpl]
-impl SwapPool {
-    pub fn initialize(e: Env, input_token: Address, output_token: Address, rate: i128) {
-        e.storage().instance().set(&SwapPoolKey::InputToken, &input_token);
-        e.storage().instance().set(&SwapPoolKey::OutputToken, &output_token);
-        e.storage().instance().set(&SwapPoolKey::Rate, &rate);
-    }
-
-    pub fn swap(e: Env, min_amount_out: i128, to: Address) -> i128 {
-        let rate: i128 = e.storage().instance().get(&SwapPoolKey::Rate).unwrap();
-        let input_token: Address = e.storage().instance().get(&SwapPoolKey::InputToken).unwrap();
-        let input_client = soroban_sdk::token::Client::new(&e, &input_token);
-        let amount_in = input_client.balance(&e.current_contract_address());
-        let amount_out = amount_in.checked_mul(rate).unwrap_or(0);
-        if amount_out < min_amount_out {
-            return amount_out;
-        }
-        let output_token: Address = e.storage().instance().get(&SwapPoolKey::OutputToken).unwrap();
-        let output_client = soroban_sdk::token::Client::new(&e, &output_token);
-        output_client.transfer(&e.current_contract_address(), &to, &amount_out);
-        amount_out
-    }
 }

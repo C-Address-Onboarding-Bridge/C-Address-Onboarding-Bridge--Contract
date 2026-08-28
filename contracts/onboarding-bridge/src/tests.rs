@@ -1466,7 +1466,7 @@ impl TestToken {
     }
 }
 
-mod swap_pool_contract {
+pub(crate) mod swap_pool_contract {
     use super::*;
 
     #[contracttype]
