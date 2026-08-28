@@ -16,6 +16,7 @@ use std::{format, println};
 use crate::tests::swap_pool_contract::{SwapPool, SwapPoolClient};
 use crate::OnboardingBridge;
 
+use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::{Address as _, Ledger as _},
@@ -314,7 +315,8 @@ fn bench_fund_c_address_crosschain() {
 
     // Register a single relayer and set threshold to 1.
     let relayer_secret: [u8; 32] = [1u8; 32];
-    let relayer_pubkey = BytesN::from_array(&env, &[1u8; 32]);
+    let relayer_signing_key = SigningKey::from_bytes(&relayer_secret);
+    let relayer_pubkey = BytesN::from_array(&env, relayer_signing_key.verifying_key().as_bytes());
     bridge.add_relayer(&relayer_pubkey);
     bridge.set_relayer_threshold(&1u32);
 
@@ -349,8 +351,8 @@ fn bench_fund_c_address_crosschain() {
     payload.append(&Bytes::from(nonce_hash));
     let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
 
-    // Create a relayer signature using the env's Ed25519.
-    let sig = env.crypto().ed25519_sign(&relayer_secret, &payload_hash);
+    // Create a relayer signature off-host (the host `Crypto` interface only verifies).
+    let sig = ed25519_sign_payload(&env, &relayer_signing_key, &payload_hash);
 
     let sigs = Vec::from_array(
         &env,
@@ -365,6 +367,27 @@ fn bench_fund_c_address_crosschain() {
     });
 
     let _ = admin;
+}
+
+// ── ed25519 signing helper ─────────────────────────────────────────────────────
+//
+// The host `Crypto` interface only exposes signature *verification*; producing
+// a signature is something done off-host by whoever holds the secret key (a
+// relayer, a meta-tx sender). Benchmarks stand in for that off-host signer
+// using ed25519-dalek directly, mirroring the pattern already used in
+// `tests.rs` (see `make_relayer_sig` / `sign_meta_fund_payload`).
+fn ed25519_sign_payload(
+    env: &Env,
+    signing_key: &SigningKey,
+    payload_hash: &BytesN<32>,
+) -> BytesN<64> {
+    let hash_bytes: Bytes = payload_hash.clone().into();
+    let mut hash_arr = [0u8; 32];
+    for i in 0..32 {
+        hash_arr[i] = hash_bytes.get(i as u32).unwrap();
+    }
+    let sig = signing_key.sign(&hash_arr);
+    BytesN::from_array(env, &sig.to_bytes())
 }
 
 /// Copies a Soroban `Address`'s strkey into `buf` and returns its SHA-256 hash,
@@ -478,7 +501,8 @@ fn bench_execute_meta_fund() {
 
     // Generate a keypair and register it as the meta signer for source.
     let secret: [u8; 32] = [7u8; 32];
-    let pubkey = BytesN::from_array(&env, &[7u8; 32]);
+    let signing_key = SigningKey::from_bytes(&secret);
+    let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
     bridge.register_meta_signer(&source, &pubkey);
 
     // Build the canonical meta-fund payload and sign it.
@@ -503,7 +527,7 @@ fn bench_execute_meta_fund() {
     payload.extend_from_array(&deadline.to_be_bytes());
     let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
 
-    let signature = env.crypto().ed25519_sign(&secret, &payload_hash);
+    let signature = ed25519_sign_payload(&env, &signing_key, &payload_hash);
 
     let params = crate::MetaFundParams {
         source: source.clone(),
