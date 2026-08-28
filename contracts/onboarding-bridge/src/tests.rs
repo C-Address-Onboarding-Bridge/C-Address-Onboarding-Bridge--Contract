@@ -5143,3 +5143,86 @@ fn test_query_is_pool_whitelisted_is_per_address() {
     assert!(bridge.query_is_pool_whitelisted(&pool_a));
     assert!(!bridge.query_is_pool_whitelisted(&pool_b));
 }
+
+// -----------------------------------------------------------------------
+// query_loyalty_token
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_query_loyalty_token_uninitialized() {
+    let env = Env::default();
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_query_loyalty_token(),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_query_loyalty_token_not_set() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // Initialized, but no loyalty token has been configured yet.
+    assert_eq!(
+        bridge.try_query_loyalty_token(),
+        Err(Ok(BridgeError::LoyaltyTokenNotSet))
+    );
+}
+
+#[test]
+fn test_query_loyalty_token_returns_configured_values() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.set_loyalty_token(&token_id, &42i128);
+
+    let (returned_token, returned_amount) = bridge.query_loyalty_token();
+    assert_eq!(returned_token, token_id);
+    assert_eq!(returned_amount, 42i128);
+}
+
+#[test]
+fn test_query_loyalty_token_zero_amount_boundary() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // The docs call out 0 as a valid boundary that "effectively disables
+    // rewards" without meaning "unset" — the token must still be
+    // considered configured.
+    bridge.set_loyalty_token(&token_id, &0i128);
+
+    let (returned_token, returned_amount) = bridge.query_loyalty_token();
+    assert_eq!(returned_token, token_id);
+    assert_eq!(returned_amount, 0i128);
+}
+
+#[test]
+fn test_query_loyalty_token_reflects_latest_update() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let other_token = Address::generate(&env);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.set_loyalty_token(&token_id, &10i128);
+    bridge.set_loyalty_token(&other_token, &20i128);
+
+    let (returned_token, returned_amount) = bridge.query_loyalty_token();
+    assert_eq!(returned_token, other_token);
+    assert_eq!(returned_amount, 20i128);
+}
