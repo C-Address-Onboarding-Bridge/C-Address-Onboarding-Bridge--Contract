@@ -5226,3 +5226,99 @@ fn test_query_loyalty_token_reflects_latest_update() {
     assert_eq!(returned_token, other_token);
     assert_eq!(returned_amount, 20i128);
 }
+
+// -----------------------------------------------------------------------
+// query_meta_signer
+// -----------------------------------------------------------------------
+
+#[test]
+fn test_query_meta_signer_returns_none_when_unregistered() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let source = Address::generate(&env);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert_eq!(bridge.query_meta_signer(&source), None);
+}
+
+#[test]
+fn test_query_meta_signer_works_before_initialize() {
+    // Unlike the query_* functions that read shared contract config,
+    // query_meta_signer has no documented Errors section and no
+    // NotInitialized check — it must be safe to call on a freshly
+    // registered, uninitialized contract.
+    let env = Env::default();
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let source = Address::generate(&env);
+
+    assert_eq!(bridge.query_meta_signer(&source), None);
+}
+
+#[test]
+fn test_query_meta_signer_returns_registered_key() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let source = Address::generate(&env);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+    let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+    bridge.register_meta_signer(&source, &pubkey);
+
+    assert_eq!(bridge.query_meta_signer(&source), Some(pubkey));
+}
+
+#[test]
+fn test_query_meta_signer_is_per_source() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let source_a = Address::generate(&env);
+    let source_b = Address::generate(&env);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let signing_key = SigningKey::from_bytes(&[3u8; 32]);
+    let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+    bridge.register_meta_signer(&source_a, &pubkey);
+
+    // Boundary: binding a key to one source must not be visible when
+    // querying an unrelated source.
+    assert_eq!(bridge.query_meta_signer(&source_a), Some(pubkey));
+    assert_eq!(bridge.query_meta_signer(&source_b), None);
+}
+
+#[test]
+fn test_query_meta_signer_reflects_reregistration() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let source = Address::generate(&env);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let key_one = BytesN::from_array(
+        &env,
+        SigningKey::from_bytes(&[1u8; 32]).verifying_key().as_bytes(),
+    );
+    let key_two = BytesN::from_array(
+        &env,
+        SigningKey::from_bytes(&[2u8; 32]).verifying_key().as_bytes(),
+    );
+
+    bridge.register_meta_signer(&source, &key_one);
+    assert_eq!(bridge.query_meta_signer(&source), Some(key_one));
+
+    // Re-registering for the same source overwrites the previous binding.
+    bridge.register_meta_signer(&source, &key_two);
+    assert_eq!(bridge.query_meta_signer(&source), Some(key_two));
+}
