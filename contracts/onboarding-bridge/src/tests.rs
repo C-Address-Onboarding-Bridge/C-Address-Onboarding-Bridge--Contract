@@ -4967,3 +4967,106 @@ fn test_set_max_withdraw_per_tx_updates_limit() {
     bridge.set_max_withdraw_per_tx(&0i128, &None);
     assert_eq!(bridge.query_max_withdraw_per_tx(), 0i128);
 }
+
+/********** remove_relayer coverage **********/
+//
+// `remove_relayer` had no test naming it directly anywhere in the suite.
+// These cover the success path, the `BelowThreshold` rejection described on
+// the function, the exact boundary at which removal stops being allowed,
+// and the `NotInitialized` guard.
+
+#[test]
+fn test_remove_relayer_success_path() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let pk1 = BytesN::from_array(&env, &[1u8; 32]);
+    let pk2 = BytesN::from_array(&env, &[2u8; 32]);
+    bridge.add_relayer(&pk1);
+    bridge.add_relayer(&pk2);
+    bridge.set_relayer_threshold(&1u32);
+
+    assert!(bridge.query_is_relayer(&pk1));
+    assert!(bridge.query_is_relayer(&pk2));
+
+    // Two relayers registered against a threshold of 1: removing one still
+    // leaves enough relayers to satisfy the threshold, so this must succeed.
+    bridge.remove_relayer(&pk2);
+
+    assert!(bridge.query_is_relayer(&pk1));
+    assert!(!bridge.query_is_relayer(&pk2));
+}
+
+#[test]
+fn test_remove_relayer_below_threshold_rejected() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let pk1 = BytesN::from_array(&env, &[3u8; 32]);
+    let pk2 = BytesN::from_array(&env, &[4u8; 32]);
+    bridge.add_relayer(&pk1);
+    bridge.add_relayer(&pk2);
+    bridge.set_relayer_threshold(&2u32);
+
+    // Exactly at the threshold: removing either relayer would drop the
+    // active count below the required 2, so it must be rejected.
+    assert_eq!(
+        bridge.try_remove_relayer(&pk1),
+        Err(Ok(BridgeError::BelowThreshold))
+    );
+
+    // The rejected call must not have mutated state.
+    assert!(bridge.query_is_relayer(&pk1));
+    assert!(bridge.query_is_relayer(&pk2));
+}
+
+#[test]
+fn test_remove_relayer_boundary_leaves_exact_threshold() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let pk1 = BytesN::from_array(&env, &[5u8; 32]);
+    let pk2 = BytesN::from_array(&env, &[6u8; 32]);
+    let pk3 = BytesN::from_array(&env, &[7u8; 32]);
+    bridge.add_relayer(&pk1);
+    bridge.add_relayer(&pk2);
+    bridge.add_relayer(&pk3);
+    bridge.set_relayer_threshold(&2u32);
+
+    // Three relayers, threshold 2: removing one lands exactly on the
+    // boundary (active count == threshold) and must still succeed.
+    bridge.remove_relayer(&pk3);
+    assert!(!bridge.query_is_relayer(&pk3));
+
+    // Now sitting exactly at the boundary — one more removal would drop
+    // below threshold and must be rejected.
+    assert_eq!(
+        bridge.try_remove_relayer(&pk1),
+        Err(Ok(BridgeError::BelowThreshold))
+    );
+}
+
+#[test]
+fn test_remove_relayer_not_initialized() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    let pk = BytesN::from_array(&env, &[8u8; 32]);
+    assert_eq!(
+        bridge.try_remove_relayer(&pk),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
