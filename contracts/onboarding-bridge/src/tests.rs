@@ -53,6 +53,23 @@ fn check_balance(env: &Env, token_id: &Address, addr: &Address) -> i128 {
     token.balance(addr)
 }
 
+/// Advances the ledger's timestamp to `timestamp`.
+///
+/// soroban-sdk 22 mutates ledger state through `testutils::Ledger` trait
+/// methods (`set_timestamp` / `set_sequence_number`) rather than inherent
+/// methods on `env.ledger()`. Centralizing the call here means the many
+/// time-dependent tests below (and the benchmarks) don't each need to
+/// import that trait or hand-roll the read-then-write.
+pub(crate) fn advance_ledger_time(env: &Env, timestamp: u64) {
+    env.ledger().set_timestamp(timestamp);
+}
+
+/// Advances the ledger's sequence number to `sequence`. See
+/// [`advance_ledger_time`] for why this indirection exists.
+pub(crate) fn advance_ledger_sequence(env: &Env, sequence: u32) {
+    env.ledger().set_sequence_number(sequence);
+}
+
 #[test]
 fn test_initialize() {
     let env = Env::default();
@@ -712,6 +729,154 @@ fn test_upgrade_non_admin_rejected() {
     bridge.upgrade(&wasm_hash, &None);
 }
 
+/********** Timelocked upgrade tests (execute_upgrade) **********/
+
+#[test]
+fn test_execute_upgrade_succeeds_at_timelock_boundary_and_clears_pending() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // Uploading a real compiled wasm costs far more than the default test
+    // budget allows; lift the limit so the test exercises logic, not gas.
+    env.cost_estimate().budget().reset_unlimited();
+    let wasm_bytes = Bytes::from_slice(&env, V2_WASM);
+    let wasm_hash: BytesN<32> = env.deployer().upload_contract_wasm(wasm_bytes);
+
+    let executable_after_ledger = bridge.schedule_upgrade(&wasm_hash, &None);
+    assert_eq!(
+        bridge.query_pending_upgrade(),
+        Some(crate::PendingUpgrade {
+            new_wasm_hash: wasm_hash.clone(),
+            executable_after_ledger,
+        })
+    );
+
+    // Exactly at the boundary: docs specify `sequence >= scheduled + timelock`,
+    // so landing exactly on `executable_after_ledger` must already succeed.
+    advance_ledger_sequence(&env, executable_after_ledger);
+    bridge.execute_upgrade(&wasm_hash, &None);
+
+    // The pending record is cleared before the wasm swap, so a second
+    // execute now reports "not scheduled" rather than replaying the upgrade.
+    assert_eq!(bridge.query_pending_upgrade(), None);
+    assert_eq!(
+        bridge.try_execute_upgrade(&wasm_hash, &None),
+        Err(Ok(BridgeError::UpgradeNotScheduled))
+    );
+
+    assert_eq!(count_events_with_topic(&env, &bridge_id, "ContractUpgraded"), 1);
+}
+
+#[test]
+fn test_execute_upgrade_not_initialized_fails() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_execute_upgrade(&BytesN::from_array(&env, &[0u8; 32]), &None),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_execute_upgrade_not_scheduled_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert_eq!(
+        bridge.try_execute_upgrade(&BytesN::from_array(&env, &[1u8; 32]), &None),
+        Err(Ok(BridgeError::UpgradeNotScheduled))
+    );
+}
+
+#[test]
+fn test_execute_upgrade_hash_mismatch_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let scheduled_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let wrong_hash = BytesN::from_array(&env, &[2u8; 32]);
+    let executable_after_ledger = bridge.schedule_upgrade(&scheduled_hash, &None);
+    advance_ledger_sequence(&env, executable_after_ledger);
+
+    // Never reaches the wasm swap, so a synthetic (non-uploaded) hash is fine here.
+    assert_eq!(
+        bridge.try_execute_upgrade(&wrong_hash, &None),
+        Err(Ok(BridgeError::UpgradeHashMismatch))
+    );
+}
+
+#[test]
+fn test_execute_upgrade_before_timelock_elapses_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let wasm_hash = BytesN::from_array(&env, &[1u8; 32]);
+    bridge.schedule_upgrade(&wasm_hash, &None);
+
+    // No ledgers have elapsed since scheduling.
+    assert_eq!(
+        bridge.try_execute_upgrade(&wasm_hash, &None),
+        Err(Ok(BridgeError::UpgradeTimelockActive))
+    );
+}
+
+#[test]
+fn test_execute_upgrade_one_ledger_before_boundary_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let wasm_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let executable_after_ledger = bridge.schedule_upgrade(&wasm_hash, &None);
+    advance_ledger_sequence(&env, executable_after_ledger - 1);
+
+    assert_eq!(
+        bridge.try_execute_upgrade(&wasm_hash, &None),
+        Err(Ok(BridgeError::UpgradeTimelockActive))
+    );
+}
+
+#[test]
+fn test_execute_upgrade_duplicate_nonce_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let wasm_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let executable_after_ledger = bridge.schedule_upgrade(&wasm_hash, &None);
+    advance_ledger_sequence(&env, executable_after_ledger);
+
+    // The admin's nonce is still 0; passing 1 must be rejected.
+    assert_eq!(
+        bridge.try_execute_upgrade(&wasm_hash, &Some(1u64)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+}
+
 // --------- Blocklist / Allowlist Tests ---------
 
 fn setup_bridge(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, Address, Address) {
@@ -959,7 +1124,7 @@ fn test_reclaim_cannot_drain_active_timelocks() {
 
     // Once claimed, the timelocked amount leaves the contract balance and is
     // no longer ring-fenced: freshly accidental tokens are reclaimable again.
-    env.ledger().set_timestamp(release_time + 1);
+    advance_ledger_time(&env, release_time + 1);
     bridge.claim_timelocked(&id);
     mint_tokens(&env, &token_id, &bridge.address, 50i128);
     bridge.reclaim_tokens(&token_id, &50i128, &destination, &None);
@@ -1466,7 +1631,7 @@ impl TestToken {
     }
 }
 
-mod swap_pool_contract {
+pub(crate) mod swap_pool_contract {
     use super::*;
 
     #[contracttype]
@@ -2677,7 +2842,7 @@ mod timelocked_tests {
             &None,
         );
 
-        env.ledger().set_timestamp(release_time + 1);
+        advance_ledger_time(&env, release_time + 1);
         bridge.claim_timelocked(&id);
 
         assert_eq!(check_balance(&env, &token_id, &target), 495i128);
@@ -2771,7 +2936,7 @@ mod timelocked_tests {
             &None,
         );
 
-        env.ledger().set_timestamp(release_time + 1);
+        advance_ledger_time(&env, release_time + 1);
         bridge.claim_timelocked(&id);
 
         assert_eq!(
@@ -2813,6 +2978,8 @@ mod timelocked_tests {
             &500i128,
             &release_time,
             &0u64,
+            &None,
+            &None,
         );
 
         assert_eq!(check_balance(&env, &loyalty_token_id, &user), 4i128);
@@ -2849,8 +3016,7 @@ mod commit_reveal_tests {
 
     /// Advances the ledger past the commit-reveal minimum delay.
     fn advance_past_min_delay(env: &Env) {
-        let seq = env.ledger().sequence();
-        env.ledger().set_sequence_number(seq + MIN_DELAY_LEDGERS);
+        advance_ledger_sequence(env, env.ledger().sequence() + MIN_DELAY_LEDGERS);
     }
 
     #[test]
@@ -4700,7 +4866,7 @@ fn test_extend_persistent_ttl_extends_asset_keys() {
         &None,
         &None,
     );
-    bridge.set_asset_fee_cap(&token_id, &1000u32);
+    bridge.set_asset_fee_cap(&token_id, &1000u32, &None);
 
     env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
     bridge.extend_persistent_ttl(&token_id, &200_000u32);
@@ -4716,6 +4882,122 @@ fn test_extend_persistent_ttl_extends_asset_keys() {
         let ttl = env.as_contract(&bridge_id, || env.storage().persistent().get_ttl(key));
         assert!(ttl >= 200_000);
     }
+}
+
+/********** extend_source_persistent_ttl tests **********/
+
+#[test]
+fn test_extend_source_persistent_ttl_extends_source_keys() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_source_daily_limit(&user, &token_id, &10_000i128, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    bridge.fund_c_address(
+        &user,
+        &Address::generate(&env),
+        &token_id,
+        &500i128,
+        &Some(0u64),
+        &None,
+    );
+
+    let seq = env.ledger().sequence();
+    bridge.verify_auth_entry(&user, &0u64, &0u32, &(seq + 100));
+
+    // The daily-usage key is scoped by calendar day, derived the same way
+    // `check_daily_limit` derives it internally.
+    let day = env.ledger().timestamp() / 86_400;
+
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    bridge.extend_source_persistent_ttl(&user, &token_id, &200_000u32);
+
+    let expected_keys = [
+        DataKey::SourceDailyLimit(user.clone(), token_id.clone()),
+        DataKey::DailyUsage(user.clone(), token_id.clone(), day),
+        DataKey::UserDeposit(user.clone(), token_id.clone()),
+        DataKey::SourceBridgedVolume(user.clone()),
+        DataKey::Nonce(user.clone()),
+        DataKey::AuthNonce(user.clone()),
+    ];
+    for key in expected_keys.iter() {
+        let ttl = env.as_contract(&bridge_id, || env.storage().persistent().get_ttl(key));
+        assert!(ttl >= 200_000);
+    }
+
+    assert_eq!(
+        count_events_with_topic(&env, &bridge_id, "SourcePersistentTtlExtended"),
+        1
+    );
+}
+
+#[test]
+fn test_extend_source_persistent_ttl_not_initialized_fails() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let source = Address::generate(&env);
+    let asset = Address::generate(&env);
+
+    assert_eq!(
+        bridge.try_extend_source_persistent_ttl(&source, &asset, &200_000u32),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_extend_source_persistent_ttl_skips_missing_keys() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // This (source, asset) pair has never touched storage; none of the six
+    // keys exist, so the call must succeed rather than erroring on a
+    // missing entry, mirroring `extend_persistent_ttl`.
+    let source = Address::generate(&env);
+    let asset = Address::generate(&env);
+    bridge.extend_source_persistent_ttl(&source, &asset, &200_000u32);
+}
+
+#[test]
+fn test_extend_source_persistent_ttl_caps_at_max_allowed_ttl() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    bridge.fund_c_address(
+        &user,
+        &Address::generate(&env),
+        &token_id,
+        &500i128,
+        &None,
+        &None,
+    );
+
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    // Requesting far beyond the hard ceiling must silently clamp to
+    // `MAX_ALLOWED_TTL` rather than erroring or exceeding it.
+    bridge.extend_source_persistent_ttl(&user, &token_id, &(MAX_ALLOWED_TTL * 10));
+
+    let ttl = env.as_contract(&bridge_id, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::UserDeposit(user.clone(), token_id.clone()))
+    });
+    assert!(ttl <= MAX_ALLOWED_TTL);
 }
 
 #[test]
@@ -4848,7 +5130,7 @@ fn test_daily_limit_resets_next_day() {
     );
 
     // Advance to the next UTC day (86 400 seconds later).
-    env.ledger().set_timestamp(env.ledger().timestamp() + 86_400);
+    advance_ledger_time(&env, env.ledger().timestamp() + 86_400);
 
     // After the day rolls over the limit should reset, allowing a fresh transfer.
     let target2 = Address::generate(&env);
@@ -4968,68 +5250,48 @@ fn test_set_max_withdraw_per_tx_updates_limit() {
     assert_eq!(bridge.query_max_withdraw_per_tx(), 0i128);
 }
 
-/********** remove_relayer coverage **********/
-//
-// `remove_relayer` had no test naming it directly anywhere in the suite.
-// These cover the success path, the `BelowThreshold` rejection described on
-// the function, the exact boundary at which removal stops being allowed,
-// and the `NotInitialized` guard.
+/********** accept_admin tests **********/
 
 #[test]
-fn test_remove_relayer_success_path() {
+fn test_accept_admin_transfers_control() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
     let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_admin = Address::generate(&env);
+    bridge.propose_new_admin(&new_admin, &None);
 
-    let pk1 = BytesN::from_array(&env, &[1u8; 32]);
-    let pk2 = BytesN::from_array(&env, &[2u8; 32]);
-    bridge.add_relayer(&pk1);
-    bridge.add_relayer(&pk2);
-    bridge.set_relayer_threshold(&1u32);
+    bridge.accept_admin();
 
-    assert!(bridge.query_is_relayer(&pk1));
-    assert!(bridge.query_is_relayer(&pk2));
-
-    // Two relayers registered against a threshold of 1: removing one still
-    // leaves enough relayers to satisfy the threshold, so this must succeed.
-    bridge.remove_relayer(&pk2);
-
-    assert!(bridge.query_is_relayer(&pk1));
-    assert!(!bridge.query_is_relayer(&pk2));
+    assert_eq!(bridge.query_admin(), new_admin);
+    assert_eq!(bridge.query_pending_admin(), None);
 }
 
 #[test]
-fn test_remove_relayer_below_threshold_rejected() {
+fn test_accept_admin_emits_event() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
     let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_admin = Address::generate(&env);
+    bridge.propose_new_admin(&new_admin, &None);
+    bridge.accept_admin();
 
-    let pk1 = BytesN::from_array(&env, &[3u8; 32]);
-    let pk2 = BytesN::from_array(&env, &[4u8; 32]);
-    bridge.add_relayer(&pk1);
-    bridge.add_relayer(&pk2);
-    bridge.set_relayer_threshold(&2u32);
-
-    // Exactly at the threshold: removing either relayer would drop the
-    // active count below the required 2, so it must be rejected.
-    assert_eq!(
-        bridge.try_remove_relayer(&pk1),
-        Err(Ok(BridgeError::BelowThreshold))
-    );
-
-    // The rejected call must not have mutated state.
-    assert!(bridge.query_is_relayer(&pk1));
-    assert!(bridge.query_is_relayer(&pk2));
+    let events = env.events().all();
+    let (contract_id, _topics, _data) = &events.get(events.len() - 1).unwrap();
+    assert_eq!(contract_id, &bridge_id);
 }
 
+// accept_admin's doc comment doesn't spell out an # Errors section, but the
+// implementation is only reachable through the same NotInitialized /
+// ContractPaused gate every other admin setter uses, plus an Unauthorized
+// bounce when there is no pending handoff to accept.
 #[test]
-fn test_remove_relayer_boundary_leaves_exact_threshold() {
+fn test_accept_admin_without_pending_proposal_fails() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
     let (bridge_id, _) = register_all_contracts_mocked(&env);
@@ -5037,369 +5299,150 @@ fn test_remove_relayer_boundary_leaves_exact_threshold() {
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
 
-    let pk1 = BytesN::from_array(&env, &[5u8; 32]);
-    let pk2 = BytesN::from_array(&env, &[6u8; 32]);
-    let pk3 = BytesN::from_array(&env, &[7u8; 32]);
-    bridge.add_relayer(&pk1);
-    bridge.add_relayer(&pk2);
-    bridge.add_relayer(&pk3);
-    bridge.set_relayer_threshold(&2u32);
-
-    // Three relayers, threshold 2: removing one lands exactly on the
-    // boundary (active count == threshold) and must still succeed.
-    bridge.remove_relayer(&pk3);
-    assert!(!bridge.query_is_relayer(&pk3));
-
-    // Now sitting exactly at the boundary — one more removal would drop
-    // below threshold and must be rejected.
     assert_eq!(
-        bridge.try_remove_relayer(&pk1),
-        Err(Ok(BridgeError::BelowThreshold))
+        bridge.try_accept_admin(),
+        Err(Ok(BridgeError::Unauthorized))
     );
 }
 
 #[test]
-fn test_remove_relayer_not_initialized() {
+fn test_accept_admin_before_initialize_fails() {
     let env = Env::default();
     let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
-    let pk = BytesN::from_array(&env, &[8u8; 32]);
     assert_eq!(
-        bridge.try_remove_relayer(&pk),
+        bridge.try_accept_admin(),
         Err(Ok(BridgeError::NotInitialized))
     );
 }
 
-/********** query_timelocked coverage **********/
-//
-// `query_timelocked` had no test naming it directly anywhere in the suite.
-// These cover the success path (including that every field round-trips and
-// that `claimed` reflects a subsequent claim), the documented
-// `TimelockNotFound` error, and the boundary of the first-ever entry ID.
-
 #[test]
-fn test_query_timelocked_returns_entry_fields() {
+fn test_accept_admin_while_paused_fails() {
     let env = Env::default();
-    env.ledger().set_timestamp(10_000);
-    let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
-    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_admin = Address::generate(&env);
+    bridge.propose_new_admin(&new_admin, &None);
+    bridge.pause(&None);
+
+    assert_eq!(
+        bridge.try_accept_admin(),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+// Boundary: the pending slot is cleared on acceptance, so a second accept
+// has nothing left to consume and must fail the same way as "never proposed".
+#[test]
+fn test_accept_admin_cannot_be_reused_after_acceptance() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_admin = Address::generate(&env);
+    bridge.propose_new_admin(&new_admin, &None);
+    bridge.accept_admin();
+
+    assert_eq!(
+        bridge.try_accept_admin(),
+        Err(Ok(BridgeError::Unauthorized))
+    );
+}
+
+/********** extend_timelock_ttl tests **********/
+
+fn setup_extend_timelock(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, u64) {
+    let (admin, user, fee_collector) = create_test_users(env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(env);
+    let bridge = create_bridge_client(env, &bridge_id);
+    init_token(env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
     bridge.add_asset(&token_id, &None);
-    mint_tokens(&env, &token_id, &user, 5_000i128);
+    mint_tokens(env, &token_id, &user, 10_000i128);
 
-    let target = Address::generate(&env);
-    let release_time = 10_500u64;
-    let cliff_time = 10_200u64;
-
+    let target = Address::generate(env);
+    let release_time = env.ledger().timestamp() + 1_000_000;
     let id = bridge.fund_c_address_timelocked(
         &user,
         &target,
         &token_id,
-        &750i128,
+        &500i128,
         &release_time,
-        &cliff_time,
+        &0u64,
         &None,
         &None,
     );
-
-    let entry = bridge.query_timelocked(&id);
-    assert_eq!(entry.source, user);
-    assert_eq!(entry.target, target);
-    assert_eq!(entry.asset, token_id);
-    assert_eq!(entry.amount, 750i128);
-    assert_eq!(entry.release_time, release_time);
-    assert_eq!(entry.cliff_time, cliff_time);
-    assert!(!entry.claimed);
+    (bridge, bridge_id, id)
 }
 
 #[test]
-fn test_query_timelocked_reflects_claimed_flag() {
+fn test_extend_timelock_ttl_extends_entry() {
     let env = Env::default();
-    env.ledger().set_timestamp(20_000);
-    let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-    init_token(&env, &token_id, &admin);
+    let (bridge, bridge_id, id) = setup_extend_timelock(&env);
 
-    bridge.initialize(&admin, &fee_collector, &100u32, &None);
-    bridge.add_asset(&token_id, &None);
-    mint_tokens(&env, &token_id, &user, 5_000i128);
+    bridge.extend_timelock_ttl(&id, &200_000u32);
 
-    let target = Address::generate(&env);
-    let release_time = 20_100u64;
-
-    let id = bridge.fund_c_address_timelocked(
-        &user, &target, &token_id, &400i128, &release_time, &0u64, &None, &None,
-    );
-
-    env.ledger().set_timestamp(release_time + 1);
-    bridge.claim_timelocked(&id);
-
-    let entry = bridge.query_timelocked(&id);
-    assert!(entry.claimed);
+    let key = DataKey::Timelock(id);
+    let ttl = env.as_contract(&bridge_id, || env.storage().persistent().get_ttl(&key));
+    assert!(ttl >= 200_000);
 }
 
 #[test]
-fn test_query_timelocked_unknown_id_fails_directly() {
+fn test_extend_timelock_ttl_emits_event() {
+    let env = Env::default();
+    let (bridge, bridge_id, id) = setup_extend_timelock(&env);
+
+    bridge.extend_timelock_ttl(&id, &200_000u32);
+
+    let events = env.events().all();
+    let (contract_id, _topics, _data) = &events.get(events.len() - 1).unwrap();
+    assert_eq!(contract_id, &bridge_id);
+}
+
+// Boundary: a ttl above MAX_ALLOWED_TTL must be silently capped, never stored
+// or applied verbatim.
+#[test]
+fn test_extend_timelock_ttl_caps_at_max_allowed_ttl() {
+    let env = Env::default();
+    let (bridge, bridge_id, id) = setup_extend_timelock(&env);
+
+    bridge.extend_timelock_ttl(&id, &(MAX_ALLOWED_TTL * 2));
+
+    let key = DataKey::Timelock(id);
+    let ttl = env.as_contract(&bridge_id, || env.storage().persistent().get_ttl(&key));
+    assert!(ttl <= MAX_ALLOWED_TTL);
+}
+
+#[test]
+fn test_extend_timelock_ttl_unknown_id_fails() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _token_id) = register_all_contracts_mocked(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
-    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
 
     assert_eq!(
-        bridge.try_query_timelocked(&0u64),
+        bridge.try_extend_timelock_ttl(&999_999u64, &200_000u32),
         Err(Ok(BridgeError::TimelockNotFound))
     );
 }
 
 #[test]
-fn test_query_timelocked_boundary_first_id() {
+fn test_extend_timelock_ttl_before_initialize_fails() {
     let env = Env::default();
-    env.ledger().set_timestamp(30_000);
-    let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-    init_token(&env, &token_id, &admin);
-
-    bridge.initialize(&admin, &fee_collector, &100u32, &None);
-    bridge.add_asset(&token_id, &None);
-    mint_tokens(&env, &token_id, &user, 1_000i128);
-
-    let target = Address::generate(&env);
-    // The very first timelock entry created must be queryable at whatever
-    // ID the contract assigns it (boundary: first-ever entry).
-    let id = bridge.fund_c_address_timelocked(
-        &user, &target, &token_id, &200i128, &30_100u64, &0u64, &None, &None,
-    );
-
-    let entry = bridge.query_timelocked(&id);
-    assert_eq!(entry.amount, 200i128);
-
-    // The next sequential ID must not yet exist.
-    assert_eq!(
-        bridge.try_query_timelocked(&(id + 1)),
-        Err(Ok(BridgeError::TimelockNotFound))
-    );
-}
-
-/********** query_source_daily_limit coverage **********/
-//
-// `query_source_daily_limit` had no test naming it directly anywhere in the
-// suite. These cover the documented default-zero ("unrestricted") boundary,
-// the success path reading back a configured value, that limits are scoped
-// per-asset, and the NotInitialized guard.
-
-#[test]
-fn test_query_source_daily_limit_defaults_to_zero() {
-    let env = Env::default();
-    let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-    init_token(&env, &token_id, &admin);
-
-    bridge.initialize(&admin, &fee_collector, &50u32, &None);
-    bridge.add_asset(&token_id, &None);
-
-    // No limit has ever been configured for this (source, asset) pair; the
-    // docs say this means "unrestricted", represented as 0.
-    assert_eq!(bridge.query_source_daily_limit(&user, &token_id), 0i128);
-}
-
-#[test]
-fn test_query_source_daily_limit_returns_configured_value() {
-    let env = Env::default();
-    let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-    init_token(&env, &token_id, &admin);
-
-    bridge.initialize(&admin, &fee_collector, &50u32, &None);
-    bridge.add_asset(&token_id, &None);
-
-    bridge.set_source_daily_limit(&user, &token_id, &12_345i128, &None);
-    assert_eq!(
-        bridge.query_source_daily_limit(&user, &token_id),
-        12_345i128
-    );
-}
-
-#[test]
-fn test_query_source_daily_limit_zero_disables_limit() {
-    let env = Env::default();
-    let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-    init_token(&env, &token_id, &admin);
-
-    bridge.initialize(&admin, &fee_collector, &50u32, &None);
-    bridge.add_asset(&token_id, &None);
-
-    bridge.set_source_daily_limit(&user, &token_id, &500i128, &None);
-    assert_eq!(bridge.query_source_daily_limit(&user, &token_id), 500i128);
-
-    // Boundary: explicitly resetting the limit to 0 must read back as
-    // unrestricted again, matching the "0 == unrestricted" convention.
-    bridge.set_source_daily_limit(&user, &token_id, &0i128, &None);
-    assert_eq!(bridge.query_source_daily_limit(&user, &token_id), 0i128);
-}
-
-#[test]
-fn test_query_source_daily_limit_is_per_asset() {
-    let env = Env::default();
-    let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-    init_token(&env, &token_id, &admin);
-
-    let other_token_id = env.register(TestToken, ());
-    init_token(&env, &other_token_id, &admin);
-
-    bridge.initialize(&admin, &fee_collector, &50u32, &None);
-    bridge.add_asset(&token_id, &None);
-    bridge.add_asset(&other_token_id, &None);
-
-    bridge.set_source_daily_limit(&user, &token_id, &1_000i128, &None);
-
-    // A limit configured for one asset must not leak into the query for a
-    // different asset on the same source.
-    assert_eq!(bridge.query_source_daily_limit(&user, &token_id), 1_000i128);
-    assert_eq!(
-        bridge.query_source_daily_limit(&user, &other_token_id),
-        0i128
-    );
-}
-
-#[test]
-fn test_query_source_daily_limit_not_initialized() {
-    let env = Env::default();
-    let (_admin, user, _fee_collector) = create_test_users(&env);
-    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
 
     assert_eq!(
-        bridge.try_query_source_daily_limit(&user, &token_id),
+        bridge.try_extend_timelock_ttl(&1u64, &200_000u32),
         Err(Ok(BridgeError::NotInitialized))
-    );
-}
-
-/********** query_pending_upgrade coverage **********/
-//
-// `query_pending_upgrade` had no test naming it directly anywhere in the
-// suite. These cover: `None` before anything is scheduled, `Some` with the
-// exact scheduled fields, `None` again after both `execute_upgrade` and
-// `cancel_upgrade` (the two documented ways a pending upgrade clears), and
-// the boundary of re-scheduling before the first entry is consumed.
-
-#[test]
-fn test_query_pending_upgrade_none_before_scheduling() {
-    let env = Env::default();
-    let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts_mocked(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-
-    bridge.initialize(&admin, &fee_collector, &50u32, &None);
-
-    assert_eq!(bridge.query_pending_upgrade(), None);
-}
-
-#[test]
-fn test_query_pending_upgrade_returns_scheduled_entry() {
-    let env = Env::default();
-    let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts_mocked(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-
-    bridge.initialize(&admin, &fee_collector, &50u32, &None);
-    env.ledger().set_sequence_number(1_000);
-
-    let new_hash = BytesN::from_array(&env, &[0xABu8; 32]);
-    let unlock_ledger = bridge.schedule_upgrade(&new_hash, &None);
-
-    let pending = bridge.query_pending_upgrade();
-    assert_eq!(
-        pending,
-        Some(crate::PendingUpgrade {
-            new_wasm_hash: new_hash,
-            executable_after_ledger: unlock_ledger,
-        })
-    );
-    assert_eq!(unlock_ledger, 1_000 + crate::UPGRADE_TIMELOCK_LEDGERS);
-}
-
-#[test]
-fn test_query_pending_upgrade_none_after_execute() {
-    let env = Env::default();
-    let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts_mocked(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-    env.mock_all_auths();
-
-    bridge.initialize(&admin, &fee_collector, &50u32, &None);
-    env.ledger().set_sequence_number(1_000);
-
-    // Uploading a real compiled wasm costs far more than the default test
-    // budget allows; lift the limit so the test exercises logic, not gas.
-    env.cost_estimate().budget().reset_unlimited();
-    let wasm_bytes = Bytes::from_slice(&env, V2_WASM);
-    let wasm_hash: BytesN<32> = env.deployer().upload_contract_wasm(wasm_bytes);
-
-    let unlock_ledger = bridge.schedule_upgrade(&wasm_hash, &None);
-
-    // Boundary: execution only becomes valid once the sequence reaches the
-    // unlock ledger.
-    env.ledger().set_sequence_number(unlock_ledger);
-    bridge.execute_upgrade(&wasm_hash, &None);
-
-    assert_eq!(bridge.query_pending_upgrade(), None);
-}
-
-#[test]
-fn test_query_pending_upgrade_none_after_cancel() {
-    let env = Env::default();
-    let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts_mocked(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-
-    bridge.initialize(&admin, &fee_collector, &50u32, &None);
-    env.ledger().set_sequence_number(1_000);
-
-    let new_hash = BytesN::from_array(&env, &[0xEFu8; 32]);
-    bridge.schedule_upgrade(&new_hash, &None);
-    assert!(bridge.query_pending_upgrade().is_some());
-
-    bridge.cancel_upgrade(&None);
-    assert_eq!(bridge.query_pending_upgrade(), None);
-}
-
-#[test]
-fn test_query_pending_upgrade_updates_on_reschedule() {
-    let env = Env::default();
-    let (admin, _user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts_mocked(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-
-    bridge.initialize(&admin, &fee_collector, &50u32, &None);
-    env.ledger().set_sequence_number(1_000);
-
-    let first_hash = BytesN::from_array(&env, &[0x11u8; 32]);
-    bridge.schedule_upgrade(&first_hash, &None);
-
-    // Boundary: scheduling a second upgrade before the first is
-    // executed/cancelled overwrites the pending entry rather than erroring.
-    let second_hash = BytesN::from_array(&env, &[0x22u8; 32]);
-    let unlock_ledger = bridge.schedule_upgrade(&second_hash, &None);
-
-    assert_eq!(
-        bridge.query_pending_upgrade(),
-        Some(crate::PendingUpgrade {
-            new_wasm_hash: second_hash,
-            executable_after_ledger: unlock_ledger,
-        })
     );
 }
