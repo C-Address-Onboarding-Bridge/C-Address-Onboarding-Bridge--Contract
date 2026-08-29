@@ -1915,7 +1915,66 @@ impl OnboardingBridge {
         amount: i128,
         referrer: Option<Address>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: fund_c_address_with_referral")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        source.require_auth();
+
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        let minimum_amount = read_minimum_amount(&env);
+        if amount < minimum_amount {
+            return Err(BridgeError::InvalidAmount);
+        }
+
+        check_access(&env, &target)?;
+        check_asset_whitelisted(&env, &asset)?;
+        check_daily_limit(&env, &source, &asset, amount)?;
+
+        let token_client = token::Client::new(&env, &asset);
+        let contract_addr = env.current_contract_address();
+        token_client.transfer(&source, &contract_addr, &amount);
+
+        let global_fee_bps = read_fee_bps(&env);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
+        let fee = calculate_fee(amount, effective_fee_bps)?;
+        let net_amount = safe_math::safe_sub(amount, fee)?;
+
+        if net_amount > 0 {
+            token_client.transfer(&contract_addr, &target, &net_amount);
+        }
+
+        let mut protocol_fee = fee;
+        if let Some(ref referrer_addr) = referrer {
+            let referral_rate = read_referral_rate(&env);
+            let referral_fee = calculate_fee(fee, referral_rate)?;
+            if referral_fee > 0 {
+                token_client.transfer(&contract_addr, referrer_addr, &referral_fee);
+                protocol_fee = safe_math::safe_sub(fee, referral_fee)?;
+                env.events().publish(
+                    ("ReferralPaid", source.clone(), referrer_addr.clone()),
+                    (referral_fee, asset.clone()),
+                );
+            }
+        }
+
+        increment_user_deposit(&env, &source, &asset, amount)?;
+        increment_accrued_fees(&env, &asset, protocol_fee)?;
+        increment_total_bridged(&env, &asset, net_amount)?;
+        increment_total_fees_collected(&env, &asset, protocol_fee)?;
+        increment_source_bridged_volume(&env, &source, amount)?;
+
+        extend_instance_ttl(&env);
+
+        mint_loyalty_tokens(&env, &source);
+
+        env.events().publish(
+            ("CAddressFunded", asset, source, target),
+            (amount, fee),
+        );
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1937,7 +1996,8 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_admin(env: Env) -> Result<Address, BridgeError> {
-        todo!("implement: query_admin")
+        check_initialized(&env)?;
+        Ok(read_admin(&env))
     }
 
     /// Returns the token balance of `c_address` for `asset`.
@@ -1950,7 +2010,8 @@ impl OnboardingBridge {
     /// * `c_address` (`Address`) — The address whose balance is queried.
     /// * `asset` (`Address`) — The token contract address.
     pub fn query_balance(env: Env, c_address: Address, asset: Address) -> i128 {
-        todo!("implement: query_balance")
+        let token_client = token::Client::new(&env, &asset);
+        token_client.balance(&c_address)
     }
 
     /// Returns the bridge contract's own balance for each asset in `assets`.
@@ -1995,7 +2056,9 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_fee_balance(env: Env, asset: Address) -> Result<i128, BridgeError> {
-        todo!("implement: query_fee_balance")
+        check_initialized(&env)?;
+        let token_client = token::Client::new(&env, &asset);
+        Ok(token_client.balance(&env.current_contract_address()))
     }
 
     /// Returns `true` if the contract has been initialised.
