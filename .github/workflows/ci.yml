@@ -70,16 +70,28 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
+
+      # Fast fail on type errors (including the test target) before paying for
+      # a full release build. A red main here is exactly what this job exists
+      # to catch — see the "Soroban Contract" checklist in the CI issue.
+      - name: cargo check
+        run: cargo check -p onboarding-bridge --all-targets --features testutils
 
       - name: Build contract
         run: cargo build -p onboarding-bridge --release
 
       - name: Build WASM (release)
         run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
+
+      # wasm32v1-none is the current canonical Soroban deployment target; build
+      # it too so CI actually exercises the artifact that gets deployed, not
+      # just the legacy wasm32-unknown-unknown target the hash below is pinned to.
+      - name: Build WASM (wasm32v1-none)
+        run: cargo build -p onboarding-bridge --release --target wasm32v1-none
 
       - name: Verify WASM Hash
         run: |
@@ -97,8 +109,50 @@ jobs:
             exit 1
           fi
 
+      # `cargo check` alone never compiles #[cfg(test)] code (or benchmarks.rs,
+      # which is pulled in as a #[cfg(test)] module), so it can pass while the
+      # test target is completely broken. `cargo test` is the only thing that
+      # actually compiles and runs the suite.
       - name: Run contract tests
-        run: cargo test -p onboarding-bridge --features testutils
+        run: cargo test -p onboarding-bridge --features testutils 2>&1 | tee contract_test_output.txt
+
+      # Surfaces the pass/fail count in the job summary so a suite that
+      # silently shrinks (fewer tests collected, not just fewer passing) is
+      # visible without digging through raw log output.
+      - name: Report contract test count
+        run: |
+          COUNT_LINE=$(grep -E "^test result:" contract_test_output.txt | tail -n1)
+          if [ -z "$COUNT_LINE" ]; then
+            echo "::error::No 'test result:' line found in contract test output — the suite may not have run at all."
+            exit 1
+          fi
+          echo "$COUNT_LINE"
+          {
+            echo "### Contract test results"
+            echo ""
+            echo "\`$COUNT_LINE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The indexer is its own Cargo workspace root (see indexer/Cargo.toml),
+      # so its test target rots silently unless something explicitly builds
+      # and runs it too — same rationale as the contract test step above.
+      - name: Run indexer tests
+        working-directory: indexer
+        run: cargo test 2>&1 | tee ../indexer_test_output.txt
+
+      - name: Report indexer test count
+        run: |
+          COUNT_LINE=$(grep -E "^test result:" indexer_test_output.txt | tail -n1)
+          if [ -z "$COUNT_LINE" ]; then
+            echo "::error::No 'test result:' line found in indexer test output — the suite may not have run at all."
+            exit 1
+          fi
+          echo "$COUNT_LINE"
+          {
+            echo "### Indexer test results"
+            echo ""
+            echo "\`$COUNT_LINE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run benchmarks
         run: |
@@ -212,6 +266,40 @@ jobs:
 
       - name: Run contract tests
         run: cargo test -p onboarding-bridge --features testutils
+
+  indexer:
+    name: Indexer
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: indexer
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: indexer
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo check
+        run: cargo check --all-targets
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run tests
+        run: cargo test
 
   sdk:
     name: TypeScript SDK
