@@ -1812,7 +1812,8 @@ impl OnboardingBridge {
 
     pub fn query_max_withdraw_per_tx(env: Env) -> Result<i128, BridgeError> {
 
-        todo!("implement: query_max_withdraw_per_tx")
+        check_initialized(&env)?;
+        Ok(read_max_withdraw_per_tx(&env))
 
     }
 
@@ -1848,7 +1849,17 @@ impl OnboardingBridge {
     ///
     /// * `("ReferralRateChanged", bps)` — no additional data.
     pub fn set_referral_rate(env: Env, bps: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: set_referral_rate")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        if bps > FEE_DENOMINATOR as u32 {
+            return Err(BridgeError::FeeTooHigh);
+        }
+        extend_instance_ttl(&env);
+        save_referral_rate(&env, bps);
+        env.events().publish(("ReferralRateChanged", bps), ());
+        Ok(())
     }
 
     /// Returns the current referral rate in basis points.
@@ -1859,7 +1870,8 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_referral_rate(env: Env) -> Result<u32, BridgeError> {
-        todo!("implement: query_referral_rate")
+        check_initialized(&env)?;
+        Ok(read_referral_rate(&env))
     }
 
     /// Funds a C-address with an optional referrer that receives a share of the fee.
@@ -1942,7 +1954,8 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_fee_collector(env: Env) -> Result<Address, BridgeError> {
-        todo!("implement: query_fee_collector")
+        check_initialized(&env)?;
+        Ok(read_fee_collector(&env))
     }
 
     /// Returns the current admin address.
