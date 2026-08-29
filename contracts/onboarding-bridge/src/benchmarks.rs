@@ -299,7 +299,7 @@ fn bench_claim_timelocked() {
     );
 
     // Advance past release_time so the claim succeeds.
-    env.ledger().set_timestamp(release_time + 1);
+    advance_ledger_time(&env, release_time + 1);
 
     measure(&env, "claim_timelocked", || {
         bridge.claim_timelocked(&id);
@@ -443,7 +443,7 @@ fn bench_reveal_fund() {
     let id = bridge.commit_fund(&user, &target, &token_id, &amount_hash, &deadline);
 
     // Advance past the minimum delay.
-    env.ledger().set_sequence_number(env.ledger().sequence() + crate::COMMIT_REVEAL_MIN_DELAY_LEDGERS + 1);
+    advance_ledger_sequence(&env, env.ledger().sequence() + crate::COMMIT_REVEAL_MIN_DELAY_LEDGERS + 1);
 
     measure(&env, "reveal_fund", || {
         bridge.reveal_fund(&id, &user, &target, &token_id, &amount, &nonce);
