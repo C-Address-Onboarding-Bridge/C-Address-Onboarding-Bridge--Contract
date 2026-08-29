@@ -13,11 +13,13 @@
 extern crate std;
 use std::{format, println};
 
+use crate::tests::swap_pool_contract::{SwapPool, SwapPoolClient};
 use crate::OnboardingBridge;
 
+use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
     contract, contractimpl, contracttype,
-    testutils::Address as _,
+    testutils::{Address as _, Ledger as _},
     Address, Bytes, BytesN, Env, Vec,
 };
 
@@ -313,7 +315,8 @@ fn bench_fund_c_address_crosschain() {
 
     // Register a single relayer and set threshold to 1.
     let relayer_secret: [u8; 32] = [1u8; 32];
-    let relayer_pubkey = BytesN::from_array(&env, &[1u8; 32]);
+    let relayer_signing_key = SigningKey::from_bytes(&relayer_secret);
+    let relayer_pubkey = BytesN::from_array(&env, relayer_signing_key.verifying_key().as_bytes());
     bridge.add_relayer(&relayer_pubkey);
     bridge.set_relayer_threshold(&1u32);
 
@@ -336,17 +339,8 @@ fn bench_fund_c_address_crosschain() {
     let nonce_hash: BytesN<32> = env.crypto().sha256(&nonce_pre).into();
 
     let mut addr_buf = [0u8; 64];
-    let tstr = target.to_string();
-    let tlen = tstr.len();
-    tstr.copy_into_slice(&mut addr_buf[..tlen]);
-    let target_hash: BytesN<32> =
-        env.crypto().sha256(&Bytes::from_slice(&env, &addr_buf[..tlen])).into();
-
-    let astr = token_id.to_string();
-    let alen = astr.len();
-    astr.copy_into_slice(&mut addr_buf[..alen]);
-    let asset_hash: BytesN<32> =
-        env.crypto().sha256(&Bytes::from_slice(&env, &addr_buf[..alen])).into();
+    let target_hash = hash_address(&env, &mut addr_buf, &target);
+    let asset_hash = hash_address(&env, &mut addr_buf, &token_id);
 
     let mut payload = Bytes::new(&env);
     payload.extend_from_array(&chain_id.to_be_bytes());
@@ -357,8 +351,8 @@ fn bench_fund_c_address_crosschain() {
     payload.append(&Bytes::from(nonce_hash));
     let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
 
-    // Create a relayer signature using the env's Ed25519.
-    let sig = env.crypto().ed25519_sign(&relayer_secret, &payload_hash);
+    // Create a relayer signature off-host (the host `Crypto` interface only verifies).
+    let sig = ed25519_sign_payload(&env, &relayer_signing_key, &payload_hash);
 
     let sigs = Vec::from_array(
         &env,
@@ -373,6 +367,38 @@ fn bench_fund_c_address_crosschain() {
     });
 
     let _ = admin;
+}
+
+// ── ed25519 signing helper ─────────────────────────────────────────────────────
+//
+// The host `Crypto` interface only exposes signature *verification*; producing
+// a signature is something done off-host by whoever holds the secret key (a
+// relayer, a meta-tx sender). Benchmarks stand in for that off-host signer
+// using ed25519-dalek directly, mirroring the pattern already used in
+// `tests.rs` (see `make_relayer_sig` / `sign_meta_fund_payload`).
+fn ed25519_sign_payload(
+    env: &Env,
+    signing_key: &SigningKey,
+    payload_hash: &BytesN<32>,
+) -> BytesN<64> {
+    let hash_bytes: Bytes = payload_hash.clone().into();
+    let mut hash_arr = [0u8; 32];
+    for i in 0..32 {
+        hash_arr[i] = hash_bytes.get(i as u32).unwrap();
+    }
+    let sig = signing_key.sign(&hash_arr);
+    BytesN::from_array(env, &sig.to_bytes())
+}
+
+/// Copies a Soroban `Address`'s strkey into `buf` and returns its SHA-256 hash,
+/// matching the contract's on-chain address-hashing scheme.
+fn hash_address(env: &Env, buf: &mut [u8; 64], addr: &Address) -> BytesN<32> {
+    let s = addr.to_string();
+    let len = s.len() as usize;
+    s.copy_into_slice(&mut buf[..len]);
+    env.crypto()
+        .sha256(&Bytes::from_slice(env, &buf[..len]))
+        .into()
 }
 
 // ── commit_fund / reveal_fund ─────────────────────────────────────────────────
@@ -443,8 +469,7 @@ fn bench_fund_c_address_with_swap() {
 
     // Deploy a minimal swap pool.
     let pool_id = env.register(SwapPool, ());
-    crate::benchmarks::SwapPoolClient::new(&env, &pool_id)
-        .initialize(&src_token_id, &dst_token_id, &1i128);
+    SwapPoolClient::new(&env, &pool_id).initialize(&src_token_id, &dst_token_id, &1i128);
 
     // Fund the swap pool with destination tokens.
     mint(&env, &dst_token_id, &pool_id, 10_000i128);
@@ -476,7 +501,8 @@ fn bench_execute_meta_fund() {
 
     // Generate a keypair and register it as the meta signer for source.
     let secret: [u8; 32] = [7u8; 32];
-    let pubkey = BytesN::from_array(&env, &[7u8; 32]);
+    let signing_key = SigningKey::from_bytes(&secret);
+    let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
     bridge.register_meta_signer(&source, &pubkey);
 
     // Build the canonical meta-fund payload and sign it.
@@ -484,20 +510,9 @@ fn bench_execute_meta_fund() {
     let domain = Bytes::from_slice(&env, b"meta_fund");
     let mut addr_buf = [0u8; 64];
 
-    let src_str = source.to_string();
-    let slen = src_str.len();
-    src_str.copy_into_slice(&mut addr_buf[..slen]);
-    let src_hash: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, &addr_buf[..slen])).into();
-
-    let tgt_str = target.to_string();
-    let tlen = tgt_str.len();
-    tgt_str.copy_into_slice(&mut addr_buf[..tlen]);
-    let tgt_hash: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, &addr_buf[..tlen])).into();
-
-    let ast_str = token_id.to_string();
-    let alen = ast_str.len();
-    ast_str.copy_into_slice(&mut addr_buf[..alen]);
-    let ast_hash: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, &addr_buf[..alen])).into();
+    let src_hash = hash_address(&env, &mut addr_buf, &source);
+    let tgt_hash = hash_address(&env, &mut addr_buf, &target);
+    let ast_hash = hash_address(&env, &mut addr_buf, &token_id);
 
     let nonce = 1u64;
     let deadline = env.ledger().timestamp() + 86_400;
@@ -512,7 +527,7 @@ fn bench_execute_meta_fund() {
     payload.extend_from_array(&deadline.to_be_bytes());
     let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
 
-    let signature = env.crypto().ed25519_sign(&secret, &payload_hash);
+    let signature = ed25519_sign_payload(&env, &signing_key, &payload_hash);
 
     let params = crate::MetaFundParams {
         source: source.clone(),
@@ -556,40 +571,4 @@ fn bench_tiered_fee_lookup() {
     });
 
     let _ = (admin, fee_collector);
-}
-
-// ═══ Minimal swap pool for bench_fund_c_address_with_swap ═════════════════════
-
-#[contracttype]
-pub enum SwapPoolKey {
-    InputToken,
-    OutputToken,
-    Rate,
-}
-
-#[contract]
-pub struct SwapPool;
-
-#[contractimpl]
-impl SwapPool {
-    pub fn initialize(e: Env, input_token: Address, output_token: Address, rate: i128) {
-        e.storage().instance().set(&SwapPoolKey::InputToken, &input_token);
-        e.storage().instance().set(&SwapPoolKey::OutputToken, &output_token);
-        e.storage().instance().set(&SwapPoolKey::Rate, &rate);
-    }
-
-    pub fn swap(e: Env, min_amount_out: i128, to: Address) -> i128 {
-        let rate: i128 = e.storage().instance().get(&SwapPoolKey::Rate).unwrap();
-        let input_token: Address = e.storage().instance().get(&SwapPoolKey::InputToken).unwrap();
-        let input_client = soroban_sdk::token::Client::new(&e, &input_token);
-        let amount_in = input_client.balance(&e.current_contract_address());
-        let amount_out = amount_in.checked_mul(rate).unwrap_or(0);
-        if amount_out < min_amount_out {
-            return amount_out;
-        }
-        let output_token: Address = e.storage().instance().get(&SwapPoolKey::OutputToken).unwrap();
-        let output_client = soroban_sdk::token::Client::new(&e, &output_token);
-        output_client.transfer(&e.current_contract_address(), &to, &amount_out);
-        amount_out
-    }
 }
