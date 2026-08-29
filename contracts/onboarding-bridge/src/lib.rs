@@ -2404,7 +2404,14 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn add_to_blocklist(env: Env, address: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: add_to_blocklist")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Blocked(address), &true);
+        Ok(())
     }
 
     /// Removes `address` from the blocklist, restoring its ability to receive funds.
@@ -2446,7 +2453,14 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn add_to_allowlist(env: Env, address: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: add_to_allowlist")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowlisted(address), &true);
+        Ok(())
     }
 
     /// Removes `address` from the allowlist.
@@ -2493,12 +2507,17 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn set_allowlist_mode(env: Env, enabled: bool, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: set_allowlist_mode")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        set_allowlist_mode_flag(&env, enabled);
+        Ok(())
     }
 
     /// Returns `true` if `address` is on the blocklist.
     pub fn query_is_blocked(env: Env, address: Address) -> bool {
-        todo!("implement: query_is_blocked")
+        is_blocked(&env, &address)
     }
 
     /// Returns `true` if `address` is on the allowlist.
