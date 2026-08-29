@@ -1,6 +1,6 @@
 use crate::{
     BridgeError, DataKey, FeeTier, MetaFundParams, OnboardingBridge,
-    CRITICAL_ENTRY_TTL_THRESHOLD, MAX_ALLOWED_TTL,
+    CRITICAL_ENTRY_TTL_THRESHOLD, MAX_ALLOWED_TTL, UPGRADE_TIMELOCK_LEDGERS,
 };
 
 use ed25519_dalek::{Signer, SigningKey};
