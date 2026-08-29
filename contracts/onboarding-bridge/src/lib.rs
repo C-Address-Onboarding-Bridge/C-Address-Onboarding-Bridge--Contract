@@ -1695,9 +1695,7 @@ impl OnboardingBridge {
     }
 
     pub fn query_pending_fee_collector(env: Env) -> Option<Address> {
-
-        todo!("implement: query_pending_fee_collector")
-
+        read_pending_fee_collector(&env)
     }
 
     pub fn set_admin(env: Env, new_admin: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
@@ -1734,9 +1732,7 @@ impl OnboardingBridge {
     }
 
     pub fn query_pending_admin(env: Env) -> Option<Address> {
-
-        todo!("implement: query_pending_admin")
-
+        read_pending_admin(&env)
     }
 
     pub fn set_minimum_amount(env: Env, amount: i128, nonce: Option<u64>) -> Result<(), BridgeError> {
@@ -1756,7 +1752,8 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_minimum_amount(env: Env) -> Result<i128, BridgeError> {
-        todo!("implement: query_minimum_amount")
+        check_initialized(&env)?;
+        Ok(read_minimum_amount(&env))
     }
 
     /// Withdraws accrued protocol fees to the fee collector.
