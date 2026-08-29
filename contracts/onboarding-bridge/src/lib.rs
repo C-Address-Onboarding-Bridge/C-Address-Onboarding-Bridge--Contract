@@ -1815,12 +1815,36 @@ impl OnboardingBridge {
     /// operations because it proves the proposed collector controls the key
     /// before the role is moved.
     pub fn propose_new_fee_collector(env: Env, new_collector: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: propose_new_fee_collector")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+        save_pending_fee_collector(&env, &new_collector);
+        env.events()
+            .publish(("FeeCollectorTransferProposed", admin, new_collector), ());
+        Ok(())
     }
 
     /// Accepts a pending fee-collector handoff.
     pub fn accept_fee_collector(env: Env) -> Result<(), BridgeError> {
-        todo!("implement: accept_fee_collector")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let pending = read_pending_fee_collector(&env).ok_or(BridgeError::Unauthorized)?;
+        pending.require_auth();
+        extend_instance_ttl(&env);
+        let old_collector = read_fee_collector(&env);
+        save_fee_collector(&env, &pending);
+        let mut config = read_bridge_config(&env);
+        config.fee_collector = pending.clone();
+        save_bridge_config(&env, &config);
+        clear_pending_fee_collector(&env);
+        env.events()
+            .publish(("FeeCollectorTransferred", old_collector, pending), ());
+        Ok(())
     }
 
     pub fn query_pending_fee_collector(env: Env) -> Option<Address> {
@@ -2424,7 +2448,30 @@ impl OnboardingBridge {
         new_wasm_hash: BytesN<32>,
         nonce: Option<u64>,
     ) -> Result<u32, BridgeError> {
-        todo!("implement: schedule_upgrade")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_deactivated(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+
+        let executable_after_ledger = env
+            .ledger()
+            .sequence()
+            .saturating_add(UPGRADE_TIMELOCK_LEDGERS);
+
+        let pending = PendingUpgrade {
+            new_wasm_hash: new_wasm_hash.clone(),
+            executable_after_ledger,
+        };
+        save_pending_upgrade(&env, &pending);
+
+        env.events().publish(
+            ("UpgradeScheduled",),
+            (new_wasm_hash, executable_after_ledger, admin),
+        );
+        Ok(executable_after_ledger)
     }
 
     /// Executes a previously scheduled upgrade once its timelock has elapsed.
@@ -2489,7 +2536,24 @@ impl OnboardingBridge {
     ///
     /// * `("UpgradeCancelled",)` — data: `(cancelled_wasm_hash, admin)`
     pub fn cancel_upgrade(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: cancel_upgrade")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_deactivated(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+
+        let pending = read_pending_upgrade(&env)
+            .ok_or(BridgeError::UpgradeNotScheduled)?;
+
+        clear_pending_upgrade(&env);
+
+        env.events().publish(
+            ("UpgradeCancelled",),
+            (pending.new_wasm_hash, admin),
+        );
+        Ok(())
     }
 
     /// Returns the pending scheduled upgrade, if any.
@@ -2497,7 +2561,7 @@ impl OnboardingBridge {
     /// Returns `None` if no upgrade has been scheduled or if a previous
     /// upgrade has already been executed or cancelled.
     pub fn query_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
-        todo!("implement: query_pending_upgrade")
+        read_pending_upgrade(&env)
     }
 
     /// Migrates the contract state to a new contract address in case of emergency.
@@ -3071,7 +3135,13 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn add_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
-        todo!("implement: add_relayer")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        read_admin(&env).require_auth();
+        extend_instance_ttl(&env);
+        add_relayer(&env, &pubkey);
+        Ok(())
     }
 
     /// Removes a relayer from the trusted set.
@@ -3389,7 +3459,26 @@ impl OnboardingBridge {
     ///
     /// * `("CommitmentTtlExtended",)` — data: `(admin, id, actual_ttl)`
     pub fn extend_commitment_ttl(env: Env, id: u64, ttl: u32) -> Result<(), BridgeError> {
-        todo!("implement: extend_commitment_ttl")
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let key = DataKey::Commitment(id);
+        if !env.storage().persistent().has(&key) {
+            return Err(BridgeError::CommitmentNotFound);
+        }
+        let max_ttl = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        let threshold = max_ttl / 4;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, max_ttl);
+        env.events()
+            .publish(("CommitmentTtlExtended",), (admin, id, max_ttl));
+        Ok(())
     }
 
     /// Extends the persistent-storage TTL for a registered relayer's entry.
@@ -3412,7 +3501,26 @@ impl OnboardingBridge {
     ///
     /// * `("RelayerTtlExtended",)` — data: `(admin, pubkey, actual_ttl)`
     pub fn extend_relayer_ttl(env: Env, pubkey: BytesN<32>, ttl: u32) -> Result<(), BridgeError> {
-        todo!("implement: extend_relayer_ttl")
+        let _guard = ReentrancyGuard::enter(&env);
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let key = DataKey::Relayer(pubkey.clone());
+        if !env.storage().persistent().has(&key) {
+            return Err(BridgeError::NotRelayer);
+        }
+        let max_ttl = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        let threshold = max_ttl / 4;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, max_ttl);
+        env.events()
+            .publish(("RelayerTtlExtended",), (admin, pubkey, max_ttl));
+        Ok(())
     }
 
     /// Extends the persistent-storage TTL for all per-`(source, asset)` and

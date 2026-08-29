@@ -311,6 +311,24 @@ cargo build -p onboarding-bridge --release
 cargo test -p onboarding-bridge --features testutils
 ```
 
+#### Recently added coverage
+
+`accept_fee_collector`, `cancel_upgrade`, `extend_commitment_ttl`, and
+`extend_relayer_ttl` previously had no tests anywhere in the suite. Coverage
+for each now lives in `contracts/onboarding-bridge/src/tests.rs`:
+
+| Function | Success path | Failure modes covered | Boundary covered |
+|---|---|---|---|
+| `accept_fee_collector` | Pending handoff is accepted, fee collector updates | `NotInitialized`, `ContractPaused`, no pending handoff, missing authorization | — |
+| `cancel_upgrade` | Pending upgrade is cancelled, `execute_upgrade` then errors `UpgradeNotScheduled` | `NotInitialized`, `UpgradeNotScheduled`, `DuplicateNonce`, missing admin authorization | Cancelling twice in a row |
+| `extend_commitment_ttl` | Persistent-storage TTL is verifiably extended | `NotInitialized`, `CommitmentNotFound`, missing admin authorization | Requested TTL above `MAX_ALLOWED_TTL` is capped |
+| `extend_relayer_ttl` | Persistent-storage TTL is verifiably extended | `NotInitialized`, `NotRelayer`, missing admin authorization | Requested TTL above `MAX_ALLOWED_TTL` is capped |
+
+Each test set fails if its target function's body is removed. The
+`onboarding-bridge` test target has 19 pre-existing compile errors unrelated
+to this work (soroban-sdk API drift and stale call signatures); these tests
+will run once that separate blocker is resolved.
+
 ### Deploy to Testnet
 
 1. Build WASM:
