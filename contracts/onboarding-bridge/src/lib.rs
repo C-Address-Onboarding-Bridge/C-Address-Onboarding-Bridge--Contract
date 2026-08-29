@@ -1490,7 +1490,98 @@ impl OnboardingBridge {
         nonce: Option<u64>,
         deadline: Option<u64>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: batch_fund_c_address")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        if targets.len() > MAX_BATCH_SIZE {
+            return Err(BridgeError::BatchTooLarge);
+        }
+        if let Some(dl) = deadline {
+            if env.ledger().timestamp() > dl {
+                return Err(BridgeError::TransactionExpired);
+            }
+        }
+        if targets.len() != amounts.len() {
+            return Err(BridgeError::MismatchedArrays);
+        }
+
+        check_asset_whitelisted(&env, &asset)?;
+
+        // Validate every amount before any tokens move.
+        let minimum_amount = read_minimum_amount(&env);
+        let mut total: i128 = 0;
+        for amount in amounts.iter() {
+            if amount <= 0 || amount < minimum_amount {
+                return Err(BridgeError::InvalidAmount);
+            }
+            total = safe_math::safe_add(total, amount)?;
+        }
+
+        check_daily_limit(&env, &source, &asset, total)?;
+
+        source.require_auth();
+        consume_nonce(&env, &source, nonce)?;
+
+        let token_client = token::Client::new(&env, &asset);
+        let contract_addr = env.current_contract_address();
+        token_client.transfer(&source, &contract_addr, &total);
+
+        // Aggregate amounts per unique target to minimize transfer count.
+        let mut aggregated: Map<Address, i128> = Map::new(&env);
+        for i in 0..targets.len() {
+            let target = targets.get(i).unwrap();
+            let amount = amounts.get(i).unwrap();
+            let updated = safe_math::safe_add(aggregated.get(target.clone()).unwrap_or(0), amount)?;
+            aggregated.set(target, updated);
+        }
+
+        let global_fee_bps = read_fee_bps(&env);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
+
+        let mut num_success: u32 = 0;
+        let mut num_failures: u32 = 0;
+        let mut refund_total: i128 = 0;
+
+        for (target, amount) in aggregated.iter() {
+            if check_access(&env, &target).is_err() {
+                num_failures += 1;
+                refund_total = safe_math::safe_add(refund_total, amount)?;
+                env.events().publish(
+                    ("BatchTransferFailed", source.clone(), target.clone()),
+                    (amount, soroban_sdk::Symbol::new(&env, "access_denied")),
+                );
+                continue;
+            }
+
+            let fee = calculate_fee(amount, effective_fee_bps)?;
+            let net_amount = safe_math::safe_sub(amount, fee)?;
+
+            if net_amount > 0 {
+                token_client.transfer(&contract_addr, &target, &net_amount);
+            }
+            update_asset_counters(&env, &asset, fee, net_amount)?;
+
+            num_success += 1;
+            env.events().publish(
+                ("CAddressFunded", asset.clone(), source.clone(), target.clone()),
+                (amount, fee),
+            );
+        }
+
+        if refund_total > 0 {
+            token_client.transfer(&contract_addr, &source, &refund_total);
+        }
+
+        increment_source_bridged_volume(&env, &source, total)?;
+        extend_instance_ttl(&env);
+        mint_loyalty_tokens(&env, &source);
+
+        env.events()
+            .publish(("BatchCompleted", source), (num_success, num_failures));
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1530,7 +1621,24 @@ impl OnboardingBridge {
     /// // assert_eq!(bridge.query_fee_bps(), 200u32);
     /// ```
     pub fn set_fee_bps(env: Env, new_fee_bps: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: set_fee_bps")
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        if new_fee_bps > MAX_FEE_BPS {
+            return Err(BridgeError::FeeTooHigh);
+        }
+
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+
+        let old_fee_bps = read_fee_bps(&env);
+        save_fee_bps(&env, &new_fee_bps);
+        extend_instance_ttl(&env);
+
+        env.events()
+            .publish(("FeeBpsChanged", old_fee_bps, new_fee_bps), (admin,));
+
+        Ok(())
     }
 
     /// Sets a maximum daily transfer limit for a specific `(source, asset)` pair.
@@ -1569,7 +1677,16 @@ impl OnboardingBridge {
         limit_amount: i128,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: set_source_daily_limit")
+        check_initialized(&env)?;
+
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+
+        save_source_daily_limit(&env, &source, &asset, limit_amount);
+        extend_instance_ttl(&env);
+
+        Ok(())
     }
 
     /// Returns the daily transfer limit for a `(source, asset)` pair.
@@ -1627,7 +1744,19 @@ impl OnboardingBridge {
         max_fee_bps: u32,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: set_asset_fee_cap")
+        check_initialized(&env)?;
+        if max_fee_bps > MAX_FEE_BPS {
+            return Err(BridgeError::FeeTooHigh);
+        }
+
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+
+        save_asset_fee_cap(&env, &asset, max_fee_bps);
+        extend_instance_ttl(&env);
+
+        Ok(())
     }
 
     /// Returns the fee cap configured for `asset`.
