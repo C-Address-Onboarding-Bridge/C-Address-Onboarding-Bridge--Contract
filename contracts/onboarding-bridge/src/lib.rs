@@ -1714,7 +1714,21 @@ impl OnboardingBridge {
 
     /// Accepts a pending admin handoff.
     pub fn accept_admin(env: Env) -> Result<(), BridgeError> {
-        todo!("implement: accept_admin")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let pending = read_pending_admin(&env).ok_or(BridgeError::Unauthorized)?;
+        pending.require_auth();
+        extend_instance_ttl(&env);
+        let old_admin = read_admin(&env);
+        save_admin(&env, &pending);
+        let mut config = read_bridge_config(&env);
+        config.admin = pending.clone();
+        save_bridge_config(&env, &config);
+        clear_pending_admin(&env);
+        env.events()
+            .publish(("AdminTransferred", old_admin, pending), ());
+        Ok(())
     }
 
     pub fn query_pending_admin(env: Env) -> Option<Address> {
@@ -3204,7 +3218,26 @@ impl OnboardingBridge {
     ///
     /// * `("TimelockTtlExtended",)` — data: `(admin, id, actual_ttl)`
     pub fn extend_timelock_ttl(env: Env, id: u64, ttl: u32) -> Result<(), BridgeError> {
-        todo!("implement: extend_timelock_ttl")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let key = DataKey::Timelock(id);
+        if !env.storage().persistent().has(&key) {
+            return Err(BridgeError::TimelockNotFound);
+        }
+        let max_ttl = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        let threshold = max_ttl / 4;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, max_ttl);
+        env.events()
+            .publish(("TimelockTtlExtended",), (admin, id, max_ttl));
+        Ok(())
     }
 
     /// Extends the persistent-storage TTL for a specific commit-reveal entry.
