@@ -3603,7 +3603,22 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::InvalidTtl`] — `ttl` is below `MIN_ALLOWED_TTL`.
     pub fn set_max_persistent_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
-        todo!("implement: set_max_persistent_ttl")
+        check_initialized(&env)?;
+
+        if ttl < MIN_ALLOWED_TTL {
+            return Err(BridgeError::InvalidTtl);
+        }
+
+        let admin = read_admin(&env);
+        admin.require_auth();
+
+        let capped = ttl.min(MAX_ALLOWED_TTL);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxPersistentTtl, &capped);
+        extend_instance_ttl(&env);
+
+        Ok(())
     }
 
     /// Returns the four TTL configuration values.
