@@ -1796,7 +1796,8 @@ impl OnboardingBridge {
         env: Env,
         asset: Address,
     ) -> Result<u32, BridgeError> {
-        todo!("implement: query_asset_fee_cap")
+        check_initialized(&env)?;
+        Ok(read_asset_fee_cap(&env, &asset))
     }
 
     /// Changes the address that is entitled to call `withdraw_fees`.
