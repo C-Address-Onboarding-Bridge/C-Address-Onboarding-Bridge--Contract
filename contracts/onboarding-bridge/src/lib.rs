@@ -2592,7 +2592,27 @@ impl OnboardingBridge {
         new_contract: Address,
         migrate_data: bool,
     ) -> Result<(), BridgeError> {
-        todo!("implement: emergency_migrate")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+
+        if migrate_data {
+            let config = read_config(&env);
+            env.events().publish(
+                ("EmergencyMigrate", "config"),
+                (config.fee_bps, config.paused, config.allowlist_mode),
+            );
+            env.events().publish(
+                ("EmergencyMigrate", "collector"),
+                (read_fee_collector(&env),),
+            );
+        }
+
+        env.storage().instance().set(&DataKey::Deactivated, &true);
+        env.events()
+            .publish(("EmergencyMigrated", admin), (new_contract,));
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2640,7 +2660,16 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn remove_from_blocklist(env: Env, address: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: remove_from_blocklist")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Blocked(address));
+
+        Ok(())
     }
 
     /// Adds `address` to the allowlist.
@@ -2685,7 +2714,16 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn remove_from_allowlist(env: Env, address: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: remove_from_allowlist")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Allowlisted(address));
+
+        Ok(())
     }
 
     /// Enables or disables allowlist mode.
