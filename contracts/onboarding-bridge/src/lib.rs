@@ -2297,7 +2297,8 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_total_fees_collected(env: Env, asset: Address) -> Result<i128, BridgeError> {
-        todo!("implement: query_total_fees_collected")
+        check_initialized(&env)?;
+        Ok(read_total_fees_collected(&env, &asset))
     }
 
     // -----------------------------------------------------------------------
@@ -2402,7 +2403,20 @@ impl OnboardingBridge {
     /// The `old_hash` in the event lets off-chain monitors detect unexpected
     /// upgrades. Consider using the timelocked path for mainnet deployments.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: upgrade")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+
+        let old_hash = read_current_wasm_hash(&env);
+        save_current_wasm_hash(&env, &new_wasm_hash);
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+
+        env.events()
+            .publish(("ContractUpgraded",), (old_hash, new_wasm_hash, admin));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2523,7 +2537,30 @@ impl OnboardingBridge {
         expected_hash: BytesN<32>,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: execute_upgrade")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+
+        let pending = read_pending_upgrade(&env).ok_or(BridgeError::UpgradeNotScheduled)?;
+        if pending.new_wasm_hash != expected_hash {
+            return Err(BridgeError::UpgradeHashMismatch);
+        }
+        if env.ledger().sequence() < pending.executable_after_ledger {
+            return Err(BridgeError::UpgradeTimelockActive);
+        }
+
+        clear_pending_upgrade(&env);
+
+        let old_hash = read_current_wasm_hash(&env);
+        save_current_wasm_hash(&env, &expected_hash);
+        env.deployer()
+            .update_current_contract_wasm(expected_hash.clone());
+
+        env.events()
+            .publish(("ContractUpgraded",), (old_hash, expected_hash, admin));
+        Ok(())
     }
 
     /// Cancels a pending scheduled upgrade.
