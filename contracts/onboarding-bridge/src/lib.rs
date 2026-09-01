@@ -1890,7 +1890,13 @@ impl OnboardingBridge {
 
     pub fn set_minimum_amount(env: Env, amount: i128, nonce: Option<u64>) -> Result<(), BridgeError> {
 
-        todo!("implement: set_minimum_amount")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        save_minimum_amount(&env, &amount);
+        extend_instance_ttl(&env);
+        Ok(())
 
     }
 
@@ -1956,7 +1962,13 @@ impl OnboardingBridge {
 
     pub fn set_max_withdraw_per_tx(env: Env, amount: i128, nonce: Option<u64>) -> Result<(), BridgeError> {
 
-        todo!("implement: set_max_withdraw_per_tx")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        save_max_withdraw_per_tx(&env, amount);
+        extend_instance_ttl(&env);
+        Ok(())
 
     }
 
@@ -1968,7 +1980,8 @@ impl OnboardingBridge {
 
     pub fn query_fee_bps(env: Env) -> Result<u32, BridgeError> {
 
-        todo!("implement: query_fee_bps")
+        check_initialized(&env)?;
+        Ok(read_fee_bps(&env))
 
     }
 
