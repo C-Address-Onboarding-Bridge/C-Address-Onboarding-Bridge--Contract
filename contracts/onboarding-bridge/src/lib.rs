@@ -2935,12 +2935,12 @@ impl OnboardingBridge {
 
     /// Returns `true` if `address` is on the allowlist.
     pub fn query_is_allowlisted(env: Env, address: Address) -> bool {
-        todo!("implement: query_is_allowlisted")
+        is_allowlisted(&env, &address)
     }
 
     /// Returns `true` if allowlist mode is currently enabled.
     pub fn query_allowlist_mode(env: Env) -> bool {
-        todo!("implement: query_allowlist_mode")
+        allowlist_mode(&env)
     }
 
     // -----------------------------------------------------------------------
@@ -2996,7 +2996,29 @@ impl OnboardingBridge {
         destination: Address,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: reclaim_tokens")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+
+        let token_client = token::Client::new(&env, &asset);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+        let counters = read_asset_counters(&env, &asset);
+        let reclaimable = contract_balance - counters.accrued_fees - counters.locked_timelock;
+
+        if reclaimable < amount {
+            return Err(BridgeError::InsufficientReclaimable);
+        }
+
+        token_client.transfer(&env.current_contract_address(), &destination, &amount);
+        env.events()
+            .publish(("TokensReclaimed", admin, asset), (amount, destination));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -3023,7 +3045,16 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn add_asset(env: Env, asset: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: add_asset")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+        let mut whitelist = read_whitelist(&env);
+        whitelist.set(asset, true);
+        save_whitelist(&env, &whitelist);
+        Ok(())
     }
 
     /// Removes `asset` from the token whitelist.
