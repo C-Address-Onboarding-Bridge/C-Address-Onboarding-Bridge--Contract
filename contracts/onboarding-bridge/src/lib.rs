@@ -1345,7 +1345,28 @@ impl OnboardingBridge {
         fee_bps: u32,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: initialize")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        if read_initialized(&env) {
+            return Err(BridgeError::AlreadyInitialized);
+        }
+        if fee_bps > MAX_FEE_BPS {
+            return Err(BridgeError::FeeTooHigh);
+        }
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        save_admin(&env, &admin);
+        save_fee_collector(&env, &fee_collector);
+        save_fee_bps(&env, &fee_bps);
+        save_bridge_config(&env, &BridgeConfigData {
+            admin: admin.clone(),
+            fee_collector: fee_collector.clone(),
+            fee_bps,
+        });
+        mark_initialized(&env);
+        extend_instance_ttl(&env);
+        env.events()
+            .publish(("Initialized", admin.clone(), fee_collector.clone()), (fee_bps,));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
