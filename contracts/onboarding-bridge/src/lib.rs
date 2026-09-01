@@ -1862,7 +1862,17 @@ impl OnboardingBridge {
     /// This two-step path is preferred over `set_admin` for normal operations
     /// because it prevents accidentally transferring control to an unusable key.
     pub fn propose_new_admin(env: Env, new_admin: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: propose_new_admin")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+        save_pending_admin(&env, &new_admin);
+        env.events()
+            .publish(("AdminProposed", admin, new_admin), ());
+        Ok(())
     }
 
     /// Accepts a pending admin handoff.
