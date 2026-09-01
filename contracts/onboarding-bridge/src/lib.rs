@@ -2346,7 +2346,14 @@ impl OnboardingBridge {
         asset: Address,
         amount: i128,
     ) -> Result<(u32, i128, i128), BridgeError> {
-        todo!("implement: query_effective_fee")
+        check_initialized(&env)?;
+        let global_fee_bps = read_fee_bps(&env);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let cap = read_asset_fee_cap(&env, &asset);
+        let effective_fee_bps = tiered_fee_bps.min(cap);
+        let fee = calculate_fee(amount, effective_fee_bps)?;
+        let net = safe_math::safe_sub(amount, fee)?;
+        Ok((effective_fee_bps, fee, net))
     }
 
     /// Returns the cumulative net amount of `asset` that has been delivered to
@@ -2411,7 +2418,15 @@ impl OnboardingBridge {
     /// scheduling or executing upgrades, which are intentionally not pause-gated
     /// so that an upgrade can fix whatever condition required the pause.
     pub fn pause(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: pause")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+
+        set_paused(&env, true);
+
+        env.events().publish(("ContractPaused",), (admin,));
+        Ok(())
     }
 
     /// Resumes normal contract operation after a pause.
@@ -2433,12 +2448,20 @@ impl OnboardingBridge {
     ///
     /// * `("ContractUnpaused",)` — data: `(admin,)`
     pub fn unpause(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: unpause")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+
+        set_paused(&env, false);
+
+        env.events().publish(("ContractUnpaused",), (admin,));
+        Ok(())
     }
 
     /// Returns `true` if the contract is currently paused.
     pub fn query_is_paused(env: Env) -> bool {
-        todo!("implement: query_is_paused")
+        read_paused(&env)
     }
 
     // -----------------------------------------------------------------------
