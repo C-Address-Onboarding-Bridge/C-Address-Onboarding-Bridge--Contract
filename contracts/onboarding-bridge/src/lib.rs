@@ -2159,7 +2159,16 @@ impl OnboardingBridge {
         env: Env,
         assets: Vec<Address>,
     ) -> Result<Map<Address, i128>, BridgeError> {
-        todo!("implement: query_all_balances")
+        if assets.len() > MAX_BATCH_SIZE {
+            return Err(BridgeError::BatchTooLarge);
+        }
+        let contract_addr = env.current_contract_address();
+        let mut balances = Map::new(&env);
+        for asset in assets.iter() {
+            let token_client = token::Client::new(&env, &asset);
+            balances.set(asset.clone(), token_client.balance(&contract_addr));
+        }
+        Ok(balances)
     }
 
     /// Returns the contract's total token balance for `asset`.
@@ -2177,7 +2186,7 @@ impl OnboardingBridge {
 
     /// Returns `true` if the contract has been initialised.
     pub fn query_is_initialized(env: Env) -> bool {
-        todo!("implement: query_is_initialized")
+        read_initialized(&env)
     }
 
     /// Returns the current sequential nonce value for `caller`.
@@ -2190,7 +2199,7 @@ impl OnboardingBridge {
     ///
     /// * `caller` (`Address`) — The address whose nonce is queried.
     pub fn query_nonce(env: Env, caller: Address) -> u64 {
-        todo!("implement: query_nonce")
+        read_nonce(&env, &caller)
     }
 
     /// Simulates the fee and net amount for a given gross amount at the current
@@ -2217,7 +2226,10 @@ impl OnboardingBridge {
     /// // assert_eq!(net, 990i128);
     /// ```
     pub fn query_calculate_fee(env: Env, gross_amount: i128) -> Result<(i128, i128), BridgeError> {
-        todo!("implement: query_calculate_fee")
+        let fee_bps = read_fee_bps(&env);
+        let fee = calculate_fee(gross_amount, fee_bps)?;
+        let net = safe_math::safe_sub(gross_amount, fee)?;
+        Ok((fee, net))
     }
 
     /// Returns the real effective fee that would be charged for a specific
