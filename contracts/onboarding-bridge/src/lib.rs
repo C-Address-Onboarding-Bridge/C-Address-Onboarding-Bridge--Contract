@@ -1967,7 +1967,36 @@ impl OnboardingBridge {
     /// // bridge.withdraw_fees(&usdc, &5i128, &None);
     /// ```
     pub fn withdraw_fees(env: Env, asset: Address, amount: i128, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: withdraw_fees")
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        // Only the current fee collector may withdraw accrued fees.
+        let fee_collector = read_fee_collector(&env);
+        fee_collector.require_auth();
+        consume_nonce(&env, &fee_collector, nonce)?;
+
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+
+        let accrued = read_accrued_fees(&env, &asset);
+        if amount > accrued {
+            return Err(BridgeError::InsufficientReclaimable);
+        }
+
+        // Transfer the tokens to the fee collector, then decrement the accrued
+        // fee counter so it always tracks the fee collector's entitlement.
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&env.current_contract_address(), &fee_collector, &amount);
+        decrement_accrued_fees(&env, &asset, amount);
+
+        env.events().publish(
+            ("FeesWithdrawn", fee_collector.clone()),
+            (amount, asset),
+        );
+
+        extend_instance_ttl(&env);
+        Ok(())
     }
 
     pub fn set_max_withdraw_per_tx(env: Env, amount: i128, nonce: Option<u64>) -> Result<(), BridgeError> {
