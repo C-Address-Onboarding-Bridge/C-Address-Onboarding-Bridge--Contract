@@ -5446,3 +5446,158 @@ fn test_extend_timelock_ttl_before_initialize_fails() {
         Err(Ok(BridgeError::NotInitialized))
     );
 }
+
+/********** Fee tier tests **********/
+
+#[test]
+fn test_query_current_tier_default_when_no_tiers_set() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    let tier = bridge.query_current_tier(&user);
+    assert_eq!(tier.min_volume, 0i128);
+    assert_eq!(tier.max_volume, i128::MAX);
+    assert_eq!(tier.fee_bps, 100u32);
+}
+
+#[test]
+fn test_query_current_tier_matches_volume() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    let tiers = Vec::from_array(
+        &env,
+        [
+            FeeTier { min_volume: 0, max_volume: 999, fee_bps: 100 },
+            FeeTier { min_volume: 1000, max_volume: 4999, fee_bps: 80 },
+            FeeTier { min_volume: 5000, max_volume: i128::MAX, fee_bps: 50 },
+        ],
+    );
+    bridge.set_fee_tiers(&tiers);
+
+    // No bridged volume yet => first tier.
+    let tier = bridge.query_current_tier(&user);
+    assert_eq!(tier.fee_bps, 100u32);
+    assert_eq!(tier.max_volume, 999i128);
+}
+
+#[test]
+fn test_query_current_tier_not_initialized_fails() {
+    let env = Env::default();
+    let user = Address::generate(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_query_current_tier(&user),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_set_fee_tiers_success() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier { min_volume: 0, max_volume: i128::MAX, fee_bps: 200 }],
+    );
+    bridge.set_fee_tiers(&tiers);
+
+    // Verify via query_current_tier since query_fee_tiers is not yet implemented.
+    let tier = bridge.query_current_tier(&user);
+    assert_eq!(tier.fee_bps, 200u32);
+}
+
+#[test]
+fn test_set_fee_tiers_when_paused_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.pause(&None);
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier { min_volume: 0, max_volume: i128::MAX, fee_bps: 200 }],
+    );
+
+    assert_eq!(
+        bridge.try_set_fee_tiers(&tiers),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_set_fee_tiers_too_many_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    let mut tiers: Vec<FeeTier> = Vec::new(&env);
+    for i in 0..51u32 {
+        tiers.push_back(FeeTier {
+            min_volume: i as i128,
+            max_volume: i as i128,
+            fee_bps: 10,
+        });
+    }
+
+    assert_eq!(
+        bridge.try_set_fee_tiers(&tiers),
+        Err(Ok(BridgeError::TooManyFeeTiers))
+    );
+}
+
+#[test]
+fn test_set_fee_tiers_fee_too_high_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier { min_volume: 0, max_volume: i128::MAX, fee_bps: 1001 }],
+    );
+
+    assert_eq!(
+        bridge.try_set_fee_tiers(&tiers),
+        Err(Ok(BridgeError::FeeTooHigh))
+    );
+}
+
+#[test]
+#[should_panic]
+fn test_set_fee_tiers_requires_admin_auth() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier { min_volume: 0, max_volume: i128::MAX, fee_bps: 200 }],
+    );
+
+    use soroban_sdk::xdr::SorobanAuthorizationEntry;
+    env.set_auths(&[] as &[SorobanAuthorizationEntry]);
+
+    bridge.set_fee_tiers(&tiers);
+}
