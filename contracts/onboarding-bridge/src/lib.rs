@@ -3127,7 +3127,16 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn remove_asset(env: Env, asset: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: remove_asset")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+        let mut whitelist = read_whitelist(&env);
+        whitelist.set(asset, false);
+        save_whitelist(&env, &whitelist);
+        Ok(())
     }
 
     /// Returns `true` if `asset` is currently on the whitelist.
@@ -3136,7 +3145,8 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_is_asset_whitelisted(env: Env, asset: Address) -> Result<bool, BridgeError> {
-        todo!("implement: query_is_asset_whitelisted")
+        check_initialized(&env)?;
+        Ok(read_whitelist(&env).get(asset).unwrap_or(false))
     }
 
     /// Returns a page of currently whitelisted asset addresses.
