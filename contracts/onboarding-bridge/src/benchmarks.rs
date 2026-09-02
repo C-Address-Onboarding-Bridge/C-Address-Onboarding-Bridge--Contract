@@ -1,5 +1,4 @@
 //! Gas/cost benchmarks for OnboardingBridge contract functions.
-//!
 //! Run with:
 //!   cargo test -p onboarding-bridge --features testutils bench_ -- --nocapture
 //!
@@ -14,6 +13,7 @@ extern crate std;
 use std::{format, println};
 
 use crate::tests::swap_pool_contract::{SwapPool, SwapPoolClient};
+use crate::tests::{advance_ledger_sequence, advance_ledger_time};
 use crate::OnboardingBridge;
 
 use ed25519_dalek::{Signer, SigningKey};

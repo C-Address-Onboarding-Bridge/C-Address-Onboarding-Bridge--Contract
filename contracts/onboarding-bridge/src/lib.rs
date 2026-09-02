@@ -3185,7 +3185,17 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn add_swap_pool(env: Env, pool: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: add_swap_pool")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+        let mut whitelist = read_pool_whitelist(&env);
+        whitelist.set(pool, true);
+        save_pool_whitelist(&env, &whitelist);
+        Ok(())
     }
 
     /// Removes `pool` from the DEX swap-pool whitelist.
@@ -3207,7 +3217,17 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn remove_swap_pool(env: Env, pool: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
-        todo!("implement: remove_swap_pool")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+        let mut whitelist = read_pool_whitelist(&env);
+        whitelist.set(pool, false);
+        save_pool_whitelist(&env, &whitelist);
+        Ok(())
     }
 
     /// Returns `true` if `pool` is currently on the swap-pool whitelist.

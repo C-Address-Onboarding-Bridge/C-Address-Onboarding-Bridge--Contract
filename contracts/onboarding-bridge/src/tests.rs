@@ -5446,3 +5446,103 @@ fn test_extend_timelock_ttl_before_initialize_fails() {
         Err(Ok(BridgeError::NotInitialized))
     );
 }
+
+/********** Swap-pool whitelist tests **********/
+
+#[test]
+fn test_remove_swap_pool_success() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let pool = Address::generate(&env);
+    bridge.add_swap_pool(&pool, &None);
+    bridge.remove_swap_pool(&pool, &None);
+
+    // Removing an already-removed pool is idempotent and still succeeds.
+    bridge.remove_swap_pool(&pool, &None);
+}
+
+#[test]
+fn test_remove_swap_pool_allows_re_add() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let pool = Address::generate(&env);
+    bridge.add_swap_pool(&pool, &None);
+    bridge.remove_swap_pool(&pool, &None);
+    bridge.add_swap_pool(&pool, &None);
+}
+
+#[test]
+fn test_remove_swap_pool_not_initialized_fails() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let pool = Address::generate(&env);
+
+    assert_eq!(
+        bridge.try_remove_swap_pool(&pool, &None),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_remove_swap_pool_duplicate_nonce_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let pool = Address::generate(&env);
+    bridge.add_swap_pool(&pool, &Some(0u64));
+    bridge.remove_swap_pool(&pool, &Some(1u64));
+
+    // Reusing the same nonce must fail.
+    assert_eq!(
+        bridge.try_remove_swap_pool(&pool, &Some(0u64)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+}
+
+#[test]
+fn test_remove_swap_pool_when_paused_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let pool = Address::generate(&env);
+    bridge.add_swap_pool(&pool, &None);
+    bridge.pause(&None);
+
+    assert_eq!(
+        bridge.try_remove_swap_pool(&pool, &None),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+#[should_panic]
+fn test_remove_swap_pool_requires_admin_auth() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let pool = Address::generate(&env);
+    bridge.add_swap_pool(&pool, &None);
+
+    use soroban_sdk::xdr::SorobanAuthorizationEntry;
+    env.set_auths(&[] as &[SorobanAuthorizationEntry]);
+
+    bridge.remove_swap_pool(&pool, &None);
+}
