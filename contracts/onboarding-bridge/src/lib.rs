@@ -3323,7 +3323,8 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_fee_tiers(env: Env) -> Result<Vec<FeeTier>, BridgeError> {
-        todo!("implement: query_fee_tiers")
+        check_initialized(&env)?;
+        Ok(read_fee_tiers(&env).unwrap_or(Vec::new(&env)))
     }
 
     /// Returns the fee tier that currently applies to `source`, based on their
@@ -3493,7 +3494,17 @@ impl OnboardingBridge {
     /// * [`BridgeError::ThresholdExceedsRelayers`] — `threshold` is greater than
     ///   the number of registered relayers.
     pub fn set_relayer_threshold(env: Env, threshold: u32) -> Result<(), BridgeError> {
-        todo!("implement: set_relayer_threshold")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        if threshold > relayer_count(&env) {
+            return Err(BridgeError::ThresholdExceedsRelayers);
+        }
+        save_relayer_threshold(&env, threshold);
+        extend_instance_ttl(&env);
+        Ok(())
     }
 
     /// Returns the current M-of-N relayer signature threshold.
