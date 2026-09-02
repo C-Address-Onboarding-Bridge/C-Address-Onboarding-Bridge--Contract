@@ -3340,7 +3340,16 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_current_tier(env: Env, source: Address) -> Result<FeeTier, BridgeError> {
-        todo!("implement: query_current_tier")
+        check_initialized(&env)?;
+        let global_bps = read_fee_bps(&env);
+        match find_current_tier(&env, &source) {
+            Some(tier) => Ok(tier),
+            None => Ok(FeeTier {
+                min_volume: 0,
+                max_volume: i128::MAX,
+                fee_bps: global_bps,
+            }),
+        }
     }
 
     // -----------------------------------------------------------------------
