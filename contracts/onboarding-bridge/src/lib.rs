@@ -3311,7 +3311,29 @@ impl OnboardingBridge {
     ///
     /// * `("FeeTiersSet", admin)` — data: `(tiers.len(),)`
     pub fn set_fee_tiers(env: Env, tiers: Vec<FeeTier>) -> Result<(), BridgeError> {
-        todo!("implement: set_fee_tiers")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+
+        if tiers.len() > MAX_FEE_TIERS {
+            return Err(BridgeError::TooManyFeeTiers);
+        }
+
+        for i in 0..tiers.len() {
+            let tier = tiers.get(i).unwrap();
+            if tier.fee_bps > 1000 {
+                return Err(BridgeError::FeeTooHigh);
+            }
+        }
+
+        save_fee_tiers(&env, &tiers);
+        extend_instance_ttl(&env);
+
+        env.events().publish(("FeeTiersSet", admin), (tiers.len(),));
+
+        Ok(())
     }
 
     /// Returns the configured fee tiers.
@@ -3340,7 +3362,16 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_current_tier(env: Env, source: Address) -> Result<FeeTier, BridgeError> {
-        todo!("implement: query_current_tier")
+        check_initialized(&env)?;
+        if let Some(tier) = find_current_tier(&env, &source) {
+            Ok(tier)
+        } else {
+            Ok(FeeTier {
+                min_volume: 0,
+                max_volume: i128::MAX,
+                fee_bps: read_fee_bps(&env),
+            })
+        }
     }
 
     // -----------------------------------------------------------------------
