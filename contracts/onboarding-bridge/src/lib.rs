@@ -3268,7 +3268,9 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::LoyaltyTokenNotSet`] — No loyalty token has been configured.
     pub fn query_loyalty_token(env: Env) -> Result<(Address, i128), BridgeError> {
-        todo!("implement: query_loyalty_token")
+        check_initialized(&env)?;
+        let token = read_loyalty_token(&env).ok_or(BridgeError::LoyaltyTokenNotSet)?;
+        Ok((token, read_loyalty_amount_per_fund(&env)))
     }
 
     // -----------------------------------------------------------------------
@@ -3502,7 +3504,8 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_relayer_threshold(env: Env) -> Result<u32, BridgeError> {
-        todo!("implement: query_relayer_threshold")
+        check_initialized(&env)?;
+        Ok(relayer_threshold(&env))
     }
 
     /// Returns `true` if `pubkey` is a registered relayer.
