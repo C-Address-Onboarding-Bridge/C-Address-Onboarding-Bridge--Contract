@@ -3637,7 +3637,7 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::TimelockNotFound`] — No entry exists for `id`.
     pub fn query_timelocked(env: Env, id: u64) -> Result<TimelockEntry, BridgeError> {
-        todo!("implement: query_timelocked")
+        read_timelock_entry(&env, id).ok_or(BridgeError::TimelockNotFound)
     }
 
     // -----------------------------------------------------------------------
