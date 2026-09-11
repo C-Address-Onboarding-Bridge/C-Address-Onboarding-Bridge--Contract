@@ -2,6 +2,32 @@ use crate::events::IndexedEvent;
 use crate::webhook::{CreateSubscription, Subscription, WebhookDelivery};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 
+/// Raw column tuple for a `subscriptions` row, in SELECT order:
+/// id, url, event_type, asset_filter, source_filter, target_filter, active, created_at.
+type SubscriptionRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+    String,
+);
+
+/// Raw column tuple for a `webhook_deliveries` row, in SELECT order:
+/// id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at.
+type WebhookDeliveryRow = (
+    String,
+    String,
+    String,
+    String,
+    i32,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
 pub struct Database {
     pool: SqlitePool,
 }
@@ -95,11 +121,10 @@ impl Database {
     }
 
     pub async fn get_last_ledger(&self) -> Result<Option<i64>, sqlx::Error> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT value FROM indexer_state WHERE key = 'last_ledger'",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM indexer_state WHERE key = 'last_ledger'")
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.map(|(v,)| v.parse().unwrap_or(0)))
     }
 
@@ -223,7 +248,7 @@ impl Database {
     }
 
     pub async fn list_subscriptions(&self) -> Result<Vec<Subscription>, sqlx::Error> {
-        let rows: Vec<(String, String, Option<String>, Option<String>, Option<String>, Option<String>, bool, String)> =
+        let rows: Vec<SubscriptionRow> =
             sqlx::query_as(
                 "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, created_at
                  FROM subscriptions WHERE active = 1",
@@ -233,8 +258,8 @@ impl Database {
 
         Ok(rows
             .into_iter()
-            .map(|(id, url, event_type, asset_filter, source_filter, target_filter, active, created_at)| {
-                Subscription {
+            .map(
+                |(
                     id,
                     url,
                     event_type,
@@ -243,8 +268,19 @@ impl Database {
                     target_filter,
                     active,
                     created_at,
-                }
-            })
+                )| {
+                    Subscription {
+                        id,
+                        url,
+                        event_type,
+                        asset_filter,
+                        source_filter,
+                        target_filter,
+                        active,
+                        created_at,
+                    }
+                },
+            )
             .collect())
     }
 
@@ -256,10 +292,7 @@ impl Database {
         Ok(())
     }
 
-    pub async fn queue_webhook_deliveries(
-        &self,
-        event: &IndexedEvent,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn queue_webhook_deliveries(&self, event: &IndexedEvent) -> Result<(), sqlx::Error> {
         let subs = self.list_subscriptions().await?;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -310,7 +343,7 @@ impl Database {
 
     pub async fn get_pending_deliveries(&self) -> Result<Vec<WebhookDelivery>, sqlx::Error> {
         let now = chrono::Utc::now().to_rfc3339();
-        let rows: Vec<(String, String, String, String, i32, Option<String>, Option<String>, String)> =
+        let rows: Vec<WebhookDeliveryRow> =
             sqlx::query_as(
                 "SELECT id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at
                  FROM webhook_deliveries
@@ -323,8 +356,8 @@ impl Database {
 
         Ok(rows
             .into_iter()
-            .map(|(id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at)| {
-                WebhookDelivery {
+            .map(
+                |(
                     id,
                     subscription_id,
                     event_id,
@@ -333,8 +366,19 @@ impl Database {
                     next_retry_at,
                     last_error,
                     created_at,
-                }
-            })
+                )| {
+                    WebhookDelivery {
+                        id,
+                        subscription_id,
+                        event_id,
+                        status,
+                        attempts,
+                        next_retry_at,
+                        last_error,
+                        created_at,
+                    }
+                },
+            )
             .collect())
     }
 
@@ -400,10 +444,9 @@ impl Database {
     }
 
     pub async fn get_stats(&self) -> Result<serde_json::Value, sqlx::Error> {
-        let total_events: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM events")
-                .fetch_one(&self.pool)
-                .await?;
+        let total_events: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events")
+            .fetch_one(&self.pool)
+            .await?;
 
         let total_subs: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM subscriptions WHERE active = 1")
@@ -497,7 +540,9 @@ mod tests {
 
         db.insert_event(&event).await.expect("first insert");
         // Second insert of the same id should silently do nothing (INSERT OR IGNORE).
-        db.insert_event(&event).await.expect("duplicate insert must not error");
+        db.insert_event(&event)
+            .await
+            .expect("duplicate insert must not error");
 
         let rows = db.list_events(10, 0).await.expect("list_events");
         assert_eq!(rows.len(), 1, "duplicate insert must leave exactly one row");
@@ -509,8 +554,12 @@ mod tests {
     async fn test_insert_two_distinct_events_both_persist() {
         let db = setup_db().await;
 
-        db.insert_event(&make_event("evt-001")).await.expect("first insert");
-        db.insert_event(&make_event("evt-002")).await.expect("second insert");
+        db.insert_event(&make_event("evt-001"))
+            .await
+            .expect("first insert");
+        db.insert_event(&make_event("evt-002"))
+            .await
+            .expect("second insert");
 
         let rows = db.list_events(10, 0).await.expect("list_events");
         assert_eq!(rows.len(), 2, "two distinct events must both be stored");
@@ -542,6 +591,9 @@ mod tests {
             .expect("second parse must succeed")
             .id;
 
-        assert_eq!(id1, id2, "parse_contract_event must produce the same id for the same input");
+        assert_eq!(
+            id1, id2,
+            "parse_contract_event must produce the same id for the same input"
+        );
     }
 }
