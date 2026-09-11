@@ -30,8 +30,15 @@ jobs:
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
 
+      # `| tee` made this step exit 0 no matter what cargo did, so the job
+      # reported green for the whole bounty programme while cargo was actually
+      # exiting 101 ("no test target named gas_benchmark" -- the file lived in
+      # benches/, not tests/). The file has been moved and pipefail is on, so a
+      # real failure now fails the job.
       - name: Run benchmark tests
+        shell: bash
         run: |
+          set -o pipefail
           cargo test -p onboarding-bridge --features testutils \
             --test gas_benchmark -- --nocapture 2>&1 | tee benchmark_output.txt
 

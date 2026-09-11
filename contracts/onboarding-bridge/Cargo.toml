@@ -7,7 +7,10 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+# `rlib` alongside `cdylib` so benches/ and integration targets can link the
+# crate (`use onboarding_bridge::...`). The deployed artifact is still the
+# cdylib; adding rlib does not change the emitted wasm.
+crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]

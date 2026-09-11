@@ -23,7 +23,11 @@ impl std::fmt::Display for UrlValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidUrl(s) => write!(f, "invalid URL: {}", s),
-            Self::ForbiddenScheme(s) => write!(f, "forbidden scheme '{}': only http and https are allowed", s),
+            Self::ForbiddenScheme(s) => write!(
+                f,
+                "forbidden scheme '{}': only http and https are allowed",
+                s
+            ),
             Self::PrivateOrReservedHost(s) => write!(f, "private/reserved host rejected: {}", s),
             Self::UnresolvableHost(s) => write!(f, "host could not be resolved: {}", s),
         }
@@ -73,8 +77,7 @@ fn is_private_or_reserved(ip: IpAddr) -> bool {
 /// For a production service you would use `tokio::net::lookup_host` instead.
 pub fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
     // --- 1. Parse the URL ---------------------------------------------------
-    let parsed = url::Url::parse(url)
-        .map_err(|e| UrlValidationError::InvalidUrl(e.to_string()))?;
+    let parsed = url::Url::parse(url).map_err(|e| UrlValidationError::InvalidUrl(e.to_string()))?;
 
     // --- 2. Scheme check ----------------------------------------------------
     let scheme = parsed.scheme();
@@ -88,7 +91,10 @@ pub fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
         .ok_or_else(|| UrlValidationError::InvalidUrl("URL has no host".to_string()))?;
 
     // If the host is already an IP literal, check it directly.
-    if let Ok(ip) = host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+    if let Ok(ip) = host
+        .trim_matches(|c| c == '[' || c == ']')
+        .parse::<IpAddr>()
+    {
         if is_private_or_reserved(ip) {
             return Err(UrlValidationError::PrivateOrReservedHost(ip.to_string()));
         }
@@ -98,7 +104,9 @@ pub fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
     // --- 4. DNS resolution + IP check ---------------------------------------
     // Reject bare "localhost" without a DNS lookup.
     if host.eq_ignore_ascii_case("localhost") {
-        return Err(UrlValidationError::PrivateOrReservedHost("localhost".to_string()));
+        return Err(UrlValidationError::PrivateOrReservedHost(
+            "localhost".to_string(),
+        ));
     }
 
     let port = parsed.port_or_known_default().unwrap_or(80);
@@ -107,7 +115,9 @@ pub fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
 
     for addr in addrs {
         if is_private_or_reserved(addr.ip()) {
-            return Err(UrlValidationError::PrivateOrReservedHost(addr.ip().to_string()));
+            return Err(UrlValidationError::PrivateOrReservedHost(
+                addr.ip().to_string(),
+            ));
         }
     }
 
@@ -184,7 +194,11 @@ async fn deliver_pending(state: &AppState) -> Result<(), Box<dyn std::error::Err
     let deliveries = state.db.get_pending_deliveries().await?;
 
     for delivery in deliveries {
-        let url = match state.db.get_subscription_url(&delivery.subscription_id).await? {
+        let url = match state
+            .db
+            .get_subscription_url(&delivery.subscription_id)
+            .await?
+        {
             Some(url) => url,
             None => {
                 state
@@ -250,10 +264,7 @@ async fn handle_retry(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let attempt = delivery.attempts + 1;
     if attempt >= MAX_RETRIES {
-        state
-            .db
-            .mark_delivery_dead(&delivery.id, error)
-            .await?;
+        state.db.mark_delivery_dead(&delivery.id, error).await?;
         tracing::warn!(
             "Webhook delivery {} dead after {} attempts: {}",
             delivery.id,
@@ -262,7 +273,8 @@ async fn handle_retry(
         );
     } else {
         let backoff_secs = (2i64).pow(attempt as u32);
-        let next_retry = (chrono::Utc::now() + chrono::Duration::seconds(backoff_secs)).to_rfc3339();
+        let next_retry =
+            (chrono::Utc::now() + chrono::Duration::seconds(backoff_secs)).to_rfc3339();
         state
             .db
             .mark_delivery_failed(&delivery.id, error, &next_retry)
@@ -308,68 +320,112 @@ mod tests {
     #[test]
     fn test_non_http_scheme_is_rejected() {
         let err = validate_webhook_url("ftp://example.com/hook").unwrap_err();
-        assert!(matches!(err, UrlValidationError::ForbiddenScheme(_)), "got: {:?}", err);
+        assert!(
+            matches!(err, UrlValidationError::ForbiddenScheme(_)),
+            "got: {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_file_scheme_is_rejected() {
         let err = validate_webhook_url("file:///etc/passwd").unwrap_err();
-        assert!(matches!(err, UrlValidationError::ForbiddenScheme(_)), "got: {:?}", err);
+        assert!(
+            matches!(err, UrlValidationError::ForbiddenScheme(_)),
+            "got: {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_localhost_host_is_rejected() {
         let err = validate_webhook_url("http://localhost/hook").unwrap_err();
-        assert!(matches!(err, UrlValidationError::PrivateOrReservedHost(_)), "got: {:?}", err);
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_loopback_ipv4_is_rejected() {
         let err = validate_webhook_url("http://127.0.0.1/hook").unwrap_err();
-        assert!(matches!(err, UrlValidationError::PrivateOrReservedHost(_)), "got: {:?}", err);
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_private_10_block_is_rejected() {
         let err = validate_webhook_url("http://10.0.0.1/hook").unwrap_err();
-        assert!(matches!(err, UrlValidationError::PrivateOrReservedHost(_)), "got: {:?}", err);
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_private_172_block_is_rejected() {
         let err = validate_webhook_url("http://172.16.0.1/hook").unwrap_err();
-        assert!(matches!(err, UrlValidationError::PrivateOrReservedHost(_)), "got: {:?}", err);
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_private_192_168_block_is_rejected() {
         let err = validate_webhook_url("http://192.168.1.1/hook").unwrap_err();
-        assert!(matches!(err, UrlValidationError::PrivateOrReservedHost(_)), "got: {:?}", err);
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_link_local_metadata_ip_is_rejected() {
         // 169.254.169.254 is the EC2 / GCP instance metadata endpoint
         let err = validate_webhook_url("http://169.254.169.254/latest/meta-data/").unwrap_err();
-        assert!(matches!(err, UrlValidationError::PrivateOrReservedHost(_)), "got: {:?}", err);
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_link_local_range_is_rejected() {
         let err = validate_webhook_url("http://169.254.0.1/hook").unwrap_err();
-        assert!(matches!(err, UrlValidationError::PrivateOrReservedHost(_)), "got: {:?}", err);
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_ipv6_loopback_is_rejected() {
         let err = validate_webhook_url("http://[::1]/hook").unwrap_err();
-        assert!(matches!(err, UrlValidationError::PrivateOrReservedHost(_)), "got: {:?}", err);
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
     }
 
     #[test]
     fn test_malformed_url_is_rejected() {
         let err = validate_webhook_url("not-a-url").unwrap_err();
-        assert!(matches!(err, UrlValidationError::InvalidUrl(_)), "got: {:?}", err);
+        assert!(
+            matches!(err, UrlValidationError::InvalidUrl(_)),
+            "got: {:?}",
+            err
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -403,7 +459,9 @@ mod tests {
             data: serde_json::json!({}),
         };
         db.insert_event(&event).await.expect("insert event");
-        db.queue_webhook_deliveries(&event).await.expect("queue deliveries");
+        db.queue_webhook_deliveries(&event)
+            .await
+            .expect("queue deliveries");
 
         let deliveries = db.get_pending_deliveries().await.expect("get pending");
         assert_eq!(deliveries.len(), 1);
@@ -434,7 +492,10 @@ mod tests {
             .await
             .expect("mark failed");
 
-        let retried = db.get_pending_deliveries().await.expect("get pending after retry");
+        let retried = db
+            .get_pending_deliveries()
+            .await
+            .expect("get pending after retry");
         let retried_id = if retried.is_empty() {
             delivery_id.clone()
         } else {
@@ -457,10 +518,10 @@ mod tests {
     fn test_backoff_formula_grows_exponentially() {
         // Mirrors: let backoff_secs = (2i64).pow(attempt as u32);
         let expected: Vec<(i32, i64)> = vec![
-            (1, 2),   // attempt 1 → 2 s
-            (2, 4),   // attempt 2 → 4 s
-            (3, 8),   // attempt 3 → 8 s
-            (4, 16),  // attempt 4 → 16 s
+            (1, 2),  // attempt 1 → 2 s
+            (2, 4),  // attempt 2 → 4 s
+            (3, 8),  // attempt 3 → 8 s
+            (4, 16), // attempt 4 → 16 s
         ];
 
         for (attempt, want_secs) in expected {
@@ -505,7 +566,9 @@ mod tests {
             data: serde_json::json!({}),
         };
         db.insert_event(&event).await.expect("insert event");
-        db.queue_webhook_deliveries(&event).await.expect("queue deliveries");
+        db.queue_webhook_deliveries(&event)
+            .await
+            .expect("queue deliveries");
 
         // Retrieve the delivery that was queued.
         let deliveries = db.get_pending_deliveries().await.expect("get pending");
@@ -516,9 +579,8 @@ mod tests {
         // the threshold.  Each `mark_delivery_failed` increments `attempts`.
         for i in 0..(MAX_RETRIES - 1) {
             let backoff_secs = (2i64).pow((i + 1) as u32);
-            let next_retry = (chrono::Utc::now()
-                + chrono::Duration::seconds(backoff_secs))
-            .to_rfc3339();
+            let next_retry =
+                (chrono::Utc::now() + chrono::Duration::seconds(backoff_secs)).to_rfc3339();
             db.mark_delivery_failed(&delivery_id, "transient error", &next_retry)
                 .await
                 .expect("mark failed");
@@ -582,8 +644,7 @@ mod tests {
         let delivery_id = deliveries[0].id.clone();
 
         // Fail once — still well below MAX_RETRIES (5).
-        let next_retry =
-            (chrono::Utc::now() + chrono::Duration::seconds(2)).to_rfc3339();
+        let next_retry = (chrono::Utc::now() + chrono::Duration::seconds(2)).to_rfc3339();
         db.mark_delivery_failed(&delivery_id, "first error", &next_retry)
             .await
             .expect("mark failed");
