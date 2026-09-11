@@ -30,6 +30,13 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # `--all-targets` compiles the test target, and the upgrade tests in
+      # src/tests.rs `include_bytes!` the release wasm -- so on a clean runner
+      # clippy fails with "couldn't read ...onboarding_bridge.wasm" unless the
+      # wasm is built first (same ordering fix as the Soroban Contract job).
+      - name: Build WASM fixture for the test target
+        run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
+
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
