@@ -1479,15 +1479,56 @@ impl OnboardingBridge {
     /// // bridge.fund_c_address(&source, &target, &usdc, &500i128, &None, &None);
     /// ```
     pub fn fund_c_address(
-        _env: Env,
-        _source: Address,
-        _target: Address,
-        _asset: Address,
-        _amount: i128,
-        _nonce: Option<u64>,
-        _deadline: Option<u64>,
+        env: Env,
+        source: Address,
+        target: Address,
+        asset: Address,
+        amount: i128,
+        nonce: Option<u64>,
+        deadline: Option<u64>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: fund_c_address")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        if let Some(dl) = deadline {
+            if env.ledger().timestamp() > dl {
+                return Err(BridgeError::TransactionExpired);
+            }
+        }
+        if amount <= 0 || amount < read_minimum_amount(&env) {
+            return Err(BridgeError::InvalidAmount);
+        }
+
+        check_access(&env, &target)?;
+        check_asset_whitelisted(&env, &asset)?;
+        check_daily_limit(&env, &source, &asset, amount)?;
+
+        source.require_auth();
+        consume_nonce(&env, &source, nonce)?;
+
+        let global_fee_bps = read_fee_bps(&env);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
+        let fee = calculate_fee(amount, effective_fee_bps)?;
+        let net_amount = safe_math::safe_sub(amount, fee)?;
+
+        let token_client = token::Client::new(&env, &asset);
+        let contract_addr = env.current_contract_address();
+        token_client.transfer(&source, &contract_addr, &amount);
+        if net_amount > 0 {
+            token_client.transfer(&contract_addr, &target, &net_amount);
+        }
+
+        update_asset_counters(&env, &asset, fee, net_amount)?;
+        increment_source_bridged_volume(&env, &source, amount)?;
+        extend_instance_ttl(&env);
+        mint_loyalty_tokens(&env, &source);
+
+        env.events()
+            .publish(("CAddressFunded", asset, source, target), (amount, fee));
+
+        Ok(())
     }
 
     /// Funds multiple C-addresses in a single transaction from one source account.
@@ -1779,11 +1820,12 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_source_daily_limit(
-        _env: Env,
-        _source: Address,
-        _asset: Address,
+        env: Env,
+        source: Address,
+        asset: Address,
     ) -> Result<i128, BridgeError> {
-        todo!("implement: query_source_daily_limit")
+        check_initialized(&env)?;
+        Ok(read_source_daily_limit(&env, &source, &asset))
     }
 
     /// Sets a per-asset maximum fee cap in basis points.
@@ -3303,11 +3345,20 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn remove_swap_pool(
-        _env: Env,
-        _pool: Address,
-        _nonce: Option<u64>,
+        env: Env,
+        pool: Address,
+        nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: remove_swap_pool")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+        let mut whitelist = read_pool_whitelist(&env);
+        whitelist.remove(pool);
+        save_pool_whitelist(&env, &whitelist);
+        Ok(())
     }
 
     /// Returns `true` if `pool` is currently on the swap-pool whitelist.
