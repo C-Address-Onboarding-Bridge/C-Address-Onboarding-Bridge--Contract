@@ -3572,8 +3572,16 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::BelowThreshold`] — Removing this relayer would drop the
     ///   count below the required threshold.
-    pub fn remove_relayer(_env: Env, _pubkey: BytesN<32>) -> Result<(), BridgeError> {
-        todo!("implement: remove_relayer")
+    pub fn remove_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        if is_relayer(&env, &pubkey) && relayer_count(&env) - 1 < relayer_threshold(&env) {
+            return Err(BridgeError::BelowThreshold);
+        }
+        remove_relayer(&env, &pubkey);
+        extend_instance_ttl(&env);
+        Ok(())
     }
 
     /// Sets the minimum number of relayer signatures required to process a
@@ -3592,8 +3600,16 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ThresholdExceedsRelayers`] — `threshold` is greater than
     ///   the number of registered relayers.
-    pub fn set_relayer_threshold(_env: Env, _threshold: u32) -> Result<(), BridgeError> {
-        todo!("implement: set_relayer_threshold")
+    pub fn set_relayer_threshold(env: Env, threshold: u32) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        if threshold > relayer_count(&env) {
+            return Err(BridgeError::ThresholdExceedsRelayers);
+        }
+        save_relayer_threshold(&env, threshold);
+        extend_instance_ttl(&env);
+        Ok(())
     }
 
     /// Returns the current M-of-N relayer signature threshold.
@@ -3601,8 +3617,9 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_relayer_threshold(_env: Env) -> Result<u32, BridgeError> {
-        todo!("implement: query_relayer_threshold")
+    pub fn query_relayer_threshold(env: Env) -> Result<u32, BridgeError> {
+        check_initialized(&env)?;
+        Ok(relayer_threshold(&env))
     }
 
     /// Returns `true` if `pubkey` is a registered relayer.
