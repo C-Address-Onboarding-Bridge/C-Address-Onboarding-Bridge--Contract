@@ -3614,8 +3614,9 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_is_relayer(_env: Env, _pubkey: BytesN<32>) -> Result<bool, BridgeError> {
-        todo!("implement: query_is_relayer")
+    pub fn query_is_relayer(env: Env, pubkey: BytesN<32>) -> Result<bool, BridgeError> {
+        check_initialized(&env)?;
+        Ok(is_relayer(&env, &pubkey))
     }
 
     // -----------------------------------------------------------------------
@@ -3678,17 +3679,66 @@ impl OnboardingBridge {
     /// If the global fee rate changes between deposit and claim, the net amount
     /// received by `target` may differ from the amount at deposit time.
     pub fn fund_c_address_timelocked(
-        _env: Env,
-        _source: Address,
-        _target: Address,
-        _asset: Address,
-        _amount: i128,
-        _release_time: u64,
-        _cliff_time: u64,
-        _nonce: Option<u64>,
-        _deadline: Option<u64>,
+        env: Env,
+        source: Address,
+        target: Address,
+        asset: Address,
+        amount: i128,
+        release_time: u64,
+        cliff_time: u64,
+        nonce: Option<u64>,
+        deadline: Option<u64>,
     ) -> Result<u64, BridgeError> {
-        todo!("implement: fund_c_address_timelocked")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        if let Some(dl) = deadline {
+            if env.ledger().timestamp() > dl {
+                return Err(BridgeError::TransactionExpired);
+            }
+        }
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        if release_time <= env.ledger().timestamp() || (cliff_time > 0 && cliff_time > release_time)
+        {
+            return Err(BridgeError::InvalidReleaseTime);
+        }
+
+        check_access(&env, &target)?;
+        check_asset_whitelisted(&env, &asset)?;
+
+        source.require_auth();
+        consume_nonce(&env, &source, nonce)?;
+
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&source, &env.current_contract_address(), &amount);
+
+        let id = next_timelock_id(&env);
+        save_timelock_entry(
+            &env,
+            id,
+            &TimelockEntry {
+                source: source.clone(),
+                target: target.clone(),
+                asset: asset.clone(),
+                amount,
+                release_time,
+                cliff_time,
+                claimed: false,
+            },
+        );
+        increment_locked_timelock(&env, &asset, amount);
+        increment_user_deposit(&env, &source, &asset, amount)?;
+        mint_loyalty_tokens(&env, &source);
+        extend_instance_ttl(&env);
+
+        env.events().publish(
+            ("TimelockCreated", source, target),
+            (id, amount, asset, release_time, cliff_time),
+        );
+        Ok(id)
     }
 
     /// Claims a matured timelock entry, releasing the net tokens to `target`.
@@ -3723,8 +3773,41 @@ impl OnboardingBridge {
     /// Soroban execution is single-threaded within a ledger, this effectively
     /// prevents re-entrancy. The fee rate is the **current** global rate at
     /// claim time, which may differ from the rate at deposit time.
-    pub fn claim_timelocked(_env: Env, _id: u64) -> Result<(), BridgeError> {
-        todo!("implement: claim_timelocked")
+    pub fn claim_timelocked(env: Env, id: u64) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        let mut entry = read_timelock_entry(&env, id).ok_or(BridgeError::TimelockNotFound)?;
+        if entry.claimed {
+            return Err(BridgeError::Unauthorized);
+        }
+        if env.ledger().timestamp() < entry.release_time {
+            return Err(BridgeError::TimelockNotMatured);
+        }
+        entry.target.require_auth();
+
+        entry.claimed = true;
+        save_timelock_entry(&env, id, &entry);
+
+        let global_fee_bps = read_fee_bps(&env);
+        let effective_fee_bps = get_effective_fee_bps(&env, &entry.asset, global_fee_bps);
+        let fee = calculate_fee(entry.amount, effective_fee_bps)?;
+        let net_amount = safe_math::safe_sub(entry.amount, fee)?;
+
+        decrement_locked_timelock(&env, &entry.asset, entry.amount);
+        if net_amount > 0 {
+            let token_client = token::Client::new(&env, &entry.asset);
+            token_client.transfer(&env.current_contract_address(), &entry.target, &net_amount);
+        }
+        update_asset_counters(&env, &entry.asset, fee, net_amount)?;
+        extend_instance_ttl(&env);
+
+        env.events().publish(
+            ("TimelockClaimed", entry.target.clone()),
+            (id, net_amount, fee, entry.asset.clone()),
+        );
+        Ok(())
     }
 
     /// Returns the timelock entry for `id`.
@@ -3736,8 +3819,8 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::TimelockNotFound`] — No entry exists for `id`.
-    pub fn query_timelocked(_env: Env, _id: u64) -> Result<TimelockEntry, BridgeError> {
-        todo!("implement: query_timelocked")
+    pub fn query_timelocked(env: Env, id: u64) -> Result<TimelockEntry, BridgeError> {
+        read_timelock_entry(&env, id).ok_or(BridgeError::TimelockNotFound)
     }
 
     // -----------------------------------------------------------------------
