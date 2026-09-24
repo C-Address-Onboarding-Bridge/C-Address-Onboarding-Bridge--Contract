@@ -7,7 +7,7 @@ import type { CAddressFundedEvent, BridgeEventPayload } from '../events';
 const mockGetEvents = jest.fn();
 
 jest.mock('@stellar/stellar-sdk', () => ({
-  SorobanRpc: {
+  rpc: {
     Server: jest.fn().mockImplementation(() => ({
       getEvents: mockGetEvents,
     })),

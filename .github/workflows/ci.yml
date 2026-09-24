@@ -71,14 +71,9 @@ jobs:
         with:
           node-version: 20
 
-      # TODO(next-bounty): non-blocking. All 7 advisories come in through
-      # @stellar/stellar-sdk ^12 (toml, and its own transitive deps); clearing
-      # them means moving the SDK to stellar-sdk 15+, which is a breaking
-      # upgrade and its own piece of work. Drop the flag once that lands.
       - name: Audit SDK dependencies
         working-directory: sdk
         run: npm audit --audit-level=high
-        continue-on-error: true
 
   contract:
     name: Soroban Contract

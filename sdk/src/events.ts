@@ -21,7 +21,7 @@
  * ```
  */
 
-import { SorobanRpc, scValToNative } from '@stellar/stellar-sdk';
+import { rpc, scValToNative } from '@stellar/stellar-sdk';
 
 // ---------------------------------------------------------------------------
 // Event payload types
@@ -192,7 +192,7 @@ export interface EventSubscriberConfig {
  */
 export class EventSubscriber {
   private readonly contractId: string;
-  private readonly server: SorobanRpc.Server;
+  private readonly server: rpc.Server;
   private readonly pollingIntervalMs: number;
   private readonly limit: number;
 
@@ -210,7 +210,7 @@ export class EventSubscriber {
 
   constructor(config: EventSubscriberConfig) {
     this.contractId = config.contractId;
-    this.server = new SorobanRpc.Server(config.rpcUrl);
+    this.server = new rpc.Server(config.rpcUrl);
     this.pollingIntervalMs = config.pollingIntervalMs ?? 5_000;
     this.limit = config.limit ?? 100;
     this.cursor = config.startLedger ?? 'now';
@@ -332,7 +332,7 @@ export class EventSubscriber {
   }
 
   private async fetchAndDispatch(): Promise<void> {
-    const params: SorobanRpc.Server.GetEventsRequest = {
+    const params: any = {
       filters: [
         {
           type: 'contract',
@@ -351,16 +351,17 @@ export class EventSubscriber {
     }
     // When cursor === 'now', omit both — the RPC defaults to current ledger
 
-    const response = await this.server.getEvents(params);
+    const response = await this.server.getEvents(params as rpc.Server.GetEventsRequest);
 
     for (const raw of response.events) {
       const payload = this.parseEvent(raw);
       if (payload) {
         this.dispatch(payload);
       }
-      // Advance cursor to the last received paging token
-      if (raw.pagingToken) {
-        this.cursor = raw.pagingToken as string;
+      // Advance cursor to the last received paging token or response cursor
+      const nextToken = (raw as any).pagingToken ?? (response as any).cursor ?? (raw as any).id;
+      if (nextToken) {
+        this.cursor = nextToken as string;
       }
     }
   }
@@ -369,12 +370,12 @@ export class EventSubscriber {
   // Event parsing
   // -------------------------------------------------------------------------
 
-  private parseEvent(raw: SorobanRpc.Api.EventResponse): BridgeEventPayload | null {
+  private parseEvent(raw: rpc.Api.EventResponse): BridgeEventPayload | null {
     try {
       const topics = raw.topic.map((t) => scValToNative(t));
       const value = scValToNative(raw.value);
       const ledger = raw.ledger;
-      const pagingToken = raw.pagingToken;
+      const pagingToken = ((raw as any).pagingToken ?? (raw as any).id ?? '') as string;
 
       const name = typeof topics[0] === 'string' ? topics[0] : String(topics[0]);
 

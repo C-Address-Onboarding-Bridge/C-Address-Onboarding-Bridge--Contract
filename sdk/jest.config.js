@@ -5,4 +5,7 @@ module.exports = {
   transform: {
     '^.+\\.[jt]s$': 'ts-jest',
   },
+  transformIgnorePatterns: [
+    'node_modules/(?!(uint8array-extras|@exodus|@noble|@stellar)/)',
+  ],
 };

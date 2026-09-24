@@ -21,7 +21,7 @@
  */
 
 import {
-  SorobanRpc,
+  rpc,
   Contract,
   TransactionBuilder,
   BASE_FEE,
@@ -158,10 +158,10 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function poll(
-  provider: SorobanRpc.Server,
+  provider: rpc.Server,
   hash: string,
   retries = 20,
-): Promise<SorobanRpc.Api.GetTransactionResponse> {
+): Promise<rpc.Api.GetTransactionResponse> {
   for (let i = 0; i < retries; i++) {
     const r = await provider.getTransaction(hash);
     if (r.status !== 'NOT_FOUND') return r;
@@ -175,14 +175,14 @@ async function poll(
 // ---------------------------------------------------------------------------
 
 async function deployContract(
-  provider: SorobanRpc.Server,
+  provider: rpc.Server,
   cfg: DeployConfig,
   admin: Keypair,
 ): Promise<string> {
   const wasm = fs.readFileSync(cfg.wasmPath);
 
   console.log('Installing WASM…');
-  const installResp = await provider.installContractCode(wasm);
+  const installResp = await (provider as any).installContractCode(wasm);
   const installTx = TransactionBuilder.fromXdr(installResp, cfg.networkPassphrase);
   installTx.sign(admin);
   const installSend = await provider.sendTransaction(installTx);
@@ -191,22 +191,22 @@ async function deployContract(
   console.log('  WASM installed ✓');
 
   console.log('Creating contract instance…');
-  const createResp = await provider.createContract(wasm, admin.publicKey(), '0'.repeat(64));
+  const createResp = await (provider as any).createContract(wasm, admin.publicKey(), '0'.repeat(64));
   const createTx = TransactionBuilder.fromXdr(createResp, cfg.networkPassphrase);
   createTx.sign(admin);
   const createSend = await provider.sendTransaction(createTx);
   console.log(`  Create tx: ${createSend.hash}`);
   const createResult = await poll(provider, createSend.hash);
 
-  if (!createResult.contractId) {
+  if (!(createResult as any).contractId) {
     throw new Error('Contract deployment succeeded but returned no contractId');
   }
-  console.log(`  Contract ID: ${createResult.contractId} ✓`);
-  return createResult.contractId;
+  console.log(`  Contract ID: ${(createResult as any).contractId} ✓`);
+  return (createResult as any).contractId;
 }
 
 async function initialize(
-  provider: SorobanRpc.Server,
+  provider: rpc.Server,
   cfg: DeployConfig,
   admin: Keypair,
   contractId: string,
@@ -262,7 +262,7 @@ async function main(): Promise<void> {
   }
 
   const admin = Keypair.fromSecret(cfg.adminSecretKey);
-  const provider = new SorobanRpc.Server(cfg.rpcUrl, { allowHttp: cfg.network === 'dev' });
+  const provider = new rpc.Server(cfg.rpcUrl, { allowHttp: cfg.network === 'dev' });
 
   console.log(`\n=== C-Address Onboarding Bridge Deployment ===`);
   console.log(`Network:  ${cfg.network}`);

@@ -1,9 +1,9 @@
 import { CachedContractClient } from '../cachedBridge';
 import { InMemoryCache } from '../cache';
-import { SorobanRpc, scValToNative, xdr, Contract, TransactionBuilder, Address, Account } from '@stellar/stellar-sdk';
+import { rpc, scValToNative, xdr, Contract, TransactionBuilder, Address, Account } from '@stellar/stellar-sdk';
 
 jest.mock('@stellar/stellar-sdk', () => ({
-  SorobanRpc: {
+  rpc: {
     Server: jest.fn(),
   },
   Contract: jest.fn().mockImplementation(() => ({
@@ -68,7 +68,7 @@ describe('CachedContractClient', () => {
       simulateTransaction: jest.fn(),
     };
 
-    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    (rpc.Server as unknown as jest.Mock).mockImplementation(() => mockProvider);
     cache = new InMemoryCache();
     wrapper = new CachedContractClient(CONFIG, { provider: cache, ttlMs: { getFee: 1000 } });
   });
@@ -157,7 +157,7 @@ describe('CachedContractClient', () => {
   });
 
   it('forwards the configured timeout to transaction builders', async () => {
-    (SorobanRpc.Server as jest.Mock).mockClear();
+    (rpc.Server as unknown as jest.Mock).mockClear();
     (TransactionBuilder as unknown as jest.Mock).mockClear();
 
     const setTimeoutSpy = jest.fn().mockReturnThis();
@@ -173,7 +173,7 @@ describe('CachedContractClient', () => {
       sendTransaction: jest.fn().mockResolvedValue({ hash: 'h', status: 'PENDING' }),
       simulateTransaction: jest.fn().mockResolvedValue({}),
     };
-    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockAccountProvider);
+    (rpc.Server as unknown as jest.Mock).mockImplementation(() => mockAccountProvider);
 
     const customWrapper = new CachedContractClient({ ...CONFIG, timeout: 45 }, { provider: cache });
 

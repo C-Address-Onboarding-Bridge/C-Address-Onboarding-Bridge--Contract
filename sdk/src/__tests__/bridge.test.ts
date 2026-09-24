@@ -1,7 +1,7 @@
 import { OnboardingBridgeSDK, BASE_RESERVE_STROOPS } from "../bridge";
 import { OffRampIntegration } from "../offramp";
 import {
-  SorobanRpc,
+  rpc,
   Contract,
   scValToNative,
   xdr,
@@ -12,7 +12,7 @@ import {
 } from "@stellar/stellar-sdk";
 
 jest.mock("@stellar/stellar-sdk", () => ({
-  SorobanRpc: {
+  rpc: {
     Server: jest.fn(),
   },
   Contract: jest.fn().mockImplementation(() => ({
@@ -111,7 +111,7 @@ describe("OnboardingBridgeSDK", () => {
       getLedgerEntries: jest.fn().mockResolvedValue(ledgerEntriesFor(0)),
     };
 
-    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    (rpc.Server as unknown as jest.Mock).mockImplementation(() => mockProvider);
     sdk = new OnboardingBridgeSDK(CONFIG);
   });
 
@@ -1543,7 +1543,7 @@ describe("address validation", () => {
         .mockResolvedValue({ hash: "h", status: "PENDING" }),
       simulateTransaction: jest.fn().mockResolvedValue({}),
     };
-    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    (rpc.Server as unknown as jest.Mock).mockImplementation(() => mockProvider);
     sdk = new OnboardingBridgeSDK(CONFIG);
   });
 
@@ -1717,7 +1717,7 @@ describe("Error handling - invalid inputs", () => {
         .mockResolvedValue({ hash: "h", status: "PENDING" }),
       simulateTransaction: jest.fn().mockResolvedValue({}),
     };
-    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    (rpc.Server as unknown as jest.Mock).mockImplementation(() => mockProvider);
     sdk = new OnboardingBridgeSDK(CONFIG);
   });
 
@@ -1898,7 +1898,7 @@ describe("Type validation at runtime", () => {
         .mockResolvedValue({ hash: "h", status: "PENDING" }),
       simulateTransaction: jest.fn().mockResolvedValue({}),
     };
-    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    (rpc.Server as unknown as jest.Mock).mockImplementation(() => mockProvider);
     sdk = new OnboardingBridgeSDK(CONFIG);
   });
 
@@ -1914,7 +1914,7 @@ describe("Type validation at runtime", () => {
   });
 
   it("uses the configured timeout instead of the default 30 seconds", async () => {
-    (SorobanRpc.Server as jest.Mock).mockClear();
+    (rpc.Server as unknown as jest.Mock).mockClear();
     (TransactionBuilder as unknown as jest.Mock).mockClear();
 
     const setTimeoutSpy = jest.fn().mockReturnThis();
@@ -1934,7 +1934,7 @@ describe("Type validation at runtime", () => {
         .mockResolvedValue({ hash: "h", status: "PENDING" }),
       simulateTransaction: jest.fn().mockResolvedValue({}),
     };
-    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    (rpc.Server as unknown as jest.Mock).mockImplementation(() => mockProvider);
 
     await customSdk.fundCAddress(
       {
@@ -1956,7 +1956,7 @@ describe("Type validation at runtime", () => {
   });
 
   it("falls back to 30-second timeout when config.timeout is omitted", async () => {
-    (SorobanRpc.Server as jest.Mock).mockClear();
+    (rpc.Server as unknown as jest.Mock).mockClear();
     (TransactionBuilder as unknown as jest.Mock).mockClear();
 
     const setTimeoutSpy = jest.fn().mockReturnThis();
@@ -1976,7 +1976,7 @@ describe("Type validation at runtime", () => {
         .mockResolvedValue({ hash: "h", status: "PENDING" }),
       simulateTransaction: jest.fn().mockResolvedValue({}),
     };
-    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    (rpc.Server as unknown as jest.Mock).mockImplementation(() => mockProvider);
 
     await (defaultSdk as any).fundCAddress(
       {
@@ -2088,7 +2088,7 @@ describe("Observability hooks - onRpcCall coverage", () => {
       getLedgerEntries: jest.fn().mockResolvedValue(ledgerEntriesFor(0)),
     };
 
-    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    (rpc.Server as unknown as jest.Mock).mockImplementation(() => mockProvider);
     (scValToNative as jest.Mock).mockReturnValue({ toString: () => "100" });
 
     sdk = new OnboardingBridgeSDK({

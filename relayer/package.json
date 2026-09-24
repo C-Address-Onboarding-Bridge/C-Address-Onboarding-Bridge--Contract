@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@stellar/c-address-onboarding-bridge-sdk": "*",
-    "@stellar/stellar-sdk": "^12.0.0"
+    "@stellar/stellar-sdk": "^17.1.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
