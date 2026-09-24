@@ -3303,11 +3303,20 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     pub fn remove_swap_pool(
-        _env: Env,
-        _pool: Address,
-        _nonce: Option<u64>,
+        env: Env,
+        pool: Address,
+        nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: remove_swap_pool")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+        let mut whitelist = read_pool_whitelist(&env);
+        whitelist.remove(pool);
+        save_pool_whitelist(&env, &whitelist);
+        Ok(())
     }
 
     /// Returns `true` if `pool` is currently on the swap-pool whitelist.
@@ -3315,8 +3324,9 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_is_pool_whitelisted(_env: Env, _pool: Address) -> Result<bool, BridgeError> {
-        todo!("implement: query_is_pool_whitelisted")
+    pub fn query_is_pool_whitelisted(env: Env, pool: Address) -> Result<bool, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_pool_whitelist(&env).get(pool).unwrap_or(false))
     }
 
     // -----------------------------------------------------------------------
@@ -3350,11 +3360,22 @@ impl OnboardingBridge {
     ///
     /// * `("LoyaltyTokenSet", admin)` — data: `(token, amount_per_fund)`
     pub fn set_loyalty_token(
-        _env: Env,
-        _token: Address,
-        _amount_per_fund: i128,
+        env: Env,
+        token: Address,
+        amount_per_fund: i128,
     ) -> Result<(), BridgeError> {
-        todo!("implement: set_loyalty_token")
+        check_initialized(&env)?;
+        if amount_per_fund < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        let admin = read_admin(&env);
+        admin.require_auth();
+        save_loyalty_token(&env, &token);
+        save_loyalty_amount_per_fund(&env, &amount_per_fund);
+        extend_instance_ttl(&env);
+        env.events()
+            .publish(("LoyaltyTokenSet", admin), (token, amount_per_fund));
+        Ok(())
     }
 
     /// Returns the loyalty token address and reward amount per fund.
@@ -3367,8 +3388,10 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::LoyaltyTokenNotSet`] — No loyalty token has been configured.
-    pub fn query_loyalty_token(_env: Env) -> Result<(Address, i128), BridgeError> {
-        todo!("implement: query_loyalty_token")
+    pub fn query_loyalty_token(env: Env) -> Result<(Address, i128), BridgeError> {
+        check_initialized(&env)?;
+        let token = read_loyalty_token(&env).ok_or(BridgeError::LoyaltyTokenNotSet)?;
+        Ok((token, read_loyalty_amount_per_fund(&env)))
     }
 
     // -----------------------------------------------------------------------
