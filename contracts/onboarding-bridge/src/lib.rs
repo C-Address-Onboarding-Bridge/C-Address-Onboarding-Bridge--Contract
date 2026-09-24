@@ -1879,11 +1879,27 @@ impl OnboardingBridge {
     /// // assert_eq!(bridge.query_fee_collector(), new_collector);
     /// ```
     pub fn set_fee_collector(
-        _env: Env,
-        _new_fee_collector: Address,
-        _nonce: Option<u64>,
+        env: Env,
+        new_fee_collector: Address,
+        nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: set_fee_collector")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+        let old_collector = read_fee_collector(&env);
+        save_fee_collector(&env, &new_fee_collector);
+        let mut config = read_bridge_config(&env);
+        config.fee_collector = new_fee_collector.clone();
+        save_bridge_config(&env, &config);
+        env.events().publish(
+            ("FeeCollectorChanged", old_collector, new_fee_collector),
+            (admin,),
+        );
+        Ok(())
     }
 
     /// Proposes a fee-collector handoff that must be accepted by `new_collector`.
@@ -1932,12 +1948,20 @@ impl OnboardingBridge {
         read_pending_fee_collector(&env)
     }
 
-    pub fn set_admin(
-        _env: Env,
-        _new_admin: Address,
-        _nonce: Option<u64>,
-    ) -> Result<(), BridgeError> {
-        todo!("implement: set_admin")
+    pub fn set_admin(env: Env, new_admin: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+        save_admin(&env, &new_admin);
+        let mut config = read_bridge_config(&env);
+        config.admin = new_admin.clone();
+        save_bridge_config(&env, &config);
+        env.events().publish(("AdminChanged", admin, new_admin), ());
+        Ok(())
     }
 
     /// Proposes an admin handoff that must be accepted by `new_admin`.
