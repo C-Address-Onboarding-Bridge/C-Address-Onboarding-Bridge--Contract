@@ -5677,3 +5677,55 @@ fn test_extend_timelock_ttl_before_initialize_fails() {
         Err(Ok(BridgeError::NotInitialized))
     );
 }
+
+// ---------------------------------------------------------------------------
+// query_current_tier
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_query_current_tier_defaults_to_global_fee_without_tiers() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &75u32, &None);
+
+    let tier = bridge.query_current_tier(&user);
+    assert_eq!(tier.min_volume, 0);
+    assert_eq!(tier.max_volume, i128::MAX);
+    assert_eq!(tier.fee_bps, 75u32);
+}
+
+#[test]
+fn test_query_current_tier_matches_configured_tier() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier {
+            min_volume: 0,
+            max_volume: 10_000,
+            fee_bps: 25,
+        }],
+    );
+    bridge.set_fee_tiers(&tiers);
+
+    assert_eq!(bridge.query_current_tier(&user).fee_bps, 25u32);
+}
+
+#[test]
+fn test_query_current_tier_before_initialize_fails() {
+    let env = Env::default();
+    let (_admin, user, _fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_query_current_tier(&user),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}

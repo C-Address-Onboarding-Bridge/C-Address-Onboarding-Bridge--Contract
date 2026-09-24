@@ -3959,12 +3959,39 @@ impl OnboardingBridge {
     ///
     /// * `("SourcePersistentTtlExtended",)` — data: `(admin, source, asset, actual_ttl)`
     pub fn extend_source_persistent_ttl(
-        _env: Env,
-        _source: Address,
-        _asset: Address,
-        _ttl: u32,
+        env: Env,
+        source: Address,
+        asset: Address,
+        ttl: u32,
     ) -> Result<(), BridgeError> {
-        todo!("implement: extend_source_persistent_ttl")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let max_ttl = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        let threshold = max_ttl / 4;
+        for key in [
+            DataKey::SourceDailyLimit(source.clone(), asset.clone()),
+            DataKey::DailyUsage(source.clone(), asset.clone(), current_day(&env)),
+            DataKey::UserDeposit(source.clone(), asset.clone()),
+            DataKey::SourceBridgedVolume(source.clone()),
+            DataKey::Nonce(source.clone()),
+            DataKey::AuthNonce(source.clone()),
+        ] {
+            if env.storage().persistent().has(&key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, threshold, max_ttl);
+            }
+        }
+        env.events().publish(
+            ("SourcePersistentTtlExtended",),
+            (admin, source, asset, max_ttl),
+        );
+        Ok(())
     }
 
     /// Overrides the maximum instance-storage TTL used by the internal
@@ -3988,8 +4015,23 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::InvalidTtl`] — `ttl` is below `MIN_ALLOWED_TTL`.
-    pub fn set_max_instance_ttl(_env: Env, _ttl: u32) -> Result<(), BridgeError> {
-        todo!("implement: set_max_instance_ttl")
+    pub fn set_max_instance_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        if ttl < MIN_ALLOWED_TTL {
+            return Err(BridgeError::InvalidTtl);
+        }
+        let capped = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxInstanceTtl, &capped);
+        extend_instance_ttl(&env);
+        Ok(())
     }
 
     /// Overrides the maximum persistent-storage TTL used by `extend_persistent_ttl`.
