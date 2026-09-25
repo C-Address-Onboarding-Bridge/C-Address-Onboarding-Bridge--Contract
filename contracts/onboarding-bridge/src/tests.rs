@@ -1739,62 +1739,68 @@ pub(crate) mod swap_pool_contract {
 
 use swap_pool_contract::{SwapPool, SwapPoolClient};
 
-#[contracttype]
-enum DishonestSwapPoolDataKey {
-    InputToken,
-    OutputToken,
-    ReportedAmount,
-    PayoutAmount,
-}
+pub(crate) mod dishonest_swap_pool {
+    use super::*;
 
-#[contract]
-struct DishonestSwapPool;
-
-#[contractimpl]
-impl DishonestSwapPool {
-    pub fn initialize(
-        e: Env,
-        input_token: Address,
-        output_token: Address,
-        reported_amount: i128,
-        payout_amount: i128,
-    ) {
-        e.storage()
-            .instance()
-            .set(&DishonestSwapPoolDataKey::InputToken, &input_token);
-        e.storage()
-            .instance()
-            .set(&DishonestSwapPoolDataKey::OutputToken, &output_token);
-        e.storage()
-            .instance()
-            .set(&DishonestSwapPoolDataKey::ReportedAmount, &reported_amount);
-        e.storage()
-            .instance()
-            .set(&DishonestSwapPoolDataKey::PayoutAmount, &payout_amount);
+    #[contracttype]
+    pub enum DishonestSwapPoolDataKey {
+        InputToken,
+        OutputToken,
+        ReportedAmount,
+        PayoutAmount,
     }
 
-    pub fn swap(e: Env, _min_amount_out: i128, to: Address) -> i128 {
-        let output_token: Address = e
-            .storage()
-            .instance()
-            .get(&DishonestSwapPoolDataKey::OutputToken)
-            .unwrap();
-        let payout_amount: i128 = e
-            .storage()
-            .instance()
-            .get(&DishonestSwapPoolDataKey::PayoutAmount)
-            .unwrap();
-        soroban_sdk::token::Client::new(&e, &output_token).transfer(
-            &e.current_contract_address(),
-            &to,
-            &payout_amount,
-        );
-        e.storage()
-            .instance()
-            .get(&DishonestSwapPoolDataKey::ReportedAmount)
-            .unwrap()
+    #[contract]
+    pub struct DishonestSwapPool;
+
+    #[contractimpl]
+    impl DishonestSwapPool {
+        pub fn initialize(
+            e: Env,
+            input_token: Address,
+            output_token: Address,
+            reported_amount: i128,
+            payout_amount: i128,
+        ) {
+            e.storage()
+                .instance()
+                .set(&DishonestSwapPoolDataKey::InputToken, &input_token);
+            e.storage()
+                .instance()
+                .set(&DishonestSwapPoolDataKey::OutputToken, &output_token);
+            e.storage()
+                .instance()
+                .set(&DishonestSwapPoolDataKey::ReportedAmount, &reported_amount);
+            e.storage()
+                .instance()
+                .set(&DishonestSwapPoolDataKey::PayoutAmount, &payout_amount);
+        }
+
+        pub fn swap(e: Env, _min_amount_out: i128, to: Address) -> i128 {
+            let output_token: Address = e
+                .storage()
+                .instance()
+                .get(&DishonestSwapPoolDataKey::OutputToken)
+                .unwrap();
+            let payout_amount: i128 = e
+                .storage()
+                .instance()
+                .get(&DishonestSwapPoolDataKey::PayoutAmount)
+                .unwrap();
+            soroban_sdk::token::Client::new(&e, &output_token).transfer(
+                &e.current_contract_address(),
+                &to,
+                &payout_amount,
+            );
+            e.storage()
+                .instance()
+                .get(&DishonestSwapPoolDataKey::ReportedAmount)
+                .unwrap()
+        }
     }
 }
+
+use dishonest_swap_pool::{DishonestSwapPool, DishonestSwapPoolClient};
 
 /********** fund_c_address_with_swap tests **********/
 
