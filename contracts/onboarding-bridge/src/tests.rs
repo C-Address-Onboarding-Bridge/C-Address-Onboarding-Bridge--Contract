@@ -1739,6 +1739,63 @@ pub(crate) mod swap_pool_contract {
 
 use swap_pool_contract::{SwapPool, SwapPoolClient};
 
+#[contracttype]
+enum DishonestSwapPoolDataKey {
+    InputToken,
+    OutputToken,
+    ReportedAmount,
+    PayoutAmount,
+}
+
+#[contract]
+struct DishonestSwapPool;
+
+#[contractimpl]
+impl DishonestSwapPool {
+    pub fn initialize(
+        e: Env,
+        input_token: Address,
+        output_token: Address,
+        reported_amount: i128,
+        payout_amount: i128,
+    ) {
+        e.storage()
+            .instance()
+            .set(&DishonestSwapPoolDataKey::InputToken, &input_token);
+        e.storage()
+            .instance()
+            .set(&DishonestSwapPoolDataKey::OutputToken, &output_token);
+        e.storage()
+            .instance()
+            .set(&DishonestSwapPoolDataKey::ReportedAmount, &reported_amount);
+        e.storage()
+            .instance()
+            .set(&DishonestSwapPoolDataKey::PayoutAmount, &payout_amount);
+    }
+
+    pub fn swap(e: Env, _min_amount_out: i128, to: Address) -> i128 {
+        let output_token: Address = e
+            .storage()
+            .instance()
+            .get(&DishonestSwapPoolDataKey::OutputToken)
+            .unwrap();
+        let payout_amount: i128 = e
+            .storage()
+            .instance()
+            .get(&DishonestSwapPoolDataKey::PayoutAmount)
+            .unwrap();
+        soroban_sdk::token::Client::new(&e, &output_token).transfer(
+            &e.current_contract_address(),
+            &to,
+            &payout_amount,
+        );
+        e.storage()
+            .instance()
+            .get(&DishonestSwapPoolDataKey::ReportedAmount)
+            .unwrap()
+    }
+}
+
 /********** fund_c_address_with_swap tests **********/
 
 fn setup_swap(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, Address, Address) {
@@ -1823,6 +1880,39 @@ fn test_swap_rejects_source_daily_limit_exceeded() {
         Err(Ok(BridgeError::DailyLimitExceeded))
     );
     assert_eq!(check_balance(&env, &source_token_id, &user), 1_000i128);
+}
+
+#[test]
+fn test_swap_uses_actual_target_tokens_received() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+    let pool_id = env.register(DishonestSwapPool, ());
+    DishonestSwapPoolClient::new(&env, &pool_id).initialize(
+        &source_token_id,
+        &target_token_id,
+        &500i128,
+        &100i128,
+    );
+    mint_tokens(&env, &target_token_id, &pool_id, 100i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target,
+            &source_token_id,
+            &target_token_id,
+            &500i128,
+            &400i128,
+            &swap_route,
+            &None,
+            &None,
+        ),
+        Err(Ok(BridgeError::SlippageExceeded))
+    );
+    assert_eq!(check_balance(&env, &target_token_id, &target), 0i128);
 }
 
 #[test]
