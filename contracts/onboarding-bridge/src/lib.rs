@@ -394,9 +394,10 @@ pub struct PendingUpgrade {
 
 /// A pending commit-reveal entry created by `commit_fund`.
 ///
-/// The `amount_hash` is `sha256(amount_be16 || nonce_be8)`.  The `reveal_fund`
-/// function verifies this hash before executing the transfer so that the
-/// actual amount is never visible in the mempool.
+/// The `amount_hash` is a domain-separated hash of the commitment parties,
+/// amount, and nonce. The `reveal_fund` function verifies this hash before
+/// executing the transfer so that the actual amount is never visible in the
+/// mempool.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitmentEntry {
@@ -406,7 +407,8 @@ pub struct CommitmentEntry {
     pub target: Address,
     /// Whitelisted token contract address.
     pub asset: Address,
-    /// sha256(amount_be16 || nonce_be8) — binds the reveal to a specific amount.
+    /// Domain-separated hash binding the reveal to its source, target, asset,
+    /// contract, amount, and nonce.
     pub amount_hash: BytesN<32>,
     /// Unix timestamp deadline; reveal must happen before this.
     pub deadline: u64,
@@ -4163,8 +4165,8 @@ impl OnboardingBridge {
     /// Stores a blinded funding commitment without revealing the amount.
     ///
     /// The caller commits to a specific `(source, target, asset, amount)` by
-    /// providing `amount_hash = sha256(amount_be16 || nonce_be8)`.  The actual
-    /// amount stays hidden until `reveal_fund` is called, preventing
+    /// providing a domain-separated `amount_hash`. The actual amount stays
+    /// hidden until `reveal_fund` is called, preventing
     /// front-runners from observing the value before the commitment is settled.
     ///
     /// # Arguments
@@ -4172,7 +4174,8 @@ impl OnboardingBridge {
     /// * `source` (`Address`) — The account that will supply the tokens.
     /// * `target` (`Address`) — The C-address that will receive the net amount.
     /// * `asset` (`Address`) — Whitelisted token contract address.
-    /// * `amount_hash` (`BytesN<32>`) — `sha256(amount_be16 || nonce_be8)`.
+    /// * `amount_hash` (`BytesN<32>`) — hash of the commitment domain,
+    ///   contract, network, source, target, asset, amount, and nonce.
     /// * `deadline` (`u64`) — Unix timestamp; `reveal_fund` must be called
     ///   before this time.
     ///
@@ -4243,9 +4246,9 @@ impl OnboardingBridge {
 
     /// Executes a previously committed fund transfer after the minimum delay.
     ///
-    /// Verifies `sha256(amount_be16 || nonce_be8) == stored_amount_hash` before
-    /// transferring tokens, ensuring the caller cannot substitute a different
-    /// amount from the one committed.
+    /// Verifies the domain-separated commitment hash before transferring
+    /// tokens, ensuring the caller cannot substitute a different amount or
+    /// commitment context.
     ///
     /// # Arguments
     ///
@@ -4314,8 +4317,19 @@ impl OnboardingBridge {
             return Err(BridgeError::Unauthorized);
         }
 
-        // Verify hash: sha256(amount_be16 || nonce_be8)
+        // Verify the domain-separated commitment before moving funds.
         let mut preimage = Bytes::new(&env);
+        preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
+        let contract_str = env.current_contract_address().to_string();
+        preimage.append(&Bytes::from_slice(&env, contract_str.as_bytes()));
+        let network_id = env.ledger().network_id();
+        preimage.extend_from_array(&network_id.to_be_bytes());
+        let source_str = source.to_string();
+        preimage.append(&Bytes::from_slice(&env, source_str.as_bytes()));
+        let target_str = target.to_string();
+        preimage.append(&Bytes::from_slice(&env, target_str.as_bytes()));
+        let asset_str = asset.to_string();
+        preimage.append(&Bytes::from_slice(&env, asset_str.as_bytes()));
         preimage.extend_from_array(&amount.to_be_bytes());
         preimage.extend_from_array(&nonce.to_be_bytes());
         let computed_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
