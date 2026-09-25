@@ -1351,7 +1351,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
         wasm_hash: BytesN<32>,
     ) -> Result<(), BridgeError> {
-        initialize_inner(env, admin, fee_collector, fee_bps, nonce, wasm_hash)
+        Self::initialize_inner(env, admin, fee_collector, fee_bps, nonce, wasm_hash)
     }
 
     /// Initialises the bridge contract. Must be called exactly once before any
@@ -1405,14 +1405,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
-        initialize_inner(
-            env,
-            admin,
-            fee_collector,
-            fee_bps,
-            nonce,
-            wasm_hash,
-        )
+        Self::initialize_inner(env, admin, fee_collector, fee_bps, nonce, wasm_hash)
     }
 
     /// Initializes the bridge and records the hash of the deployed WASM.
@@ -1428,7 +1421,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
         wasm_hash: BytesN<32>,
     ) -> Result<(), BridgeError> {
-        initialize_inner(env, admin, fee_collector, fee_bps, nonce, wasm_hash)
+        Self::initialize_inner(env, admin, fee_collector, fee_bps, nonce, wasm_hash)
     }
 
     fn initialize_inner(
