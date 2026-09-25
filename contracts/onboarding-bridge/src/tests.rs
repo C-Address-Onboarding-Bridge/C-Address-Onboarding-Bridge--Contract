@@ -1207,11 +1207,12 @@ fn commit_reveal_amount_hash(
 ) -> BytesN<32> {
     let mut preimage = Bytes::new(env);
     preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
-    preimage.append(&Bytes::from_slice(env, bridge.to_string().as_bytes()));
-    preimage.extend_from_array(&env.ledger().network_id().to_be_bytes());
-    preimage.append(&Bytes::from_slice(env, source.to_string().as_bytes()));
-    preimage.append(&Bytes::from_slice(env, target.to_string().as_bytes()));
-    preimage.append(&Bytes::from_slice(env, asset.to_string().as_bytes()));
+    append_address_to_bytes(env, &mut preimage, bridge);
+    let network_id: Bytes = env.ledger().network_id().into();
+    preimage.append(&network_id);
+    append_address_to_bytes(env, &mut preimage, source);
+    append_address_to_bytes(env, &mut preimage, target);
+    append_address_to_bytes(env, &mut preimage, asset);
     preimage.extend_from_array(&amount.to_be_bytes());
     preimage.extend_from_array(&nonce.to_be_bytes());
     env.crypto().sha256(&preimage).into()
@@ -3171,11 +3172,12 @@ mod commit_reveal_tests {
     ) -> BytesN<32> {
         let mut preimage = Bytes::new(env);
         preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
-        preimage.append(&Bytes::from_slice(env, bridge.to_string().as_bytes()));
-        preimage.extend_from_array(&env.ledger().network_id().to_be_bytes());
-        preimage.append(&Bytes::from_slice(env, source.to_string().as_bytes()));
-        preimage.append(&Bytes::from_slice(env, target.to_string().as_bytes()));
-        preimage.append(&Bytes::from_slice(env, asset.to_string().as_bytes()));
+        append_address_to_bytes(env, &mut preimage, bridge);
+        let network_id: Bytes = env.ledger().network_id().into();
+        preimage.append(&network_id);
+        append_address_to_bytes(env, &mut preimage, source);
+        append_address_to_bytes(env, &mut preimage, target);
+        append_address_to_bytes(env, &mut preimage, asset);
         preimage.extend_from_array(&amount.to_be_bytes());
         preimage.extend_from_array(&nonce.to_be_bytes());
         env.crypto().sha256(&preimage).into()
@@ -3288,6 +3290,23 @@ mod commit_reveal_tests {
         );
         assert_eq!(check_balance(&env, &token_id, &target), 0i128);
         assert!(!bridge.query_commitment(&id).revealed);
+    }
+
+    #[test]
+    fn test_source_can_cancel_unrevealed_commitment() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(&env, &bridge.address, &user, &target, &token_id, 500i128, 13u64);
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
+
+        bridge.cancel_commitment(&id);
+        assert_eq!(
+            bridge.try_query_commitment(&id),
+            Err(Ok(BridgeError::CommitmentNotFound))
+        );
     }
 }
 
@@ -4767,6 +4786,12 @@ fn test_meta_fund_happy_path() {
         deadline,
     };
 
+    soroban_sdk::token::Client::new(&env, &token_id).approve(
+        &user,
+        &bridge_id,
+        &amount,
+        &100u32,
+    );
     bridge.execute_meta_fund(&params, &pubkey, &signature);
 
     // 500 * 100 / 10000 = 5 fee → net 495 to target
@@ -4855,6 +4880,12 @@ fn test_meta_fund_nonce_replay_rejected() {
         deadline,
     };
 
+    soroban_sdk::token::Client::new(&env, &token_id).approve(
+        &user,
+        &bridge_id,
+        &amount,
+        &100u32,
+    );
     // First use succeeds.
     bridge.execute_meta_fund(&params, &pubkey, &signature);
     assert_eq!(check_balance(&env, &token_id, &target1), 500i128);

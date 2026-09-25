@@ -525,6 +525,12 @@ fn bench_commit_fund() {
 
     use soroban_sdk::Bytes;
     let mut preimage = Bytes::new(&env);
+    preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
+    crate::append_address_to_bytes(&env, &mut preimage, &bridge_id);
+    preimage.append(&env.ledger().network_id().into());
+    crate::append_address_to_bytes(&env, &mut preimage, &user);
+    crate::append_address_to_bytes(&env, &mut preimage, &target);
+    crate::append_address_to_bytes(&env, &mut preimage, &token_id);
     preimage.extend_from_array(&10_000i128.to_be_bytes());
     preimage.extend_from_array(&1u64.to_be_bytes());
     let amount_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
@@ -548,6 +554,12 @@ fn bench_reveal_fund() {
 
     use soroban_sdk::Bytes;
     let mut preimage = Bytes::new(&env);
+    preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
+    crate::append_address_to_bytes(&env, &mut preimage, &bridge_id);
+    preimage.append(&env.ledger().network_id().into());
+    crate::append_address_to_bytes(&env, &mut preimage, &user);
+    crate::append_address_to_bytes(&env, &mut preimage, &target);
+    crate::append_address_to_bytes(&env, &mut preimage, &token_id);
     preimage.extend_from_array(&amount.to_be_bytes());
     preimage.extend_from_array(&nonce.to_be_bytes());
     let amount_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
@@ -664,6 +676,12 @@ fn bench_execute_meta_fund() {
         deadline,
     };
 
+    soroban_sdk::token::Client::new(&env, &token_id).approve(
+        &source,
+        &bridge_id,
+        &amount,
+        &100u32,
+    );
     measure(&env, "execute_meta_fund", || {
         bridge.execute_meta_fund(&params, &pubkey, &signature);
     });

@@ -1280,6 +1280,14 @@ fn read_commitment(env: &Env, id: u64) -> Option<CommitmentEntry> {
     env.storage().persistent().get(&DataKey::Commitment(id))
 }
 
+pub(crate) fn append_address_to_bytes(env: &Env, preimage: &mut Bytes, address: &Address) {
+    let address_string = address.to_string();
+    let length = address_string.len() as usize;
+    let mut buffer = [0u8; MAX_STRKEY_LEN];
+    address_string.copy_into_slice(&mut buffer[..length]);
+    preimage.append(&Bytes::from_slice(env, &buffer[..length]));
+}
+
 // ---------------------------------------------------------------------------
 // Overflow-safe arithmetic (issue #26)
 // ---------------------------------------------------------------------------
@@ -4321,16 +4329,12 @@ impl OnboardingBridge {
         // limit is checked only here because the amount is hidden at commit time.
         let mut preimage = Bytes::new(&env);
         preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
-        let contract_str = env.current_contract_address().to_string();
-        preimage.append(&Bytes::from_slice(&env, contract_str.as_bytes()));
-        let network_id = env.ledger().network_id();
-        preimage.extend_from_array(&network_id.to_be_bytes());
-        let source_str = source.to_string();
-        preimage.append(&Bytes::from_slice(&env, source_str.as_bytes()));
-        let target_str = target.to_string();
-        preimage.append(&Bytes::from_slice(&env, target_str.as_bytes()));
-        let asset_str = asset.to_string();
-        preimage.append(&Bytes::from_slice(&env, asset_str.as_bytes()));
+        append_address_to_bytes(&env, &mut preimage, &env.current_contract_address());
+        let network_id: Bytes = env.ledger().network_id().into();
+        preimage.append(&network_id);
+        append_address_to_bytes(&env, &mut preimage, &source);
+        append_address_to_bytes(&env, &mut preimage, &target);
+        append_address_to_bytes(&env, &mut preimage, &asset);
         preimage.extend_from_array(&amount.to_be_bytes());
         preimage.extend_from_array(&nonce.to_be_bytes());
         let computed_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
@@ -4379,6 +4383,31 @@ impl OnboardingBridge {
             ("CommitRevealFunded", asset, source, target),
             (commitment_id, amount, fee),
         );
+        Ok(())
+    }
+
+    /// Cancels an unrevealed commitment and removes its persistent entry.
+    ///
+    /// The committed source may cancel at any time, including after the
+    /// reveal deadline has passed. This lets abandoned commitments be cleaned
+    /// up without waiting for storage TTL expiry.
+    pub fn cancel_commitment(env: Env, commitment_id: u64) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        let entry =
+            read_commitment(&env, commitment_id).ok_or(BridgeError::CommitmentNotFound)?;
+        if entry.revealed {
+            return Err(BridgeError::CommitmentAlreadyRevealed);
+        }
+
+        entry.source.require_auth();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Commitment(commitment_id));
+        env.events()
+            .publish(("CommitmentCancelled",), (commitment_id, entry.source));
         Ok(())
     }
 
@@ -4637,8 +4666,10 @@ impl OnboardingBridge {
     ///    checks the deadline and nonce, then performs the same token-transfer
     ///    flow as `fund_c_address`.
     ///
-    /// This enables gas abstraction: the user never needs XLM for fees; the
-    /// relayer covers the Stellar transaction fee.
+    /// The source must approve this bridge contract to spend the requested
+    /// asset amount before signing the meta-transaction. This allowance lets
+    /// the bridge use `transfer_from` without requiring a Soroban
+    /// authorization entry from the source in the relayer's transaction.
     ///
     /// # Arguments
     ///
@@ -4649,9 +4680,9 @@ impl OnboardingBridge {
     ///
     /// # Authorization
     ///
-    /// No `require_auth()` — authentication is entirely via Ed25519 signature.
-    /// The relayer submits this transaction; the user's identity is proven by
-    /// `pubkey` and `signature`.
+    /// No `require_auth()` — authentication is via the registered Ed25519
+    /// signature, and token spending is authorized by the source's allowance
+    /// to this bridge contract.
     ///
     /// # Errors
     ///
@@ -4775,7 +4806,12 @@ impl OnboardingBridge {
         // 7. Execute the transfer (same logic as fund_c_address)
         let token_client = token::Client::new(&env, &params.asset);
         let contract_addr = env.current_contract_address();
-        token_client.transfer(&params.source, &contract_addr, &params.amount);
+        token_client.transfer_from(
+            &contract_addr,
+            &params.source,
+            &contract_addr,
+            &params.amount,
+        );
 
         let global_fee_bps = read_fee_bps(&env);
         let tiered_fee_bps = get_tiered_fee_bps(&env, &params.source, global_fee_bps);
