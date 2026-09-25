@@ -3485,8 +3485,23 @@ impl OnboardingBridge {
     /// # Events
     ///
     /// * `("FeeTiersSet", admin)` — data: `(tiers.len(),)`
-    pub fn set_fee_tiers(_env: Env, _tiers: Vec<FeeTier>) -> Result<(), BridgeError> {
-        todo!("implement: set_fee_tiers")
+    pub fn set_fee_tiers(env: Env, tiers: Vec<FeeTier>) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        if tiers.len() > MAX_FEE_TIERS {
+            return Err(BridgeError::TooManyFeeTiers);
+        }
+        for tier in tiers.iter() {
+            if tier.fee_bps > MAX_FEE_BPS {
+                return Err(BridgeError::FeeTooHigh);
+            }
+        }
+        let admin = read_admin(&env);
+        admin.require_auth();
+        save_fee_tiers(&env, &tiers);
+        extend_instance_ttl(&env);
+        env.events().publish(("FeeTiersSet", admin), (tiers.len(),));
+        Ok(())
     }
 
     /// Returns the configured fee tiers.
@@ -3497,8 +3512,17 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_fee_tiers(_env: Env) -> Result<Vec<FeeTier>, BridgeError> {
-        todo!("implement: query_fee_tiers")
+    pub fn query_fee_tiers(env: Env) -> Result<Vec<FeeTier>, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_fee_tiers(&env).unwrap_or_else(|| {
+            let mut default_tiers = Vec::new(&env);
+            default_tiers.push_back(FeeTier {
+                min_volume: 0,
+                max_volume: i128::MAX,
+                fee_bps: read_fee_bps(&env),
+            });
+            default_tiers
+        }))
     }
 
     /// Returns the fee tier that currently applies to `source`, based on their
@@ -3514,8 +3538,13 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_current_tier(_env: Env, _source: Address) -> Result<FeeTier, BridgeError> {
-        todo!("implement: query_current_tier")
+    pub fn query_current_tier(env: Env, source: Address) -> Result<FeeTier, BridgeError> {
+        check_initialized(&env)?;
+        Ok(find_current_tier(&env, &source).unwrap_or(FeeTier {
+            min_volume: 0,
+            max_volume: i128::MAX,
+            fee_bps: read_fee_bps(&env),
+        }))
     }
 
     // -----------------------------------------------------------------------
@@ -3591,15 +3620,97 @@ impl OnboardingBridge {
     /// once toward the threshold; duplicates are rejected with
     /// [`BridgeError::DuplicateRelayerSignature`].
     pub fn fund_c_address_crosschain(
-        _env: Env,
-        _chain_id: u32,
-        _tx_hash: BytesN<32>,
-        _target: Address,
-        _asset: Address,
-        _amount: i128,
-        _sigs: Vec<RelayerSig>,
+        env: Env,
+        chain_id: u32,
+        tx_hash: BytesN<32>,
+        target: Address,
+        asset: Address,
+        amount: i128,
+        sigs: Vec<RelayerSig>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: fund_c_address_crosschain")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        check_access(&env, &target)?;
+        check_asset_whitelisted(&env, &asset)?;
+
+        let tx_hash_bytes: soroban_sdk::Bytes = tx_hash.clone().into();
+        let mut nonce_pre = soroban_sdk::Bytes::new(&env);
+        nonce_pre.extend_from_array(&chain_id.to_be_bytes());
+        nonce_pre.append(&tx_hash_bytes);
+        let nonce: BytesN<32> = env.crypto().sha256(&nonce_pre).into();
+        if is_nonce_used(&env, &nonce) {
+            return Err(BridgeError::ReplayedNonce);
+        }
+
+        let mut addr_buf = [0u8; MAX_STRKEY_LEN];
+        let tgt_str = target.clone().to_string();
+        let tlen = tgt_str.len() as usize;
+        if tlen > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
+        tgt_str.copy_into_slice(&mut addr_buf[..tlen]);
+        let tgt_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..tlen]);
+        let tgt_hash: soroban_sdk::Bytes = env.crypto().sha256(&tgt_raw).into();
+
+        let ast_str = asset.clone().to_string();
+        let alen = ast_str.len() as usize;
+        if alen > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
+        ast_str.copy_into_slice(&mut addr_buf[..alen]);
+        let ast_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..alen]);
+        let ast_hash: soroban_sdk::Bytes = env.crypto().sha256(&ast_raw).into();
+
+        let nonce_bytes: soroban_sdk::Bytes = nonce.clone().into();
+        let mut payload = soroban_sdk::Bytes::new(&env);
+        payload.extend_from_array(&chain_id.to_be_bytes());
+        payload.append(&tx_hash_bytes);
+        payload.append(&tgt_hash);
+        payload.append(&ast_hash);
+        payload.extend_from_array(&amount.to_be_bytes());
+        payload.append(&nonce_bytes);
+        let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
+
+        let mut seen: Vec<BytesN<32>> = Vec::new(&env);
+        for sig in sigs.iter() {
+            if !is_relayer(&env, &sig.pubkey) {
+                return Err(BridgeError::NotRelayer);
+            }
+            if seen.contains(&sig.pubkey) {
+                return Err(BridgeError::DuplicateRelayerSignature);
+            }
+            seen.push_back(sig.pubkey.clone());
+            env.crypto()
+                .ed25519_verify(&sig.pubkey, &payload_hash.clone().into(), &sig.signature);
+        }
+        if seen.len() < relayer_threshold(&env) {
+            return Err(BridgeError::BelowThreshold);
+        }
+
+        mark_nonce_used(&env, &nonce);
+
+        let global_fee_bps = read_fee_bps(&env);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, global_fee_bps);
+        let fee = calculate_fee(amount, effective_fee_bps)?;
+        let net_amount = safe_math::safe_sub(amount, fee)?;
+
+        if net_amount > 0 {
+            let token_client = token::Client::new(&env, &asset);
+            token_client.transfer(&env.current_contract_address(), &target, &net_amount);
+        }
+        update_asset_counters(&env, &asset, fee, net_amount)?;
+        mint_loyalty_tokens(&env, &target);
+        extend_instance_ttl(&env);
+
+        env.events().publish(
+            ("CrossChainFunded", target),
+            (chain_id, tx_hash, amount, fee, asset),
+        );
+        Ok(())
     }
 
     /// Registers an Ed25519 public key as a trusted relayer.
