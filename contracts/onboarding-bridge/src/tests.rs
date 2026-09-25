@@ -4991,6 +4991,53 @@ fn test_batch_fund_within_daily_limit_succeeds() {
     );
 }
 
+/********** Daily-limit configuration validation **********/
+
+#[test]
+fn test_set_source_daily_limit_rejects_negative_limit() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    assert_eq!(
+        bridge.try_set_source_daily_limit(
+            &_user,
+            &token_id,
+            &-1i128,
+            &None
+        ),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+}
+
+#[test]
+fn test_set_source_daily_limit_rejects_non_whitelisted_asset() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let non_whitelisted_asset = Address::generate(&env);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+
+    assert_eq!(
+        bridge.try_set_source_daily_limit(
+            &user,
+            &non_whitelisted_asset,
+            &500i128,
+            &None
+        ),
+        Err(Ok(BridgeError::AssetNotWhitelisted))
+    );
+
+    bridge.add_asset(&token_id, &None);
+    bridge.set_source_daily_limit(&user, &token_id, &0i128, &None);
+}
+
 /********** Tiered fee applied to batch/referral funding paths **********/
 
 // get_tiered_fee_bps was only consulted by fund_c_address, reveal_fund,

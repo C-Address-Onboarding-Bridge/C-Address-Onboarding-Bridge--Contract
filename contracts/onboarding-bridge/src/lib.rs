@@ -1754,6 +1754,10 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        if limit_amount < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        require_asset_whitelisted(&env, &asset)?;
 
         let admin = read_admin(&env);
         admin.require_auth();
