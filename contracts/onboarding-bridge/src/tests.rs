@@ -5478,6 +5478,38 @@ fn test_set_max_withdraw_per_tx_updates_limit() {
     assert_eq!(bridge.query_max_withdraw_per_tx(), 0i128);
 }
 
+#[test]
+fn test_set_max_withdraw_per_tx_rejects_negative_limit() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert_eq!(
+        bridge.try_set_max_withdraw_per_tx(&-1i128, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+    assert_eq!(bridge.query_max_withdraw_per_tx(), 0i128);
+}
+
+#[test]
+fn test_set_minimum_amount_rejects_negative_limit() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert_eq!(
+        bridge.try_set_minimum_amount(&-1i128, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+    assert_eq!(bridge.query_minimum_amount(), 0i128);
+}
+
 /********** accept_admin tests **********/
 
 #[test]
