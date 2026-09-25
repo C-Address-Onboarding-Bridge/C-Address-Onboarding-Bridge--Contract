@@ -455,7 +455,7 @@ fn read_pending_admin(env: &Env) -> Option<Address> {
     env.storage().instance().get(&DataKey::PendingAdmin)
 }
 
-fn clear_pending_admin(env: &Env) {
+fn remove_pending_admin(env: &Env) {
     env.storage().instance().remove(&DataKey::PendingAdmin);
 }
 
@@ -469,7 +469,7 @@ fn read_pending_fee_collector(env: &Env) -> Option<Address> {
     env.storage().instance().get(&DataKey::PendingFeeCollector)
 }
 
-fn clear_pending_fee_collector(env: &Env) {
+fn remove_pending_fee_collector(env: &Env) {
     env.storage()
         .instance()
         .remove(&DataKey::PendingFeeCollector);
@@ -1922,7 +1922,7 @@ impl OnboardingBridge {
         let mut config = read_bridge_config(&env);
         config.fee_collector = pending.clone();
         save_bridge_config(&env, &config);
-        clear_pending_fee_collector(&env);
+        remove_pending_fee_collector(&env);
         env.events()
             .publish(("FeeCollectorTransferred", old_collector, pending), ());
         Ok(())
@@ -1975,7 +1975,7 @@ impl OnboardingBridge {
         let mut config = read_bridge_config(&env);
         config.admin = pending.clone();
         save_bridge_config(&env, &config);
-        clear_pending_admin(&env);
+        remove_pending_admin(&env);
         env.events()
             .publish(("AdminTransferred", old_admin, pending), ());
         Ok(())
@@ -1983,6 +1983,40 @@ impl OnboardingBridge {
 
     pub fn query_pending_admin(env: Env) -> Option<Address> {
         read_pending_admin(&env)
+    }
+
+    /// Cancels a pending admin handoff.
+    pub fn clear_pending_admin(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_deactivated(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        read_pending_admin(&env).ok_or(BridgeError::Unauthorized)?;
+        remove_pending_admin(&env);
+        extend_instance_ttl(&env);
+        env.events().publish(("AdminTransferCancelled",), (admin,));
+        Ok(())
+    }
+
+    /// Cancels a pending fee-collector handoff.
+    pub fn clear_pending_fee_collector(
+        env: Env,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_deactivated(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        read_pending_fee_collector(&env).ok_or(BridgeError::Unauthorized)?;
+        remove_pending_fee_collector(&env);
+        extend_instance_ttl(&env);
+        env.events()
+            .publish(("FeeCollectorTransferCancelled",), (admin,));
+        Ok(())
     }
 
     pub fn set_minimum_amount(

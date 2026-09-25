@@ -63,10 +63,12 @@ graph TD
 | Roles | `set_fee_collector` | Replace the fee collector immediately |
 | Roles | `propose_new_fee_collector` | Start a two-step fee collector transfer |
 | Roles | `accept_fee_collector` | Accept a pending fee collector role |
+| Roles | `clear_pending_fee_collector` | Cancel a pending fee collector transfer |
 | Roles | `query_pending_fee_collector` | Read the pending fee collector, if any |
 | Roles | `set_admin` | Replace the admin immediately |
 | Roles | `propose_new_admin` | Start a two-step admin transfer |
 | Roles | `accept_admin` | Accept a pending admin role |
+| Roles | `clear_pending_admin` | Cancel a pending admin transfer |
 | Roles | `query_pending_admin` | Read the pending admin, if any |
 | Referrals and loyalty | `set_referral_rate` | Configure the referral fee share |
 | Referrals and loyalty | `query_referral_rate` | Read the referral fee share |

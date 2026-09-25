@@ -5583,6 +5583,34 @@ fn test_accept_admin_cannot_be_reused_after_acceptance() {
     );
 }
 
+#[test]
+fn test_clear_pending_admin_cancels_handoff() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.propose_new_admin(&Address::generate(&env), &None);
+    bridge.clear_pending_admin(&None);
+
+    assert_eq!(bridge.query_pending_admin(), None);
+}
+
+#[test]
+fn test_clear_pending_fee_collector_cancels_handoff() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.propose_new_fee_collector(&Address::generate(&env), &None);
+    bridge.clear_pending_fee_collector(&None);
+
+    assert_eq!(bridge.query_pending_fee_collector(), None);
+}
+
 /********** extend_timelock_ttl tests **********/
 
 fn setup_extend_timelock(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, u64) {
