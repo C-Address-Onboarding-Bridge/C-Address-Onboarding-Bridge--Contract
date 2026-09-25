@@ -4140,8 +4140,8 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `source` (`Address`) — The address to query.
-    pub fn query_auth_nonce(_env: Env, _source: Address) -> u64 {
-        todo!("implement: query_auth_nonce")
+    pub fn query_auth_nonce(env: Env, source: Address) -> u64 {
+        read_auth_nonce(&env, &source)
     }
 
     /// Returns `true` if a specific auth nonce has already been consumed for `source`.
