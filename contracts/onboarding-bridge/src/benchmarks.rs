@@ -15,7 +15,7 @@ use std::{format, println};
 
 use crate::tests::swap_pool_contract::{SwapPool, SwapPoolClient};
 use crate::tests::{advance_ledger_sequence, advance_ledger_time};
-use crate::OnboardingBridge;
+use crate::{OnboardingBridge, ReentrancyGuard};
 
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
@@ -138,6 +138,7 @@ fn bench_initialize_warm() {
 fn bench_fund_amount(amount: i128) {
     let (env, bridge_id, token_id, _admin, _fee_collector) = initialized_setup();
     let bridge = crate::OnboardingBridgeClient::new(&env, &bridge_id);
+    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
     let user = Address::generate(&env);
     let target = Address::generate(&env);
     mint(&env, &token_id, &user, amount * 2);
@@ -355,6 +356,21 @@ fn bench_admin_setters() {
     });
 }
 
+#[test]
+fn bench_reentrancy_guard_overhead() {
+    let (env, bridge_id, _token_id, _admin, _fee_collector) = setup();
+
+    measure(&env, "reentrancy_guard/host_call_baseline", || {
+        env.as_contract(&bridge_id, || {});
+    });
+    measure(&env, "reentrancy_guard/enter_drop", || {
+        env.as_contract(&bridge_id, || {
+            let guard = ReentrancyGuard::enter(&env).unwrap();
+            drop(guard);
+        });
+    });
+}
+
 // ── fund_c_address_timelocked / claim_timelocked ──────────────────────────────
 
 #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
@@ -423,7 +439,7 @@ fn bench_fund_c_address_crosschain() {
     let relayer_secret: [u8; 32] = [1u8; 32];
     let relayer_signing_key = SigningKey::from_bytes(&relayer_secret);
     let relayer_pubkey = BytesN::from_array(&env, relayer_signing_key.verifying_key().as_bytes());
-    bridge.add_relayer(&relayer_pubkey);
+    bridge.add_relayer(&relayer_pubkey, &None);
     bridge.set_relayer_threshold(&1u32);
 
     // Fund the bridge so it can transfer to target.
@@ -525,6 +541,12 @@ fn bench_commit_fund() {
 
     use soroban_sdk::Bytes;
     let mut preimage = Bytes::new(&env);
+    preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
+    crate::append_address_to_bytes(&env, &mut preimage, &bridge_id);
+    preimage.append(&env.ledger().network_id().into());
+    crate::append_address_to_bytes(&env, &mut preimage, &user);
+    crate::append_address_to_bytes(&env, &mut preimage, &target);
+    crate::append_address_to_bytes(&env, &mut preimage, &token_id);
     preimage.extend_from_array(&10_000i128.to_be_bytes());
     preimage.extend_from_array(&1u64.to_be_bytes());
     let amount_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
@@ -548,6 +570,12 @@ fn bench_reveal_fund() {
 
     use soroban_sdk::Bytes;
     let mut preimage = Bytes::new(&env);
+    preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
+    crate::append_address_to_bytes(&env, &mut preimage, &bridge_id);
+    preimage.append(&env.ledger().network_id().into());
+    crate::append_address_to_bytes(&env, &mut preimage, &user);
+    crate::append_address_to_bytes(&env, &mut preimage, &target);
+    crate::append_address_to_bytes(&env, &mut preimage, &token_id);
     preimage.extend_from_array(&amount.to_be_bytes());
     preimage.extend_from_array(&nonce.to_be_bytes());
     let amount_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
@@ -630,6 +658,7 @@ fn bench_execute_meta_fund() {
     let signing_key = SigningKey::from_bytes(&secret);
     let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
     bridge.register_meta_signer(&source, &pubkey);
+    bridge.set_meta_tx_network_id(&network_id);
 
     // Build the canonical meta-fund payload and sign it.
     use soroban_sdk::Bytes;
@@ -645,6 +674,9 @@ fn bench_execute_meta_fund() {
 
     let mut payload = Bytes::new(&env);
     payload.append(&domain);
+    payload.append(&network_id.clone().into());
+    let contract_hash = hash_address(&env, &mut addr_buf, &bridge_id);
+    payload.append(&contract_hash.into());
     payload.append(&src_hash.into());
     payload.append(&tgt_hash.into());
     payload.append(&ast_hash.into());
@@ -656,6 +688,7 @@ fn bench_execute_meta_fund() {
     let signature = ed25519_sign_payload(&env, &signing_key, &payload_hash);
 
     let params = crate::MetaFundParams {
+        network_id,
         source: source.clone(),
         target: target.clone(),
         asset: token_id.clone(),
@@ -664,6 +697,12 @@ fn bench_execute_meta_fund() {
         deadline,
     };
 
+    soroban_sdk::token::Client::new(&env, &token_id).approve(
+        &source,
+        &bridge_id,
+        &amount,
+        &100u32,
+    );
     measure(&env, "execute_meta_fund", || {
         bridge.execute_meta_fund(&params, &pubkey, &signature);
     });

@@ -398,6 +398,25 @@ fn bench_commit_fund() -> BenchResult {
     let user = Address::generate(&env);
     let target = Address::generate(&env);
     let mut preimage = soroban_sdk::Bytes::new(&env);
+    preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
+    let mut address_buffer = [0u8; 64];
+    let bridge_string = bridge_id.to_string();
+    let bridge_length = bridge_string.len() as usize;
+    bridge_string.copy_into_slice(&mut address_buffer[..bridge_length]);
+    preimage.append(&soroban_sdk::Bytes::from_slice(
+        &env,
+        &address_buffer[..bridge_length],
+    ));
+    preimage.append(&env.ledger().network_id().into());
+    for address in [&user, &target, &token_id] {
+        let address_string = address.to_string();
+        let length = address_string.len() as usize;
+        address_string.copy_into_slice(&mut address_buffer[..length]);
+        preimage.append(&soroban_sdk::Bytes::from_slice(
+            &env,
+            &address_buffer[..length],
+        ));
+    }
     preimage.extend_from_array(&10_000i128.to_be_bytes());
     preimage.extend_from_array(&1u64.to_be_bytes());
     let amount_hash: BytesN<32> = env.crypto().sha256(&preimage).into();

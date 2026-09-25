@@ -70,6 +70,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
     IntoVal, Map, Vec,
 };
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -183,7 +184,9 @@ pub enum BridgeError {
     InvalidTtl = 48,
     /// The supplied pubkey is not the registered meta-signer for `source`.
     MetaTxPubkeySourceMismatch = 49,
-    // Next free discriminant: 50. Always take the next unused value here and
+    /// The meta-transaction network identifier is not configured.
+    MetaTxNetworkIdNotConfigured = 50,
+    // Next free discriminant: 51. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
 
@@ -202,10 +205,7 @@ pub enum DataKey {
     Blocked(Address),
     Allowlisted(Address),
     AllowlistMode,
-    AccruedFees(Address),
     AssetWhitelist,
-    TotalBridged(Address),
-    TotalFeesCollected(Address),
     SourceDailyLimit(Address, Address),
     AssetFeeCap(Address),
     Nonce(Address),
@@ -252,9 +252,12 @@ pub enum DataKey {
     // Registry binding a source address to the one Ed25519 pubkey it will
     // accept meta-transaction signatures from.
     MetaSigner(Address),
+    MetaTxNetworkId,
     Deactivated,
     // Admin-managed whitelist of DEX pool addresses usable in `swap_route`.
     PoolWhitelist,
+    AssetWhitelistEntry(Address),
+    PoolWhitelistEntry(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -305,14 +308,15 @@ pub struct BridgeConfig {
     pub allowlist_mode: bool,
 }
 
-/// Snapshot of admin + fee_collector + fee_bps used during initialization and
-/// cached for efficient admin-auth checks in mutating functions.
+/// The authoritative contract-wide configuration.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BridgeConfigData {
     pub admin: Address,
     pub fee_collector: Address,
     pub fee_bps: u32,
+    pub paused: bool,
+    pub allowlist_mode: bool,
 }
 
 /// Packed per-asset counters stored in a single persistent-storage entry.
@@ -394,9 +398,10 @@ pub struct PendingUpgrade {
 
 /// A pending commit-reveal entry created by `commit_fund`.
 ///
-/// The `amount_hash` is `sha256(amount_be16 || nonce_be8)`.  The `reveal_fund`
-/// function verifies this hash before executing the transfer so that the
-/// actual amount is never visible in the mempool.
+/// The `amount_hash` is a domain-separated hash of the commitment parties,
+/// amount, and nonce. The `reveal_fund` function verifies this hash before
+/// executing the transfer so that the actual amount is never visible in the
+/// mempool.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitmentEntry {
@@ -406,7 +411,8 @@ pub struct CommitmentEntry {
     pub target: Address,
     /// Whitelisted token contract address.
     pub asset: Address,
-    /// sha256(amount_be16 || nonce_be8) — binds the reveal to a specific amount.
+    /// Domain-separated hash binding the reveal to its source, target, asset,
+    /// contract, amount, and nonce.
     pub amount_hash: BytesN<32>,
     /// Unix timestamp deadline; reveal must happen before this.
     pub deadline: u64,
@@ -455,7 +461,7 @@ fn read_pending_admin(env: &Env) -> Option<Address> {
     env.storage().instance().get(&DataKey::PendingAdmin)
 }
 
-fn clear_pending_admin(env: &Env) {
+fn remove_pending_admin(env: &Env) {
     env.storage().instance().remove(&DataKey::PendingAdmin);
 }
 
@@ -469,7 +475,7 @@ fn read_pending_fee_collector(env: &Env) -> Option<Address> {
     env.storage().instance().get(&DataKey::PendingFeeCollector)
 }
 
-fn clear_pending_fee_collector(env: &Env) {
+fn remove_pending_fee_collector(env: &Env) {
     env.storage()
         .instance()
         .remove(&DataKey::PendingFeeCollector);
@@ -496,6 +502,8 @@ fn read_bridge_config(env: &Env) -> BridgeConfigData {
             admin: read_admin(env),
             fee_collector: read_fee_collector(env),
             fee_bps: read_fee_bps(env),
+            paused: false,
+            allowlist_mode: false,
         })
 }
 
@@ -515,6 +523,14 @@ fn read_max_persistent_ttl(env: &Env) -> u32 {
         .instance()
         .get(&DataKey::MaxPersistentTtl)
         .unwrap_or(MAX_ALLOWED_TTL)
+}
+
+fn persistent_ttl_request(ttl: u32, configured_max: u32) -> Result<(u32, u32), BridgeError> {
+    if ttl < MIN_ALLOWED_TTL {
+        return Err(BridgeError::InvalidTtl);
+    }
+    let max_ttl = ttl.min(configured_max);
+    Ok((max_ttl, max_ttl / 4))
 }
 
 fn extend_instance_ttl(env: &Env) {
@@ -560,51 +576,63 @@ fn increment_user_deposit(
 
 #[inline(never)]
 fn save_admin(env: &Env, admin: &Address) {
-    env.storage().instance().set(&DataKey::Admin, admin);
+    let mut config = read_bridge_config(env);
+    config.admin = admin.clone();
+    save_bridge_config(env, &config);
 }
 
 #[inline(never)]
 fn read_admin(env: &Env) -> Address {
-    env.storage().instance().get(&DataKey::Admin).unwrap()
+    env.storage()
+        .instance()
+        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
+        .map(|config| config.admin)
+        .or_else(|| env.storage().instance().get(&DataKey::Admin))
+        .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized))
 }
 
 #[inline(never)]
 fn save_fee_collector(env: &Env, addr: &Address) {
-    env.storage().instance().set(&DataKey::FeeCollector, addr);
+    let mut config = read_bridge_config(env);
+    config.fee_collector = addr.clone();
+    save_bridge_config(env, &config);
 }
 
 #[inline(never)]
 fn read_fee_collector(env: &Env) -> Address {
     env.storage()
         .instance()
-        .get(&DataKey::FeeCollector)
-        .unwrap()
+        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
+        .map(|config| config.fee_collector)
+        .or_else(|| env.storage().instance().get(&DataKey::FeeCollector))
+        .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized))
 }
 
 fn read_config(env: &Env) -> BridgeConfig {
-    env.storage()
-        .instance()
-        .get(&DataKey::Config)
-        .unwrap_or(BridgeConfig {
-            fee_bps: 0,
-            paused: false,
-            allowlist_mode: false,
-        })
+    let config = read_bridge_config(env);
+    BridgeConfig {
+        fee_bps: config.fee_bps,
+        paused: config.paused,
+        allowlist_mode: config.allowlist_mode,
+    }
 }
 
 fn save_config(env: &Env, config: &BridgeConfig) {
-    env.storage().instance().set(&DataKey::Config, config);
+    let mut bridge_config = read_bridge_config(env);
+    bridge_config.fee_bps = config.fee_bps;
+    bridge_config.paused = config.paused;
+    bridge_config.allowlist_mode = config.allowlist_mode;
+    save_bridge_config(env, &bridge_config);
 }
 
 fn save_fee_bps(env: &Env, fee_bps: &u32) {
     let mut config = read_config(env);
     config.fee_bps = *fee_bps;
     save_config(env, &config);
-    env.storage().instance().set(&DataKey::FeeBps, fee_bps);
 }
 
 fn read_fee_bps(env: &Env) -> u32 {
-    read_config(env).fee_bps
+    read_bridge_config(env).fee_bps
 }
 
 fn read_initialized(env: &Env) -> bool {
@@ -645,7 +673,6 @@ fn set_paused(env: &Env, paused: bool) {
     let mut config = read_config(env);
     config.paused = paused;
     save_config(env, &config);
-    env.storage().instance().set(&DataKey::Paused, &paused);
 }
 
 fn is_deactivated(env: &Env) -> bool {
@@ -699,9 +726,6 @@ fn set_allowlist_mode_flag(env: &Env, enabled: bool) {
     let mut config = read_config(env);
     config.allowlist_mode = enabled;
     save_config(env, &config);
-    env.storage()
-        .instance()
-        .set(&DataKey::AllowlistMode, &enabled);
 }
 
 fn check_access(env: &Env, target: &Address) -> Result<(), BridgeError> {
@@ -714,23 +738,21 @@ fn check_access(env: &Env, target: &Address) -> Result<(), BridgeError> {
     Ok(())
 }
 
-#[inline(never)]
-fn read_whitelist(env: &Env) -> Map<Address, bool> {
+fn read_whitelist(env: &Env, asset: &Address) -> bool {
     env.storage()
         .instance()
-        .get(&DataKey::AssetWhitelist)
-        .unwrap_or_else(|| Map::new(env))
+        .get(&DataKey::AssetWhitelistEntry(asset.clone()))
+        .unwrap_or(false)
 }
 
-#[inline(never)]
-fn save_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
+fn save_whitelist(env: &Env, asset: &Address, whitelisted: bool) {
     env.storage()
         .instance()
-        .set(&DataKey::AssetWhitelist, whitelist);
+        .set(&DataKey::AssetWhitelistEntry(asset.clone()), &whitelisted);
 }
 
 fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError> {
-    if !read_whitelist(env).get(asset.clone()).unwrap_or(false) {
+    if !read_whitelist(env, asset) {
         return Err(BridgeError::AssetNotWhitelisted);
     }
     Ok(())
@@ -738,41 +760,24 @@ fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError
 
 // fund_c_address_with_swap must not invoke arbitrary caller-supplied pool
 // addresses. Mirrors the asset whitelist pattern above.
-#[inline(never)]
-fn read_pool_whitelist(env: &Env) -> Map<Address, bool> {
+fn read_pool_whitelist(env: &Env, pool: &Address) -> bool {
     env.storage()
         .instance()
-        .get(&DataKey::PoolWhitelist)
-        .unwrap_or_else(|| Map::new(env))
+        .get(&DataKey::PoolWhitelistEntry(pool.clone()))
+        .unwrap_or(false)
 }
 
-#[inline(never)]
-fn save_pool_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
+fn save_pool_whitelist(env: &Env, pool: &Address, whitelisted: bool) {
     env.storage()
         .instance()
-        .set(&DataKey::PoolWhitelist, whitelist);
+        .set(&DataKey::PoolWhitelistEntry(pool.clone()), &whitelisted);
 }
 
 fn check_pool_whitelisted(env: &Env, pool: &Address) -> Result<(), BridgeError> {
-    if !read_pool_whitelist(env).get(pool.clone()).unwrap_or(false) {
+    if !read_pool_whitelist(env, pool) {
         return Err(BridgeError::PoolNotWhitelisted);
     }
     Ok(())
-}
-
-// Issue #96: SAC native token (XLM) support
-//
-// Native SAC tokens (e.g., XLM) use the same token interface but may have
-// different behavior in the Soroban environment. This helper detects native
-// tokens so we can handle them appropriately if needed in the future.
-#[inline]
-fn is_native_sac_token(env: &Env, asset: &Address) -> bool {
-    // In Soroban testnet/mainnet, the native XLM token has a canonical address.
-    // We can use env.invoker() to determine if this is the native SAC.
-    // For now, we treat all assets uniformly through token::Client.
-    // Future enhancement: detect native token via stellar contract protocol.
-    let _ = (env, asset);
-    false
 }
 
 fn read_asset_counters(env: &Env, asset: &Address) -> AssetCounters {
@@ -787,33 +792,24 @@ fn read_asset_counters(env: &Env, asset: &Address) -> AssetCounters {
         })
 }
 
-fn increment_locked_timelock(env: &Env, asset: &Address, amount: i128) {
+fn increment_locked_timelock(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
     let mut c = read_asset_counters(env, asset);
-    c.locked_timelock += amount;
+    c.locked_timelock = safe_math::safe_add(c.locked_timelock, amount)?;
     save_asset_counters(env, asset, &c);
+    Ok(())
 }
 
-fn decrement_locked_timelock(env: &Env, asset: &Address, amount: i128) {
+fn decrement_locked_timelock(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
     let mut c = read_asset_counters(env, asset);
-    c.locked_timelock -= amount;
+    c.locked_timelock = safe_math::safe_sub(c.locked_timelock, amount)?;
     save_asset_counters(env, asset, &c);
+    Ok(())
 }
 
 fn save_asset_counters(env: &Env, asset: &Address, counters: &AssetCounters) {
     env.storage()
         .persistent()
         .set(&DataKey::AssetStats(asset.clone()), counters);
-    env.storage()
-        .persistent()
-        .set(&DataKey::AccruedFees(asset.clone()), &counters.accrued_fees);
-    env.storage().persistent().set(
-        &DataKey::TotalBridged(asset.clone()),
-        &counters.total_bridged,
-    );
-    env.storage().persistent().set(
-        &DataKey::TotalFeesCollected(asset.clone()),
-        &counters.total_fees_collected,
-    );
 }
 
 fn read_accrued_fees(env: &Env, asset: &Address) -> i128 {
@@ -827,10 +823,11 @@ fn increment_accrued_fees(env: &Env, asset: &Address, amount: i128) -> Result<()
     Ok(())
 }
 
-fn decrement_accrued_fees(env: &Env, asset: &Address, amount: i128) {
+fn decrement_accrued_fees(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
     let mut c = read_asset_counters(env, asset);
-    c.accrued_fees -= amount;
+    c.accrued_fees = safe_math::safe_sub(c.accrued_fees, amount)?;
     save_asset_counters(env, asset, &c);
+    Ok(())
 }
 
 fn read_total_bridged(env: &Env, asset: &Address) -> i128 {
@@ -922,7 +919,7 @@ fn is_auth_nonce_used(env: &Env, source: &Address, nonce: u64) -> bool {
         .unwrap_or(false)
 }
 
-fn mark_auth_nonce_used(env: &Env, source: &Address, nonce: u64) {
+fn mark_auth_nonce_used(env: &Env, source: &Address, nonce: u64) -> Result<(), BridgeError> {
     env.storage()
         .persistent()
         .set(&DataKey::UsedAuthNonce(source.clone(), nonce), &true);
@@ -930,17 +927,19 @@ fn mark_auth_nonce_used(env: &Env, source: &Address, nonce: u64) {
     // expected nonce without scanning storage.
     let current = read_auth_nonce(env, source);
     if nonce >= current {
+        let next = nonce.checked_add(1).ok_or(BridgeError::Overflow)?;
         env.storage()
             .persistent()
-            .set(&DataKey::AuthNonce(source.clone()), &(nonce + 1));
+            .set(&DataKey::AuthNonce(source.clone()), &next);
     }
+    Ok(())
 }
 
 /// Validate and consume a Soroban authorization-entry nonce.
 ///
 /// Parameters
 /// - `source`              : address whose auth entry is being validated
-/// - `nonce`               : caller-supplied nonce (must not have been used before)
+/// - `nonce`              : caller-supplied next nonce (must not have been used before)
 /// - `valid_after_ledger`  : inclusive lower bound on `env.ledger().sequence()`
 /// - `valid_before_ledger` : exclusive upper bound on `env.ledger().sequence()`
 ///
@@ -958,13 +957,18 @@ fn consume_auth_nonce(
         return Err(BridgeError::AuthNonceExpired);
     }
 
-    // 2. Used-nonce check (prevents exact replay of this (source, nonce) pair)
+    // 2. Enforce monotonic sequencing before checking the used-nonce set.
+    if nonce != read_auth_nonce(env, source) {
+        return Err(BridgeError::DuplicateNonce);
+    }
+
+    // 3. Used-nonce check (prevents exact replay of this (source, nonce) pair)
     if is_auth_nonce_used(env, source, nonce) {
         return Err(BridgeError::AuthNonceAlreadyUsed);
     }
 
-    // 3. Mark as used and advance the per-address counter
-    mark_auth_nonce_used(env, source, nonce);
+    // 4. Mark as used and advance the per-address counter
+    mark_auth_nonce_used(env, source, nonce)?;
 
     // 4. Emit AuthUsed event for off-chain indexers
     env.events().publish(("AuthUsed", source.clone()), (nonce,));
@@ -1033,15 +1037,28 @@ fn remove_relayer(env: &Env, pubkey: &BytesN<32>) {
 // requires `source.require_auth()` once, on-chain).
 
 fn save_meta_signer(env: &Env, source: &Address, pubkey: &BytesN<32>) {
+    let key = DataKey::MetaSigner(source.clone());
+    env.storage().persistent().set(&key, pubkey);
+    let max_ttl = read_max_persistent_ttl(env);
     env.storage()
         .persistent()
-        .set(&DataKey::MetaSigner(source.clone()), pubkey);
+        .extend_ttl(&key, max_ttl / 4, max_ttl);
+}
+
+fn clear_meta_signer(env: &Env, source: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::MetaSigner(source.clone()));
 }
 
 fn read_meta_signer(env: &Env, source: &Address) -> Option<BytesN<32>> {
     env.storage()
         .persistent()
         .get(&DataKey::MetaSigner(source.clone()))
+}
+
+fn read_meta_tx_network_id(env: &Env) -> Option<BytesN<32>> {
+    env.storage().instance().get(&DataKey::MetaTxNetworkId)
 }
 
 fn relayer_threshold(env: &Env) -> u32 {
@@ -1278,6 +1295,14 @@ fn read_commitment(env: &Env, id: u64) -> Option<CommitmentEntry> {
     env.storage().persistent().get(&DataKey::Commitment(id))
 }
 
+pub(crate) fn append_address_to_bytes(env: &Env, preimage: &mut Bytes, address: &Address) {
+    let address_string = address.to_string();
+    let length = address_string.len() as usize;
+    let mut buffer = [0u8; MAX_STRKEY_LEN];
+    address_string.copy_into_slice(&mut buffer[..length]);
+    preimage.append(&Bytes::from_slice(env, &buffer[..length]));
+}
+
 // ---------------------------------------------------------------------------
 // Overflow-safe arithmetic (issue #26)
 // ---------------------------------------------------------------------------
@@ -1340,6 +1365,20 @@ impl OnboardingBridge {
     // Lifecycle
     // -----------------------------------------------------------------------
 
+    /// Initializes the contract as part of the Soroban create-contract
+    /// operation. Deployment tooling should use this constructor instead of
+    /// creating an uninitialized instance and sending a second transaction.
+    pub fn __constructor(
+        env: Env,
+        admin: Address,
+        fee_collector: Address,
+        fee_bps: u32,
+        nonce: Option<u64>,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), BridgeError> {
+        Self::initialize_inner(env, admin, fee_collector, fee_bps, nonce, wasm_hash)
+    }
+
     /// Initialises the bridge contract. Must be called exactly once before any
     /// other function.
     ///
@@ -1390,6 +1429,34 @@ impl OnboardingBridge {
         fee_bps: u32,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
+        let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+        Self::initialize_inner(env, admin, fee_collector, fee_bps, nonce, wasm_hash)
+    }
+
+    /// Initializes the bridge and records the hash of the deployed WASM.
+    ///
+    /// Deploy tooling must pass the SHA-256 hash of the exact WASM artifact
+    /// used to create this contract. The value becomes the `old_hash` in the
+    /// first `ContractUpgraded` event.
+    pub fn initialize_with_wasm_hash(
+        env: Env,
+        admin: Address,
+        fee_collector: Address,
+        fee_bps: u32,
+        nonce: Option<u64>,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), BridgeError> {
+        Self::initialize_inner(env, admin, fee_collector, fee_bps, nonce, wasm_hash)
+    }
+
+    fn initialize_inner(
+        env: Env,
+        admin: Address,
+        fee_collector: Address,
+        fee_bps: u32,
+        nonce: Option<u64>,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         if read_initialized(&env) {
             return Err(BridgeError::AlreadyInitialized);
@@ -1402,6 +1469,7 @@ impl OnboardingBridge {
         save_admin(&env, &admin);
         save_fee_collector(&env, &fee_collector);
         save_fee_bps(&env, &fee_bps);
+        save_current_wasm_hash(&env, &wasm_hash);
         save_bridge_config(
             &env,
             &BridgeConfigData {
@@ -1479,15 +1547,56 @@ impl OnboardingBridge {
     /// // bridge.fund_c_address(&source, &target, &usdc, &500i128, &None, &None);
     /// ```
     pub fn fund_c_address(
-        _env: Env,
-        _source: Address,
-        _target: Address,
-        _asset: Address,
-        _amount: i128,
-        _nonce: Option<u64>,
-        _deadline: Option<u64>,
+        env: Env,
+        source: Address,
+        target: Address,
+        asset: Address,
+        amount: i128,
+        nonce: Option<u64>,
+        deadline: Option<u64>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: fund_c_address")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        if let Some(dl) = deadline {
+            if env.ledger().timestamp() > dl {
+                return Err(BridgeError::TransactionExpired);
+            }
+        }
+        if amount <= 0 || amount < read_minimum_amount(&env) {
+            return Err(BridgeError::InvalidAmount);
+        }
+
+        check_access(&env, &target)?;
+        check_asset_whitelisted(&env, &asset)?;
+        check_daily_limit(&env, &source, &asset, amount)?;
+
+        source.require_auth();
+        consume_nonce(&env, &source, nonce)?;
+
+        let global_fee_bps = read_fee_bps(&env);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
+        let fee = calculate_fee(amount, effective_fee_bps)?;
+        let net_amount = safe_math::safe_sub(amount, fee)?;
+
+        let token_client = token::Client::new(&env, &asset);
+        let contract_addr = env.current_contract_address();
+        token_client.transfer(&source, &contract_addr, &amount);
+        if net_amount > 0 {
+            token_client.transfer(&contract_addr, &target, &net_amount);
+        }
+
+        update_asset_counters(&env, &asset, fee, net_amount)?;
+        increment_source_bridged_volume(&env, &source, amount)?;
+        extend_instance_ttl(&env);
+        mint_loyalty_tokens(&env, &source);
+
+        env.events()
+            .publish(("CAddressFunded", asset, source, target), (amount, fee));
+
+        Ok(())
     }
 
     /// Funds multiple C-addresses in a single transaction from one source account.
@@ -1754,13 +1863,22 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        if limit_amount < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        check_asset_whitelisted(&env, &asset)?;
 
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
 
+        let old_limit = read_source_daily_limit(&env, &source, &asset);
         save_source_daily_limit(&env, &source, &asset, limit_amount);
         extend_instance_ttl(&env);
+        env.events().publish(
+            ("SourceDailyLimitChanged", old_limit, limit_amount),
+            (admin, source, asset),
+        );
 
         Ok(())
     }
@@ -1779,11 +1897,12 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_source_daily_limit(
-        _env: Env,
-        _source: Address,
-        _asset: Address,
+        env: Env,
+        source: Address,
+        asset: Address,
     ) -> Result<i128, BridgeError> {
-        todo!("implement: query_source_daily_limit")
+        check_initialized(&env)?;
+        Ok(read_source_daily_limit(&env, &source, &asset))
     }
 
     /// Sets a per-asset maximum fee cap in basis points.
@@ -1800,7 +1919,8 @@ impl OnboardingBridge {
     ///
     /// # Authorization
     ///
-    /// Requires the current admin's `require_auth()`.
+    /// No authorization is required because this operation only pays rent and
+    /// does not change contract state.
     ///
     /// # Errors
     ///
@@ -1829,8 +1949,11 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
 
+        let old_fee_cap = read_asset_fee_cap(&env, &asset);
         save_asset_fee_cap(&env, &asset, max_fee_bps);
         extend_instance_ttl(&env);
+        env.events()
+            .publish(("AssetFeeCapChanged", old_fee_cap, max_fee_bps), (admin, asset));
 
         Ok(())
     }
@@ -1879,11 +2002,27 @@ impl OnboardingBridge {
     /// // assert_eq!(bridge.query_fee_collector(), new_collector);
     /// ```
     pub fn set_fee_collector(
-        _env: Env,
-        _new_fee_collector: Address,
-        _nonce: Option<u64>,
+        env: Env,
+        new_fee_collector: Address,
+        nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: set_fee_collector")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+        let old_collector = read_fee_collector(&env);
+        save_fee_collector(&env, &new_fee_collector);
+        let mut config = read_bridge_config(&env);
+        config.fee_collector = new_fee_collector.clone();
+        save_bridge_config(&env, &config);
+        env.events().publish(
+            ("FeeCollectorChanged", old_collector, new_fee_collector),
+            (admin,),
+        );
+        Ok(())
     }
 
     /// Proposes a fee-collector handoff that must be accepted by `new_collector`.
@@ -1898,7 +2037,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -1913,7 +2052,7 @@ impl OnboardingBridge {
     pub fn accept_fee_collector(env: Env) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
+        check_not_deactivated(&env)?;
         let pending = read_pending_fee_collector(&env).ok_or(BridgeError::Unauthorized)?;
         pending.require_auth();
         extend_instance_ttl(&env);
@@ -1922,7 +2061,7 @@ impl OnboardingBridge {
         let mut config = read_bridge_config(&env);
         config.fee_collector = pending.clone();
         save_bridge_config(&env, &config);
-        clear_pending_fee_collector(&env);
+        remove_pending_fee_collector(&env);
         env.events()
             .publish(("FeeCollectorTransferred", old_collector, pending), ());
         Ok(())
@@ -1932,12 +2071,20 @@ impl OnboardingBridge {
         read_pending_fee_collector(&env)
     }
 
-    pub fn set_admin(
-        _env: Env,
-        _new_admin: Address,
-        _nonce: Option<u64>,
-    ) -> Result<(), BridgeError> {
-        todo!("implement: set_admin")
+    pub fn set_admin(env: Env, new_admin: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+        save_admin(&env, &new_admin);
+        let mut config = read_bridge_config(&env);
+        config.admin = new_admin.clone();
+        save_bridge_config(&env, &config);
+        env.events().publish(("AdminChanged", admin, new_admin), ());
+        Ok(())
     }
 
     /// Proposes an admin handoff that must be accepted by `new_admin`.
@@ -1951,7 +2098,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -1966,7 +2113,7 @@ impl OnboardingBridge {
     pub fn accept_admin(env: Env) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
+        check_not_deactivated(&env)?;
         let pending = read_pending_admin(&env).ok_or(BridgeError::Unauthorized)?;
         pending.require_auth();
         extend_instance_ttl(&env);
@@ -1975,7 +2122,7 @@ impl OnboardingBridge {
         let mut config = read_bridge_config(&env);
         config.admin = pending.clone();
         save_bridge_config(&env, &config);
-        clear_pending_admin(&env);
+        remove_pending_admin(&env);
         env.events()
             .publish(("AdminTransferred", old_admin, pending), ());
         Ok(())
@@ -1985,17 +2132,57 @@ impl OnboardingBridge {
         read_pending_admin(&env)
     }
 
+    /// Cancels a pending admin handoff.
+    pub fn clear_pending_admin(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_deactivated(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        read_pending_admin(&env).ok_or(BridgeError::Unauthorized)?;
+        remove_pending_admin(&env);
+        extend_instance_ttl(&env);
+        env.events().publish(("AdminTransferCancelled",), (admin,));
+        Ok(())
+    }
+
+    /// Cancels a pending fee-collector handoff.
+    pub fn clear_pending_fee_collector(
+        env: Env,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_deactivated(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        read_pending_fee_collector(&env).ok_or(BridgeError::Unauthorized)?;
+        remove_pending_fee_collector(&env);
+        extend_instance_ttl(&env);
+        env.events()
+            .publish(("FeeCollectorTransferCancelled",), (admin,));
+        Ok(())
+    }
+
     pub fn set_minimum_amount(
         env: Env,
         amount: i128,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        if amount < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
+        let old_amount = read_minimum_amount(&env);
         save_minimum_amount(&env, &amount);
         extend_instance_ttl(&env);
+        env.events()
+            .publish(("MinimumAmountChanged", old_amount, amount), (admin,));
         Ok(())
     }
 
@@ -2072,6 +2259,10 @@ impl OnboardingBridge {
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
+        let max_withdraw_per_tx = read_max_withdraw_per_tx(&env);
+        if max_withdraw_per_tx != 0 && amount > max_withdraw_per_tx {
+            return Err(BridgeError::WithdrawExceedsLimit);
+        }
 
         let accrued = read_accrued_fees(&env, &asset);
         if amount > accrued {
@@ -2097,11 +2288,17 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        if amount < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
+        let old_amount = read_max_withdraw_per_tx(&env);
         save_max_withdraw_per_tx(&env, amount);
         extend_instance_ttl(&env);
+        env.events()
+            .publish(("MaxWithdrawPerTxChanged", old_amount, amount), (admin,));
         Ok(())
     }
 
@@ -2279,9 +2476,7 @@ impl OnboardingBridge {
         }
 
         increment_user_deposit(&env, &source, &asset, amount)?;
-        increment_accrued_fees(&env, &asset, protocol_fee)?;
-        increment_total_bridged(&env, &asset, net_amount)?;
-        increment_total_fees_collected(&env, &asset, protocol_fee)?;
+        update_asset_counters(&env, &asset, protocol_fee, net_amount)?;
         increment_source_bridged_volume(&env, &source, amount)?;
 
         extend_instance_ttl(&env);
@@ -2375,16 +2570,21 @@ impl OnboardingBridge {
     /// Returns the contract's total token balance for `asset`.
     ///
     /// This includes both accrued fees and any tokens held for other purposes
-    /// (e.g. timelocked funds). Use `query_accrued_fees` to isolate just the
-    /// fee portion.
+    /// (e.g. timelocked funds). Use `query_accrued_fees` to isolate the fee
+    /// portion.
     ///
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_fee_balance(env: Env, asset: Address) -> Result<i128, BridgeError> {
+    pub fn query_contract_balance(env: Env, asset: Address) -> Result<i128, BridgeError> {
         check_initialized(&env)?;
         let token_client = token::Client::new(&env, &asset);
         Ok(token_client.balance(&env.current_contract_address()))
+    }
+
+    /// Deprecated compatibility alias for [`query_contract_balance`].
+    pub fn query_fee_balance(env: Env, asset: Address) -> Result<i128, BridgeError> {
+        Self::query_contract_balance(env, asset)
     }
 
     /// Returns `true` if the contract has been initialised.
@@ -2564,6 +2764,7 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
 
         set_paused(&env, true);
+        extend_instance_ttl(&env);
 
         env.events().publish(("ContractPaused",), (admin,));
         Ok(())
@@ -2594,6 +2795,7 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
 
         set_paused(&env, false);
+        extend_instance_ttl(&env);
 
         env.events().publish(("ContractUnpaused",), (admin,));
         Ok(())
@@ -2927,7 +3129,9 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         env.storage()
             .persistent()
-            .set(&DataKey::Blocked(address), &true);
+            .set(&DataKey::Blocked(address.clone()), &true);
+        env.events()
+            .publish(("AddressBlocklisted", address), (admin,));
         Ok(())
     }
 
@@ -2958,7 +3162,9 @@ impl OnboardingBridge {
 
         env.storage()
             .persistent()
-            .remove(&DataKey::Blocked(address));
+            .remove(&DataKey::Blocked(address.clone()));
+        env.events()
+            .publish(("AddressUnblocklisted", address), (admin,));
 
         Ok(())
     }
@@ -2993,7 +3199,9 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         env.storage()
             .persistent()
-            .set(&DataKey::Allowlisted(address), &true);
+            .set(&DataKey::Allowlisted(address.clone()), &true);
+        env.events()
+            .publish(("AddressAllowlisted", address), (admin,));
         Ok(())
     }
 
@@ -3027,7 +3235,9 @@ impl OnboardingBridge {
 
         env.storage()
             .persistent()
-            .remove(&DataKey::Allowlisted(address));
+            .remove(&DataKey::Allowlisted(address.clone()));
+        env.events()
+            .publish(("AddressUnallowlisted", address), (admin,));
 
         Ok(())
     }
@@ -3062,7 +3272,10 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
+        let old_enabled = allowlist_mode(&env);
         set_allowlist_mode_flag(&env, enabled);
+        env.events()
+            .publish(("AllowlistModeChanged", old_enabled, enabled), (admin,));
         Ok(())
     }
 
@@ -3147,7 +3360,10 @@ impl OnboardingBridge {
         let token_client = token::Client::new(&env, &asset);
         let contract_balance = token_client.balance(&env.current_contract_address());
         let counters = read_asset_counters(&env, &asset);
-        let reclaimable = contract_balance - counters.accrued_fees - counters.locked_timelock;
+        let reclaimable = safe_math::safe_sub(
+            safe_math::safe_sub(contract_balance, counters.accrued_fees)?,
+            counters.locked_timelock,
+        )?;
 
         if reclaimable < amount {
             return Err(BridgeError::InsufficientReclaimable);
@@ -3190,8 +3406,11 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         let mut whitelist = read_whitelist(&env);
-        whitelist.set(asset, true);
+        let was_whitelisted = whitelist.get(asset.clone()).unwrap_or(false);
+        whitelist.set(asset.clone(), true);
         save_whitelist(&env, &whitelist);
+        env.events()
+            .publish(("AssetAdded",), (admin, asset, was_whitelisted));
         Ok(())
     }
 
@@ -3214,12 +3433,17 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
-    pub fn remove_asset(
-        _env: Env,
-        _asset: Address,
-        _nonce: Option<u64>,
-    ) -> Result<(), BridgeError> {
-        todo!("implement: remove_asset")
+    pub fn remove_asset(env: Env, asset: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+        let mut whitelist = read_whitelist(&env);
+        whitelist.remove(asset);
+        save_whitelist(&env, &whitelist);
+        Ok(())
     }
 
     /// Returns `true` if `asset` is currently on the whitelist.
@@ -3247,11 +3471,28 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_whitelisted_assets(
-        _env: Env,
-        _offset: u32,
-        _limit: u32,
+        env: Env,
+        offset: u32,
+        limit: u32,
     ) -> Result<Vec<Address>, BridgeError> {
-        todo!("implement: query_whitelisted_assets")
+        check_initialized(&env)?;
+        let limit = if limit > MAX_BATCH_SIZE {
+            MAX_BATCH_SIZE
+        } else {
+            limit
+        };
+        let mut out: Vec<Address> = Vec::new(&env);
+        let mut idx: u32 = 0;
+        for (asset, allowed) in read_whitelist(&env).iter() {
+            if !allowed {
+                continue;
+            }
+            if idx >= offset && out.len() < limit {
+                out.push_back(asset);
+            }
+            idx += 1;
+        }
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------
@@ -3277,18 +3518,13 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
-    pub fn add_swap_pool(
-        env: Env,
-        pool: Address,
-        nonce: Option<u64>,
-    ) -> Result<(), BridgeError> {
+    pub fn add_swap_pool(env: Env, pool: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
-
         let mut whitelist = read_pool_whitelist(&env);
         whitelist.set(pool, true);
         save_pool_whitelist(&env, &whitelist);
@@ -3324,9 +3560,8 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
-
         let mut whitelist = read_pool_whitelist(&env);
-        whitelist.set(pool, false);
+        whitelist.remove(pool);
         save_pool_whitelist(&env, &whitelist);
         Ok(())
     }
@@ -3372,11 +3607,22 @@ impl OnboardingBridge {
     ///
     /// * `("LoyaltyTokenSet", admin)` — data: `(token, amount_per_fund)`
     pub fn set_loyalty_token(
-        _env: Env,
-        _token: Address,
-        _amount_per_fund: i128,
+        env: Env,
+        token: Address,
+        amount_per_fund: i128,
     ) -> Result<(), BridgeError> {
-        todo!("implement: set_loyalty_token")
+        check_initialized(&env)?;
+        if amount_per_fund < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        let admin = read_admin(&env);
+        admin.require_auth();
+        save_loyalty_token(&env, &token);
+        save_loyalty_amount_per_fund(&env, &amount_per_fund);
+        extend_instance_ttl(&env);
+        env.events()
+            .publish(("LoyaltyTokenSet", admin), (token, amount_per_fund));
+        Ok(())
     }
 
     /// Returns the loyalty token address and reward amount per fund.
@@ -3389,8 +3635,10 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::LoyaltyTokenNotSet`] — No loyalty token has been configured.
-    pub fn query_loyalty_token(_env: Env) -> Result<(Address, i128), BridgeError> {
-        todo!("implement: query_loyalty_token")
+    pub fn query_loyalty_token(env: Env) -> Result<(Address, i128), BridgeError> {
+        check_initialized(&env)?;
+        let token = read_loyalty_token(&env).ok_or(BridgeError::LoyaltyTokenNotSet)?;
+        Ok((token, read_loyalty_amount_per_fund(&env)))
     }
 
     // -----------------------------------------------------------------------
@@ -3432,8 +3680,23 @@ impl OnboardingBridge {
     /// # Events
     ///
     /// * `("FeeTiersSet", admin)` — data: `(tiers.len(),)`
-    pub fn set_fee_tiers(_env: Env, _tiers: Vec<FeeTier>) -> Result<(), BridgeError> {
-        todo!("implement: set_fee_tiers")
+    pub fn set_fee_tiers(env: Env, tiers: Vec<FeeTier>) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        if tiers.len() > MAX_FEE_TIERS {
+            return Err(BridgeError::TooManyFeeTiers);
+        }
+        for tier in tiers.iter() {
+            if tier.fee_bps > MAX_FEE_BPS {
+                return Err(BridgeError::FeeTooHigh);
+            }
+        }
+        let admin = read_admin(&env);
+        admin.require_auth();
+        save_fee_tiers(&env, &tiers);
+        extend_instance_ttl(&env);
+        env.events().publish(("FeeTiersSet", admin), (tiers.len(),));
+        Ok(())
     }
 
     /// Returns the configured fee tiers.
@@ -3444,8 +3707,17 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_fee_tiers(_env: Env) -> Result<Vec<FeeTier>, BridgeError> {
-        todo!("implement: query_fee_tiers")
+    pub fn query_fee_tiers(env: Env) -> Result<Vec<FeeTier>, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_fee_tiers(&env).unwrap_or_else(|| {
+            let mut default_tiers = Vec::new(&env);
+            default_tiers.push_back(FeeTier {
+                min_volume: 0,
+                max_volume: i128::MAX,
+                fee_bps: read_fee_bps(&env),
+            });
+            default_tiers
+        }))
     }
 
     /// Returns the fee tier that currently applies to `source`, based on their
@@ -3461,8 +3733,13 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_current_tier(_env: Env, _source: Address) -> Result<FeeTier, BridgeError> {
-        todo!("implement: query_current_tier")
+    pub fn query_current_tier(env: Env, source: Address) -> Result<FeeTier, BridgeError> {
+        check_initialized(&env)?;
+        Ok(find_current_tier(&env, &source).unwrap_or(FeeTier {
+            min_volume: 0,
+            max_volume: i128::MAX,
+            fee_bps: read_fee_bps(&env),
+        }))
     }
 
     // -----------------------------------------------------------------------
@@ -3538,15 +3815,97 @@ impl OnboardingBridge {
     /// once toward the threshold; duplicates are rejected with
     /// [`BridgeError::DuplicateRelayerSignature`].
     pub fn fund_c_address_crosschain(
-        _env: Env,
-        _chain_id: u32,
-        _tx_hash: BytesN<32>,
-        _target: Address,
-        _asset: Address,
-        _amount: i128,
-        _sigs: Vec<RelayerSig>,
+        env: Env,
+        chain_id: u32,
+        tx_hash: BytesN<32>,
+        target: Address,
+        asset: Address,
+        amount: i128,
+        sigs: Vec<RelayerSig>,
     ) -> Result<(), BridgeError> {
-        todo!("implement: fund_c_address_crosschain")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        check_access(&env, &target)?;
+        check_asset_whitelisted(&env, &asset)?;
+
+        let tx_hash_bytes: soroban_sdk::Bytes = tx_hash.clone().into();
+        let mut nonce_pre = soroban_sdk::Bytes::new(&env);
+        nonce_pre.extend_from_array(&chain_id.to_be_bytes());
+        nonce_pre.append(&tx_hash_bytes);
+        let nonce: BytesN<32> = env.crypto().sha256(&nonce_pre).into();
+        if is_nonce_used(&env, &nonce) {
+            return Err(BridgeError::ReplayedNonce);
+        }
+
+        let mut addr_buf = [0u8; MAX_STRKEY_LEN];
+        let tgt_str = target.clone().to_string();
+        let tlen = tgt_str.len() as usize;
+        if tlen > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
+        tgt_str.copy_into_slice(&mut addr_buf[..tlen]);
+        let tgt_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..tlen]);
+        let tgt_hash: soroban_sdk::Bytes = env.crypto().sha256(&tgt_raw).into();
+
+        let ast_str = asset.clone().to_string();
+        let alen = ast_str.len() as usize;
+        if alen > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
+        ast_str.copy_into_slice(&mut addr_buf[..alen]);
+        let ast_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..alen]);
+        let ast_hash: soroban_sdk::Bytes = env.crypto().sha256(&ast_raw).into();
+
+        let nonce_bytes: soroban_sdk::Bytes = nonce.clone().into();
+        let mut payload = soroban_sdk::Bytes::new(&env);
+        payload.extend_from_array(&chain_id.to_be_bytes());
+        payload.append(&tx_hash_bytes);
+        payload.append(&tgt_hash);
+        payload.append(&ast_hash);
+        payload.extend_from_array(&amount.to_be_bytes());
+        payload.append(&nonce_bytes);
+        let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
+
+        let mut seen: Vec<BytesN<32>> = Vec::new(&env);
+        for sig in sigs.iter() {
+            if !is_relayer(&env, &sig.pubkey) {
+                return Err(BridgeError::NotRelayer);
+            }
+            if seen.contains(&sig.pubkey) {
+                return Err(BridgeError::DuplicateRelayerSignature);
+            }
+            seen.push_back(sig.pubkey.clone());
+            env.crypto()
+                .ed25519_verify(&sig.pubkey, &payload_hash.clone().into(), &sig.signature);
+        }
+        if seen.len() < relayer_threshold(&env) {
+            return Err(BridgeError::BelowThreshold);
+        }
+
+        mark_nonce_used(&env, &nonce);
+
+        let global_fee_bps = read_fee_bps(&env);
+        let effective_fee_bps = get_effective_fee_bps(&env, &asset, global_fee_bps);
+        let fee = calculate_fee(amount, effective_fee_bps)?;
+        let net_amount = safe_math::safe_sub(amount, fee)?;
+
+        if net_amount > 0 {
+            let token_client = token::Client::new(&env, &asset);
+            token_client.transfer(&env.current_contract_address(), &target, &net_amount);
+        }
+        update_asset_counters(&env, &asset, fee, net_amount)?;
+        mint_loyalty_tokens(&env, &target);
+        extend_instance_ttl(&env);
+
+        env.events().publish(
+            ("CrossChainFunded", target),
+            (chain_id, tx_hash, amount, fee, asset),
+        );
+        Ok(())
     }
 
     /// Registers an Ed25519 public key as a trusted relayer.
@@ -3557,6 +3916,7 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `pubkey` (`BytesN<32>`) — Ed25519 public key of the relayer.
+    /// * `nonce` (`Option<u64>`) — Optional sequential admin nonce.
     ///
     /// # Authorization
     ///
@@ -3565,13 +3925,25 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn add_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` does not match the stored
+    ///   admin nonce.
+    ///
+    /// # Events
+    ///
+    /// * `("RelayerAdded",)` — data: `(admin, pubkey)`
+    pub fn add_relayer(
+        env: Env,
+        pubkey: BytesN<32>,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
-        read_admin(&env).require_auth();
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         add_relayer(&env, &pubkey);
+        env.events().publish(("RelayerAdded",), (admin, pubkey));
         Ok(())
     }
 
@@ -3594,8 +3966,16 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::BelowThreshold`] — Removing this relayer would drop the
     ///   count below the required threshold.
-    pub fn remove_relayer(_env: Env, _pubkey: BytesN<32>) -> Result<(), BridgeError> {
-        todo!("implement: remove_relayer")
+    pub fn remove_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        if is_relayer(&env, &pubkey) && relayer_count(&env) - 1 < relayer_threshold(&env) {
+            return Err(BridgeError::BelowThreshold);
+        }
+        remove_relayer(&env, &pubkey);
+        extend_instance_ttl(&env);
+        Ok(())
     }
 
     /// Sets the minimum number of relayer signatures required to process a
@@ -3614,8 +3994,16 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ThresholdExceedsRelayers`] — `threshold` is greater than
     ///   the number of registered relayers.
-    pub fn set_relayer_threshold(_env: Env, _threshold: u32) -> Result<(), BridgeError> {
-        todo!("implement: set_relayer_threshold")
+    pub fn set_relayer_threshold(env: Env, threshold: u32) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        if threshold > relayer_count(&env) {
+            return Err(BridgeError::ThresholdExceedsRelayers);
+        }
+        save_relayer_threshold(&env, threshold);
+        extend_instance_ttl(&env);
+        Ok(())
     }
 
     /// Returns the current M-of-N relayer signature threshold.
@@ -3623,8 +4011,9 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_relayer_threshold(_env: Env) -> Result<u32, BridgeError> {
-        todo!("implement: query_relayer_threshold")
+    pub fn query_relayer_threshold(env: Env) -> Result<u32, BridgeError> {
+        check_initialized(&env)?;
+        Ok(relayer_threshold(&env))
     }
 
     /// Returns `true` if `pubkey` is a registered relayer.
@@ -3636,8 +4025,9 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_is_relayer(_env: Env, _pubkey: BytesN<32>) -> Result<bool, BridgeError> {
-        todo!("implement: query_is_relayer")
+    pub fn query_is_relayer(env: Env, pubkey: BytesN<32>) -> Result<bool, BridgeError> {
+        check_initialized(&env)?;
+        Ok(is_relayer(&env, &pubkey))
     }
 
     // -----------------------------------------------------------------------
@@ -3700,17 +4090,66 @@ impl OnboardingBridge {
     /// If the global fee rate changes between deposit and claim, the net amount
     /// received by `target` may differ from the amount at deposit time.
     pub fn fund_c_address_timelocked(
-        _env: Env,
-        _source: Address,
-        _target: Address,
-        _asset: Address,
-        _amount: i128,
-        _release_time: u64,
-        _cliff_time: u64,
-        _nonce: Option<u64>,
-        _deadline: Option<u64>,
+        env: Env,
+        source: Address,
+        target: Address,
+        asset: Address,
+        amount: i128,
+        release_time: u64,
+        cliff_time: u64,
+        nonce: Option<u64>,
+        deadline: Option<u64>,
     ) -> Result<u64, BridgeError> {
-        todo!("implement: fund_c_address_timelocked")
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        if let Some(dl) = deadline {
+            if env.ledger().timestamp() > dl {
+                return Err(BridgeError::TransactionExpired);
+            }
+        }
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        if release_time <= env.ledger().timestamp() || (cliff_time > 0 && cliff_time > release_time)
+        {
+            return Err(BridgeError::InvalidReleaseTime);
+        }
+
+        check_access(&env, &target)?;
+        check_asset_whitelisted(&env, &asset)?;
+
+        source.require_auth();
+        consume_nonce(&env, &source, nonce)?;
+
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&source, &env.current_contract_address(), &amount);
+
+        let id = next_timelock_id(&env);
+        save_timelock_entry(
+            &env,
+            id,
+            &TimelockEntry {
+                source: source.clone(),
+                target: target.clone(),
+                asset: asset.clone(),
+                amount,
+                release_time,
+                cliff_time,
+                claimed: false,
+            },
+        );
+        increment_locked_timelock(&env, &asset, amount);
+        increment_user_deposit(&env, &source, &asset, amount)?;
+        mint_loyalty_tokens(&env, &source);
+        extend_instance_ttl(&env);
+
+        env.events().publish(
+            ("TimelockCreated", source, target),
+            (id, amount, asset, release_time, cliff_time),
+        );
+        Ok(id)
     }
 
     /// Claims a matured timelock entry, releasing the net tokens to `target`.
@@ -3745,8 +4184,41 @@ impl OnboardingBridge {
     /// Soroban execution is single-threaded within a ledger, this effectively
     /// prevents re-entrancy. The fee rate is the **current** global rate at
     /// claim time, which may differ from the rate at deposit time.
-    pub fn claim_timelocked(_env: Env, _id: u64) -> Result<(), BridgeError> {
-        todo!("implement: claim_timelocked")
+    pub fn claim_timelocked(env: Env, id: u64) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        let mut entry = read_timelock_entry(&env, id).ok_or(BridgeError::TimelockNotFound)?;
+        if entry.claimed {
+            return Err(BridgeError::Unauthorized);
+        }
+        if env.ledger().timestamp() < entry.release_time {
+            return Err(BridgeError::TimelockNotMatured);
+        }
+        entry.target.require_auth();
+
+        entry.claimed = true;
+        save_timelock_entry(&env, id, &entry);
+
+        let global_fee_bps = read_fee_bps(&env);
+        let effective_fee_bps = get_effective_fee_bps(&env, &entry.asset, global_fee_bps);
+        let fee = calculate_fee(entry.amount, effective_fee_bps)?;
+        let net_amount = safe_math::safe_sub(entry.amount, fee)?;
+
+        decrement_locked_timelock(&env, &entry.asset, entry.amount);
+        if net_amount > 0 {
+            let token_client = token::Client::new(&env, &entry.asset);
+            token_client.transfer(&env.current_contract_address(), &entry.target, &net_amount);
+        }
+        update_asset_counters(&env, &entry.asset, fee, net_amount)?;
+        extend_instance_ttl(&env);
+
+        env.events().publish(
+            ("TimelockClaimed", entry.target.clone()),
+            (id, net_amount, fee, entry.asset.clone()),
+        );
+        Ok(())
     }
 
     /// Returns the timelock entry for `id`.
@@ -3758,8 +4230,8 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::TimelockNotFound`] — No entry exists for `id`.
-    pub fn query_timelocked(_env: Env, _id: u64) -> Result<TimelockEntry, BridgeError> {
-        todo!("implement: query_timelocked")
+    pub fn query_timelocked(env: Env, id: u64) -> Result<TimelockEntry, BridgeError> {
+        read_timelock_entry(&env, id).ok_or(BridgeError::TimelockNotFound)
     }
 
     // -----------------------------------------------------------------------
@@ -3773,7 +4245,9 @@ impl OnboardingBridge {
     ///
     /// # Arguments
     ///
-    /// * `ttl` (`u32`) — Desired TTL in ledgers (capped at `MAX_ALLOWED_TTL`).
+    /// * `ttl` (`u32`) — Desired TTL in ledgers. Values below
+    ///   `MIN_ALLOWED_TTL` are rejected; larger values are capped at the
+    ///   configured `MaxPersistentTtl`.
     ///
     /// # Authorization
     ///
@@ -3786,8 +4260,19 @@ impl OnboardingBridge {
     /// # Events
     ///
     /// * `("InstanceTtlExtended",)` — data: `(admin, actual_ttl)`
-    pub fn extend_instance_ttl(_env: Env, _ttl: u32) -> Result<(), BridgeError> {
-        todo!("implement: extend_instance_ttl")
+    pub fn extend_instance_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let max_ttl = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        env.storage().instance().extend_ttl(max_ttl / 4, max_ttl);
+        env.events()
+            .publish(("InstanceTtlExtended",), (admin, max_ttl));
+        Ok(())
     }
 
     /// Extends the persistent-storage TTL for the three per-asset counter keys
@@ -3800,7 +4285,9 @@ impl OnboardingBridge {
     ///
     /// * `key_asset` (`Address`) — The asset whose persistent counters should
     ///   have their TTL extended.
-    /// * `ttl` (`u32`) — Desired TTL in ledgers (capped at `MAX_ALLOWED_TTL`).
+    /// * `ttl` (`u32`) — Desired TTL in ledgers. Values below
+    ///   `MIN_ALLOWED_TTL` are rejected; larger values are capped at the
+    ///   configured `MaxPersistentTtl`.
     ///
     /// # Authorization
     ///
@@ -3814,11 +4301,33 @@ impl OnboardingBridge {
     ///
     /// * `("PersistentTtlExtended",)` — data: `(admin, key_asset, actual_ttl)`
     pub fn extend_persistent_ttl(
-        _env: Env,
-        _key_asset: Address,
-        _ttl: u32,
+        env: Env,
+        key_asset: Address,
+        ttl: u32,
     ) -> Result<(), BridgeError> {
-        todo!("implement: extend_persistent_ttl")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let max_ttl = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        let threshold = max_ttl / 4;
+        for key in [
+            DataKey::AccruedFees(key_asset.clone()),
+            DataKey::TotalBridged(key_asset.clone()),
+            DataKey::TotalFeesCollected(key_asset.clone()),
+        ] {
+            if env.storage().persistent().has(&key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, threshold, max_ttl);
+            }
+        }
+        env.events()
+            .publish(("PersistentTtlExtended",), (admin, key_asset, max_ttl));
+        Ok(())
     }
 
     /// Extends the persistent-storage TTL for a specific timelock entry.
@@ -3833,11 +4342,14 @@ impl OnboardingBridge {
     ///
     /// * `id` (`u64`) — The timelock entry ID, as returned by
     ///   `fund_c_address_timelocked`.
-    /// * `ttl` (`u32`) — Desired TTL in ledgers (capped at `MAX_ALLOWED_TTL`).
+    /// * `ttl` (`u32`) — Desired TTL in ledgers. Values below
+    ///   `MIN_ALLOWED_TTL` are rejected; larger values are capped at the
+    ///   configured `MaxPersistentTtl`.
     ///
     /// # Authorization
     ///
-    /// Requires the current admin's `require_auth()`.
+    /// No authorization is required because this operation only pays rent and
+    /// does not change contract state.
     ///
     /// # Errors
     ///
@@ -3846,27 +4358,20 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
-    /// * `("TimelockTtlExtended",)` — data: `(admin, id, actual_ttl)`
+    /// * `("TimelockTtlExtended",)` — data: `(id, actual_ttl)`
     pub fn extend_timelock_ttl(env: Env, id: u64, ttl: u32) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        let admin = read_admin(&env);
-        admin.require_auth();
         let key = DataKey::Timelock(id);
         if !env.storage().persistent().has(&key) {
             return Err(BridgeError::TimelockNotFound);
         }
-        let max_ttl = if ttl > MAX_ALLOWED_TTL {
-            MAX_ALLOWED_TTL
-        } else {
-            ttl
-        };
-        let threshold = max_ttl / 4;
+        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
         env.storage()
             .persistent()
             .extend_ttl(&key, threshold, max_ttl);
         env.events()
-            .publish(("TimelockTtlExtended",), (admin, id, max_ttl));
+            .publish(("TimelockTtlExtended",), (id, max_ttl));
         Ok(())
     }
 
@@ -3879,7 +4384,8 @@ impl OnboardingBridge {
     ///
     /// # Authorization
     ///
-    /// Requires the current admin's `require_auth()`.
+    /// No authorization is required because this operation only pays rent and
+    /// does not change contract state.
     ///
     /// # Errors
     ///
@@ -3888,27 +4394,20 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
-    /// * `("CommitmentTtlExtended",)` — data: `(admin, id, actual_ttl)`
+    /// * `("CommitmentTtlExtended",)` — data: `(id, actual_ttl)`
     pub fn extend_commitment_ttl(env: Env, id: u64, ttl: u32) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        let admin = read_admin(&env);
-        admin.require_auth();
         let key = DataKey::Commitment(id);
         if !env.storage().persistent().has(&key) {
             return Err(BridgeError::CommitmentNotFound);
         }
-        let max_ttl = if ttl > MAX_ALLOWED_TTL {
-            MAX_ALLOWED_TTL
-        } else {
-            ttl
-        };
-        let threshold = max_ttl / 4;
+        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
         env.storage()
             .persistent()
             .extend_ttl(&key, threshold, max_ttl);
         env.events()
-            .publish(("CommitmentTtlExtended",), (admin, id, max_ttl));
+            .publish(("CommitmentTtlExtended",), (id, max_ttl));
         Ok(())
     }
 
@@ -3921,7 +4420,8 @@ impl OnboardingBridge {
     ///
     /// # Authorization
     ///
-    /// Requires the current admin's `require_auth()`.
+    /// No authorization is required because this operation only pays rent and
+    /// does not change contract state.
     ///
     /// # Errors
     ///
@@ -3930,27 +4430,20 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
-    /// * `("RelayerTtlExtended",)` — data: `(admin, pubkey, actual_ttl)`
+    /// * `("RelayerTtlExtended",)` — data: `(pubkey, actual_ttl)`
     pub fn extend_relayer_ttl(env: Env, pubkey: BytesN<32>, ttl: u32) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        let admin = read_admin(&env);
-        admin.require_auth();
         let key = DataKey::Relayer(pubkey.clone());
         if !env.storage().persistent().has(&key) {
             return Err(BridgeError::NotRelayer);
         }
-        let max_ttl = if ttl > MAX_ALLOWED_TTL {
-            MAX_ALLOWED_TTL
-        } else {
-            ttl
-        };
-        let threshold = max_ttl / 4;
+        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
         env.storage()
             .persistent()
             .extend_ttl(&key, threshold, max_ttl);
         env.events()
-            .publish(("RelayerTtlExtended",), (admin, pubkey, max_ttl));
+            .publish(("RelayerTtlExtended",), (pubkey, max_ttl));
         Ok(())
     }
 
@@ -3981,12 +4474,39 @@ impl OnboardingBridge {
     ///
     /// * `("SourcePersistentTtlExtended",)` — data: `(admin, source, asset, actual_ttl)`
     pub fn extend_source_persistent_ttl(
-        _env: Env,
-        _source: Address,
-        _asset: Address,
-        _ttl: u32,
+        env: Env,
+        source: Address,
+        asset: Address,
+        ttl: u32,
     ) -> Result<(), BridgeError> {
-        todo!("implement: extend_source_persistent_ttl")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let max_ttl = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        let threshold = max_ttl / 4;
+        for key in [
+            DataKey::SourceDailyLimit(source.clone(), asset.clone()),
+            DataKey::DailyUsage(source.clone(), asset.clone(), current_day(&env)),
+            DataKey::UserDeposit(source.clone(), asset.clone()),
+            DataKey::SourceBridgedVolume(source.clone()),
+            DataKey::Nonce(source.clone()),
+            DataKey::AuthNonce(source.clone()),
+        ] {
+            if env.storage().persistent().has(&key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, threshold, max_ttl);
+            }
+        }
+        env.events().publish(
+            ("SourcePersistentTtlExtended",),
+            (admin, source, asset, max_ttl),
+        );
+        Ok(())
     }
 
     /// Overrides the maximum instance-storage TTL used by the internal
@@ -4010,8 +4530,23 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::InvalidTtl`] — `ttl` is below `MIN_ALLOWED_TTL`.
-    pub fn set_max_instance_ttl(_env: Env, _ttl: u32) -> Result<(), BridgeError> {
-        todo!("implement: set_max_instance_ttl")
+    pub fn set_max_instance_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        if ttl < MIN_ALLOWED_TTL {
+            return Err(BridgeError::InvalidTtl);
+        }
+        let capped = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxInstanceTtl, &capped);
+        extend_instance_ttl(&env);
+        Ok(())
     }
 
     /// Overrides the maximum persistent-storage TTL used by `extend_persistent_ttl`.
@@ -4044,10 +4579,13 @@ impl OnboardingBridge {
         admin.require_auth();
 
         let capped = ttl.min(MAX_ALLOWED_TTL);
+        let old_ttl = read_max_persistent_ttl(&env);
         env.storage()
             .instance()
             .set(&DataKey::MaxPersistentTtl, &capped);
         extend_instance_ttl(&env);
+        env.events()
+            .publish(("MaxPersistentTtlChanged", old_ttl, capped), (admin,));
 
         Ok(())
     }
@@ -4164,7 +4702,7 @@ impl OnboardingBridge {
     ///
     /// Accrued fees accumulate on every `fund_c_address` call and are
     /// decremented when `withdraw_fees` is called. This value is always
-    /// ≤ `query_fee_balance` (the contract's actual token balance).
+    /// ≤ `query_contract_balance` (the contract's actual token balance).
     ///
     /// # Arguments
     ///
@@ -4185,8 +4723,8 @@ impl OnboardingBridge {
     /// Stores a blinded funding commitment without revealing the amount.
     ///
     /// The caller commits to a specific `(source, target, asset, amount)` by
-    /// providing `amount_hash = sha256(amount_be16 || nonce_be8)`.  The actual
-    /// amount stays hidden until `reveal_fund` is called, preventing
+    /// providing a domain-separated `amount_hash`. The actual amount stays
+    /// hidden until `reveal_fund` is called, preventing
     /// front-runners from observing the value before the commitment is settled.
     ///
     /// # Arguments
@@ -4194,7 +4732,8 @@ impl OnboardingBridge {
     /// * `source` (`Address`) — The account that will supply the tokens.
     /// * `target` (`Address`) — The C-address that will receive the net amount.
     /// * `asset` (`Address`) — Whitelisted token contract address.
-    /// * `amount_hash` (`BytesN<32>`) — `sha256(amount_be16 || nonce_be8)`.
+    /// * `amount_hash` (`BytesN<32>`) — hash of the commitment domain,
+    ///   contract, network, source, target, asset, amount, and nonce.
     /// * `deadline` (`u64`) — Unix timestamp; `reveal_fund` must be called
     ///   before this time.
     ///
@@ -4265,9 +4804,9 @@ impl OnboardingBridge {
 
     /// Executes a previously committed fund transfer after the minimum delay.
     ///
-    /// Verifies `sha256(amount_be16 || nonce_be8) == stored_amount_hash` before
-    /// transferring tokens, ensuring the caller cannot substitute a different
-    /// amount from the one committed.
+    /// Verifies the domain-separated commitment hash before transferring
+    /// tokens, ensuring the caller cannot substitute a different amount or
+    /// commitment context.
     ///
     /// # Arguments
     ///
@@ -4336,8 +4875,16 @@ impl OnboardingBridge {
             return Err(BridgeError::Unauthorized);
         }
 
-        // Verify hash: sha256(amount_be16 || nonce_be8)
+        // Verify the domain-separated commitment before moving funds. The daily
+        // limit is checked only here because the amount is hidden at commit time.
         let mut preimage = Bytes::new(&env);
+        preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
+        append_address_to_bytes(&env, &mut preimage, &env.current_contract_address());
+        let network_id: Bytes = env.ledger().network_id().into();
+        preimage.append(&network_id);
+        append_address_to_bytes(&env, &mut preimage, &source);
+        append_address_to_bytes(&env, &mut preimage, &target);
+        append_address_to_bytes(&env, &mut preimage, &asset);
         preimage.extend_from_array(&amount.to_be_bytes());
         preimage.extend_from_array(&nonce.to_be_bytes());
         let computed_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
@@ -4353,11 +4900,7 @@ impl OnboardingBridge {
             return Err(BridgeError::InvalidAmount);
         }
 
-        // Revalidate mutable policy state at settlement time. A commitment
-        // may outlive changes to the target blocklist or asset whitelist.
-        check_access(&env, &target)?;
-        check_asset_whitelisted(&env, &asset)?;
-
+        check_daily_limit(&env, &source, &asset, amount)?;
         source.require_auth();
 
         // Mark revealed before the transfer to prevent re-entrancy replay.
@@ -4378,9 +4921,7 @@ impl OnboardingBridge {
             token_client.transfer(&contract_addr, &target, &net_amount);
         }
 
-        increment_accrued_fees(&env, &asset, fee)?;
-        increment_total_bridged(&env, &asset, net_amount)?;
-        increment_total_fees_collected(&env, &asset, fee)?;
+        update_asset_counters(&env, &asset, fee, net_amount)?;
         increment_source_bridged_volume(&env, &source, amount)?;
         extend_instance_ttl(&env);
 
@@ -4390,6 +4931,31 @@ impl OnboardingBridge {
             ("CommitRevealFunded", asset, source, target),
             (commitment_id, amount, fee),
         );
+        Ok(())
+    }
+
+    /// Cancels an unrevealed commitment and removes its persistent entry.
+    ///
+    /// The committed source may cancel at any time, including after the
+    /// reveal deadline has passed. This lets abandoned commitments be cleaned
+    /// up without waiting for storage TTL expiry.
+    pub fn cancel_commitment(env: Env, commitment_id: u64) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+
+        let entry =
+            read_commitment(&env, commitment_id).ok_or(BridgeError::CommitmentNotFound)?;
+        if entry.revealed {
+            return Err(BridgeError::CommitmentAlreadyRevealed);
+        }
+
+        entry.source.require_auth();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Commitment(commitment_id));
+        env.events()
+            .publish(("CommitmentCancelled",), (commitment_id, entry.source));
         Ok(())
     }
 
@@ -4571,9 +5137,7 @@ impl OnboardingBridge {
             target_token.transfer(&contract_addr, &target, &net_amount);
         }
 
-        increment_accrued_fees(&env, &target_asset, fee)?;
-        increment_total_bridged(&env, &target_asset, net_amount)?;
-        increment_total_fees_collected(&env, &target_asset, fee)?;
+        update_asset_counters(&env, &target_asset, fee, net_amount)?;
         increment_source_bridged_volume(&env, &source, source_amount)?;
 
         mint_loyalty_tokens(&env, &source);
@@ -4622,12 +5186,27 @@ impl OnboardingBridge {
         source: Address,
         pubkey: BytesN<32>,
     ) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         source.require_auth();
         save_meta_signer(&env, &source, &pubkey);
         env.events()
             .publish(("MetaSignerRegistered", source), (pubkey,));
+        Ok(())
+    }
+
+    /// Removes the meta-transaction signing key bound to `source`.
+    ///
+    /// Requires `source.require_auth()`. Subsequent meta-transactions for the
+    /// source are rejected until a new key is registered.
+    pub fn unregister_meta_signer(env: Env, source: Address) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        source.require_auth();
+        clear_meta_signer(&env, &source);
+        env.events().publish(("MetaSignerUnregistered", source), ());
         Ok(())
     }
 
@@ -4641,6 +5220,23 @@ impl OnboardingBridge {
         read_meta_signer(&env, &source)
     }
 
+    /// Configures the network identifier included in every meta-transaction
+    /// signature. The value should be the canonical identifier of the network
+    /// where this contract is deployed.
+    pub fn set_meta_tx_network_id(
+        env: Env,
+        network_id: BytesN<32>,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::MetaTxNetworkId, &network_id);
+        extend_instance_ttl(&env);
+        Ok(())
+    }
+
     /// Execute a fund_c_address on behalf of a user who signed the parameters
     /// off-chain.
     ///
@@ -4650,6 +5246,8 @@ impl OnboardingBridge {
     ///    ```text
     ///    payload = sha256(
     ///        "meta_fund"           (8 bytes, ASCII)
+    ///        || network_id         (32 bytes)
+    ///        || current_contract_address (address bytes)
     ///        || source_strkey      (sha256 of strkey bytes, 32 bytes)
     ///        || target_strkey      (sha256 of strkey bytes, 32 bytes)
     ///        || asset_strkey       (sha256 of strkey bytes, 32 bytes)
@@ -4664,8 +5262,10 @@ impl OnboardingBridge {
     ///    checks the deadline and nonce, then performs the same token-transfer
     ///    flow as `fund_c_address`.
     ///
-    /// This enables gas abstraction: the user never needs XLM for fees; the
-    /// relayer covers the Stellar transaction fee.
+    /// The source must approve this bridge contract to spend the requested
+    /// asset amount before signing the meta-transaction. This allowance lets
+    /// the bridge use `transfer_from` without requiring a Soroban
+    /// authorization entry from the source in the relayer's transaction.
     ///
     /// # Arguments
     ///
@@ -4676,9 +5276,9 @@ impl OnboardingBridge {
     ///
     /// # Authorization
     ///
-    /// No `require_auth()` — authentication is entirely via Ed25519 signature.
-    /// The relayer submits this transaction; the user's identity is proven by
-    /// `pubkey` and `signature`.
+    /// No `require_auth()` — authentication is via the registered Ed25519
+    /// signature, and token spending is authorized by the source's allowance
+    /// to this bridge contract.
     ///
     /// # Errors
     ///
@@ -4686,8 +5286,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
     /// * [`BridgeError::MetaTxExpired`] — `params.deadline` is in the past.
     /// * [`BridgeError::MetaTxNonceAlreadyUsed`] — Nonce already consumed.
-    /// * [`BridgeError::MetaTxInvalidSignature`] — Signature verification failed
-    ///   (host will trap on invalid Ed25519 — this variant is for structural errors).
+    /// * [`BridgeError::MetaTxInvalidSignature`] — Signature verification failed.
     /// * [`BridgeError::InvalidAmount`] — `params.amount` ≤ 0.
     /// * [`BridgeError::AddressBlocked`] — `params.target` is blocked.
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode and target not listed.
@@ -4745,12 +5344,28 @@ impl OnboardingBridge {
             _ => return Err(BridgeError::MetaTxPubkeySourceMismatch),
         }
 
-        // 5. Build canonical payload hash and verify signature
-        //    payload = sha256(domain || source_hash || target_hash || asset_hash
-        //                     || amount_be16 || nonce_be8 || deadline_be8)
-        let domain: soroban_sdk::Bytes = soroban_sdk::Bytes::from_slice(&env, b"meta_fund");
+        let network_id =
+            read_meta_tx_network_id(&env).ok_or(BridgeError::MetaTxNetworkIdNotConfigured)?;
+        if params.network_id != network_id {
+            return Err(BridgeError::MetaTxInvalidSignature);
+        }
 
+        // 5. Build canonical payload hash and verify signature
+        //    payload = sha256(domain || network_id || contract_address ||
+        //                     source_hash || target_hash || asset_hash ||
+        //                     amount_be16 || nonce_be8 || deadline_be8)
+        let domain: soroban_sdk::Bytes = soroban_sdk::Bytes::from_slice(&env, b"meta_fund");
         let mut addr_buf = [0u8; MAX_STRKEY_LEN];
+        let contract_address = env.current_contract_address();
+        let contract_str = contract_address.to_string();
+        let contract_len = contract_str.len() as usize;
+        if contract_len > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
+        contract_str.copy_into_slice(&mut addr_buf[..contract_len]);
+        let contract_raw =
+            soroban_sdk::Bytes::from_slice(&env, &addr_buf[..contract_len]);
+        let contract_hash: BytesN<32> = env.crypto().sha256(&contract_raw).into();
 
         let src_str = params.source.clone().to_string();
         let slen = src_str.len() as usize;
@@ -4781,6 +5396,8 @@ impl OnboardingBridge {
 
         let mut payload = soroban_sdk::Bytes::new(&env);
         payload.append(&domain);
+        payload.append(&network_id.clone().into());
+        payload.append(&contract_hash.into());
         payload.append(&src_hash.into());
         payload.append(&tgt_hash.into());
         payload.append(&ast_hash.into());
@@ -4790,11 +5407,12 @@ impl OnboardingBridge {
 
         let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
 
-        // ed25519_verify traps on invalid sig — this is the intended behaviour
-        // (same as fund_c_address_crosschain). The MetaTxInvalidSignature error
-        // is reserved for future structural checks.
-        env.crypto()
-            .ed25519_verify(&pubkey, &payload_hash.into(), &signature);
+        let verifying_key = VerifyingKey::from_bytes(&pubkey.to_array())
+            .map_err(|_| BridgeError::MetaTxInvalidSignature)?;
+        let signature = Signature::from_bytes(&signature.to_array());
+        verifying_key
+            .verify_strict(&payload_hash.to_array(), &signature)
+            .map_err(|_| BridgeError::MetaTxInvalidSignature)?;
 
         // 6. Mark nonce used (before any transfer to prevent re-entrancy)
         env.storage().persistent().set(&nonce_key, &true);
@@ -4802,7 +5420,12 @@ impl OnboardingBridge {
         // 7. Execute the transfer (same logic as fund_c_address)
         let token_client = token::Client::new(&env, &params.asset);
         let contract_addr = env.current_contract_address();
-        token_client.transfer(&params.source, &contract_addr, &params.amount);
+        token_client.transfer_from(
+            &contract_addr,
+            &params.source,
+            &contract_addr,
+            &params.amount,
+        );
 
         let global_fee_bps = read_fee_bps(&env);
         let tiered_fee_bps = get_tiered_fee_bps(&env, &params.source, global_fee_bps);
@@ -4815,9 +5438,7 @@ impl OnboardingBridge {
         }
 
         increment_user_deposit(&env, &params.source, &params.asset, params.amount)?;
-        increment_accrued_fees(&env, &params.asset, fee)?;
-        increment_total_bridged(&env, &params.asset, net_amount)?;
-        increment_total_fees_collected(&env, &params.asset, fee)?;
+        update_asset_counters(&env, &params.asset, fee, net_amount)?;
         increment_source_bridged_volume(&env, &params.source, params.amount)?;
 
         extend_instance_ttl(&env);
@@ -4864,6 +5485,8 @@ impl OnboardingBridge {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetaFundParams {
+    /// Network identifier configured by the bridge admin.
+    pub network_id: BytesN<32>,
     /// The user's Stellar address (source of funds). `pubkey` must be the key
     /// registered for this address via `register_meta_signer` — enforced by
     /// `execute_meta_fund`, not merely documented here.
