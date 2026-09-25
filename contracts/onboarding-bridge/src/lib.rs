@@ -54,7 +54,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Map,
-    Vec, IntoVal,
+    Vec, IntoVal, panic_with_error,
 };
 
 // ---------------------------------------------------------------------------
@@ -280,14 +280,15 @@ pub struct BridgeConfig {
     pub allowlist_mode: bool,
 }
 
-/// Snapshot of admin + fee_collector + fee_bps used during initialization and
-/// cached for efficient admin-auth checks in mutating functions.
+/// The authoritative contract-wide configuration.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BridgeConfigData {
     pub admin: Address,
     pub fee_collector: Address,
     pub fee_bps: u32,
+    pub paused: bool,
+    pub allowlist_mode: bool,
 }
 
 /// Packed per-asset counters stored in a single persistent-storage entry.
@@ -461,6 +462,8 @@ fn read_bridge_config(env: &Env) -> BridgeConfigData {
             admin: read_admin(env),
             fee_collector: read_fee_collector(env),
             fee_bps: read_fee_bps(env),
+            paused: false,
+            allowlist_mode: false,
         })
 }
 
@@ -524,51 +527,63 @@ fn increment_user_deposit(env: &Env, source: &Address, asset: &Address, amount: 
 
 #[inline(never)]
 fn save_admin(env: &Env, admin: &Address) {
-    env.storage().instance().set(&DataKey::Admin, admin);
+    let mut config = read_bridge_config(env);
+    config.admin = admin.clone();
+    save_bridge_config(env, &config);
 }
 
 #[inline(never)]
 fn read_admin(env: &Env) -> Address {
-    env.storage().instance().get(&DataKey::Admin).unwrap()
+    env.storage()
+        .instance()
+        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
+        .map(|config| config.admin)
+        .or_else(|| env.storage().instance().get(&DataKey::Admin))
+        .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized))
 }
 
 #[inline(never)]
 fn save_fee_collector(env: &Env, addr: &Address) {
-    env.storage().instance().set(&DataKey::FeeCollector, addr);
+    let mut config = read_bridge_config(env);
+    config.fee_collector = addr.clone();
+    save_bridge_config(env, &config);
 }
 
 #[inline(never)]
 fn read_fee_collector(env: &Env) -> Address {
     env.storage()
         .instance()
-        .get(&DataKey::FeeCollector)
-        .unwrap()
+        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
+        .map(|config| config.fee_collector)
+        .or_else(|| env.storage().instance().get(&DataKey::FeeCollector))
+        .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized))
 }
 
 fn read_config(env: &Env) -> BridgeConfig {
-    env.storage()
-        .instance()
-        .get(&DataKey::Config)
-        .unwrap_or(BridgeConfig {
-            fee_bps: 0,
-            paused: false,
-            allowlist_mode: false,
-        })
+    let config = read_bridge_config(env);
+    BridgeConfig {
+        fee_bps: config.fee_bps,
+        paused: config.paused,
+        allowlist_mode: config.allowlist_mode,
+    }
 }
 
 fn save_config(env: &Env, config: &BridgeConfig) {
-    env.storage().instance().set(&DataKey::Config, config);
+    let mut bridge_config = read_bridge_config(env);
+    bridge_config.fee_bps = config.fee_bps;
+    bridge_config.paused = config.paused;
+    bridge_config.allowlist_mode = config.allowlist_mode;
+    save_bridge_config(env, &bridge_config);
 }
 
 fn save_fee_bps(env: &Env, fee_bps: &u32) {
     let mut config = read_config(env);
     config.fee_bps = *fee_bps;
     save_config(env, &config);
-    env.storage().instance().set(&DataKey::FeeBps, fee_bps);
 }
 
 fn read_fee_bps(env: &Env) -> u32 {
-    read_config(env).fee_bps
+    read_bridge_config(env).fee_bps
 }
 
 fn read_initialized(env: &Env) -> bool {
@@ -607,7 +622,6 @@ fn set_paused(env: &Env, paused: bool) {
     let mut config = read_config(env);
     config.paused = paused;
     save_config(env, &config);
-    env.storage().instance().set(&DataKey::Paused, &paused);
 }
 
 fn is_deactivated(env: &Env) -> bool {
@@ -661,9 +675,6 @@ fn set_allowlist_mode_flag(env: &Env, enabled: bool) {
     let mut config = read_config(env);
     config.allowlist_mode = enabled;
     save_config(env, &config);
-    env.storage()
-        .instance()
-        .set(&DataKey::AllowlistMode, &enabled);
 }
 
 fn check_access(env: &Env, target: &Address) -> Result<(), BridgeError> {
@@ -749,16 +760,18 @@ fn read_asset_counters(env: &Env, asset: &Address) -> AssetCounters {
         })
 }
 
-fn increment_locked_timelock(env: &Env, asset: &Address, amount: i128) {
+fn increment_locked_timelock(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
     let mut c = read_asset_counters(env, asset);
-    c.locked_timelock += amount;
+    c.locked_timelock = safe_math::safe_add(c.locked_timelock, amount)?;
     save_asset_counters(env, asset, &c);
+    Ok(())
 }
 
-fn decrement_locked_timelock(env: &Env, asset: &Address, amount: i128) {
+fn decrement_locked_timelock(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
     let mut c = read_asset_counters(env, asset);
-    c.locked_timelock -= amount;
+    c.locked_timelock = safe_math::safe_sub(c.locked_timelock, amount)?;
     save_asset_counters(env, asset, &c);
+    Ok(())
 }
 
 fn save_asset_counters(env: &Env, asset: &Address, counters: &AssetCounters) {
@@ -790,10 +803,11 @@ fn increment_accrued_fees(env: &Env, asset: &Address, amount: i128) -> Result<()
     Ok(())
 }
 
-fn decrement_accrued_fees(env: &Env, asset: &Address, amount: i128) {
+fn decrement_accrued_fees(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
     let mut c = read_asset_counters(env, asset);
-    c.accrued_fees -= amount;
+    c.accrued_fees = safe_math::safe_sub(c.accrued_fees, amount)?;
     save_asset_counters(env, asset, &c);
+    Ok(())
 }
 
 fn read_total_bridged(env: &Env, asset: &Address) -> i128 {
@@ -876,7 +890,7 @@ fn is_auth_nonce_used(env: &Env, source: &Address, nonce: u64) -> bool {
         .unwrap_or(false)
 }
 
-fn mark_auth_nonce_used(env: &Env, source: &Address, nonce: u64) {
+fn mark_auth_nonce_used(env: &Env, source: &Address, nonce: u64) -> Result<(), BridgeError> {
     env.storage()
         .persistent()
         .set(&DataKey::UsedAuthNonce(source.clone(), nonce), &true);
@@ -884,17 +898,19 @@ fn mark_auth_nonce_used(env: &Env, source: &Address, nonce: u64) {
     // expected nonce without scanning storage.
     let current = read_auth_nonce(env, source);
     if nonce >= current {
+        let next = nonce.checked_add(1).ok_or(BridgeError::Overflow)?;
         env.storage()
             .persistent()
-            .set(&DataKey::AuthNonce(source.clone()), &(nonce + 1));
+            .set(&DataKey::AuthNonce(source.clone()), &next);
     }
+    Ok(())
 }
 
 /// Validate and consume a Soroban authorization-entry nonce.
 ///
 /// Parameters
 /// - `source`              : address whose auth entry is being validated
-/// - `nonce`               : caller-supplied nonce (must not have been used before)
+/// - `nonce`              : caller-supplied next nonce (must not have been used before)
 /// - `valid_after_ledger`  : inclusive lower bound on `env.ledger().sequence()`
 /// - `valid_before_ledger` : exclusive upper bound on `env.ledger().sequence()`
 ///
@@ -912,15 +928,20 @@ fn consume_auth_nonce(
         return Err(BridgeError::AuthNonceExpired);
     }
 
-    // 2. Used-nonce check (prevents exact replay of this (source, nonce) pair)
+    // 2. Enforce monotonic sequencing before checking the used-nonce set.
+    if nonce != read_auth_nonce(env, source) {
+        return Err(BridgeError::DuplicateNonce);
+    }
+
+    // 3. Used-nonce check (prevents exact replay of this (source, nonce) pair)
     if is_auth_nonce_used(env, source, nonce) {
         return Err(BridgeError::AuthNonceAlreadyUsed);
     }
 
-    // 3. Mark as used and advance the per-address counter
-    mark_auth_nonce_used(env, source, nonce);
+    // 4. Mark as used and advance the per-address counter
+    mark_auth_nonce_used(env, source, nonce)?;
 
-    // 4. Emit AuthUsed event for off-chain indexers
+    // 5. Emit AuthUsed event for off-chain indexers
     env.events()
         .publish(("AuthUsed", source.clone()), (nonce,));
 
@@ -1343,13 +1364,12 @@ impl OnboardingBridge {
         }
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        save_admin(&env, &admin);
-        save_fee_collector(&env, &fee_collector);
-        save_fee_bps(&env, &fee_bps);
         save_bridge_config(&env, &BridgeConfigData {
             admin: admin.clone(),
             fee_collector: fee_collector.clone(),
             fee_bps,
+            paused: false,
+            allowlist_mode: false,
         });
         mark_initialized(&env);
         extend_instance_ttl(&env);
@@ -2103,7 +2123,7 @@ impl OnboardingBridge {
         let token_client = token::Client::new(&env, &asset);
         token_client.transfer(&env.current_contract_address(), &fee_collector, &amount);
 
-        decrement_accrued_fees(&env, &asset, amount);
+        decrement_accrued_fees(&env, &asset, amount)?;
         env.events()
             .publish(("FeesWithdrawn", fee_collector), (amount, asset));
         Ok(())
@@ -3195,7 +3215,10 @@ impl OnboardingBridge {
         let token_client = token::Client::new(&env, &asset);
         let contract_balance = token_client.balance(&env.current_contract_address());
         let counters = read_asset_counters(&env, &asset);
-        let reclaimable = contract_balance - counters.accrued_fees - counters.locked_timelock;
+        let reclaimable = safe_math::safe_sub(
+            safe_math::safe_sub(contract_balance, counters.accrued_fees)?,
+            counters.locked_timelock,
+        )?;
 
         if reclaimable < amount {
             return Err(BridgeError::InsufficientReclaimable);
@@ -3988,7 +4011,7 @@ impl OnboardingBridge {
             },
         );
         // Ring-fence this deposit so reclaim_tokens cannot drain it before claim.
-        increment_locked_timelock(&env, &asset, amount);
+        increment_locked_timelock(&env, &asset, amount)?;
 
         // Minted at deposit time, not at claim_timelocked, since `source`
         // (the funder) authorises this call, while claim_timelocked is
@@ -4056,7 +4079,7 @@ impl OnboardingBridge {
         // This entry's full deposit is leaving the "locked" pool: the fee
         // portion is now tracked in accrued_fees and net_amount leaves the
         // contract balance entirely.
-        decrement_locked_timelock(&env, &entry.asset, entry.amount);
+        decrement_locked_timelock(&env, &entry.asset, entry.amount)?;
 
         let fee_bps = read_fee_bps(&env);
         let effective_fee_bps = get_effective_fee_bps(&env, &entry.asset, fee_bps);
