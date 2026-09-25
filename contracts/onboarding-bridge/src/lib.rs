@@ -1795,13 +1795,22 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        if limit_amount < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        check_asset_whitelisted(&env, &asset)?;
 
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
 
+        let old_limit = read_source_daily_limit(&env, &source, &asset);
         save_source_daily_limit(&env, &source, &asset, limit_amount);
         extend_instance_ttl(&env);
+        env.events().publish(
+            ("SourceDailyLimitChanged", old_limit, limit_amount),
+            (admin, source, asset),
+        );
 
         Ok(())
     }
@@ -1871,8 +1880,11 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
 
+        let old_fee_cap = read_asset_fee_cap(&env, &asset);
         save_asset_fee_cap(&env, &asset, max_fee_bps);
         extend_instance_ttl(&env);
+        env.events()
+            .publish(("AssetFeeCapChanged", old_fee_cap, max_fee_bps), (admin, asset));
 
         Ok(())
     }
@@ -2060,8 +2072,11 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
+        let old_amount = read_minimum_amount(&env);
         save_minimum_amount(&env, &amount);
         extend_instance_ttl(&env);
+        env.events()
+            .publish(("MinimumAmountChanged", old_amount, amount), (admin,));
         Ok(())
     }
 
@@ -2138,6 +2153,10 @@ impl OnboardingBridge {
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
+        let max_withdraw_per_tx = read_max_withdraw_per_tx(&env);
+        if max_withdraw_per_tx != 0 && amount > max_withdraw_per_tx {
+            return Err(BridgeError::WithdrawExceedsLimit);
+        }
 
         let accrued = read_accrued_fees(&env, &asset);
         if amount > accrued {
@@ -2163,11 +2182,17 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        if amount < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
+        let old_amount = read_max_withdraw_per_tx(&env);
         save_max_withdraw_per_tx(&env, amount);
         extend_instance_ttl(&env);
+        env.events()
+            .publish(("MaxWithdrawPerTxChanged", old_amount, amount), (admin,));
         Ok(())
     }
 
@@ -2993,7 +3018,9 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         env.storage()
             .persistent()
-            .set(&DataKey::Blocked(address), &true);
+            .set(&DataKey::Blocked(address.clone()), &true);
+        env.events()
+            .publish(("AddressBlocklisted", address), (admin,));
         Ok(())
     }
 
@@ -3024,7 +3051,9 @@ impl OnboardingBridge {
 
         env.storage()
             .persistent()
-            .remove(&DataKey::Blocked(address));
+            .remove(&DataKey::Blocked(address.clone()));
+        env.events()
+            .publish(("AddressUnblocklisted", address), (admin,));
 
         Ok(())
     }
@@ -3059,7 +3088,9 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         env.storage()
             .persistent()
-            .set(&DataKey::Allowlisted(address), &true);
+            .set(&DataKey::Allowlisted(address.clone()), &true);
+        env.events()
+            .publish(("AddressAllowlisted", address), (admin,));
         Ok(())
     }
 
@@ -3093,7 +3124,9 @@ impl OnboardingBridge {
 
         env.storage()
             .persistent()
-            .remove(&DataKey::Allowlisted(address));
+            .remove(&DataKey::Allowlisted(address.clone()));
+        env.events()
+            .publish(("AddressUnallowlisted", address), (admin,));
 
         Ok(())
     }
@@ -3128,7 +3161,10 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
+        let old_enabled = allowlist_mode(&env);
         set_allowlist_mode_flag(&env, enabled);
+        env.events()
+            .publish(("AllowlistModeChanged", old_enabled, enabled), (admin,));
         Ok(())
     }
 
@@ -3256,8 +3292,11 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         let mut whitelist = read_whitelist(&env);
-        whitelist.set(asset, true);
+        let was_whitelisted = whitelist.get(asset.clone()).unwrap_or(false);
+        whitelist.set(asset.clone(), true);
         save_whitelist(&env, &whitelist);
+        env.events()
+            .publish(("AssetAdded",), (admin, asset, was_whitelisted));
         Ok(())
     }
 
@@ -4425,10 +4464,13 @@ impl OnboardingBridge {
         admin.require_auth();
 
         let capped = ttl.min(MAX_ALLOWED_TTL);
+        let old_ttl = read_max_persistent_ttl(&env);
         env.storage()
             .instance()
             .set(&DataKey::MaxPersistentTtl, &capped);
         extend_instance_ttl(&env);
+        env.events()
+            .publish(("MaxPersistentTtlChanged", old_ttl, capped), (admin,));
 
         Ok(())
     }
