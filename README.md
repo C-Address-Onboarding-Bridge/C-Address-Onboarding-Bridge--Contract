@@ -136,11 +136,12 @@ graph TD
 | Auth replay protection | `query_auth_nonce_used` | Check whether an auth nonce has been used |
 | Commit-reveal funding | `commit_fund` | Store a funding commitment hash |
 | Commit-reveal funding | `reveal_fund` | Reveal and execute a committed funding transfer |
+| Commit-reveal funding | `cancel_commitment` | Remove an unrevealed commitment |
 | Commit-reveal funding | `query_commitment` | Read a commitment entry |
 | Swap funding | `fund_c_address_with_swap` | Swap a source asset through a whitelisted pool and fund the target asset |
 | Meta-transactions | `register_meta_signer` | Bind an Ed25519 public key to a source address |
 | Meta-transactions | `query_meta_signer` | Read the meta-transaction signer for a source |
-| Meta-transactions | `execute_meta_fund` | Execute a signed funding request submitted by a relayer |
+| Meta-transactions | `execute_meta_fund` | Execute a signed funding request submitted by a relayer (requires a token allowance to the bridge) |
 | Meta-transactions | `query_meta_tx_nonce_used` | Check whether a meta-transaction nonce has been used |
 
 ### Transaction Flow

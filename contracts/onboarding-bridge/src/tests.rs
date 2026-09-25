@@ -1211,8 +1211,23 @@ fn test_reclaim_cannot_drain_active_commitments() {
 
 /********** Commit-reveal (reveal_fund) tests **********/
 
-fn commit_reveal_amount_hash(env: &Env, amount: i128, nonce: u64) -> BytesN<32> {
+fn commit_reveal_amount_hash(
+    env: &Env,
+    bridge: &Address,
+    source: &Address,
+    target: &Address,
+    asset: &Address,
+    amount: i128,
+    nonce: u64,
+) -> BytesN<32> {
     let mut preimage = Bytes::new(env);
+    preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
+    append_address_to_bytes(env, &mut preimage, bridge);
+    let network_id: Bytes = env.ledger().network_id().into();
+    preimage.append(&network_id);
+    append_address_to_bytes(env, &mut preimage, source);
+    append_address_to_bytes(env, &mut preimage, target);
+    append_address_to_bytes(env, &mut preimage, asset);
     preimage.extend_from_array(&amount.to_be_bytes());
     preimage.extend_from_array(&nonce.to_be_bytes());
     env.crypto().sha256(&preimage).into()
@@ -1233,7 +1248,8 @@ fn test_reveal_fund_mints_loyalty() {
 
     let amount: i128 = 500;
     let nonce: u64 = 1;
-    let amount_hash = commit_reveal_amount_hash(&env, amount, nonce);
+    let amount_hash =
+        commit_reveal_amount_hash(&env, &bridge.address, &user, &target, &token_id, amount, nonce);
 
     let id = bridge.commit_fund(&user, &target, &token_id, &amount_hash, &10_000u64);
     env.ledger().set_sequence_number(10);
@@ -1254,7 +1270,8 @@ fn test_reveal_fund_rejects_below_minimum() {
 
     let amount: i128 = 50; // below the configured minimum of 100
     let nonce: u64 = 1;
-    let amount_hash = commit_reveal_amount_hash(&env, amount, nonce);
+    let amount_hash =
+        commit_reveal_amount_hash(&env, &bridge.address, &user, &target, &token_id, amount, nonce);
 
     let id = bridge.commit_fund(&user, &target, &token_id, &amount_hash, &10_000u64);
     env.ledger().set_sequence_number(10);
@@ -3158,9 +3175,24 @@ mod commit_reveal_tests {
         (bridge, user, token_id)
     }
 
-    /// Mirrors the contract's `sha256(amount_be16 || nonce_be8)` commitment hash.
-    fn amount_hash(env: &Env, amount: i128, nonce: u64) -> BytesN<32> {
+    /// Mirrors the contract's domain-separated commitment hash.
+    fn amount_hash(
+        env: &Env,
+        bridge: &Address,
+        source: &Address,
+        target: &Address,
+        asset: &Address,
+        amount: i128,
+        nonce: u64,
+    ) -> BytesN<32> {
         let mut preimage = Bytes::new(env);
+        preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
+        append_address_to_bytes(env, &mut preimage, bridge);
+        let network_id: Bytes = env.ledger().network_id().into();
+        preimage.append(&network_id);
+        append_address_to_bytes(env, &mut preimage, source);
+        append_address_to_bytes(env, &mut preimage, target);
+        append_address_to_bytes(env, &mut preimage, asset);
         preimage.extend_from_array(&amount.to_be_bytes());
         preimage.extend_from_array(&nonce.to_be_bytes());
         env.crypto().sha256(&preimage).into()
@@ -3178,7 +3210,7 @@ mod commit_reveal_tests {
         let (bridge, user, token_id) = setup_commit_reveal(&env);
         let target = Address::generate(&env);
 
-        let hash = amount_hash(&env, 500i128, 42u64);
+        let hash = amount_hash(&env, &bridge.address, &user, &target, &token_id, 500i128, 42u64);
         let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
 
         let entry = bridge.query_commitment(&id);
@@ -3202,7 +3234,7 @@ mod commit_reveal_tests {
         let (bridge, user, token_id) = setup_commit_reveal(&env);
         let target = Address::generate(&env);
 
-        let hash = amount_hash(&env, 500i128, 7u64);
+        let hash = amount_hash(&env, &bridge.address, &user, &target, &token_id, 500i128, 7u64);
         let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
 
         // Revealed in the same ledger the commitment was created in.
@@ -3220,7 +3252,7 @@ mod commit_reveal_tests {
         let (bridge, user, token_id) = setup_commit_reveal(&env);
         let target = Address::generate(&env);
 
-        let hash = amount_hash(&env, 500i128, 9u64);
+        let hash = amount_hash(&env, &bridge.address, &user, &target, &token_id, 500i128, 9u64);
         let id = bridge.commit_fund(&user, &target, &token_id, &hash, &1_500u64);
 
         advance_past_min_delay(&env);
@@ -3240,7 +3272,7 @@ mod commit_reveal_tests {
         let (bridge, user, token_id) = setup_commit_reveal(&env);
         let target = Address::generate(&env);
 
-        let hash = amount_hash(&env, 500i128, 11u64);
+        let hash = amount_hash(&env, &bridge.address, &user, &target, &token_id, 500i128, 11u64);
         let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
 
         advance_past_min_delay(&env);
@@ -3261,7 +3293,7 @@ mod commit_reveal_tests {
         let (bridge, user, token_id) = setup_commit_reveal(&env);
         let target = Address::generate(&env);
 
-        let hash = amount_hash(&env, 500i128, 13u64);
+        let hash = amount_hash(&env, &bridge.address, &user, &target, &token_id, 500i128, 13u64);
         let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
 
         advance_past_min_delay(&env);
@@ -3273,6 +3305,23 @@ mod commit_reveal_tests {
         );
         assert_eq!(check_balance(&env, &token_id, &target), 0i128);
         assert!(!bridge.query_commitment(&id).revealed);
+    }
+
+    #[test]
+    fn test_source_can_cancel_unrevealed_commitment() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(&env, &bridge.address, &user, &target, &token_id, 500i128, 13u64);
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
+
+        bridge.cancel_commitment(&id);
+        assert_eq!(
+            bridge.try_query_commitment(&id),
+            Err(Ok(BridgeError::CommitmentNotFound))
+        );
     }
 }
 
@@ -4752,6 +4801,12 @@ fn test_meta_fund_happy_path() {
         deadline,
     };
 
+    soroban_sdk::token::Client::new(&env, &token_id).approve(
+        &user,
+        &bridge_id,
+        &amount,
+        &100u32,
+    );
     bridge.execute_meta_fund(&params, &pubkey, &signature);
 
     // 500 * 100 / 10000 = 5 fee → net 495 to target
@@ -4840,6 +4895,12 @@ fn test_meta_fund_nonce_replay_rejected() {
         deadline,
     };
 
+    soroban_sdk::token::Client::new(&env, &token_id).approve(
+        &user,
+        &bridge_id,
+        &amount,
+        &100u32,
+    );
     // First use succeeds.
     bridge.execute_meta_fund(&params, &pubkey, &signature);
     assert_eq!(check_balance(&env, &token_id, &target1), 500i128);
