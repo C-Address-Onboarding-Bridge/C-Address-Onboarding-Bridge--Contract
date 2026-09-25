@@ -31,6 +31,17 @@ pub enum BridgeEventType {
     CrossChainFunded,
     TimelockCreated,
     TimelockClaimed,
+    AssetAdded,
+    AssetFeeCapChanged,
+    SourceDailyLimitChanged,
+    MinimumAmountChanged,
+    MaxWithdrawPerTxChanged,
+    MaxPersistentTtlChanged,
+    AddressBlocklisted,
+    AddressUnblocklisted,
+    AddressAllowlisted,
+    AddressUnallowlisted,
+    AllowlistModeChanged,
 }
 
 impl BridgeEventType {
@@ -48,6 +59,17 @@ impl BridgeEventType {
             "CrossChainFunded" => Some(Self::CrossChainFunded),
             "TimelockCreated" => Some(Self::TimelockCreated),
             "TimelockClaimed" => Some(Self::TimelockClaimed),
+            "AssetAdded" => Some(Self::AssetAdded),
+            "AssetFeeCapChanged" => Some(Self::AssetFeeCapChanged),
+            "SourceDailyLimitChanged" => Some(Self::SourceDailyLimitChanged),
+            "MinimumAmountChanged" => Some(Self::MinimumAmountChanged),
+            "MaxWithdrawPerTxChanged" => Some(Self::MaxWithdrawPerTxChanged),
+            "MaxPersistentTtlChanged" => Some(Self::MaxPersistentTtlChanged),
+            "AddressBlocklisted" => Some(Self::AddressBlocklisted),
+            "AddressUnblocklisted" => Some(Self::AddressUnblocklisted),
+            "AddressAllowlisted" => Some(Self::AddressAllowlisted),
+            "AddressUnallowlisted" => Some(Self::AddressUnallowlisted),
+            "AllowlistModeChanged" => Some(Self::AllowlistModeChanged),
             _ => None,
         }
     }
@@ -66,6 +88,17 @@ impl BridgeEventType {
             Self::CrossChainFunded => "CrossChainFunded",
             Self::TimelockCreated => "TimelockCreated",
             Self::TimelockClaimed => "TimelockClaimed",
+            Self::AssetAdded => "AssetAdded",
+            Self::AssetFeeCapChanged => "AssetFeeCapChanged",
+            Self::SourceDailyLimitChanged => "SourceDailyLimitChanged",
+            Self::MinimumAmountChanged => "MinimumAmountChanged",
+            Self::MaxWithdrawPerTxChanged => "MaxWithdrawPerTxChanged",
+            Self::MaxPersistentTtlChanged => "MaxPersistentTtlChanged",
+            Self::AddressBlocklisted => "AddressBlocklisted",
+            Self::AddressUnblocklisted => "AddressUnblocklisted",
+            Self::AddressAllowlisted => "AddressAllowlisted",
+            Self::AddressUnallowlisted => "AddressUnallowlisted",
+            Self::AllowlistModeChanged => "AllowlistModeChanged",
         }
     }
 }
@@ -94,6 +127,17 @@ mod tests {
             ("CrossChainFunded", "CrossChainFunded"),
             ("TimelockCreated", "TimelockCreated"),
             ("TimelockClaimed", "TimelockClaimed"),
+            ("AssetAdded", "AssetAdded"),
+            ("AssetFeeCapChanged", "AssetFeeCapChanged"),
+            ("SourceDailyLimitChanged", "SourceDailyLimitChanged"),
+            ("MinimumAmountChanged", "MinimumAmountChanged"),
+            ("MaxWithdrawPerTxChanged", "MaxWithdrawPerTxChanged"),
+            ("MaxPersistentTtlChanged", "MaxPersistentTtlChanged"),
+            ("AddressBlocklisted", "AddressBlocklisted"),
+            ("AddressUnblocklisted", "AddressUnblocklisted"),
+            ("AddressAllowlisted", "AddressAllowlisted"),
+            ("AddressUnallowlisted", "AddressUnallowlisted"),
+            ("AllowlistModeChanged", "AllowlistModeChanged"),
         ];
 
         for (topic, expected_str) in cases {

@@ -57,14 +57,15 @@ jobs:
 
       # Covers the contract, indexer, and relayer crates via the workspace lockfile.
       #
-      # TODO(next-bounty): `--deny warnings` was dropped. There are no actual
-      # vulnerabilities, but three advisories (derivative + paste unmaintained,
-      # spin yanked) arrive transitively through soroban-sdk -> soroban-env-host
-      # and cannot be resolved without an upstream Soroban release. Plain
-      # `cargo audit` still fails the job on a real vulnerability. Restore the
-      # flag, or add explicit --ignore entries, once upstream moves.
       - name: Audit Rust dependencies
-        run: cargo audit
+        # These are transitive Soroban-host advisories with no compatible
+        # upstream replacement in the SDK 22 dependency graph. Keep the audit
+        # blocking for every other advisory and document the narrow exceptions.
+        run: >
+          cargo audit --deny warnings
+          --ignore RUSTSEC-2024-0388
+          --ignore RUSTSEC-2024-0436
+          --ignore RUSTSEC-2023-0031
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -277,9 +278,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The contract uses SDK 22 APIs (Env::register, cost_estimate);
-        # majors 20/21 cannot compile it and were removed from the matrix.
-        soroban-sdk-version: ["22"]
+        # SDK 22 is the release baseline; SDK 23 is checked separately so
+        # compatibility regressions are not hidden by the default build.
+        soroban-sdk-version: ["22", "23"]
     steps:
       - uses: actions/checkout@v4
 

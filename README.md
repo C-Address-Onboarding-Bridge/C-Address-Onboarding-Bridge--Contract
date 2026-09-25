@@ -63,10 +63,12 @@ graph TD
 | Roles | `set_fee_collector` | Replace the fee collector immediately |
 | Roles | `propose_new_fee_collector` | Start a two-step fee collector transfer |
 | Roles | `accept_fee_collector` | Accept a pending fee collector role |
+| Roles | `clear_pending_fee_collector` | Cancel a pending fee collector transfer |
 | Roles | `query_pending_fee_collector` | Read the pending fee collector, if any |
 | Roles | `set_admin` | Replace the admin immediately |
 | Roles | `propose_new_admin` | Start a two-step admin transfer |
 | Roles | `accept_admin` | Accept a pending admin role |
+| Roles | `clear_pending_admin` | Cancel a pending admin transfer |
 | Roles | `query_pending_admin` | Read the pending admin, if any |
 | Referrals and loyalty | `set_referral_rate` | Configure the referral fee share |
 | Referrals and loyalty | `query_referral_rate` | Read the referral fee share |
@@ -77,7 +79,8 @@ graph TD
 | Queries | `query_admin` | Read the active admin |
 | Queries | `query_balance` | Read an address's token balance |
 | Queries | `query_all_balances` | Read this contract's balances for multiple assets |
-| Queries | `query_fee_balance` | Read accrued fee balance for an asset |
+| Queries | `query_accrued_fees` | Read accrued fee balance for an asset |
+| Queries | `query_contract_balance` | Read the contract's raw token balance for an asset |
 | Queries | `query_is_initialized` | Check whether the contract is initialized |
 | Queries | `query_nonce` | Read the next sequential nonce for a caller |
 | Queries | `query_total_bridged` | Read total net bridged amount for an asset |
@@ -102,7 +105,7 @@ graph TD
 | Access control | `query_allowlist_mode` | Check whether allowlist mode is enabled |
 | Asset and pool lists | `add_asset` | Whitelist a token asset |
 | Asset and pool lists | `remove_asset` | Remove a token asset from the whitelist |
-| Asset and pool lists | `query_is_asset_whitelisted` | Check whether an asset is whitelisted |
+| Asset and pool lists | `query_is_asset_whitelisted` | Check whether an asset is whitelisted using a per-address storage entry |
 | Asset and pool lists | `query_whitelisted_assets` | List whitelisted assets |
 | Asset and pool lists | `add_swap_pool` | Whitelist a swap pool |
 | Asset and pool lists | `remove_swap_pool` | Remove a swap pool from the whitelist |
@@ -133,11 +136,12 @@ graph TD
 | Auth replay protection | `query_auth_nonce_used` | Check whether an auth nonce has been used |
 | Commit-reveal funding | `commit_fund` | Store a funding commitment hash |
 | Commit-reveal funding | `reveal_fund` | Reveal and execute a committed funding transfer |
+| Commit-reveal funding | `cancel_commitment` | Remove an unrevealed commitment |
 | Commit-reveal funding | `query_commitment` | Read a commitment entry |
 | Swap funding | `fund_c_address_with_swap` | Swap a source asset through a whitelisted pool and fund the target asset |
 | Meta-transactions | `register_meta_signer` | Bind an Ed25519 public key to a source address |
 | Meta-transactions | `query_meta_signer` | Read the meta-transaction signer for a source |
-| Meta-transactions | `execute_meta_fund` | Execute a signed funding request submitted by a relayer |
+| Meta-transactions | `execute_meta_fund` | Execute a signed funding request submitted by a relayer (requires a token allowance to the bridge) |
 | Meta-transactions | `query_meta_tx_nonce_used` | Check whether a meta-transaction nonce has been used |
 
 ### Transaction Flow
@@ -319,7 +323,7 @@ for each now lives in `contracts/onboarding-bridge/src/tests.rs`:
 
 | Function | Success path | Failure modes covered | Boundary covered |
 |---|---|---|---|
-| `accept_fee_collector` | Pending handoff is accepted, fee collector updates | `NotInitialized`, `ContractPaused`, no pending handoff, missing authorization | — |
+| `accept_fee_collector` | Pending handoff is accepted, fee collector updates | `NotInitialized`, no pending handoff, missing authorization | — |
 | `cancel_upgrade` | Pending upgrade is cancelled, `execute_upgrade` then errors `UpgradeNotScheduled` | `NotInitialized`, `UpgradeNotScheduled`, `DuplicateNonce`, missing admin authorization | Cancelling twice in a row |
 | `extend_commitment_ttl` | Persistent-storage TTL is verifiably extended | `NotInitialized`, `CommitmentNotFound`, missing admin authorization | Requested TTL above `MAX_ALLOWED_TTL` is capped |
 | `extend_relayer_ttl` | Persistent-storage TTL is verifiably extended | `NotInitialized`, `NotRelayer`, missing admin authorization | Requested TTL above `MAX_ALLOWED_TTL` is capped |

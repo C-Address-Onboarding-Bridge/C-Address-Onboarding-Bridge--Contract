@@ -431,6 +431,9 @@ export interface PendingUpgrade {
 
   /** Ledger sequence at or after which the upgrade can execute. */
   executableAfterLedger: number;
+
+  /** Ledger sequence after which the scheduled upgrade can no longer execute. */
+  expiresAfterLedger: number;
 }
 
 export interface MetaFundParams {
@@ -815,6 +818,9 @@ export interface RelayerManagementOptions {
    * hex string (64 characters).
    */
   pubkey: string;
+
+  /** Optional sequential admin nonce for replay protection. */
+  nonce?: string | number | bigint;
 }
 
 // ---------------------------------------------------------------------------
