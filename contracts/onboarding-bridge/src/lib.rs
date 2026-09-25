@@ -255,6 +255,7 @@ pub enum DataKey {
     Deactivated,
     // Admin-managed whitelist of DEX pool addresses usable in `swap_route`.
     PoolWhitelist,
+    RelayerSet,
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +332,14 @@ pub struct AssetCounters {
     /// contract's token balance but is not owned by the fee collector or
     /// available for `reclaim_tokens`.
     pub locked_timelock: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationAssetState {
+    pub asset: Address,
+    pub counters: AssetCounters,
+    pub fee_cap_bps: u32,
 }
 
 /// A volume-based fee tier.
@@ -1013,10 +1022,22 @@ fn add_relayer(env: &Env, pubkey: &BytesN<32>) {
         env.storage()
             .persistent()
             .set(&DataKey::Relayer(pubkey.clone()), &true);
+        let mut relayers = read_relayer_set(env);
+        relayers.push_back(pubkey.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::RelayerSet, &relayers);
         env.storage()
             .instance()
             .set(&DataKey::RelayerCount, &(relayer_count(env) + 1));
     }
+}
+
+fn read_relayer_set(env: &Env) -> Vec<BytesN<32>> {
+    env.storage()
+        .instance()
+        .get(&DataKey::RelayerSet)
+        .unwrap_or_else(|| Vec::new(env))
 }
 
 fn remove_relayer(env: &Env, pubkey: &BytesN<32>) {
@@ -2865,7 +2886,9 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `new_contract` (`Address`) — The address of the new contract.
-    /// * `migrate_data` (`bool`) — If true, emits all contract state as events.
+    /// * `migrate_data` (`bool`) — If true, emits a complete snapshot of the
+    ///   supported configuration and accounting state as events.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
     ///
     /// # Authorization
     ///
@@ -2874,10 +2897,16 @@ impl OnboardingBridge {
         env: Env,
         new_contract: Address,
         migrate_data: bool,
+        nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+
+        if is_deactivated(&env) {
+            return Err(BridgeError::ContractDeactivated);
+        }
+        consume_nonce(&env, &admin, nonce)?;
 
         if migrate_data {
             let config = read_config(&env);
@@ -2888,6 +2917,35 @@ impl OnboardingBridge {
             env.events().publish(
                 ("EmergencyMigrate", "collector"),
                 (read_fee_collector(&env),),
+            );
+            let asset_whitelist = read_whitelist(&env);
+            let pool_whitelist = read_pool_whitelist(&env);
+            let mut assets = Vec::new(&env);
+            for (asset, enabled) in asset_whitelist.iter() {
+                if enabled {
+                    assets.push_back(MigrationAssetState {
+                        asset: asset.clone(),
+                        counters: read_asset_counters(&env, &asset),
+                        fee_cap_bps: read_asset_fee_cap(&env, &asset),
+                    });
+                }
+            }
+            env.events().publish(
+                ("EmergencyMigrate", "assets"),
+                (asset_whitelist, pool_whitelist, assets),
+            );
+            env.events().publish(
+                ("EmergencyMigrate", "fees"),
+                (
+                    read_fee_tiers(&env),
+                    read_referral_rate(&env),
+                    read_loyalty_token(&env),
+                    read_loyalty_amount_per_fund(&env),
+                ),
+            );
+            env.events().publish(
+                ("EmergencyMigrate", "relayers"),
+                (read_relayer_set(&env), relayer_threshold(&env)),
             );
         }
 

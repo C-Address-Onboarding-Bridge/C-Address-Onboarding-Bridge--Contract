@@ -1076,7 +1076,7 @@ fn test_emergency_migration_keeps_reserved_tokens_recoverable() {
     bridge.fund_c_address(&user, &target, &token_id, &1000i128, &None, &None);
     assert_eq!(check_balance(&env, &token_id, &bridge.address), 100i128);
 
-    bridge.emergency_migrate(&new_contract, &true);
+    bridge.emergency_migrate(&new_contract, &true, &None);
 
     bridge.withdraw_fees(&token_id, &100i128, &None);
     assert_eq!(check_balance(&env, &token_id, &bridge.address), 0i128);
@@ -4520,7 +4520,7 @@ fn test_emergency_migrate_basic() {
 
     // Call emergency_migrate as admin
     env.mock_all_auths();
-    bridge.emergency_migrate(&new_contract, &true);
+    bridge.emergency_migrate(&new_contract, &true, &None);
 
     // Verify it is deactivated by trying to call pause/unpause/set_minimum_amount
     assert_eq!(
@@ -4552,7 +4552,7 @@ fn test_emergency_migrate_basic() {
         Err(Ok(BridgeError::ContractDeactivated))
     );
     assert_eq!(
-        bridge.try_emergency_migrate(&new_contract, &true),
+        bridge.try_emergency_migrate(&new_contract, &true, &None),
         Err(Ok(BridgeError::ContractDeactivated))
     );
 
@@ -4575,7 +4575,7 @@ fn test_emergency_migrate_non_admin_rejected() {
     // Clear all mocked auths so emergency_migrate is called without admin authorization.
     use soroban_sdk::xdr::SorobanAuthorizationEntry;
     env.set_auths(&[] as &[SorobanAuthorizationEntry]);
-    bridge.emergency_migrate(&new_contract, &true);
+    bridge.emergency_migrate(&new_contract, &true, &None);
 }
 
 /********** Meta-fund pubkey/source binding **********/
