@@ -70,6 +70,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
     IntoVal, Map, Vec,
 };
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -183,7 +184,9 @@ pub enum BridgeError {
     InvalidTtl = 48,
     /// The supplied pubkey is not the registered meta-signer for `source`.
     MetaTxPubkeySourceMismatch = 49,
-    // Next free discriminant: 50. Always take the next unused value here and
+    /// The meta-transaction network identifier is not configured.
+    MetaTxNetworkIdNotConfigured = 50,
+    // Next free discriminant: 51. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
 
@@ -249,6 +252,7 @@ pub enum DataKey {
     // Registry binding a source address to the one Ed25519 pubkey it will
     // accept meta-transaction signatures from.
     MetaSigner(Address),
+    MetaTxNetworkId,
     Deactivated,
     // Admin-managed whitelist of DEX pool addresses usable in `swap_route`.
     PoolWhitelist,
@@ -1033,15 +1037,28 @@ fn remove_relayer(env: &Env, pubkey: &BytesN<32>) {
 // requires `source.require_auth()` once, on-chain).
 
 fn save_meta_signer(env: &Env, source: &Address, pubkey: &BytesN<32>) {
+    let key = DataKey::MetaSigner(source.clone());
+    env.storage().persistent().set(&key, pubkey);
+    let max_ttl = read_max_persistent_ttl(env);
     env.storage()
         .persistent()
-        .set(&DataKey::MetaSigner(source.clone()), pubkey);
+        .extend_ttl(&key, max_ttl / 4, max_ttl);
+}
+
+fn clear_meta_signer(env: &Env, source: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::MetaSigner(source.clone()));
 }
 
 fn read_meta_signer(env: &Env, source: &Address) -> Option<BytesN<32>> {
     env.storage()
         .persistent()
         .get(&DataKey::MetaSigner(source.clone()))
+}
+
+fn read_meta_tx_network_id(env: &Env) -> Option<BytesN<32>> {
+    env.storage().instance().get(&DataKey::MetaTxNetworkId)
 }
 
 fn relayer_threshold(env: &Env) -> u32 {
@@ -4336,7 +4353,7 @@ impl OnboardingBridge {
     ///
     /// * `("CommitmentTtlExtended",)` — data: `(id, actual_ttl)`
     pub fn extend_commitment_ttl(env: Env, id: u64, ttl: u32) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let key = DataKey::Commitment(id);
         if !env.storage().persistent().has(&key) {
@@ -4372,7 +4389,7 @@ impl OnboardingBridge {
     ///
     /// * `("RelayerTtlExtended",)` — data: `(pubkey, actual_ttl)`
     pub fn extend_relayer_ttl(env: Env, pubkey: BytesN<32>, ttl: u32) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let key = DataKey::Relayer(pubkey.clone());
         if !env.storage().persistent().has(&key) {
@@ -5110,12 +5127,27 @@ impl OnboardingBridge {
         source: Address,
         pubkey: BytesN<32>,
     ) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         source.require_auth();
         save_meta_signer(&env, &source, &pubkey);
         env.events()
             .publish(("MetaSignerRegistered", source), (pubkey,));
+        Ok(())
+    }
+
+    /// Removes the meta-transaction signing key bound to `source`.
+    ///
+    /// Requires `source.require_auth()`. Subsequent meta-transactions for the
+    /// source are rejected until a new key is registered.
+    pub fn unregister_meta_signer(env: Env, source: Address) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        source.require_auth();
+        clear_meta_signer(&env, &source);
+        env.events().publish(("MetaSignerUnregistered", source), ());
         Ok(())
     }
 
@@ -5129,6 +5161,23 @@ impl OnboardingBridge {
         read_meta_signer(&env, &source)
     }
 
+    /// Configures the network identifier included in every meta-transaction
+    /// signature. The value should be the canonical identifier of the network
+    /// where this contract is deployed.
+    pub fn set_meta_tx_network_id(
+        env: Env,
+        network_id: BytesN<32>,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::MetaTxNetworkId, &network_id);
+        extend_instance_ttl(&env);
+        Ok(())
+    }
+
     /// Execute a fund_c_address on behalf of a user who signed the parameters
     /// off-chain.
     ///
@@ -5138,6 +5187,8 @@ impl OnboardingBridge {
     ///    ```text
     ///    payload = sha256(
     ///        "meta_fund"           (8 bytes, ASCII)
+    ///        || network_id         (32 bytes)
+    ///        || current_contract_address (address bytes)
     ///        || source_strkey      (sha256 of strkey bytes, 32 bytes)
     ///        || target_strkey      (sha256 of strkey bytes, 32 bytes)
     ///        || asset_strkey       (sha256 of strkey bytes, 32 bytes)
@@ -5176,8 +5227,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
     /// * [`BridgeError::MetaTxExpired`] — `params.deadline` is in the past.
     /// * [`BridgeError::MetaTxNonceAlreadyUsed`] — Nonce already consumed.
-    /// * [`BridgeError::MetaTxInvalidSignature`] — Signature verification failed
-    ///   (host will trap on invalid Ed25519 — this variant is for structural errors).
+    /// * [`BridgeError::MetaTxInvalidSignature`] — Signature verification failed.
     /// * [`BridgeError::InvalidAmount`] — `params.amount` ≤ 0.
     /// * [`BridgeError::AddressBlocked`] — `params.target` is blocked.
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode and target not listed.
@@ -5235,12 +5285,28 @@ impl OnboardingBridge {
             _ => return Err(BridgeError::MetaTxPubkeySourceMismatch),
         }
 
-        // 5. Build canonical payload hash and verify signature
-        //    payload = sha256(domain || source_hash || target_hash || asset_hash
-        //                     || amount_be16 || nonce_be8 || deadline_be8)
-        let domain: soroban_sdk::Bytes = soroban_sdk::Bytes::from_slice(&env, b"meta_fund");
+        let network_id =
+            read_meta_tx_network_id(&env).ok_or(BridgeError::MetaTxNetworkIdNotConfigured)?;
+        if params.network_id != network_id {
+            return Err(BridgeError::MetaTxInvalidSignature);
+        }
 
+        // 5. Build canonical payload hash and verify signature
+        //    payload = sha256(domain || network_id || contract_address ||
+        //                     source_hash || target_hash || asset_hash ||
+        //                     amount_be16 || nonce_be8 || deadline_be8)
+        let domain: soroban_sdk::Bytes = soroban_sdk::Bytes::from_slice(&env, b"meta_fund");
         let mut addr_buf = [0u8; MAX_STRKEY_LEN];
+        let contract_address = env.current_contract_address();
+        let contract_str = contract_address.to_string();
+        let contract_len = contract_str.len() as usize;
+        if contract_len > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
+        contract_str.copy_into_slice(&mut addr_buf[..contract_len]);
+        let contract_raw =
+            soroban_sdk::Bytes::from_slice(&env, &addr_buf[..contract_len]);
+        let contract_hash: BytesN<32> = env.crypto().sha256(&contract_raw).into();
 
         let src_str = params.source.clone().to_string();
         let slen = src_str.len() as usize;
@@ -5271,6 +5337,8 @@ impl OnboardingBridge {
 
         let mut payload = soroban_sdk::Bytes::new(&env);
         payload.append(&domain);
+        payload.append(&network_id.clone().into());
+        payload.append(&contract_hash.into());
         payload.append(&src_hash.into());
         payload.append(&tgt_hash.into());
         payload.append(&ast_hash.into());
@@ -5280,11 +5348,12 @@ impl OnboardingBridge {
 
         let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
 
-        // ed25519_verify traps on invalid sig — this is the intended behaviour
-        // (same as fund_c_address_crosschain). The MetaTxInvalidSignature error
-        // is reserved for future structural checks.
-        env.crypto()
-            .ed25519_verify(&pubkey, &payload_hash.into(), &signature);
+        let verifying_key = VerifyingKey::from_bytes(&pubkey.to_array())
+            .map_err(|_| BridgeError::MetaTxInvalidSignature)?;
+        let signature = Signature::from_bytes(&signature.to_array());
+        verifying_key
+            .verify_strict(&payload_hash.to_array(), &signature)
+            .map_err(|_| BridgeError::MetaTxInvalidSignature)?;
 
         // 6. Mark nonce used (before any transfer to prevent re-entrancy)
         env.storage().persistent().set(&nonce_key, &true);
@@ -5357,6 +5426,8 @@ impl OnboardingBridge {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetaFundParams {
+    /// Network identifier configured by the bridge admin.
+    pub network_id: BytesN<32>,
     /// The user's Stellar address (source of funds). `pubkey` must be the key
     /// registered for this address via `register_meta_signer` — enforced by
     /// `execute_meta_fund`, not merely documented here.
