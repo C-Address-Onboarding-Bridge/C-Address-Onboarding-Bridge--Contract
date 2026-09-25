@@ -3799,6 +3799,42 @@ fn test_fund_with_referral_zero_referral_rate() {
 }
 
 #[test]
+fn test_referral_rejects_source_and_target_as_referrer() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_referral_rate(&2000u32, &None);
+    mint_tokens(&env, &token_id, &user, 2000i128);
+
+    let target = Address::generate(&env);
+    assert_eq!(
+        bridge.try_fund_c_address_with_referral(
+            &user,
+            &target,
+            &token_id,
+            &1000i128,
+            &Some(user.clone()),
+        ),
+        Err(Ok(BridgeError::InvalidReferrer))
+    );
+    assert_eq!(
+        bridge.try_fund_c_address_with_referral(
+            &user,
+            &target,
+            &token_id,
+            &1000i128,
+            &Some(target),
+        ),
+        Err(Ok(BridgeError::InvalidReferrer))
+    );
+}
+
+#[test]
 fn test_fee_tier_cannot_raise_global_fee() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);

@@ -183,7 +183,9 @@ pub enum BridgeError {
     InvalidTtl = 48,
     /// The supplied pubkey is not the registered meta-signer for `source`.
     MetaTxPubkeySourceMismatch = 49,
-    // Next free discriminant: 50. Always take the next unused value here and
+    /// The referrer cannot be the funding source or recipient.
+    InvalidReferrer = 50,
+    // Next free discriminant: 51. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
 
@@ -2232,6 +2234,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
     /// * [`BridgeError::DailyLimitExceeded`] — Daily limit exceeded for
     ///   `(source, asset)`.
+    /// * [`BridgeError::InvalidReferrer`] — `referrer` is `source` or `target`.
     ///
     /// # Events
     ///
@@ -2277,6 +2280,11 @@ impl OnboardingBridge {
         check_access(&env, &target)?;
         check_asset_whitelisted(&env, &asset)?;
         check_daily_limit(&env, &source, &asset, amount)?;
+        if let Some(referrer_addr) = &referrer {
+            if referrer_addr == &source || referrer_addr == &target {
+                return Err(BridgeError::InvalidReferrer);
+            }
+        }
 
         let token_client = token::Client::new(&env, &asset);
         let contract_addr = env.current_contract_address();
@@ -2473,9 +2481,10 @@ impl OnboardingBridge {
     ///
     /// 1. **Global rate** — the contract-wide fee_bps.
     /// 2. **Volume tier** — if `source`&#39;s cumulative bridged volume falls
-    ///    within a configured `FeeTier`, that tier&#39;s rate is used instead.
-    /// 3. **Asset cap** — the per-asset maximum fee cap is applied as an
-    ///    upper bound on the tiered rate.
+    ///    within a configured `FeeTier`, its rate provides an additional upper
+    ///    bound.
+    /// 3. **Asset cap** — the per-asset maximum fee cap provides another upper
+    ///    bound.
     ///
     /// The referral fee split does **not** affect the gross fee amount;
     /// it only determines how the fee is distributed between the fee
@@ -3450,7 +3459,7 @@ impl OnboardingBridge {
     /// ```text
     /// for each tier in tiers:
     ///     if source_volume ∈ [tier.min_volume, tier.max_volume]:
-    ///         effective_fee_bps = tier.fee_bps
+    ///         effective_fee_bps = min(global_fee_bps, tier.fee_bps)
     ///         break
     /// else:
     ///     effective_fee_bps = global_fee_bps  (fallback)
