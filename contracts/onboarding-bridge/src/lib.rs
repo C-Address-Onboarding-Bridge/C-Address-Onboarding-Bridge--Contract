@@ -3815,8 +3815,19 @@ impl OnboardingBridge {
     /// # Events
     ///
     /// * `("InstanceTtlExtended",)` — data: `(admin, actual_ttl)`
-    pub fn extend_instance_ttl(_env: Env, _ttl: u32) -> Result<(), BridgeError> {
-        todo!("implement: extend_instance_ttl")
+    pub fn extend_instance_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let max_ttl = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        env.storage().instance().extend_ttl(max_ttl / 4, max_ttl);
+        env.events()
+            .publish(("InstanceTtlExtended",), (admin, max_ttl));
+        Ok(())
     }
 
     /// Extends the persistent-storage TTL for the three per-asset counter keys
@@ -3843,11 +3854,33 @@ impl OnboardingBridge {
     ///
     /// * `("PersistentTtlExtended",)` — data: `(admin, key_asset, actual_ttl)`
     pub fn extend_persistent_ttl(
-        _env: Env,
-        _key_asset: Address,
-        _ttl: u32,
+        env: Env,
+        key_asset: Address,
+        ttl: u32,
     ) -> Result<(), BridgeError> {
-        todo!("implement: extend_persistent_ttl")
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let max_ttl = if ttl > MAX_ALLOWED_TTL {
+            MAX_ALLOWED_TTL
+        } else {
+            ttl
+        };
+        let threshold = max_ttl / 4;
+        for key in [
+            DataKey::AccruedFees(key_asset.clone()),
+            DataKey::TotalBridged(key_asset.clone()),
+            DataKey::TotalFeesCollected(key_asset.clone()),
+        ] {
+            if env.storage().persistent().has(&key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, threshold, max_ttl);
+            }
+        }
+        env.events()
+            .publish(("PersistentTtlExtended",), (admin, key_asset, max_ttl));
+        Ok(())
     }
 
     /// Extends the persistent-storage TTL for a specific timelock entry.
