@@ -2263,6 +2263,9 @@ impl OnboardingBridge {
         }
 
         check_access(&env, &target)?;
+        if let Some(referrer_addr) = referrer.clone() {
+            check_access(&env, &referrer_addr)?;
+        }
         check_asset_whitelisted(&env, &asset)?;
         check_daily_limit(&env, &source, &asset, amount)?;
         source.require_auth();

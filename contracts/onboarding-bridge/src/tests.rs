@@ -3757,6 +3757,39 @@ fn test_fund_with_no_referrer_accrues_full_fee() {
 }
 
 #[test]
+fn test_fund_with_blocked_referrer_fails_before_transfer() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_referral_rate(&2000u32, &None);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    let target = Address::generate(&env);
+    let referrer = Address::generate(&env);
+    bridge.add_to_blocklist(&referrer, &None);
+
+    assert_eq!(
+        bridge.try_fund_c_address_with_referral(
+            &user,
+            &target,
+            &token_id,
+            &1000i128,
+            &Some(referrer),
+            &None,
+            &None,
+        ),
+        Err(Ok(BridgeError::AddressBlocked))
+    );
+    assert_eq!(check_balance(&env, &token_id, &user), 1000i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 0i128);
+}
+
+#[test]
 fn test_fund_with_referral_zero_referral_rate() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
