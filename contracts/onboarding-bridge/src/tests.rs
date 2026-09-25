@@ -3718,6 +3718,8 @@ fn test_fund_with_referral_splits_fee() {
         &token_id,
         &1000i128,
         &Some(referrer.clone()),
+        &None,
+        &None,
     );
 
     // gross = 1000, fee = 10 (1%), referral_fee = 2 (20% of 10), protocol_fee = 8
@@ -3743,7 +3745,9 @@ fn test_fund_with_no_referrer_accrues_full_fee() {
     mint_tokens(&env, &token_id, &user, 1000i128);
     let target = Address::generate(&env);
 
-    bridge.fund_c_address_with_referral(&user, &target, &token_id, &1000i128, &None);
+    bridge.fund_c_address_with_referral(
+        &user, &target, &token_id, &1000i128, &None, &None, &None,
+    );
 
     // No referrer — full fee (10) stays in contract
     assert_eq!(check_balance(&env, &token_id, &target), 990i128);
@@ -3772,6 +3776,8 @@ fn test_fund_with_referral_zero_referral_rate() {
         &token_id,
         &1000i128,
         &Some(referrer.clone()),
+        &None,
+        &None,
     );
 
     // referral_rate = 0, so referrer gets nothing, full fee in contract
@@ -3798,7 +3804,9 @@ fn test_referral_fund_mints_loyalty() {
     mint_tokens(&env, &token_id, &user, 1000i128);
 
     let target = Address::generate(&env);
-    bridge.fund_c_address_with_referral(&user, &target, &token_id, &1000i128, &None);
+    bridge.fund_c_address_with_referral(
+        &user, &target, &token_id, &1000i128, &None, &None, &None,
+    );
 
     assert_eq!(check_balance(&env, &loyalty_token_id, &user), 6i128);
 }
@@ -3818,7 +3826,9 @@ fn test_referral_fund_rejects_below_minimum() {
 
     let target = Address::generate(&env);
     assert_eq!(
-        bridge.try_fund_c_address_with_referral(&user, &target, &token_id, &50i128, &None),
+        bridge.try_fund_c_address_with_referral(
+            &user, &target, &token_id, &50i128, &None, &None, &None
+        ),
         Err(Ok(BridgeError::InvalidAmount))
     );
 }
@@ -5277,7 +5287,9 @@ fn test_referral_fund_applies_tiered_fee() {
     mint_tokens(&env, &token_id, &user, 1000i128);
     let target = Address::generate(&env);
 
-    bridge.fund_c_address_with_referral(&user, &target, &token_id, &1000i128, &None);
+    bridge.fund_c_address_with_referral(
+        &user, &target, &token_id, &1000i128, &None, &None, &None,
+    );
 
     // Tiered fee (10 bps) on 1000 = 1, not the flat global rate (100 bps = 10).
     assert_eq!(check_balance(&env, &token_id, &target), 999i128);
