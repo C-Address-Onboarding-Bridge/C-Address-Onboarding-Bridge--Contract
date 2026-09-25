@@ -2344,16 +2344,21 @@ impl OnboardingBridge {
     /// Returns the contract's total token balance for `asset`.
     ///
     /// This includes both accrued fees and any tokens held for other purposes
-    /// (e.g. timelocked funds). Use `query_accrued_fees` to isolate just the
-    /// fee portion.
+    /// (e.g. timelocked funds). Use `query_accrued_fees` to isolate the fee
+    /// portion.
     ///
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_fee_balance(env: Env, asset: Address) -> Result<i128, BridgeError> {
+    pub fn query_contract_balance(env: Env, asset: Address) -> Result<i128, BridgeError> {
         check_initialized(&env)?;
         let token_client = token::Client::new(&env, &asset);
         Ok(token_client.balance(&env.current_contract_address()))
+    }
+
+    /// Deprecated compatibility alias for [`query_contract_balance`].
+    pub fn query_fee_balance(env: Env, asset: Address) -> Result<i128, BridgeError> {
+        Self::query_contract_balance(env, asset)
     }
 
     /// Returns `true` if the contract has been initialised.
@@ -4111,7 +4116,7 @@ impl OnboardingBridge {
     ///
     /// Accrued fees accumulate on every `fund_c_address` call and are
     /// decremented when `withdraw_fees` is called. This value is always
-    /// ≤ `query_fee_balance` (the contract's actual token balance).
+    /// ≤ `query_contract_balance` (the contract's actual token balance).
     ///
     /// # Arguments
     ///

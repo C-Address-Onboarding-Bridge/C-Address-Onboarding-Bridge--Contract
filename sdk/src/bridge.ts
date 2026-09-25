@@ -1331,8 +1331,7 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Get the accumulated (uncollected) fee balance held by the contract for a
-   * specific asset.
+   * Get the accumulated (uncollected) fee balance for a specific asset.
    *
    * Use this before calling `withdrawFees` to know the exact withdrawable amount.
    *
@@ -1353,14 +1352,39 @@ export class OnboardingBridgeSDK {
     const result = await withRpcHook(
       this.hooks,
       'simulateTransaction',
-      { contractMethod: 'query_fee_balance' },
+      { contractMethod: 'query_accrued_fees' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_fee_balance', [asset]),
+        this.buildSimulationTx('query_accrued_fees', [asset]),
       ),
     );
 
     if ('error' in result && result.error) {
       throw new Error(`Failed to get fee balance: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? scValToNative(scVal).toString() : '0';
+  }
+
+  /**
+   * Get the contract's raw token balance for an asset.
+   *
+   * This includes accrued fees, timelocked funds, loyalty reserves, and any
+   * other tokens held by the contract.
+   */
+  async getContractBalance(asset: string): Promise<string> {
+    assertContractAddress(asset, 'asset');
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_contract_balance' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_contract_balance', [asset]),
+      ),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get contract balance: ${result.error}`);
     }
 
     const scVal = (result as any).results?.[0]?.retval;

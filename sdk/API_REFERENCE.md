@@ -180,7 +180,17 @@ Queries the balance of a C-address for a specific whitelisted token.
 ```ts
 async getFeeBalance(asset: string): Promise<string>
 ```
-Queries the accumulated fee balance for a given token contract.
+Queries accrued, uncollected protocol fees for a given token contract.
+- **Parameters**:
+  - `asset`: `string` — Token contract address.
+- **Returns**: `Promise<string>`
+
+##### `getContractBalance`
+```ts
+async getContractBalance(asset: string): Promise<string>
+```
+Queries the contract's raw token balance for a given asset. This includes
+accrued fees, timelocked funds, loyalty reserves, and stray tokens.
 - **Parameters**:
   - `asset`: `string` — Token contract address.
 - **Returns**: `Promise<string>`
