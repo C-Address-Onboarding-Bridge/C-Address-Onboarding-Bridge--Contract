@@ -757,21 +757,6 @@ fn check_pool_whitelisted(env: &Env, pool: &Address) -> Result<(), BridgeError> 
     Ok(())
 }
 
-// Issue #96: SAC native token (XLM) support
-//
-// Native SAC tokens (e.g., XLM) use the same token interface but may have
-// different behavior in the Soroban environment. This helper detects native
-// tokens so we can handle them appropriately if needed in the future.
-#[inline]
-fn is_native_sac_token(env: &Env, asset: &Address) -> bool {
-    // In Soroban testnet/mainnet, the native XLM token has a canonical address.
-    // We can use env.invoker() to determine if this is the native SAC.
-    // For now, we treat all assets uniformly through token::Client.
-    // Future enhancement: detect native token via stellar contract protocol.
-    let _ = (env, asset);
-    false
-}
-
 fn read_asset_counters(env: &Env, asset: &Address) -> AssetCounters {
     env.storage()
         .persistent()
