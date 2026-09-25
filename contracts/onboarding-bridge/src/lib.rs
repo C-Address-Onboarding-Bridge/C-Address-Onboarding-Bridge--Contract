@@ -2952,7 +2952,9 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         env.storage()
             .persistent()
-            .set(&DataKey::Blocked(address), &true);
+            .set(&DataKey::Blocked(address.clone()), &true);
+        env.events()
+            .publish(("AddressBlocklisted", address), (admin,));
         Ok(())
     }
 
@@ -2983,7 +2985,9 @@ impl OnboardingBridge {
 
         env.storage()
             .persistent()
-            .remove(&DataKey::Blocked(address));
+            .remove(&DataKey::Blocked(address.clone()));
+        env.events()
+            .publish(("AddressUnblocklisted", address), (admin,));
 
         Ok(())
     }
@@ -3018,7 +3022,9 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         env.storage()
             .persistent()
-            .set(&DataKey::Allowlisted(address), &true);
+            .set(&DataKey::Allowlisted(address.clone()), &true);
+        env.events()
+            .publish(("AddressAllowlisted", address), (admin,));
         Ok(())
     }
 
@@ -3052,7 +3058,9 @@ impl OnboardingBridge {
 
         env.storage()
             .persistent()
-            .remove(&DataKey::Allowlisted(address));
+            .remove(&DataKey::Allowlisted(address.clone()));
+        env.events()
+            .publish(("AddressUnallowlisted", address), (admin,));
 
         Ok(())
     }
@@ -3087,7 +3095,10 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
+        let old_enabled = allowlist_mode(&env);
         set_allowlist_mode_flag(&env, enabled);
+        env.events()
+            .publish(("AllowlistModeChanged", old_enabled, enabled), (admin,));
         Ok(())
     }
 
