@@ -3728,6 +3728,8 @@ fn test_fund_with_referral_splits_fee() {
     assert_eq!(check_balance(&env, &token_id, &referrer), 2i128);
     // contract holds protocol fee (8)
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 8i128);
+    assert_eq!(bridge.query_accrued_fees(&token_id), 8i128);
+    assert_eq!(bridge.query_total_fees_collected(&token_id), 10i128);
 }
 
 #[test]

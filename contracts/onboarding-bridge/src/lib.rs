@@ -2299,7 +2299,7 @@ impl OnboardingBridge {
         increment_user_deposit(&env, &source, &asset, amount)?;
         increment_accrued_fees(&env, &asset, protocol_fee)?;
         increment_total_bridged(&env, &asset, net_amount)?;
-        increment_total_fees_collected(&env, &asset, protocol_fee)?;
+        increment_total_fees_collected(&env, &asset, fee)?;
         increment_source_bridged_volume(&env, &source, amount)?;
 
         extend_instance_ttl(&env);
