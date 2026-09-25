@@ -1771,6 +1771,69 @@ pub(crate) mod swap_pool_contract {
 
 use swap_pool_contract::{SwapPool, SwapPoolClient};
 
+pub(crate) mod dishonest_swap_pool {
+    use super::*;
+
+    #[contracttype]
+    pub enum DishonestSwapPoolDataKey {
+        InputToken,
+        OutputToken,
+        ReportedAmount,
+        PayoutAmount,
+    }
+
+    #[contract]
+    pub struct DishonestSwapPool;
+
+    #[contractimpl]
+    impl DishonestSwapPool {
+        pub fn initialize(
+            e: Env,
+            input_token: Address,
+            output_token: Address,
+            reported_amount: i128,
+            payout_amount: i128,
+        ) {
+            e.storage()
+                .instance()
+                .set(&DishonestSwapPoolDataKey::InputToken, &input_token);
+            e.storage()
+                .instance()
+                .set(&DishonestSwapPoolDataKey::OutputToken, &output_token);
+            e.storage()
+                .instance()
+                .set(&DishonestSwapPoolDataKey::ReportedAmount, &reported_amount);
+            e.storage()
+                .instance()
+                .set(&DishonestSwapPoolDataKey::PayoutAmount, &payout_amount);
+        }
+
+        pub fn swap(e: Env, _min_amount_out: i128, to: Address) -> i128 {
+            let output_token: Address = e
+                .storage()
+                .instance()
+                .get(&DishonestSwapPoolDataKey::OutputToken)
+                .unwrap();
+            let payout_amount: i128 = e
+                .storage()
+                .instance()
+                .get(&DishonestSwapPoolDataKey::PayoutAmount)
+                .unwrap();
+            soroban_sdk::token::Client::new(&e, &output_token).transfer(
+                &e.current_contract_address(),
+                &to,
+                &payout_amount,
+            );
+            e.storage()
+                .instance()
+                .get(&DishonestSwapPoolDataKey::ReportedAmount)
+                .unwrap()
+        }
+    }
+}
+
+use dishonest_swap_pool::{DishonestSwapPool, DishonestSwapPoolClient};
+
 /********** fund_c_address_with_swap tests **********/
 
 fn setup_swap(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, Address, Address) {
@@ -1783,10 +1846,111 @@ fn setup_swap(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, Address
     init_token(env, &target_token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.add_asset(&source_token_id, &None);
     bridge.add_asset(&target_token_id, &None);
     mint_tokens(env, &source_token_id, &user, 1_000i128);
 
     (bridge, user, source_token_id, target_token_id)
+}
+
+#[test]
+fn test_swap_rejects_non_whitelisted_source_asset() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+    let unapproved_source = env.register(TestToken, ());
+    let (admin, _, _) = create_test_users(&env);
+    init_token(&env, &unapproved_source, &admin);
+    mint_tokens(&env, &unapproved_source, &user, 1_000i128);
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(
+        &unapproved_source,
+        &target_token_id,
+        &1i128,
+    );
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target,
+            &unapproved_source,
+            &target_token_id,
+            &500i128,
+            &400i128,
+            &swap_route,
+            &None,
+            &None,
+        ),
+        Err(Ok(BridgeError::AssetNotWhitelisted))
+    );
+    assert_eq!(check_balance(&env, &unapproved_source, &user), 1_000i128);
+}
+
+#[test]
+fn test_swap_rejects_source_daily_limit_exceeded() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+    bridge.set_source_daily_limit(&user, &source_token_id, &400i128, &None);
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &target_token_id, &1i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target,
+            &source_token_id,
+            &target_token_id,
+            &500i128,
+            &400i128,
+            &swap_route,
+            &None,
+            &None,
+        ),
+        Err(Ok(BridgeError::DailyLimitExceeded))
+    );
+    assert_eq!(check_balance(&env, &source_token_id, &user), 1_000i128);
+}
+
+#[test]
+fn test_swap_uses_actual_target_tokens_received() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+    let pool_id = env.register(DishonestSwapPool, ());
+    DishonestSwapPoolClient::new(&env, &pool_id).initialize(
+        &source_token_id,
+        &target_token_id,
+        &500i128,
+        &100i128,
+    );
+    mint_tokens(&env, &target_token_id, &pool_id, 100i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target,
+            &source_token_id,
+            &target_token_id,
+            &500i128,
+            &400i128,
+            &swap_route,
+            &None,
+            &None,
+        ),
+        Err(Ok(BridgeError::SlippageExceeded))
+    );
+    assert_eq!(check_balance(&env, &target_token_id, &target), 0i128);
 }
 
 #[test]
@@ -3225,6 +3389,44 @@ mod commit_reveal_tests {
         assert_eq!(check_balance(&env, &token_id, &user), 9_500i128);
         assert_eq!(bridge.query_accrued_fees(&token_id), 5i128);
         assert!(bridge.query_commitment(&id).revealed);
+    }
+
+    #[test]
+    fn test_reveal_rechecks_asset_whitelist() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+        let hash = amount_hash(&env, 500i128, 43u64);
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
+
+        bridge.remove_asset(&token_id, &None);
+        advance_past_min_delay(&env);
+
+        assert_eq!(
+            bridge.try_reveal_fund(&id, &user, &target, &token_id, &500i128, &43u64),
+            Err(Ok(BridgeError::AssetNotWhitelisted))
+        );
+        assert_eq!(check_balance(&env, &token_id, &target), 0i128);
+    }
+
+    #[test]
+    fn test_reveal_rechecks_target_access() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+        let hash = amount_hash(&env, 500i128, 44u64);
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
+
+        bridge.add_to_blocklist(&target, &None);
+        advance_past_min_delay(&env);
+
+        assert_eq!(
+            bridge.try_reveal_fund(&id, &user, &target, &token_id, &500i128, &44u64),
+            Err(Ok(BridgeError::AddressBlocked))
+        );
+        assert_eq!(check_balance(&env, &token_id, &target), 0i128);
     }
 
     #[test]

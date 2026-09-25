@@ -4978,7 +4978,8 @@ impl OnboardingBridge {
     /// 1. Pull `source_amount` of `source_asset` from `source` into the contract.
     /// 2. Invoke the single whitelisted pool in `swap_route` using the standard
     ///    two-token `swap(min_amount_out, to)` interface.
-    /// 3. Verify the final `target_asset` balance received ≥ `min_target_amount`.
+    /// 3. Verify the increase in the bridge's `target_asset` balance is
+    ///    ≥ `min_target_amount`.
     /// 4. Deduct the fee (in `target_asset`) and transfer the net amount to
     ///    `target`.
     ///
@@ -5003,15 +5004,20 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
-    /// * [`BridgeError::InvalidAmount`] — `source_amount` or `min_target_amount` ≤ 0.
+    /// * [`BridgeError::InvalidAmount`] — `source_amount` or `min_target_amount` ≤ 0,
+    ///   or `source_amount` is below the configured minimum.
     /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode is on and `target` is not listed.
-    /// * [`BridgeError::AssetNotWhitelisted`] — `target_asset` is not whitelisted.
+    /// * [`BridgeError::AssetNotWhitelisted`] — `source_asset` or `target_asset`
+    ///   is not whitelisted.
     /// * [`BridgeError::MultiHopNotSupported`] — `swap_route` does not contain
     ///   exactly one pool.
     /// * [`BridgeError::PoolNotWhitelisted`] — The pool in `swap_route` is not
     ///   on the swap-pool whitelist.
-    /// * [`BridgeError::SwapFailed`] — The pool returned zero tokens out.
+    /// * [`BridgeError::DailyLimitExceeded`] — `source_amount` exceeds the
+    ///   source's daily limit for `source_asset`.
+    /// * [`BridgeError::SwapFailed`] — The pool returned zero tokens out or
+    ///   transferred no target tokens.
     /// * [`BridgeError::SlippageExceeded`] — Swap output < `min_target_amount`.
     ///
     /// # Security Considerations
@@ -5057,10 +5063,14 @@ impl OnboardingBridge {
         if source_amount <= 0 || min_target_amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
+        if source_amount < read_minimum_amount(&env) {
+            return Err(BridgeError::InvalidAmount);
+        }
 
         check_access(&env, &target)?;
-        // Only the output asset needs to be whitelisted (what arrives at target).
+        check_asset_whitelisted(&env, &source_asset)?;
         check_asset_whitelisted(&env, &target_asset)?;
+        check_daily_limit(&env, &source, &source_asset, source_amount)?;
 
         // Multi-hop routes are out of scope: the contract cannot verify which
         // token an intermediate pool returns, so only a single, whitelisted
@@ -5088,6 +5098,8 @@ impl OnboardingBridge {
         // performs the swap, transferring target_asset back to `to`.
         source_token.transfer(&contract_addr, &pool, &source_amount);
 
+        let target_token = token::Client::new(&env, &target_asset);
+        let balance_before = target_token.balance(&contract_addr);
         let swap_sym = soroban_sdk::Symbol::new(&env, "swap");
         let swap_args: Vec<soroban_sdk::Val> = soroban_sdk::vec![
             &env,
@@ -5100,14 +5112,19 @@ impl OnboardingBridge {
             return Err(BridgeError::SwapFailed);
         }
 
-        let amount_in = amount_out;
-
-        // Step 3: slippage check on final output.
-        if amount_in < min_target_amount {
-            return Err(BridgeError::SlippageExceeded);
+        let balance_after = target_token.balance(&contract_addr);
+        if balance_after < balance_before {
+            return Err(BridgeError::SwapFailed);
+        }
+        let received_amount = safe_math::safe_sub(balance_after, balance_before)?;
+        if received_amount <= 0 {
+            return Err(BridgeError::SwapFailed);
         }
 
-        let received_amount = amount_in;
+        // Step 3: slippage check on final output.
+        if received_amount < min_target_amount {
+            return Err(BridgeError::SlippageExceeded);
+        }
 
         // Step 4: deduct fee in target_asset and forward net to target.
         let global_fee_bps = read_fee_bps(&env);
@@ -5116,7 +5133,6 @@ impl OnboardingBridge {
         let fee = calculate_fee(received_amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(received_amount, fee)?;
 
-        let target_token = token::Client::new(&env, &target_asset);
         if net_amount > 0 {
             target_token.transfer(&contract_addr, &target, &net_amount);
         }
