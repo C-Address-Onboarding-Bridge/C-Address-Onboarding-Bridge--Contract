@@ -1,5 +1,6 @@
 use crate::events::{BridgeEventType, IndexedEvent};
 use crate::AppState;
+use base64::Engine;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -175,7 +176,14 @@ fn parse_contract_event(
         return None;
     }
 
-    let first_topic = topics[0].as_str().unwrap_or("");
+    let decoded_topics: Vec<serde_json::Value> = topics
+        .iter()
+        .map(decode_rpc_scval)
+        .collect();
+    let first_topic = decoded_topics
+        .first()
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     let event_type = BridgeEventType::from_topic(first_topic)?;
 
     let ledger = raw.get("ledger").and_then(|l| l.as_i64()).unwrap_or(0);
@@ -193,22 +201,22 @@ fn parse_contract_event(
     let mut data = serde_json::Map::new();
     data.insert(
         "topics".to_string(),
-        serde_json::Value::Array(topics.clone()),
+        serde_json::Value::Array(decoded_topics.clone()),
     );
     if let Some(value) = raw.get("value") {
-        data.insert("value".to_string(), value.clone());
+        data.insert("value".to_string(), decode_rpc_scval(value));
     }
 
-    if topics.len() > 1 {
-        if let Some(source) = topics.get(1).and_then(|t| t.as_str()) {
+    if decoded_topics.len() > 1 {
+        if let Some(source) = decoded_topics.get(1).and_then(|t| t.as_str()) {
             data.insert(
                 "source".to_string(),
                 serde_json::Value::String(source.to_string()),
             );
         }
     }
-    if topics.len() > 2 {
-        if let Some(target) = topics.get(2).and_then(|t| t.as_str()) {
+    if decoded_topics.len() > 2 {
+        if let Some(target) = decoded_topics.get(2).and_then(|t| t.as_str()) {
             data.insert(
                 "target".to_string(),
                 serde_json::Value::String(target.to_string()),
@@ -242,6 +250,96 @@ fn parse_contract_event(
         timestamp,
         data: serde_json::Value::Object(data),
     })
+}
+
+/// Decode the base64 XDR representation returned by Soroban RPC. Older test
+/// fixtures use already-decoded JSON strings, so those values are preserved.
+fn decode_rpc_scval(value: &serde_json::Value) -> serde_json::Value {
+    let Some(encoded) = value.as_str() else {
+        return value.clone();
+    };
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return value.clone();
+    };
+    decode_scval(&bytes).unwrap_or_else(|_| value.clone())
+}
+
+fn decode_scval(bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
+    if bytes.len() < 4 {
+        return Err("missing ScVal type");
+    }
+    let kind = u32::from_be_bytes(bytes[0..4].try_into().map_err(|_| "invalid type")?);
+    let mut cursor = 4;
+    match kind {
+        0 => Ok(serde_json::Value::Bool(read_u32(bytes, &mut cursor)? != 0)),
+        1 => Ok(serde_json::Value::Null),
+        3 => Ok(serde_json::Value::Number(
+            read_u32(bytes, &mut cursor)?.into(),
+        )),
+        4 => Ok(serde_json::Value::Number(
+            (read_u32(bytes, &mut cursor)? as i32).into(),
+        )),
+        5 | 7 | 8 => {
+            let number = read_u64(bytes, &mut cursor)?;
+            Ok(serde_json::Value::Number(number.into()))
+        }
+        6 => Ok(serde_json::Value::Number(
+            (read_u64(bytes, &mut cursor)? as i64).into(),
+        )),
+        13 | 14 | 15 => {
+            let raw = read_opaque(bytes, &mut cursor)?;
+            if kind == 15 || kind == 14 {
+                Ok(serde_json::Value::String(
+                    String::from_utf8(raw).map_err(|_| "invalid ScVal text")?,
+                ))
+            } else {
+                Ok(serde_json::Value::String(format!("0x{}", hex::encode(raw))))
+            }
+        }
+        18 => {
+            let address_kind = read_u32(bytes, &mut cursor)?;
+            let address = read_bytes(bytes, &mut cursor, 32)?;
+            Ok(serde_json::Value::String(format!(
+                "scaddress:{}:{}",
+                address_kind,
+                hex::encode(address)
+            )))
+        }
+        _ => Err("unsupported ScVal type"),
+    }
+}
+
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, &'static str> {
+    let end = cursor.checked_add(4).ok_or("cursor overflow")?;
+    let value = u32::from_be_bytes(bytes.get(*cursor..end).ok_or("truncated u32")?.try_into().map_err(|_| "invalid u32")?);
+    *cursor = end;
+    Ok(value)
+}
+
+fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, &'static str> {
+    let end = cursor.checked_add(8).ok_or("cursor overflow")?;
+    let value = u64::from_be_bytes(bytes.get(*cursor..end).ok_or("truncated u64")?.try_into().map_err(|_| "invalid u64")?);
+    *cursor = end;
+    Ok(value)
+}
+
+fn read_bytes<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    length: usize,
+) -> Result<&'a [u8], &'static str> {
+    let end = cursor.checked_add(length).ok_or("cursor overflow")?;
+    let value = bytes.get(*cursor..end).ok_or("truncated bytes")?;
+    *cursor = end;
+    Ok(value)
+}
+
+fn read_opaque(bytes: &[u8], cursor: &mut usize) -> Result<Vec<u8>, &'static str> {
+    let length = read_u32(bytes, cursor)? as usize;
+    let value = read_bytes(bytes, cursor, length)?.to_vec();
+    let padding = (4 - (length % 4)) % 4;
+    read_bytes(bytes, cursor, padding)?;
+    Ok(value)
 }
 
 /// Public-for-tests re-export of `parse_contract_event` so that `db.rs` tests
@@ -362,6 +460,27 @@ mod tests {
             Some("CTARGET"),
             "topics[2] must be stored as data.target"
         );
+    }
+
+    #[test]
+    fn test_parse_decodes_rpc_scval_topics_and_value() {
+        let raw = raw_event(serde_json::json!([
+            "AAAADwAAAA5DQWRkcmVzc0Z1bmQ=",
+            "AAAADwAAAAtHU09VUkNFQQ==",
+            "AAAADwAAAAtDVEFSR0VUQQ=="
+        ]));
+        let raw = serde_json::json!({
+            "topic": raw["topic"],
+            "ledger": 10,
+            "txHash": "cafebabe00000000",
+            "createdAt": "2024-06-01T12:00:00Z",
+            "value": "AAAAAwAAACo="
+        });
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.event_type, "CAddressFunded");
+        assert_eq!(event.data["source"].as_str(), Some("GSOURCEADDR"));
+        assert_eq!(event.data["target"].as_str(), Some("CTARGETADDR"));
+        assert_eq!(event.data["value"], serde_json::json!(42));
     }
 
     /// When only one topic is present, `data["source"]` and `data["target"]`

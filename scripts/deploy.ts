@@ -6,8 +6,8 @@
  *
  * Commands:
  *   all          Deploy WASM, create contract instance, and initialize
- *   deploy       Deploy and create contract instance only (no init)
- *   init <id>    Initialize an already-deployed contract by its C-address
+ *   deploy       Deploy and initialize atomically
+ *   init <id>    Initialize a legacy uninitialized contract by its C-address
  *
  * Options:
  *   --network <mainnet|testnet|dev>   Select deployment environment (default: testnet)
@@ -32,6 +32,7 @@ import {
 } from '@stellar/stellar-sdk';
 import * as fs from 'fs';
 import * as path from 'path';
+import { createHash } from 'crypto';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -178,6 +179,7 @@ async function deployContract(
   provider: SorobanRpc.Server,
   cfg: DeployConfig,
   admin: Keypair,
+  wasmHash: Buffer,
 ): Promise<string> {
   const wasm = fs.readFileSync(cfg.wasmPath);
 
@@ -191,7 +193,19 @@ async function deployContract(
   console.log('  WASM installed ✓');
 
   console.log('Creating contract instance…');
-  const createResp = await provider.createContract(wasm, admin.publicKey(), '0'.repeat(64));
+  const constructorArgs = [
+    Address.fromString(admin.publicKey()).toScVal(),
+    Address.fromString(cfg.feeCollectorPublicKey).toScVal(),
+    nativeToScVal(cfg.feeBps, { type: 'u32' }),
+    nativeToScVal(null),
+    nativeToScVal(wasmHash, { type: 'bytes' }),
+  ];
+  const createResp = await provider.createContract(
+    wasm,
+    admin.publicKey(),
+    '0'.repeat(64),
+    constructorArgs,
+  );
   const createTx = TransactionBuilder.fromXdr(createResp, cfg.networkPassphrase);
   createTx.sign(admin);
   const createSend = await provider.sendTransaction(createTx);
@@ -210,6 +224,7 @@ async function initialize(
   cfg: DeployConfig,
   admin: Keypair,
   contractId: string,
+  wasmHash: Buffer,
 ): Promise<void> {
   console.log(`Initializing contract ${contractId}…`);
   const contract = new Contract(contractId);
@@ -226,6 +241,7 @@ async function initialize(
         Address.fromString(cfg.feeCollectorPublicKey).toScVal(),
         nativeToScVal(cfg.feeBps, { type: 'u32' }),
         nativeToScVal(null),
+        nativeToScVal(wasmHash, { type: 'bytes' }),
       ),
     )
     .setTimeout(30)
@@ -271,12 +287,12 @@ async function main(): Promise<void> {
   console.log(`FeeBps:   ${cfg.feeBps}\n`);
 
   if (command === 'deploy' || command === 'all') {
-    const contractId = await deployContract(provider, cfg, admin);
+    const wasmHash = createHash('sha256').update(fs.readFileSync(cfg.wasmPath)).digest();
+    const contractId = await deployContract(provider, cfg, admin, wasmHash);
     if (command === 'all') {
-      await initialize(provider, cfg, admin, contractId);
       console.log(`\nDeployment complete. CONTRACT_ID=${contractId}`);
     } else {
-      console.log(`\nDeploy complete. Run init with: npx ts-node scripts/deploy.ts init ${contractId} --network ${network}`);
+      console.log(`\nDeployment complete. CONTRACT_ID=${contractId}`);
     }
     return;
   }
@@ -286,7 +302,8 @@ async function main(): Promise<void> {
       console.error('Usage: npx ts-node scripts/deploy.ts init <contract_id> [--network <network>]');
       process.exit(1);
     }
-    await initialize(provider, cfg, admin, customId);
+    const wasmHash = createHash('sha256').update(fs.readFileSync(cfg.wasmPath)).digest();
+    await initialize(provider, cfg, admin, customId, wasmHash);
     return;
   }
 

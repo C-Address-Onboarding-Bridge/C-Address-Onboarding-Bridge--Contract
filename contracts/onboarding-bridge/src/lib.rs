@@ -1365,6 +1365,20 @@ impl OnboardingBridge {
     // Lifecycle
     // -----------------------------------------------------------------------
 
+    /// Initializes the contract as part of the Soroban create-contract
+    /// operation. Deployment tooling should use this constructor instead of
+    /// creating an uninitialized instance and sending a second transaction.
+    pub fn __constructor(
+        env: Env,
+        admin: Address,
+        fee_collector: Address,
+        fee_bps: u32,
+        nonce: Option<u64>,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), BridgeError> {
+        Self::initialize_inner(env, admin, fee_collector, fee_bps, nonce, wasm_hash)
+    }
+
     /// Initialises the bridge contract. Must be called exactly once before any
     /// other function.
     ///
@@ -1415,6 +1429,34 @@ impl OnboardingBridge {
         fee_bps: u32,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
+        let wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+        Self::initialize_inner(env, admin, fee_collector, fee_bps, nonce, wasm_hash)
+    }
+
+    /// Initializes the bridge and records the hash of the deployed WASM.
+    ///
+    /// Deploy tooling must pass the SHA-256 hash of the exact WASM artifact
+    /// used to create this contract. The value becomes the `old_hash` in the
+    /// first `ContractUpgraded` event.
+    pub fn initialize_with_wasm_hash(
+        env: Env,
+        admin: Address,
+        fee_collector: Address,
+        fee_bps: u32,
+        nonce: Option<u64>,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), BridgeError> {
+        Self::initialize_inner(env, admin, fee_collector, fee_bps, nonce, wasm_hash)
+    }
+
+    fn initialize_inner(
+        env: Env,
+        admin: Address,
+        fee_collector: Address,
+        fee_bps: u32,
+        nonce: Option<u64>,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         if read_initialized(&env) {
             return Err(BridgeError::AlreadyInitialized);
@@ -1427,6 +1469,7 @@ impl OnboardingBridge {
         save_admin(&env, &admin);
         save_fee_collector(&env, &fee_collector);
         save_fee_bps(&env, &fee_bps);
+        save_current_wasm_hash(&env, &wasm_hash);
         save_bridge_config(
             &env,
             &BridgeConfigData {
