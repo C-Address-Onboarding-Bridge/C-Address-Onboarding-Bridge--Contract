@@ -2076,6 +2076,10 @@ impl OnboardingBridge {
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
+        let max_withdraw_per_tx = read_max_withdraw_per_tx(&env);
+        if max_withdraw_per_tx != 0 && amount > max_withdraw_per_tx {
+            return Err(BridgeError::WithdrawExceedsLimit);
+        }
 
         let accrued = read_accrued_fees(&env, &asset);
         if amount > accrued {
@@ -2101,6 +2105,9 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        if amount < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;

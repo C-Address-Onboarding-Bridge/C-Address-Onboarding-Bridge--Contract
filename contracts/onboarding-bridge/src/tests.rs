@@ -5460,7 +5460,6 @@ fn test_query_asset_fee_cap_returns_configured_value() {
 
 // The per-transaction withdrawal cap must reject a withdraw_fees call that
 // exceeds the configured limit.
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_withdraw_fees_rejects_amount_over_max_per_tx() {
     let env = Env::default();
