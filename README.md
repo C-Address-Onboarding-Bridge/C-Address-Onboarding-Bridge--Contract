@@ -77,7 +77,8 @@ graph TD
 | Queries | `query_admin` | Read the active admin |
 | Queries | `query_balance` | Read an address's token balance |
 | Queries | `query_all_balances` | Read this contract's balances for multiple assets |
-| Queries | `query_fee_balance` | Read accrued fee balance for an asset |
+| Queries | `query_accrued_fees` | Read accrued fee balance for an asset |
+| Queries | `query_contract_balance` | Read the contract's raw token balance for an asset |
 | Queries | `query_is_initialized` | Check whether the contract is initialized |
 | Queries | `query_nonce` | Read the next sequential nonce for a caller |
 | Queries | `query_total_bridged` | Read total net bridged amount for an asset |

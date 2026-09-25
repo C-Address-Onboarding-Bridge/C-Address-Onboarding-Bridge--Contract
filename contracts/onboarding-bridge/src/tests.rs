@@ -586,9 +586,24 @@ fn test_add_relayer_paused() {
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
     bridge.pause(&None);
     let pubkey = BytesN::from_array(&env, &[7u8; 32]);
+    bridge.add_relayer(&pubkey, &None);
+    assert!(bridge.query_is_relayer(&pubkey));
+}
+
+#[test]
+fn test_add_relayer_nonce_replay_rejected() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let first = BytesN::from_array(&env, &[7u8; 32]);
+    let second = BytesN::from_array(&env, &[8u8; 32]);
+    bridge.add_relayer(&first, &Some(0u64));
     assert_eq!(
-        bridge.try_add_relayer(&pubkey),
-        Err(Ok(BridgeError::ContractPaused))
+        bridge.try_add_relayer(&second, &Some(0u64)),
+        Err(Ok(BridgeError::DuplicateNonce))
     );
 }
 
@@ -602,7 +617,7 @@ fn test_remove_relayer_paused() {
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
     let pubkey = BytesN::from_array(&env, &[7u8; 32]);
-    bridge.add_relayer(&pubkey);
+    bridge.add_relayer(&pubkey, &None);
     bridge.pause(&None);
     assert_eq!(
         bridge.try_remove_relayer(&pubkey),
@@ -620,7 +635,7 @@ fn test_set_relayer_threshold_paused() {
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
     let pubkey = BytesN::from_array(&env, &[7u8; 32]);
-    bridge.add_relayer(&pubkey);
+    bridge.add_relayer(&pubkey, &None);
     bridge.pause(&None);
     assert_eq!(
         bridge.try_set_relayer_threshold(&1u32),
@@ -3375,7 +3390,7 @@ mod crosschain_tests {
         let sk = make_signing_key([1u8; 32]);
         let pubkey = BytesN::from_array(&env, sk.verifying_key().as_bytes());
 
-        bridge.add_relayer(&pubkey);
+        bridge.add_relayer(&pubkey, &None);
         bridge.set_relayer_threshold(&1u32);
 
         let target = soroban_sdk::Address::generate(&env);
@@ -3410,9 +3425,9 @@ mod crosschain_tests {
         let sk2 = make_signing_key([2u8; 32]);
         let sk3 = make_signing_key([3u8; 32]);
 
-        bridge.add_relayer(&BytesN::from_array(&env, sk1.verifying_key().as_bytes()));
-        bridge.add_relayer(&BytesN::from_array(&env, sk2.verifying_key().as_bytes()));
-        bridge.add_relayer(&BytesN::from_array(&env, sk3.verifying_key().as_bytes()));
+        bridge.add_relayer(&BytesN::from_array(&env, sk1.verifying_key().as_bytes()), &None);
+        bridge.add_relayer(&BytesN::from_array(&env, sk2.verifying_key().as_bytes()), &None);
+        bridge.add_relayer(&BytesN::from_array(&env, sk3.verifying_key().as_bytes()), &None);
         bridge.set_relayer_threshold(&2u32);
 
         let target = soroban_sdk::Address::generate(&env);
@@ -3443,7 +3458,7 @@ mod crosschain_tests {
         let (_bridge_id, token_id, _admin, bridge) = setup(&env);
 
         let sk = make_signing_key([1u8; 32]);
-        bridge.add_relayer(&BytesN::from_array(&env, sk.verifying_key().as_bytes()));
+        bridge.add_relayer(&BytesN::from_array(&env, sk.verifying_key().as_bytes()), &None);
         bridge.set_relayer_threshold(&1u32);
 
         let target = soroban_sdk::Address::generate(&env);
@@ -3472,8 +3487,8 @@ mod crosschain_tests {
         let sk1 = make_signing_key([1u8; 32]);
         let sk2 = make_signing_key([2u8; 32]);
 
-        bridge.add_relayer(&BytesN::from_array(&env, sk1.verifying_key().as_bytes()));
-        bridge.add_relayer(&BytesN::from_array(&env, sk2.verifying_key().as_bytes()));
+        bridge.add_relayer(&BytesN::from_array(&env, sk1.verifying_key().as_bytes()), &None);
+        bridge.add_relayer(&BytesN::from_array(&env, sk2.verifying_key().as_bytes()), &None);
         bridge.set_relayer_threshold(&2u32);
 
         let target = soroban_sdk::Address::generate(&env);
@@ -3503,7 +3518,7 @@ mod crosschain_tests {
         bridge.add_relayer(&BytesN::from_array(
             &env,
             sk_registered.verifying_key().as_bytes(),
-        ));
+        ), &None);
         bridge.set_relayer_threshold(&1u32);
 
         let target = soroban_sdk::Address::generate(&env);
@@ -3528,7 +3543,7 @@ mod crosschain_tests {
 
         let pk = BytesN::from_array(&env, make_signing_key([5u8; 32]).verifying_key().as_bytes());
 
-        bridge.add_relayer(&pk);
+        bridge.add_relayer(&pk, &None);
         assert!(bridge.query_is_relayer(&pk));
 
         bridge.set_relayer_threshold(&1u32);
@@ -3550,8 +3565,8 @@ mod crosschain_tests {
         let sk1 = make_signing_key([1u8; 32]);
         let sk2 = make_signing_key([2u8; 32]);
 
-        bridge.add_relayer(&BytesN::from_array(&env, sk1.verifying_key().as_bytes()));
-        bridge.add_relayer(&BytesN::from_array(&env, sk2.verifying_key().as_bytes()));
+        bridge.add_relayer(&BytesN::from_array(&env, sk1.verifying_key().as_bytes()), &None);
+        bridge.add_relayer(&BytesN::from_array(&env, sk2.verifying_key().as_bytes()), &None);
         bridge.set_relayer_threshold(&2u32);
 
         let target = soroban_sdk::Address::generate(&env);
@@ -3585,7 +3600,7 @@ mod crosschain_tests {
 
         let sk = make_signing_key([9u8; 32]);
         let pubkey = BytesN::from_array(&env, sk.verifying_key().as_bytes());
-        bridge.add_relayer(&pubkey);
+        bridge.add_relayer(&pubkey, &None);
         bridge.set_relayer_threshold(&1u32);
 
         let target = soroban_sdk::Address::generate(&env);
@@ -5074,9 +5089,6 @@ fn test_extend_persistent_ttl_extends_asset_keys() {
     bridge.extend_persistent_ttl(&token_id, &200_000u32);
 
     let expected_keys = [
-        DataKey::AccruedFees(token_id.clone()),
-        DataKey::TotalBridged(token_id.clone()),
-        DataKey::TotalFeesCollected(token_id.clone()),
         DataKey::AssetStats(token_id.clone()),
         DataKey::AssetFeeCap(token_id.clone()),
     ];

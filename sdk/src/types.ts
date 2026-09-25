@@ -815,6 +815,9 @@ export interface RelayerManagementOptions {
    * hex string (64 characters).
    */
   pubkey: string;
+
+  /** Optional sequential admin nonce for replay protection. */
+  nonce?: string | number | bigint;
 }
 
 // ---------------------------------------------------------------------------
