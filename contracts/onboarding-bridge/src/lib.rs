@@ -54,7 +54,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Map,
-    Vec, IntoVal,
+    Vec, IntoVal, panic_with_error,
 };
 
 // ---------------------------------------------------------------------------
@@ -534,7 +534,12 @@ fn save_admin(env: &Env, admin: &Address) {
 
 #[inline(never)]
 fn read_admin(env: &Env) -> Address {
-    env.storage().instance().get(&DataKey::Admin).unwrap()
+    env.storage()
+        .instance()
+        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
+        .map(|config| config.admin)
+        .or_else(|| env.storage().instance().get(&DataKey::Admin))
+        .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized))
 }
 
 #[inline(never)]
@@ -548,8 +553,10 @@ fn save_fee_collector(env: &Env, addr: &Address) {
 fn read_fee_collector(env: &Env) -> Address {
     env.storage()
         .instance()
-        .get(&DataKey::FeeCollector)
-        .unwrap()
+        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
+        .map(|config| config.fee_collector)
+        .or_else(|| env.storage().instance().get(&DataKey::FeeCollector))
+        .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized))
 }
 
 fn read_config(env: &Env) -> BridgeConfig {
