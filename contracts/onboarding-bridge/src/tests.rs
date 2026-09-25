@@ -4644,6 +4644,22 @@ fn test_meta_fund_rejects_unregistered_source() {
     );
 }
 
+#[test]
+fn test_meta_signer_can_be_unregistered() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    let pubkey = BytesN::from_array(&env, &[0xCCu8; 32]);
+    bridge.register_meta_signer(&user, &pubkey);
+    assert_eq!(bridge.query_meta_signer(&user), Some(pubkey));
+
+    bridge.unregister_meta_signer(&user);
+    assert_eq!(bridge.query_meta_signer(&user), None);
+}
+
 /// Replicates the contract's payload-hash construction for `execute_meta_fund`
 /// so tests can produce valid Ed25519 signatures.
 fn build_meta_fund_payload_hash(

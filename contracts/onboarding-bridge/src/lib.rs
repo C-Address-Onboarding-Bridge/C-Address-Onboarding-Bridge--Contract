@@ -186,7 +186,7 @@ pub enum BridgeError {
     MetaTxPubkeySourceMismatch = 49,
     /// The meta-transaction network identifier is not configured.
     MetaTxNetworkIdNotConfigured = 50,
-    // Next free discriminant: 50. Always take the next unused value here and
+    // Next free discriminant: 51. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
 
@@ -1037,9 +1037,18 @@ fn remove_relayer(env: &Env, pubkey: &BytesN<32>) {
 // requires `source.require_auth()` once, on-chain).
 
 fn save_meta_signer(env: &Env, source: &Address, pubkey: &BytesN<32>) {
+    let key = DataKey::MetaSigner(source.clone());
+    env.storage().persistent().set(&key, pubkey);
+    let max_ttl = read_max_persistent_ttl(env);
     env.storage()
         .persistent()
-        .set(&DataKey::MetaSigner(source.clone()), pubkey);
+        .extend_ttl(&key, max_ttl / 4, max_ttl);
+}
+
+fn clear_meta_signer(env: &Env, source: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::MetaSigner(source.clone()));
 }
 
 fn read_meta_signer(env: &Env, source: &Address) -> Option<BytesN<32>> {
@@ -4587,12 +4596,27 @@ impl OnboardingBridge {
         source: Address,
         pubkey: BytesN<32>,
     ) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         source.require_auth();
         save_meta_signer(&env, &source, &pubkey);
         env.events()
             .publish(("MetaSignerRegistered", source), (pubkey,));
+        Ok(())
+    }
+
+    /// Removes the meta-transaction signing key bound to `source`.
+    ///
+    /// Requires `source.require_auth()`. Subsequent meta-transactions for the
+    /// source are rejected until a new key is registered.
+    pub fn unregister_meta_signer(env: Env, source: Address) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_paused(&env)?;
+        source.require_auth();
+        clear_meta_signer(&env, &source);
+        env.events().publish(("MetaSignerUnregistered", source), ());
         Ok(())
     }
 
