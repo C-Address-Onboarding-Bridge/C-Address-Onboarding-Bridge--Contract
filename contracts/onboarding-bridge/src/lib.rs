@@ -3280,12 +3280,17 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
-    pub fn remove_asset(
-        _env: Env,
-        _asset: Address,
-        _nonce: Option<u64>,
-    ) -> Result<(), BridgeError> {
-        todo!("implement: remove_asset")
+    pub fn remove_asset(env: Env, asset: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+        let mut whitelist = read_whitelist(&env);
+        whitelist.remove(asset);
+        save_whitelist(&env, &whitelist);
+        Ok(())
     }
 
     /// Returns `true` if `asset` is currently on the whitelist.
@@ -3293,8 +3298,9 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_is_asset_whitelisted(_env: Env, _asset: Address) -> Result<bool, BridgeError> {
-        todo!("implement: query_is_asset_whitelisted")
+    pub fn query_is_asset_whitelisted(env: Env, asset: Address) -> Result<bool, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_whitelist(&env).get(asset).unwrap_or(false))
     }
 
     /// Returns a page of currently whitelisted asset addresses.
@@ -3312,11 +3318,28 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_whitelisted_assets(
-        _env: Env,
-        _offset: u32,
-        _limit: u32,
+        env: Env,
+        offset: u32,
+        limit: u32,
     ) -> Result<Vec<Address>, BridgeError> {
-        todo!("implement: query_whitelisted_assets")
+        check_initialized(&env)?;
+        let limit = if limit > MAX_BATCH_SIZE {
+            MAX_BATCH_SIZE
+        } else {
+            limit
+        };
+        let mut out: Vec<Address> = Vec::new(&env);
+        let mut idx: u32 = 0;
+        for (asset, allowed) in read_whitelist(&env).iter() {
+            if !allowed {
+                continue;
+            }
+            if idx >= offset && out.len() < limit {
+                out.push_back(asset);
+            }
+            idx += 1;
+        }
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------
@@ -3342,12 +3365,17 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
-    pub fn add_swap_pool(
-        _env: Env,
-        _pool: Address,
-        _nonce: Option<u64>,
-    ) -> Result<(), BridgeError> {
-        todo!("implement: add_swap_pool")
+    pub fn add_swap_pool(env: Env, pool: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+        let mut whitelist = read_pool_whitelist(&env);
+        whitelist.set(pool, true);
+        save_pool_whitelist(&env, &whitelist);
+        Ok(())
     }
 
     /// Removes `pool` from the DEX swap-pool whitelist.
