@@ -667,6 +667,13 @@ fn check_not_paused(env: &Env) -> Result<(), BridgeError> {
     Ok(())
 }
 
+fn check_recovery_allowed(env: &Env) -> Result<(), BridgeError> {
+    if !is_deactivated(env) && read_paused(env) {
+        return Err(BridgeError::ContractPaused);
+    }
+    Ok(())
+}
+
 #[inline(always)]
 fn calculate_fee(amount: i128, fee_bps: u32) -> Result<i128, BridgeError> {
     if fee_bps == 0 {
@@ -2062,7 +2069,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
-        check_not_paused(&env)?;
+        check_recovery_allowed(&env)?;
 
         // Only the current fee collector may withdraw accrued fees.
         let fee_collector = read_fee_collector(&env);
@@ -3088,9 +3095,10 @@ impl OnboardingBridge {
     /// Allows the admin to recover tokens that were accidentally sent to the
     /// contract and are not owed as fees.
     ///
-    /// The reclaimable amount is `contract_token_balance − accrued_fees`.
-    /// This ensures the admin cannot drain fee reserves that belong to the
-    /// fee collector.
+    /// While active, the reclaimable amount is
+    /// `contract_token_balance − accrued_fees − locked_timelock`. After an
+    /// emergency migration deactivates the contract, the full remaining
+    /// balance is reclaimable so the old contract cannot strand funds.
     ///
     /// # Arguments
     ///
@@ -3117,16 +3125,13 @@ impl OnboardingBridge {
     ///
     /// # Security Considerations
     ///
-    /// The check `reclaimable = balance − accrued_fees − locked_timelock`
-    /// ensures that both fee reserves and unclaimed `TimelockEntry` deposits
-    /// are ring-fenced: `locked_timelock` is a running per-asset total
-    /// incremented in `fund_c_address_timelocked` and decremented in
-    /// `claim_timelocked`, so admins cannot drain tokens that are owed to a
-    /// pending timelock claim. Unrevealed `CommitmentEntry` records created
-    /// by `commit_fund` never hold contract balance in the first place —
-    /// `reveal_fund` pulls the tokens from `source` and forwards them to
-    /// `target` atomically within a single call — so no separate accounting
-    /// is required for them.
+    /// While active, the check
+    /// `reclaimable = balance − accrued_fees − locked_timelock` ensures that
+    /// fee reserves and unclaimed `TimelockEntry` deposits are ring-fenced.
+    /// After `emergency_migrate`, recovery intentionally takes precedence over
+    /// those reservations because the old contract is permanently disabled.
+    /// Unrevealed `CommitmentEntry` records never hold contract balance in the
+    /// first place.
     pub fn reclaim_tokens(
         env: Env,
         asset: Address,
@@ -3147,7 +3152,11 @@ impl OnboardingBridge {
         let token_client = token::Client::new(&env, &asset);
         let contract_balance = token_client.balance(&env.current_contract_address());
         let counters = read_asset_counters(&env, &asset);
-        let reclaimable = contract_balance - counters.accrued_fees - counters.locked_timelock;
+        let reclaimable = if is_deactivated(&env) {
+            contract_balance
+        } else {
+            contract_balance - counters.accrued_fees - counters.locked_timelock
+        };
 
         if reclaimable < amount {
             return Err(BridgeError::InsufficientReclaimable);

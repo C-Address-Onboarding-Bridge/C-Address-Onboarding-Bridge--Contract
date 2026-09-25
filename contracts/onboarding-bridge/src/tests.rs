@@ -1065,6 +1065,27 @@ fn test_reclaim_accidentally_sent_tokens() {
     let _ = admin; // suppress unused warning
 }
 
+#[test]
+fn test_emergency_migration_keeps_reserved_tokens_recoverable() {
+    let env = Env::default();
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let new_contract = Address::generate(&env);
+
+    bridge.set_fee_bps(&1000u32, &None);
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &1000i128, &None, &None);
+    assert_eq!(check_balance(&env, &token_id, &bridge.address), 100i128);
+
+    bridge.emergency_migrate(&new_contract, &true);
+
+    bridge.withdraw_fees(&token_id, &100i128, &None);
+    assert_eq!(check_balance(&env, &token_id, &bridge.address), 0i128);
+    assert_eq!(
+        check_balance(&env, &token_id, &bridge.query_fee_collector()),
+        100i128
+    );
+}
+
 #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_reclaim_cannot_take_accrued_fees() {
