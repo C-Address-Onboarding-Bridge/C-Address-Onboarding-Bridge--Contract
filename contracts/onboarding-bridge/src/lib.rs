@@ -202,10 +202,7 @@ pub enum DataKey {
     Blocked(Address),
     Allowlisted(Address),
     AllowlistMode,
-    AccruedFees(Address),
     AssetWhitelist,
-    TotalBridged(Address),
-    TotalFeesCollected(Address),
     SourceDailyLimit(Address, Address),
     AssetFeeCap(Address),
     Nonce(Address),
@@ -803,17 +800,6 @@ fn save_asset_counters(env: &Env, asset: &Address, counters: &AssetCounters) {
     env.storage()
         .persistent()
         .set(&DataKey::AssetStats(asset.clone()), counters);
-    env.storage()
-        .persistent()
-        .set(&DataKey::AccruedFees(asset.clone()), &counters.accrued_fees);
-    env.storage().persistent().set(
-        &DataKey::TotalBridged(asset.clone()),
-        &counters.total_bridged,
-    );
-    env.storage().persistent().set(
-        &DataKey::TotalFeesCollected(asset.clone()),
-        &counters.total_fees_collected,
-    );
 }
 
 fn read_accrued_fees(env: &Env, asset: &Address) -> i128 {
@@ -2279,9 +2265,7 @@ impl OnboardingBridge {
         }
 
         increment_user_deposit(&env, &source, &asset, amount)?;
-        increment_accrued_fees(&env, &asset, protocol_fee)?;
-        increment_total_bridged(&env, &asset, net_amount)?;
-        increment_total_fees_collected(&env, &asset, protocol_fee)?;
+        update_asset_counters(&env, &asset, protocol_fee, net_amount)?;
         increment_source_bridged_volume(&env, &source, amount)?;
 
         extend_instance_ttl(&env);
@@ -4351,9 +4335,7 @@ impl OnboardingBridge {
             token_client.transfer(&contract_addr, &target, &net_amount);
         }
 
-        increment_accrued_fees(&env, &asset, fee)?;
-        increment_total_bridged(&env, &asset, net_amount)?;
-        increment_total_fees_collected(&env, &asset, fee)?;
+        update_asset_counters(&env, &asset, fee, net_amount)?;
         increment_source_bridged_volume(&env, &source, amount)?;
         extend_instance_ttl(&env);
 
@@ -4528,9 +4510,7 @@ impl OnboardingBridge {
             target_token.transfer(&contract_addr, &target, &net_amount);
         }
 
-        increment_accrued_fees(&env, &target_asset, fee)?;
-        increment_total_bridged(&env, &target_asset, net_amount)?;
-        increment_total_fees_collected(&env, &target_asset, fee)?;
+        update_asset_counters(&env, &target_asset, fee, net_amount)?;
         increment_source_bridged_volume(&env, &source, source_amount)?;
 
         mint_loyalty_tokens(&env, &source);
@@ -4772,9 +4752,7 @@ impl OnboardingBridge {
         }
 
         increment_user_deposit(&env, &params.source, &params.asset, params.amount)?;
-        increment_accrued_fees(&env, &params.asset, fee)?;
-        increment_total_bridged(&env, &params.asset, net_amount)?;
-        increment_total_fees_collected(&env, &params.asset, fee)?;
+        update_asset_counters(&env, &params.asset, fee, net_amount)?;
         increment_source_bridged_volume(&env, &params.source, params.amount)?;
 
         extend_instance_ttl(&env);

@@ -5074,9 +5074,6 @@ fn test_extend_persistent_ttl_extends_asset_keys() {
     bridge.extend_persistent_ttl(&token_id, &200_000u32);
 
     let expected_keys = [
-        DataKey::AccruedFees(token_id.clone()),
-        DataKey::TotalBridged(token_id.clone()),
-        DataKey::TotalFeesCollected(token_id.clone()),
         DataKey::AssetStats(token_id.clone()),
         DataKey::AssetFeeCap(token_id.clone()),
     ];
