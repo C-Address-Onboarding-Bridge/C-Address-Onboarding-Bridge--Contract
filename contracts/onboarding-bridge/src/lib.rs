@@ -4415,7 +4415,8 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
-    /// * [`BridgeError::InvalidAmount`] — `source_amount` or `min_target_amount` ≤ 0.
+    /// * [`BridgeError::InvalidAmount`] — `source_amount` or `min_target_amount` ≤ 0,
+    ///   or `source_amount` is below the configured minimum.
     /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode is on and `target` is not listed.
     /// * [`BridgeError::AssetNotWhitelisted`] — `source_asset` or `target_asset`
@@ -4424,6 +4425,8 @@ impl OnboardingBridge {
     ///   exactly one pool.
     /// * [`BridgeError::PoolNotWhitelisted`] — The pool in `swap_route` is not
     ///   on the swap-pool whitelist.
+    /// * [`BridgeError::DailyLimitExceeded`] — `source_amount` exceeds the
+    ///   source's daily limit for `source_asset`.
     /// * [`BridgeError::SwapFailed`] — The pool returned zero tokens out.
     /// * [`BridgeError::SlippageExceeded`] — Swap output < `min_target_amount`.
     ///
@@ -4470,10 +4473,14 @@ impl OnboardingBridge {
         if source_amount <= 0 || min_target_amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
+        if source_amount < read_minimum_amount(&env) {
+            return Err(BridgeError::InvalidAmount);
+        }
 
         check_access(&env, &target)?;
         check_asset_whitelisted(&env, &source_asset)?;
         check_asset_whitelisted(&env, &target_asset)?;
+        check_daily_limit(&env, &source, &source_asset, source_amount)?;
 
         // Multi-hop routes are out of scope: the contract cannot verify which
         // token an intermediate pool returns, so only a single, whitelisted
