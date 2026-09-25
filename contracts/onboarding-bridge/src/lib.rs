@@ -1757,14 +1757,19 @@ impl OnboardingBridge {
         if limit_amount < 0 {
             return Err(BridgeError::InvalidAmount);
         }
-        require_asset_whitelisted(&env, &asset)?;
+        check_asset_whitelisted(&env, &asset)?;
 
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
 
+        let old_limit = read_source_daily_limit(&env, &source, &asset);
         save_source_daily_limit(&env, &source, &asset, limit_amount);
         extend_instance_ttl(&env);
+        env.events().publish(
+            ("SourceDailyLimitChanged", old_limit, limit_amount),
+            (admin, source, asset),
+        );
 
         Ok(())
     }
@@ -1833,8 +1838,11 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
 
+        let old_fee_cap = read_asset_fee_cap(&env, &asset);
         save_asset_fee_cap(&env, &asset, max_fee_bps);
         extend_instance_ttl(&env);
+        env.events()
+            .publish(("AssetFeeCapChanged", old_fee_cap, max_fee_bps), (admin, asset));
 
         Ok(())
     }
@@ -1998,8 +2006,11 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
+        let old_amount = read_minimum_amount(&env);
         save_minimum_amount(&env, &amount);
         extend_instance_ttl(&env);
+        env.events()
+            .publish(("MinimumAmountChanged", old_amount, amount), (admin,));
         Ok(())
     }
 
@@ -2111,8 +2122,11 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
+        let old_amount = read_max_withdraw_per_tx(&env);
         save_max_withdraw_per_tx(&env, amount);
         extend_instance_ttl(&env);
+        env.events()
+            .publish(("MaxWithdrawPerTxChanged", old_amount, amount), (admin,));
         Ok(())
     }
 
@@ -3201,8 +3215,11 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         let mut whitelist = read_whitelist(&env);
-        whitelist.set(asset, true);
+        let was_whitelisted = whitelist.get(asset.clone()).unwrap_or(false);
+        whitelist.set(asset.clone(), true);
         save_whitelist(&env, &whitelist);
+        env.events()
+            .publish(("AssetAdded",), (admin, asset, was_whitelisted));
         Ok(())
     }
 
@@ -4033,10 +4050,13 @@ impl OnboardingBridge {
         admin.require_auth();
 
         let capped = ttl.min(MAX_ALLOWED_TTL);
+        let old_ttl = read_max_persistent_ttl(&env);
         env.storage()
             .instance()
             .set(&DataKey::MaxPersistentTtl, &capped);
         extend_instance_ttl(&env);
+        env.events()
+            .publish(("MaxPersistentTtlChanged", old_ttl, capped), (admin,));
 
         Ok(())
     }
