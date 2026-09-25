@@ -1340,6 +1340,20 @@ impl OnboardingBridge {
     // Lifecycle
     // -----------------------------------------------------------------------
 
+    /// Initializes the contract as part of the Soroban create-contract
+    /// operation. Deployment tooling should use this constructor instead of
+    /// creating an uninitialized instance and sending a second transaction.
+    pub fn __constructor(
+        env: Env,
+        admin: Address,
+        fee_collector: Address,
+        fee_bps: u32,
+        nonce: Option<u64>,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), BridgeError> {
+        initialize_inner(env, admin, fee_collector, fee_bps, nonce, wasm_hash)
+    }
+
     /// Initialises the bridge contract. Must be called exactly once before any
     /// other function.
     ///
