@@ -2620,6 +2620,7 @@ fn test_batch_blocked_target_skipped_and_refunded() {
     let good = Address::generate(&env);
     let blocked = Address::generate(&env);
     bridge.add_to_blocklist(&blocked, &None);
+    bridge.set_source_daily_limit(&user, &token_id, &1000i128, &None);
 
     let targets = Vec::from_array(&env, [good.clone(), blocked.clone()]);
     let amounts = Vec::from_array(&env, [1000i128, 500i128]);
@@ -2656,6 +2657,7 @@ fn test_batch_all_blocked_full_refund() {
     let t2 = Address::generate(&env);
     bridge.add_to_blocklist(&t1, &None);
     bridge.add_to_blocklist(&t2, &None);
+    bridge.set_source_daily_limit(&user, &token_id, &1i128, &None);
 
     let targets = Vec::from_array(&env, [t1.clone(), t2.clone()]);
     let amounts = Vec::from_array(&env, [400i128, 600i128]);

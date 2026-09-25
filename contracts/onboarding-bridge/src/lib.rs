@@ -1589,7 +1589,17 @@ impl OnboardingBridge {
             total = safe_math::safe_add(total, amount)?;
         }
 
-        check_daily_limit(&env, &source, &asset, total)?;
+        // Only entries that can actually be delivered consume daily-limit
+        // capacity and source volume. Blocked entries are refunded below.
+        let mut successful_total: i128 = 0;
+        for i in 0..targets.len() {
+            let target = targets.get(i).unwrap();
+            if check_access(&env, &target).is_ok() {
+                successful_total =
+                    safe_math::safe_add(successful_total, amounts.get(i).unwrap())?;
+            }
+        }
+        check_daily_limit(&env, &source, &asset, successful_total)?;
 
         source.require_auth();
         consume_nonce(&env, &source, nonce)?;
@@ -1650,7 +1660,7 @@ impl OnboardingBridge {
             token_client.transfer(&contract_addr, &source, &refund_total);
         }
 
-        increment_source_bridged_volume(&env, &source, total)?;
+        increment_source_bridged_volume(&env, &source, successful_total)?;
         extend_instance_ttl(&env);
         mint_loyalty_tokens(&env, &source);
 
