@@ -910,7 +910,7 @@ fn mark_auth_nonce_used(env: &Env, source: &Address, nonce: u64) -> Result<(), B
 ///
 /// Parameters
 /// - `source`              : address whose auth entry is being validated
-/// - `nonce`               : caller-supplied nonce (must not have been used before)
+/// - `nonce`              : caller-supplied next nonce (must not have been used before)
 /// - `valid_after_ledger`  : inclusive lower bound on `env.ledger().sequence()`
 /// - `valid_before_ledger` : exclusive upper bound on `env.ledger().sequence()`
 ///
@@ -928,18 +928,20 @@ fn consume_auth_nonce(
         return Err(BridgeError::AuthNonceExpired);
     }
 
-    // 2. Used-nonce check (prevents exact replay of this (source, nonce) pair)
-    if is_auth_nonce_used(env, source, nonce) {
-        return Err(BridgeError::AuthNonceAlreadyUsed);
-    }
+    // 2. Enforce monotonic sequencing before checking the used-nonce set.
     if nonce != read_auth_nonce(env, source) {
         return Err(BridgeError::DuplicateNonce);
     }
 
-    // 3. Mark as used and advance the per-address counter
+    // 3. Used-nonce check (prevents exact replay of this (source, nonce) pair)
+    if is_auth_nonce_used(env, source, nonce) {
+        return Err(BridgeError::AuthNonceAlreadyUsed);
+    }
+
+    // 4. Mark as used and advance the per-address counter
     mark_auth_nonce_used(env, source, nonce)?;
 
-    // 4. Emit AuthUsed event for off-chain indexers
+    // 5. Emit AuthUsed event for off-chain indexers
     env.events()
         .publish(("AuthUsed", source.clone()), (nonce,));
 
