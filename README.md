@@ -321,7 +321,7 @@ for each now lives in `contracts/onboarding-bridge/src/tests.rs`:
 
 | Function | Success path | Failure modes covered | Boundary covered |
 |---|---|---|---|
-| `accept_fee_collector` | Pending handoff is accepted, fee collector updates | `NotInitialized`, `ContractPaused`, no pending handoff, missing authorization | — |
+| `accept_fee_collector` | Pending handoff is accepted, fee collector updates | `NotInitialized`, no pending handoff, missing authorization | — |
 | `cancel_upgrade` | Pending upgrade is cancelled, `execute_upgrade` then errors `UpgradeNotScheduled` | `NotInitialized`, `UpgradeNotScheduled`, `DuplicateNonce`, missing admin authorization | Cancelling twice in a row |
 | `extend_commitment_ttl` | Persistent-storage TTL is verifiably extended | `NotInitialized`, `CommitmentNotFound`, missing admin authorization | Requested TTL above `MAX_ALLOWED_TTL` is capped |
 | `extend_relayer_ttl` | Persistent-storage TTL is verifiably extended | `NotInitialized`, `NotRelayer`, missing admin authorization | Requested TTL above `MAX_ALLOWED_TTL` is capped |

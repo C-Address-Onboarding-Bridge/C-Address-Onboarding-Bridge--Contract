@@ -5546,7 +5546,7 @@ fn test_accept_admin_before_initialize_fails() {
 }
 
 #[test]
-fn test_accept_admin_while_paused_fails() {
+fn test_accept_admin_while_paused_succeeds() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
     let (bridge_id, _) = register_all_contracts_mocked(&env);
@@ -5557,10 +5557,24 @@ fn test_accept_admin_while_paused_fails() {
     bridge.propose_new_admin(&new_admin, &None);
     bridge.pause(&None);
 
-    assert_eq!(
-        bridge.try_accept_admin(),
-        Err(Ok(BridgeError::ContractPaused))
-    );
+    bridge.accept_admin();
+    assert_eq!(bridge.query_admin(), new_admin);
+}
+
+#[test]
+fn test_accept_fee_collector_while_paused_succeeds() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_collector = Address::generate(&env);
+    bridge.propose_new_fee_collector(&new_collector, &None);
+    bridge.pause(&None);
+
+    bridge.accept_fee_collector();
+    assert_eq!(bridge.query_fee_collector(), new_collector);
 }
 
 // Boundary: the pending slot is cleared on acceptance, so a second accept

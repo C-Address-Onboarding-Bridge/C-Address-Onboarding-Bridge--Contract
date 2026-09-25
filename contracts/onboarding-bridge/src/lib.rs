@@ -1898,7 +1898,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -1913,7 +1913,7 @@ impl OnboardingBridge {
     pub fn accept_fee_collector(env: Env) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
+        check_not_deactivated(&env)?;
         let pending = read_pending_fee_collector(&env).ok_or(BridgeError::Unauthorized)?;
         pending.require_auth();
         extend_instance_ttl(&env);
@@ -1951,7 +1951,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -1966,7 +1966,7 @@ impl OnboardingBridge {
     pub fn accept_admin(env: Env) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
+        check_not_deactivated(&env)?;
         let pending = read_pending_admin(&env).ok_or(BridgeError::Unauthorized)?;
         pending.require_auth();
         extend_instance_ttl(&env);
