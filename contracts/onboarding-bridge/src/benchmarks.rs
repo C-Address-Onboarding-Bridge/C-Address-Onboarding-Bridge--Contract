@@ -438,7 +438,7 @@ fn bench_fund_c_address_crosschain() {
     let relayer_secret: [u8; 32] = [1u8; 32];
     let relayer_signing_key = SigningKey::from_bytes(&relayer_secret);
     let relayer_pubkey = BytesN::from_array(&env, relayer_signing_key.verifying_key().as_bytes());
-    bridge.add_relayer(&relayer_pubkey);
+    bridge.add_relayer(&relayer_pubkey, &None);
     bridge.set_relayer_threshold(&1u32);
 
     // Fund the bridge so it can transfer to target.
