@@ -70,6 +70,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
     IntoVal, Map, Vec,
 };
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -4669,8 +4670,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
     /// * [`BridgeError::MetaTxExpired`] — `params.deadline` is in the past.
     /// * [`BridgeError::MetaTxNonceAlreadyUsed`] — Nonce already consumed.
-    /// * [`BridgeError::MetaTxInvalidSignature`] — Signature verification failed
-    ///   (host will trap on invalid Ed25519 — this variant is for structural errors).
+    /// * [`BridgeError::MetaTxInvalidSignature`] — Signature verification failed.
     /// * [`BridgeError::InvalidAmount`] — `params.amount` ≤ 0.
     /// * [`BridgeError::AddressBlocked`] — `params.target` is blocked.
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode and target not listed.
@@ -4791,11 +4791,12 @@ impl OnboardingBridge {
 
         let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
 
-        // ed25519_verify traps on invalid sig — this is the intended behaviour
-        // (same as fund_c_address_crosschain). The MetaTxInvalidSignature error
-        // is reserved for future structural checks.
-        env.crypto()
-            .ed25519_verify(&pubkey, &payload_hash.into(), &signature);
+        let verifying_key = VerifyingKey::from_bytes(&pubkey.to_array())
+            .map_err(|_| BridgeError::MetaTxInvalidSignature)?;
+        let signature = Signature::from_bytes(&signature.to_array());
+        verifying_key
+            .verify_strict(&payload_hash.to_array(), &signature)
+            .map_err(|_| BridgeError::MetaTxInvalidSignature)?;
 
         // 6. Mark nonce used (before any transfer to prevent re-entrancy)
         env.storage().persistent().set(&nonce_key, &true);

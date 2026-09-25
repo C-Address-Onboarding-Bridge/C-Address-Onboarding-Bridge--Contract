@@ -4885,7 +4885,6 @@ fn test_meta_fund_nonce_replay_rejected() {
 }
 
 #[test]
-#[should_panic]
 fn test_meta_fund_invalid_signature_fails() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
@@ -4911,8 +4910,6 @@ fn test_meta_fund_invalid_signature_fails() {
     let deadline: u64 = 2_000_000;
 
     // A signature that is corrupt: all zeros, not produced by the registered key.
-    // The Ed25519 host function traps on invalid signatures rather than returning
-    // an error, hence `#[should_panic]`.
     let forged_signature = BytesN::from_array(&env, &[0u8; 64]);
 
     let params = MetaFundParams {
@@ -4925,7 +4922,10 @@ fn test_meta_fund_invalid_signature_fails() {
         deadline,
     };
 
-    bridge.execute_meta_fund(&params, &pubkey, &forged_signature);
+    assert_eq!(
+        bridge.try_execute_meta_fund(&params, &pubkey, &forged_signature),
+        Err(Ok(BridgeError::MetaTxInvalidSignature))
+    );
 }
 
 /********** Batch fund minimum-amount enforcement **********/
