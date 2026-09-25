@@ -15,7 +15,7 @@ use std::{format, println};
 
 use crate::tests::swap_pool_contract::{SwapPool, SwapPoolClient};
 use crate::tests::{advance_ledger_sequence, advance_ledger_time};
-use crate::OnboardingBridge;
+use crate::{OnboardingBridge, ReentrancyGuard};
 
 use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
@@ -352,6 +352,21 @@ fn bench_admin_setters() {
     });
     measure(&env, "set_asset_fee_cap", || {
         bridge.set_asset_fee_cap(&token_id, &50u32, &None);
+    });
+}
+
+#[test]
+fn bench_reentrancy_guard_overhead() {
+    let (env, bridge_id, _token_id, _admin, _fee_collector) = setup();
+
+    measure(&env, "reentrancy_guard/host_call_baseline", || {
+        env.as_contract(&bridge_id, || {});
+    });
+    measure(&env, "reentrancy_guard/enter_drop", || {
+        env.as_contract(&bridge_id, || {
+            let guard = ReentrancyGuard::enter(&env).unwrap();
+            drop(guard);
+        });
     });
 }
 

@@ -517,6 +517,14 @@ fn read_max_persistent_ttl(env: &Env) -> u32 {
         .unwrap_or(MAX_ALLOWED_TTL)
 }
 
+fn persistent_ttl_request(ttl: u32, configured_max: u32) -> Result<(u32, u32), BridgeError> {
+    if ttl < MIN_ALLOWED_TTL {
+        return Err(BridgeError::InvalidTtl);
+    }
+    let max_ttl = ttl.min(configured_max);
+    Ok((max_ttl, max_ttl / 4))
+}
+
 fn extend_instance_ttl(env: &Env) {
     let max_ttl = read_max_instance_ttl(env);
     let threshold = max_ttl / 4;
@@ -1800,7 +1808,8 @@ impl OnboardingBridge {
     ///
     /// # Authorization
     ///
-    /// Requires the current admin's `require_auth()`.
+    /// No authorization is required because this operation only pays rent and
+    /// does not change contract state.
     ///
     /// # Errors
     ///
@@ -2564,6 +2573,7 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
 
         set_paused(&env, true);
+        extend_instance_ttl(&env);
 
         env.events().publish(("ContractPaused",), (admin,));
         Ok(())
@@ -2594,6 +2604,7 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
 
         set_paused(&env, false);
+        extend_instance_ttl(&env);
 
         env.events().publish(("ContractUnpaused",), (admin,));
         Ok(())
@@ -2928,6 +2939,7 @@ impl OnboardingBridge {
         env.storage()
             .persistent()
             .set(&DataKey::Blocked(address), &true);
+        extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -2959,6 +2971,7 @@ impl OnboardingBridge {
         env.storage()
             .persistent()
             .remove(&DataKey::Blocked(address));
+        extend_instance_ttl(&env);
 
         Ok(())
     }
@@ -2994,6 +3007,7 @@ impl OnboardingBridge {
         env.storage()
             .persistent()
             .set(&DataKey::Allowlisted(address), &true);
+        extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -3028,6 +3042,7 @@ impl OnboardingBridge {
         env.storage()
             .persistent()
             .remove(&DataKey::Allowlisted(address));
+        extend_instance_ttl(&env);
 
         Ok(())
     }
@@ -3063,6 +3078,7 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         set_allowlist_mode_flag(&env, enabled);
+        extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -3751,7 +3767,9 @@ impl OnboardingBridge {
     ///
     /// # Arguments
     ///
-    /// * `ttl` (`u32`) — Desired TTL in ledgers (capped at `MAX_ALLOWED_TTL`).
+    /// * `ttl` (`u32`) — Desired TTL in ledgers. Values below
+    ///   `MIN_ALLOWED_TTL` are rejected; larger values are capped at the
+    ///   configured `MaxPersistentTtl`.
     ///
     /// # Authorization
     ///
@@ -3778,7 +3796,9 @@ impl OnboardingBridge {
     ///
     /// * `key_asset` (`Address`) — The asset whose persistent counters should
     ///   have their TTL extended.
-    /// * `ttl` (`u32`) — Desired TTL in ledgers (capped at `MAX_ALLOWED_TTL`).
+    /// * `ttl` (`u32`) — Desired TTL in ledgers. Values below
+    ///   `MIN_ALLOWED_TTL` are rejected; larger values are capped at the
+    ///   configured `MaxPersistentTtl`.
     ///
     /// # Authorization
     ///
@@ -3811,11 +3831,14 @@ impl OnboardingBridge {
     ///
     /// * `id` (`u64`) — The timelock entry ID, as returned by
     ///   `fund_c_address_timelocked`.
-    /// * `ttl` (`u32`) — Desired TTL in ledgers (capped at `MAX_ALLOWED_TTL`).
+    /// * `ttl` (`u32`) — Desired TTL in ledgers. Values below
+    ///   `MIN_ALLOWED_TTL` are rejected; larger values are capped at the
+    ///   configured `MaxPersistentTtl`.
     ///
     /// # Authorization
     ///
-    /// Requires the current admin's `require_auth()`.
+    /// No authorization is required because this operation only pays rent and
+    /// does not change contract state.
     ///
     /// # Errors
     ///
@@ -3824,27 +3847,20 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
-    /// * `("TimelockTtlExtended",)` — data: `(admin, id, actual_ttl)`
+    /// * `("TimelockTtlExtended",)` — data: `(id, actual_ttl)`
     pub fn extend_timelock_ttl(env: Env, id: u64, ttl: u32) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        let admin = read_admin(&env);
-        admin.require_auth();
         let key = DataKey::Timelock(id);
         if !env.storage().persistent().has(&key) {
             return Err(BridgeError::TimelockNotFound);
         }
-        let max_ttl = if ttl > MAX_ALLOWED_TTL {
-            MAX_ALLOWED_TTL
-        } else {
-            ttl
-        };
-        let threshold = max_ttl / 4;
+        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
         env.storage()
             .persistent()
             .extend_ttl(&key, threshold, max_ttl);
         env.events()
-            .publish(("TimelockTtlExtended",), (admin, id, max_ttl));
+            .publish(("TimelockTtlExtended",), (id, max_ttl));
         Ok(())
     }
 
@@ -3857,7 +3873,8 @@ impl OnboardingBridge {
     ///
     /// # Authorization
     ///
-    /// Requires the current admin's `require_auth()`.
+    /// No authorization is required because this operation only pays rent and
+    /// does not change contract state.
     ///
     /// # Errors
     ///
@@ -3866,27 +3883,20 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
-    /// * `("CommitmentTtlExtended",)` — data: `(admin, id, actual_ttl)`
+    /// * `("CommitmentTtlExtended",)` — data: `(id, actual_ttl)`
     pub fn extend_commitment_ttl(env: Env, id: u64, ttl: u32) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
-        let admin = read_admin(&env);
-        admin.require_auth();
         let key = DataKey::Commitment(id);
         if !env.storage().persistent().has(&key) {
             return Err(BridgeError::CommitmentNotFound);
         }
-        let max_ttl = if ttl > MAX_ALLOWED_TTL {
-            MAX_ALLOWED_TTL
-        } else {
-            ttl
-        };
-        let threshold = max_ttl / 4;
+        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
         env.storage()
             .persistent()
             .extend_ttl(&key, threshold, max_ttl);
         env.events()
-            .publish(("CommitmentTtlExtended",), (admin, id, max_ttl));
+            .publish(("CommitmentTtlExtended",), (id, max_ttl));
         Ok(())
     }
 
@@ -3899,7 +3909,8 @@ impl OnboardingBridge {
     ///
     /// # Authorization
     ///
-    /// Requires the current admin's `require_auth()`.
+    /// No authorization is required because this operation only pays rent and
+    /// does not change contract state.
     ///
     /// # Errors
     ///
@@ -3908,27 +3919,20 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
-    /// * `("RelayerTtlExtended",)` — data: `(admin, pubkey, actual_ttl)`
+    /// * `("RelayerTtlExtended",)` — data: `(pubkey, actual_ttl)`
     pub fn extend_relayer_ttl(env: Env, pubkey: BytesN<32>, ttl: u32) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env);
         check_initialized(&env)?;
-        let admin = read_admin(&env);
-        admin.require_auth();
         let key = DataKey::Relayer(pubkey.clone());
         if !env.storage().persistent().has(&key) {
             return Err(BridgeError::NotRelayer);
         }
-        let max_ttl = if ttl > MAX_ALLOWED_TTL {
-            MAX_ALLOWED_TTL
-        } else {
-            ttl
-        };
-        let threshold = max_ttl / 4;
+        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
         env.storage()
             .persistent()
             .extend_ttl(&key, threshold, max_ttl);
         env.events()
-            .publish(("RelayerTtlExtended",), (admin, pubkey, max_ttl));
+            .publish(("RelayerTtlExtended",), (pubkey, max_ttl));
         Ok(())
     }
 
