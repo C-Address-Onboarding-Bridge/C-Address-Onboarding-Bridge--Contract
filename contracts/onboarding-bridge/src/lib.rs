@@ -280,14 +280,15 @@ pub struct BridgeConfig {
     pub allowlist_mode: bool,
 }
 
-/// Snapshot of admin + fee_collector + fee_bps used during initialization and
-/// cached for efficient admin-auth checks in mutating functions.
+/// The authoritative contract-wide configuration.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BridgeConfigData {
     pub admin: Address,
     pub fee_collector: Address,
     pub fee_bps: u32,
+    pub paused: bool,
+    pub allowlist_mode: bool,
 }
 
 /// Packed per-asset counters stored in a single persistent-storage entry.
@@ -461,6 +462,8 @@ fn read_bridge_config(env: &Env) -> BridgeConfigData {
             admin: read_admin(env),
             fee_collector: read_fee_collector(env),
             fee_bps: read_fee_bps(env),
+            paused: false,
+            allowlist_mode: false,
         })
 }
 
@@ -524,7 +527,9 @@ fn increment_user_deposit(env: &Env, source: &Address, asset: &Address, amount: 
 
 #[inline(never)]
 fn save_admin(env: &Env, admin: &Address) {
-    env.storage().instance().set(&DataKey::Admin, admin);
+    let mut config = read_bridge_config(env);
+    config.admin = admin.clone();
+    save_bridge_config(env, &config);
 }
 
 #[inline(never)]
@@ -534,7 +539,9 @@ fn read_admin(env: &Env) -> Address {
 
 #[inline(never)]
 fn save_fee_collector(env: &Env, addr: &Address) {
-    env.storage().instance().set(&DataKey::FeeCollector, addr);
+    let mut config = read_bridge_config(env);
+    config.fee_collector = addr.clone();
+    save_bridge_config(env, &config);
 }
 
 #[inline(never)]
@@ -546,29 +553,30 @@ fn read_fee_collector(env: &Env) -> Address {
 }
 
 fn read_config(env: &Env) -> BridgeConfig {
-    env.storage()
-        .instance()
-        .get(&DataKey::Config)
-        .unwrap_or(BridgeConfig {
-            fee_bps: 0,
-            paused: false,
-            allowlist_mode: false,
-        })
+    let config = read_bridge_config(env);
+    BridgeConfig {
+        fee_bps: config.fee_bps,
+        paused: config.paused,
+        allowlist_mode: config.allowlist_mode,
+    }
 }
 
 fn save_config(env: &Env, config: &BridgeConfig) {
-    env.storage().instance().set(&DataKey::Config, config);
+    let mut bridge_config = read_bridge_config(env);
+    bridge_config.fee_bps = config.fee_bps;
+    bridge_config.paused = config.paused;
+    bridge_config.allowlist_mode = config.allowlist_mode;
+    save_bridge_config(env, &bridge_config);
 }
 
 fn save_fee_bps(env: &Env, fee_bps: &u32) {
     let mut config = read_config(env);
     config.fee_bps = *fee_bps;
     save_config(env, &config);
-    env.storage().instance().set(&DataKey::FeeBps, fee_bps);
 }
 
 fn read_fee_bps(env: &Env) -> u32 {
-    read_config(env).fee_bps
+    read_bridge_config(env).fee_bps
 }
 
 fn read_initialized(env: &Env) -> bool {
@@ -607,7 +615,6 @@ fn set_paused(env: &Env, paused: bool) {
     let mut config = read_config(env);
     config.paused = paused;
     save_config(env, &config);
-    env.storage().instance().set(&DataKey::Paused, &paused);
 }
 
 fn is_deactivated(env: &Env) -> bool {
@@ -661,9 +668,6 @@ fn set_allowlist_mode_flag(env: &Env, enabled: bool) {
     let mut config = read_config(env);
     config.allowlist_mode = enabled;
     save_config(env, &config);
-    env.storage()
-        .instance()
-        .set(&DataKey::AllowlistMode, &enabled);
 }
 
 fn check_access(env: &Env, target: &Address) -> Result<(), BridgeError> {
@@ -1343,13 +1347,12 @@ impl OnboardingBridge {
         }
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        save_admin(&env, &admin);
-        save_fee_collector(&env, &fee_collector);
-        save_fee_bps(&env, &fee_bps);
         save_bridge_config(&env, &BridgeConfigData {
             admin: admin.clone(),
             fee_collector: fee_collector.clone(),
             fee_bps,
+            paused: false,
+            allowlist_mode: false,
         });
         mark_initialized(&env);
         extend_instance_ttl(&env);
