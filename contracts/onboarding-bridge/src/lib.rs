@@ -26,7 +26,7 @@
 //! fee       = floor(amount × fee_bps / 10_000)
 //! net       = amount − fee
 //! effective = min(global_fee_bps, asset_fee_cap)
-//! tiered    = looked up by source's cumulative bridged volume
+//! tiered    = min(global_fee_bps, matching volume-tier fee, asset_fee_cap)
 //! ```
 //!
 //! ## Access Control
@@ -341,11 +341,19 @@ pub struct AssetCounters {
     pub locked_timelock: i128,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationAssetState {
+    pub asset: Address,
+    pub counters: AssetCounters,
+    pub fee_cap_bps: u32,
+}
+
 /// A volume-based fee tier.
 ///
 /// If a source address's cumulative bridged volume falls within
-/// `[min_volume, max_volume]`, its effective fee is `fee_bps` rather than the
-/// global rate.
+/// `[min_volume, max_volume]`, its fee is capped at the tier's `fee_bps` in
+/// addition to the global and per-asset caps.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeTier {
@@ -700,6 +708,13 @@ fn check_not_paused(env: &Env) -> Result<(), BridgeError> {
     Ok(())
 }
 
+fn check_recovery_allowed(env: &Env) -> Result<(), BridgeError> {
+    if !is_deactivated(env) && read_paused(env) {
+        return Err(BridgeError::ContractPaused);
+    }
+    Ok(())
+}
+
 #[inline(always)]
 fn calculate_fee(amount: i128, fee_bps: u32) -> Result<i128, BridgeError> {
     if fee_bps == 0 {
@@ -1016,10 +1031,22 @@ fn add_relayer(env: &Env, pubkey: &BytesN<32>) {
         env.storage()
             .persistent()
             .set(&DataKey::Relayer(pubkey.clone()), &true);
+        let mut relayers = read_relayer_set(env);
+        relayers.push_back(pubkey.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::RelayerSet, &relayers);
         env.storage()
             .instance()
             .set(&DataKey::RelayerCount, &(relayer_count(env) + 1));
     }
+}
+
+fn read_relayer_set(env: &Env) -> Vec<BytesN<32>> {
+    env.storage()
+        .instance()
+        .get(&DataKey::RelayerSet)
+        .unwrap_or_else(|| Vec::new(env))
 }
 
 fn remove_relayer(env: &Env, pubkey: &BytesN<32>) {
@@ -1194,7 +1221,7 @@ fn get_tiered_fee_bps(env: &Env, source: &Address, fallback_bps: u32) -> u32 {
         for i in 0..tiers.len() {
             let tier = tiers.get(i).unwrap();
             if volume >= tier.min_volume && volume <= tier.max_volume {
-                return tier.fee_bps;
+                return fallback_bps.min(tier.fee_bps);
             }
         }
     }
@@ -2255,7 +2282,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
-        check_not_paused(&env)?;
+        check_recovery_allowed(&env)?;
 
         // Only the current fee collector may withdraw accrued fees.
         let fee_collector = read_fee_collector(&env);
@@ -2407,6 +2434,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
     /// * [`BridgeError::DailyLimitExceeded`] — Daily limit exceeded for
     ///   `(source, asset)`.
+    /// * [`BridgeError::InvalidReferrer`] — `referrer` is `source` or `target`.
     ///
     /// # Events
     ///
@@ -2452,6 +2480,11 @@ impl OnboardingBridge {
         check_access(&env, &target)?;
         check_asset_whitelisted(&env, &asset)?;
         check_daily_limit(&env, &source, &asset, amount)?;
+        if let Some(referrer_addr) = &referrer {
+            if referrer_addr == &source || referrer_addr == &target {
+                return Err(BridgeError::InvalidReferrer);
+            }
+        }
 
         let token_client = token::Client::new(&env, &asset);
         let contract_addr = env.current_contract_address();
@@ -2651,9 +2684,10 @@ impl OnboardingBridge {
     ///
     /// 1. **Global rate** — the contract-wide fee_bps.
     /// 2. **Volume tier** — if `source`&#39;s cumulative bridged volume falls
-    ///    within a configured `FeeTier`, that tier&#39;s rate is used instead.
-    /// 3. **Asset cap** — the per-asset maximum fee cap is applied as an
-    ///    upper bound on the tiered rate.
+    ///    within a configured `FeeTier`, its rate provides an additional upper
+    ///    bound.
+    /// 3. **Asset cap** — the per-asset maximum fee cap provides another upper
+    ///    bound.
     ///
     /// The referral fee split does **not** affect the gross fee amount;
     /// it only determines how the fee is distributed between the fee
@@ -3076,7 +3110,9 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `new_contract` (`Address`) — The address of the new contract.
-    /// * `migrate_data` (`bool`) — If true, emits all contract state as events.
+    /// * `migrate_data` (`bool`) — If true, emits a complete snapshot of the
+    ///   supported configuration and accounting state as events.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
     ///
     /// # Authorization
     ///
@@ -3085,10 +3121,16 @@ impl OnboardingBridge {
         env: Env,
         new_contract: Address,
         migrate_data: bool,
+        nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+
+        if is_deactivated(&env) {
+            return Err(BridgeError::ContractDeactivated);
+        }
+        consume_nonce(&env, &admin, nonce)?;
 
         if migrate_data {
             let config = read_config(&env);
@@ -3099,6 +3141,35 @@ impl OnboardingBridge {
             env.events().publish(
                 ("EmergencyMigrate", "collector"),
                 (read_fee_collector(&env),),
+            );
+            let asset_whitelist = read_whitelist(&env);
+            let pool_whitelist = read_pool_whitelist(&env);
+            let mut assets = Vec::new(&env);
+            for (asset, enabled) in asset_whitelist.iter() {
+                if enabled {
+                    assets.push_back(MigrationAssetState {
+                        asset: asset.clone(),
+                        counters: read_asset_counters(&env, &asset),
+                        fee_cap_bps: read_asset_fee_cap(&env, &asset),
+                    });
+                }
+            }
+            env.events().publish(
+                ("EmergencyMigrate", "assets"),
+                (asset_whitelist, pool_whitelist, assets),
+            );
+            env.events().publish(
+                ("EmergencyMigrate", "fees"),
+                (
+                    read_fee_tiers(&env),
+                    read_referral_rate(&env),
+                    read_loyalty_token(&env),
+                    read_loyalty_amount_per_fund(&env),
+                ),
+            );
+            env.events().publish(
+                ("EmergencyMigrate", "relayers"),
+                (read_relayer_set(&env), relayer_threshold(&env)),
             );
         }
 
@@ -3317,9 +3388,10 @@ impl OnboardingBridge {
     /// Allows the admin to recover tokens that were accidentally sent to the
     /// contract and are not owed as fees.
     ///
-    /// The reclaimable amount is `contract_token_balance − accrued_fees`.
-    /// This ensures the admin cannot drain fee reserves that belong to the
-    /// fee collector.
+    /// While active, the reclaimable amount is
+    /// `contract_token_balance − accrued_fees − locked_timelock`. After an
+    /// emergency migration deactivates the contract, the full remaining
+    /// balance is reclaimable so the old contract cannot strand funds.
     ///
     /// # Arguments
     ///
@@ -3346,16 +3418,13 @@ impl OnboardingBridge {
     ///
     /// # Security Considerations
     ///
-    /// The check `reclaimable = balance − accrued_fees − locked_timelock`
-    /// ensures that both fee reserves and unclaimed `TimelockEntry` deposits
-    /// are ring-fenced: `locked_timelock` is a running per-asset total
-    /// incremented in `fund_c_address_timelocked` and decremented in
-    /// `claim_timelocked`, so admins cannot drain tokens that are owed to a
-    /// pending timelock claim. Unrevealed `CommitmentEntry` records created
-    /// by `commit_fund` never hold contract balance in the first place —
-    /// `reveal_fund` pulls the tokens from `source` and forwards them to
-    /// `target` atomically within a single call — so no separate accounting
-    /// is required for them.
+    /// While active, the check
+    /// `reclaimable = balance − accrued_fees − locked_timelock` ensures that
+    /// fee reserves and unclaimed `TimelockEntry` deposits are ring-fenced.
+    /// After `emergency_migrate`, recovery intentionally takes precedence over
+    /// those reservations because the old contract is permanently disabled.
+    /// Unrevealed `CommitmentEntry` records never hold contract balance in the
+    /// first place.
     pub fn reclaim_tokens(
         env: Env,
         asset: Address,
@@ -3669,7 +3738,7 @@ impl OnboardingBridge {
     /// ```text
     /// for each tier in tiers:
     ///     if source_volume ∈ [tier.min_volume, tier.max_volume]:
-    ///         effective_fee_bps = tier.fee_bps
+    ///         effective_fee_bps = min(global_fee_bps, tier.fee_bps)
     ///         break
     /// else:
     ///     effective_fee_bps = global_fee_bps  (fallback)

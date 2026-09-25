@@ -1131,6 +1131,27 @@ fn test_reclaim_accidentally_sent_tokens() {
     let _ = admin; // suppress unused warning
 }
 
+#[test]
+fn test_emergency_migration_keeps_reserved_tokens_recoverable() {
+    let env = Env::default();
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let new_contract = Address::generate(&env);
+
+    bridge.set_fee_bps(&1000u32, &None);
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &1000i128, &None, &None);
+    assert_eq!(check_balance(&env, &token_id, &bridge.address), 100i128);
+
+    bridge.emergency_migrate(&new_contract, &true, &None);
+
+    bridge.withdraw_fees(&token_id, &100i128, &None);
+    assert_eq!(check_balance(&env, &token_id, &bridge.address), 0i128);
+    assert_eq!(
+        check_balance(&env, &token_id, &bridge.query_fee_collector()),
+        100i128
+    );
+}
+
 #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_reclaim_cannot_take_accrued_fees() {
@@ -4094,6 +4115,70 @@ fn test_fund_with_referral_zero_referral_rate() {
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 10i128);
 }
 
+#[test]
+fn test_referral_rejects_source_and_target_as_referrer() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_referral_rate(&2000u32, &None);
+    mint_tokens(&env, &token_id, &user, 2000i128);
+
+    let target = Address::generate(&env);
+    assert_eq!(
+        bridge.try_fund_c_address_with_referral(
+            &user,
+            &target,
+            &token_id,
+            &1000i128,
+            &Some(user.clone()),
+        ),
+        Err(Ok(BridgeError::InvalidReferrer))
+    );
+    assert_eq!(
+        bridge.try_fund_c_address_with_referral(
+            &user,
+            &target,
+            &token_id,
+            &1000i128,
+            &Some(target),
+        ),
+        Err(Ok(BridgeError::InvalidReferrer))
+    );
+}
+
+#[test]
+fn test_fee_tier_cannot_raise_global_fee() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &30u32, &None);
+    bridge.add_asset(&token_id, &None);
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier {
+            min_volume: 0,
+            max_volume: 1_000_000i128,
+            fee_bps: 100,
+        }],
+    );
+    bridge.set_fee_tiers(&tiers);
+    mint_tokens(&env, &token_id, &user, 10_000i128);
+
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &10_000i128, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &target), 9_970i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 30i128);
+}
+
 #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_referral_fund_mints_loyalty() {
@@ -4816,7 +4901,7 @@ fn test_emergency_migrate_basic() {
 
     // Call emergency_migrate as admin
     env.mock_all_auths();
-    bridge.emergency_migrate(&new_contract, &true);
+    bridge.emergency_migrate(&new_contract, &true, &None);
 
     // Verify it is deactivated by trying to call pause/unpause/set_minimum_amount
     assert_eq!(
@@ -4848,7 +4933,7 @@ fn test_emergency_migrate_basic() {
         Err(Ok(BridgeError::ContractDeactivated))
     );
     assert_eq!(
-        bridge.try_emergency_migrate(&new_contract, &true),
+        bridge.try_emergency_migrate(&new_contract, &true, &None),
         Err(Ok(BridgeError::ContractDeactivated))
     );
 
@@ -4871,7 +4956,7 @@ fn test_emergency_migrate_non_admin_rejected() {
     // Clear all mocked auths so emergency_migrate is called without admin authorization.
     use soroban_sdk::xdr::SorobanAuthorizationEntry;
     env.set_auths(&[] as &[SorobanAuthorizationEntry]);
-    bridge.emergency_migrate(&new_contract, &true);
+    bridge.emergency_migrate(&new_contract, &true, &None);
 }
 
 /********** Meta-fund pubkey/source binding **********/
