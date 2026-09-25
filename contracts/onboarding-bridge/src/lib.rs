@@ -4317,7 +4317,8 @@ impl OnboardingBridge {
             return Err(BridgeError::Unauthorized);
         }
 
-        // Verify the domain-separated commitment before moving funds.
+        // Verify the domain-separated commitment before moving funds. The daily
+        // limit is checked only here because the amount is hidden at commit time.
         let mut preimage = Bytes::new(&env);
         preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
         let contract_str = env.current_contract_address().to_string();
@@ -4345,6 +4346,7 @@ impl OnboardingBridge {
             return Err(BridgeError::InvalidAmount);
         }
 
+        check_daily_limit(&env, &source, &asset, amount)?;
         source.require_auth();
 
         // Mark revealed before the transfer to prevent re-entrancy replay.
