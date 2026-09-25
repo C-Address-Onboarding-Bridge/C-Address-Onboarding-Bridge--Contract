@@ -3798,6 +3798,34 @@ fn test_fund_with_referral_zero_referral_rate() {
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 10i128);
 }
 
+#[test]
+fn test_fee_tier_cannot_raise_global_fee() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &30u32, &None);
+    bridge.add_asset(&token_id, &None);
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier {
+            min_volume: 0,
+            max_volume: 1_000_000i128,
+            fee_bps: 100,
+        }],
+    );
+    bridge.set_fee_tiers(&tiers);
+    mint_tokens(&env, &token_id, &user, 10_000i128);
+
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &10_000i128, &None, &None);
+
+    assert_eq!(check_balance(&env, &token_id, &target), 9_970i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 30i128);
+}
+
 #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_referral_fund_mints_loyalty() {

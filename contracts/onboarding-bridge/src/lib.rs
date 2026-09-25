@@ -26,7 +26,7 @@
 //! fee       = floor(amount × fee_bps / 10_000)
 //! net       = amount − fee
 //! effective = min(global_fee_bps, asset_fee_cap)
-//! tiered    = looked up by source's cumulative bridged volume
+//! tiered    = min(global_fee_bps, matching volume-tier fee, asset_fee_cap)
 //! ```
 //!
 //! ## Access Control
@@ -345,8 +345,8 @@ pub struct MigrationAssetState {
 /// A volume-based fee tier.
 ///
 /// If a source address's cumulative bridged volume falls within
-/// `[min_volume, max_volume]`, its effective fee is `fee_bps` rather than the
-/// global rate.
+/// `[min_volume, max_volume]`, its fee is capped at the tier's `fee_bps` in
+/// addition to the global and per-asset caps.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeTier {
@@ -1199,7 +1199,7 @@ fn get_tiered_fee_bps(env: &Env, source: &Address, fallback_bps: u32) -> u32 {
         for i in 0..tiers.len() {
             let tier = tiers.get(i).unwrap();
             if volume >= tier.min_volume && volume <= tier.max_volume {
-                return tier.fee_bps;
+                return fallback_bps.min(tier.fee_bps);
             }
         }
     }
