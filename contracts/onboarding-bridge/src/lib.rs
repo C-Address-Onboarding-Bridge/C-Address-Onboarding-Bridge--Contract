@@ -255,6 +255,8 @@ pub enum DataKey {
     Deactivated,
     // Admin-managed whitelist of DEX pool addresses usable in `swap_route`.
     PoolWhitelist,
+    AssetWhitelistEntry(Address),
+    PoolWhitelistEntry(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +457,7 @@ fn read_pending_admin(env: &Env) -> Option<Address> {
     env.storage().instance().get(&DataKey::PendingAdmin)
 }
 
-fn clear_pending_admin(env: &Env) {
+fn remove_pending_admin(env: &Env) {
     env.storage().instance().remove(&DataKey::PendingAdmin);
 }
 
@@ -469,7 +471,7 @@ fn read_pending_fee_collector(env: &Env) -> Option<Address> {
     env.storage().instance().get(&DataKey::PendingFeeCollector)
 }
 
-fn clear_pending_fee_collector(env: &Env) {
+fn remove_pending_fee_collector(env: &Env) {
     env.storage()
         .instance()
         .remove(&DataKey::PendingFeeCollector);
@@ -714,23 +716,21 @@ fn check_access(env: &Env, target: &Address) -> Result<(), BridgeError> {
     Ok(())
 }
 
-#[inline(never)]
-fn read_whitelist(env: &Env) -> Map<Address, bool> {
+fn read_whitelist(env: &Env, asset: &Address) -> bool {
     env.storage()
         .instance()
-        .get(&DataKey::AssetWhitelist)
-        .unwrap_or_else(|| Map::new(env))
+        .get(&DataKey::AssetWhitelistEntry(asset.clone()))
+        .unwrap_or(false)
 }
 
-#[inline(never)]
-fn save_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
+fn save_whitelist(env: &Env, asset: &Address, whitelisted: bool) {
     env.storage()
         .instance()
-        .set(&DataKey::AssetWhitelist, whitelist);
+        .set(&DataKey::AssetWhitelistEntry(asset.clone()), &whitelisted);
 }
 
 fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError> {
-    if !read_whitelist(env).get(asset.clone()).unwrap_or(false) {
+    if !read_whitelist(env, asset) {
         return Err(BridgeError::AssetNotWhitelisted);
     }
     Ok(())
@@ -738,23 +738,21 @@ fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError
 
 // fund_c_address_with_swap must not invoke arbitrary caller-supplied pool
 // addresses. Mirrors the asset whitelist pattern above.
-#[inline(never)]
-fn read_pool_whitelist(env: &Env) -> Map<Address, bool> {
+fn read_pool_whitelist(env: &Env, pool: &Address) -> bool {
     env.storage()
         .instance()
-        .get(&DataKey::PoolWhitelist)
-        .unwrap_or_else(|| Map::new(env))
+        .get(&DataKey::PoolWhitelistEntry(pool.clone()))
+        .unwrap_or(false)
 }
 
-#[inline(never)]
-fn save_pool_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
+fn save_pool_whitelist(env: &Env, pool: &Address, whitelisted: bool) {
     env.storage()
         .instance()
-        .set(&DataKey::PoolWhitelist, whitelist);
+        .set(&DataKey::PoolWhitelistEntry(pool.clone()), &whitelisted);
 }
 
 fn check_pool_whitelisted(env: &Env, pool: &Address) -> Result<(), BridgeError> {
-    if !read_pool_whitelist(env).get(pool.clone()).unwrap_or(false) {
+    if !read_pool_whitelist(env, pool) {
         return Err(BridgeError::PoolNotWhitelisted);
     }
     Ok(())
@@ -1968,7 +1966,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -1983,7 +1981,7 @@ impl OnboardingBridge {
     pub fn accept_fee_collector(env: Env) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
+        check_not_deactivated(&env)?;
         let pending = read_pending_fee_collector(&env).ok_or(BridgeError::Unauthorized)?;
         pending.require_auth();
         extend_instance_ttl(&env);
@@ -1992,7 +1990,7 @@ impl OnboardingBridge {
         let mut config = read_bridge_config(&env);
         config.fee_collector = pending.clone();
         save_bridge_config(&env, &config);
-        clear_pending_fee_collector(&env);
+        remove_pending_fee_collector(&env);
         env.events()
             .publish(("FeeCollectorTransferred", old_collector, pending), ());
         Ok(())
@@ -2029,7 +2027,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -2044,7 +2042,7 @@ impl OnboardingBridge {
     pub fn accept_admin(env: Env) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
+        check_not_deactivated(&env)?;
         let pending = read_pending_admin(&env).ok_or(BridgeError::Unauthorized)?;
         pending.require_auth();
         extend_instance_ttl(&env);
@@ -2053,7 +2051,7 @@ impl OnboardingBridge {
         let mut config = read_bridge_config(&env);
         config.admin = pending.clone();
         save_bridge_config(&env, &config);
-        clear_pending_admin(&env);
+        remove_pending_admin(&env);
         env.events()
             .publish(("AdminTransferred", old_admin, pending), ());
         Ok(())
@@ -2063,12 +2061,49 @@ impl OnboardingBridge {
         read_pending_admin(&env)
     }
 
+    /// Cancels a pending admin handoff.
+    pub fn clear_pending_admin(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_deactivated(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        read_pending_admin(&env).ok_or(BridgeError::Unauthorized)?;
+        remove_pending_admin(&env);
+        extend_instance_ttl(&env);
+        env.events().publish(("AdminTransferCancelled",), (admin,));
+        Ok(())
+    }
+
+    /// Cancels a pending fee-collector handoff.
+    pub fn clear_pending_fee_collector(
+        env: Env,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_not_deactivated(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        read_pending_fee_collector(&env).ok_or(BridgeError::Unauthorized)?;
+        remove_pending_fee_collector(&env);
+        extend_instance_ttl(&env);
+        env.events()
+            .publish(("FeeCollectorTransferCancelled",), (admin,));
+        Ok(())
+    }
+
     pub fn set_minimum_amount(
         env: Env,
         amount: i128,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        if amount < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;

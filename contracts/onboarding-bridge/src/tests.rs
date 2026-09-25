@@ -5524,6 +5524,38 @@ fn test_set_max_withdraw_per_tx_updates_limit() {
     assert_eq!(bridge.query_max_withdraw_per_tx(), 0i128);
 }
 
+#[test]
+fn test_set_max_withdraw_per_tx_rejects_negative_limit() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert_eq!(
+        bridge.try_set_max_withdraw_per_tx(&-1i128, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+    assert_eq!(bridge.query_max_withdraw_per_tx(), 0i128);
+}
+
+#[test]
+fn test_set_minimum_amount_rejects_negative_limit() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert_eq!(
+        bridge.try_set_minimum_amount(&-1i128, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+    assert_eq!(bridge.query_minimum_amount(), 0i128);
+}
+
 /********** accept_admin tests **********/
 
 #[test]
@@ -5592,7 +5624,7 @@ fn test_accept_admin_before_initialize_fails() {
 }
 
 #[test]
-fn test_accept_admin_while_paused_fails() {
+fn test_accept_admin_while_paused_succeeds() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
     let (bridge_id, _) = register_all_contracts_mocked(&env);
@@ -5603,10 +5635,24 @@ fn test_accept_admin_while_paused_fails() {
     bridge.propose_new_admin(&new_admin, &None);
     bridge.pause(&None);
 
-    assert_eq!(
-        bridge.try_accept_admin(),
-        Err(Ok(BridgeError::ContractPaused))
-    );
+    bridge.accept_admin();
+    assert_eq!(bridge.query_admin(), new_admin);
+}
+
+#[test]
+fn test_accept_fee_collector_while_paused_succeeds() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_collector = Address::generate(&env);
+    bridge.propose_new_fee_collector(&new_collector, &None);
+    bridge.pause(&None);
+
+    bridge.accept_fee_collector();
+    assert_eq!(bridge.query_fee_collector(), new_collector);
 }
 
 // Boundary: the pending slot is cleared on acceptance, so a second accept
@@ -5627,6 +5673,34 @@ fn test_accept_admin_cannot_be_reused_after_acceptance() {
         bridge.try_accept_admin(),
         Err(Ok(BridgeError::Unauthorized))
     );
+}
+
+#[test]
+fn test_clear_pending_admin_cancels_handoff() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.propose_new_admin(&Address::generate(&env), &None);
+    bridge.clear_pending_admin(&None);
+
+    assert_eq!(bridge.query_pending_admin(), None);
+}
+
+#[test]
+fn test_clear_pending_fee_collector_cancels_handoff() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.propose_new_fee_collector(&Address::generate(&env), &None);
+    bridge.clear_pending_fee_collector(&None);
+
+    assert_eq!(bridge.query_pending_fee_collector(), None);
 }
 
 /********** extend_timelock_ttl tests **********/
