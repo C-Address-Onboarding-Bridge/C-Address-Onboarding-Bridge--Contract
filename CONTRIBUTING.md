@@ -42,11 +42,15 @@ Ensure you have the following installed:
    ```
    Edit `.env` with your local configuration (Docker Compose provides defaults for local development).
 
-3. **Install SDK dependencies:**
+3. **Install all workspace dependencies (SDK + relayer):**
    ```bash
-   cd sdk
    npm install
-   cd ..
+   ```
+   This installs both `sdk/` and `relayer/` in one step from the repo root.
+   You can also install each workspace individually:
+   ```bash
+   cd sdk && npm install && cd ..
+   cd relayer && npm install && cd ..
    ```
 
 4. **Start local services:**
@@ -112,6 +116,12 @@ npx tsc --noEmit
 npm run build
 npm test
 cd ..
+
+# Relayer
+cd relayer
+npm install
+npx tsc --noEmit
+cd ..
 ```
 
 ## Building and Testing the SDK
@@ -149,6 +159,10 @@ cd sdk
 npm run lint
 cd ..
 ```
+
+The SDK ESLint setup lives in `sdk/.eslintrc.json` and is installed with the
+SDK dev dependencies. The pre-commit hook lints staged files under `sdk/src/`
+with the same configuration.
 
 ## Code Style Guide
 

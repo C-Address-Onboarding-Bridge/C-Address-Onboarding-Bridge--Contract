@@ -113,6 +113,12 @@ export interface BridgeEventMap {
   FeesWithdrawn: FeesWithdrawnEvent;
   AdminChanged: AdminChangedEvent;
   MetaFundExecuted: MetaFundExecutedEvent;
+  /**
+   * Emitted when the polling loop encounters an RPC error.
+   * Subscribe via `sub.on('error', (err) => { ... })` to detect
+   * persistently-down endpoints.
+   */
+  'error': Error;
   /** Wildcard — receives every event regardless of name */
   '*': BridgeEventPayload;
 }
@@ -248,7 +254,9 @@ export class EventSubscriber {
           this.listeners.delete(eventName);
         }
       }
-      // Stop polling when no listeners remain
+      // Stop polling when no listeners remain (preserve 'error' listeners for
+      // the polling loop — only stop when ALL listeners are gone, including
+      // error listeners).
       if (this.listenerCount() === 0) {
         this.stopPolling();
       }
@@ -288,9 +296,17 @@ export class EventSubscriber {
 
   /**
    * Manually trigger a single poll. Useful in tests or for on-demand refresh.
+   *
+   * If the underlying RPC call rejects, the error is dispatched to registered
+   * 'error' listeners before the exception propagates to the caller.
    */
   async poll(): Promise<void> {
-    await this.fetchAndDispatch();
+    try {
+      await this.fetchAndDispatch();
+    } catch (err) {
+      this.dispatchError(err instanceof Error ? err : new Error(String(err)));
+      throw err;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -300,9 +316,10 @@ export class EventSubscriber {
   private startPolling(): void {
     if (this.intervalHandle !== null) return;
     this.intervalHandle = setInterval(() => {
-      this.fetchAndDispatch().catch(() => {
-        // Swallow polling errors to keep the loop alive. Applications should
-        // add error handling via a dedicated error event if needed.
+      this.fetchAndDispatch().catch((err) => {
+        // Emit to error listeners so consumers can detect persistently-down
+        // RPC endpoints and react (e.g. circuit break, alert, reconnect).
+        this.dispatchError(err instanceof Error ? err : new Error(String(err)));
       });
     }, this.pollingIntervalMs);
   }
@@ -456,6 +473,22 @@ export class EventSubscriber {
     if (wildcard) {
       for (const cb of wildcard) {
         try { cb(payload); } catch { /* isolate handler errors */ }
+      }
+    }
+  }
+
+  /**
+   * Dispatch an error to any registered 'error' listeners.
+   *
+   * This is called on poll failures so consumers can detect persistently-down
+   * RPC endpoints.  Handler errors are isolated so one bad listener doesn't
+   * break others.
+   */
+  private dispatchError(err: Error): void {
+    const errorListeners = this.listeners.get('error');
+    if (errorListeners) {
+      for (const cb of errorListeners) {
+        try { cb(err); } catch { /* isolate handler errors */ }
       }
     }
   }

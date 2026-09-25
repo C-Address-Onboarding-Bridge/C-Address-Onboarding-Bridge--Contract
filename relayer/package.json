@@ -1,0 +1,24 @@
+{
+  "name": "@stellar/c-address-onboarding-bridge-relayer",
+  "version": "0.1.0",
+  "description": "Cross-chain relayer service for the C-Address Onboarding Bridge",
+  "private": true,
+  "main": "index.ts",
+  "scripts": {
+    "start": "ts-node index.ts",
+    "self-test": "ts-node index.ts --self-test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@stellar/c-address-onboarding-bridge-sdk": "*",
+    "@stellar/stellar-sdk": "^12.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0",
+    "ts-node": "^10.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

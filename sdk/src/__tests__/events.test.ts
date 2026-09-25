@@ -159,6 +159,55 @@ describe('EventSubscriber', () => {
       expect(healthy).toHaveBeenCalledTimes(1);
     });
 
+    it('emits error event when the underlying RPC call rejects', async () => {
+      // Use real timers so async/await works naturally with poll()
+      jest.useRealTimers();
+      try {
+        const rpcError = new Error('RPC endpoint down');
+        mockGetEvents.mockRejectedValueOnce(rpcError);
+
+        const errors: Error[] = [];
+        subscriber.on('error', (err: Error) => errors.push(err));
+
+        // poll() dispatches errors and rethrows — catch the throw
+        await subscriber.poll().catch(() => {});
+
+        expect(errors).toHaveLength(1);
+        expect(errors[0]).toBe(rpcError);
+      } finally {
+        jest.useFakeTimers();
+      }
+    });
+
+    it('isolates a throwing error listener from other error listeners', async () => {
+      jest.useRealTimers();
+      try {
+        mockGetEvents.mockRejectedValueOnce(new Error('rpc down'));
+
+        const healthy = jest.fn();
+        subscriber.on('error', () => {
+          throw new Error('handler bug');
+        });
+        subscriber.on('error', healthy);
+
+        await subscriber.poll().catch(() => {});
+
+        expect(healthy).toHaveBeenCalledTimes(1);
+      } finally {
+        jest.useFakeTimers();
+      }
+    });
+
+    it('does not stop the polling loop when an error event fires', async () => {
+      mockGetEvents.mockRejectedValueOnce(new Error('rpc down'));
+      subscriber.on('error', jest.fn());
+
+      jest.advanceTimersByTime(1_000);
+      // The existing test pattern: just verify the loop stays alive (call count)
+      jest.advanceTimersByTime(1_000);
+      expect(mockGetEvents).toHaveBeenCalledTimes(2);
+    });
+
     it('dispatches unknown event names as generic events', async () => {
       mockGetEvents.mockResolvedValue({
         events: [

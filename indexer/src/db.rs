@@ -2,6 +2,32 @@ use crate::events::IndexedEvent;
 use crate::webhook::{CreateSubscription, Subscription, WebhookDelivery};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 
+/// Raw column tuple for a `subscriptions` row, in SELECT order:
+/// id, url, event_type, asset_filter, source_filter, target_filter, active, created_at.
+type SubscriptionRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+    String,
+);
+
+/// Raw column tuple for a `webhook_deliveries` row, in SELECT order:
+/// id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at.
+type WebhookDeliveryRow = (
+    String,
+    String,
+    String,
+    String,
+    i32,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
 pub struct Database {
     pool: SqlitePool,
 }
@@ -95,11 +121,10 @@ impl Database {
     }
 
     pub async fn get_last_ledger(&self) -> Result<Option<i64>, sqlx::Error> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT value FROM indexer_state WHERE key = 'last_ledger'",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM indexer_state WHERE key = 'last_ledger'")
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.map(|(v,)| v.parse().unwrap_or(0)))
     }
 
@@ -114,9 +139,14 @@ impl Database {
         Ok(())
     }
 
-    pub async fn insert_event(&self, event: &IndexedEvent) -> Result<(), sqlx::Error> {
+    /// Insert an event, ignoring it if its id was already indexed.
+    ///
+    /// Returns `true` when a new row was written and `false` when the event was
+    /// a duplicate. Callers use this to avoid re-queuing webhook deliveries for
+    /// an event that has already been delivered.
+    pub async fn insert_event(&self, event: &IndexedEvent) -> Result<bool, sqlx::Error> {
         let data_str = serde_json::to_string(&event.data).unwrap_or_default();
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT OR IGNORE INTO events (id, event_type, ledger_sequence, contract_id, tx_hash, timestamp, data)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
@@ -129,7 +159,7 @@ impl Database {
         .bind(&data_str)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn list_events(
@@ -218,7 +248,7 @@ impl Database {
     }
 
     pub async fn list_subscriptions(&self) -> Result<Vec<Subscription>, sqlx::Error> {
-        let rows: Vec<(String, String, Option<String>, Option<String>, Option<String>, Option<String>, bool, String)> =
+        let rows: Vec<SubscriptionRow> =
             sqlx::query_as(
                 "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, created_at
                  FROM subscriptions WHERE active = 1",
@@ -228,8 +258,8 @@ impl Database {
 
         Ok(rows
             .into_iter()
-            .map(|(id, url, event_type, asset_filter, source_filter, target_filter, active, created_at)| {
-                Subscription {
+            .map(
+                |(
                     id,
                     url,
                     event_type,
@@ -238,8 +268,19 @@ impl Database {
                     target_filter,
                     active,
                     created_at,
-                }
-            })
+                )| {
+                    Subscription {
+                        id,
+                        url,
+                        event_type,
+                        asset_filter,
+                        source_filter,
+                        target_filter,
+                        active,
+                        created_at,
+                    }
+                },
+            )
             .collect())
     }
 
@@ -251,10 +292,7 @@ impl Database {
         Ok(())
     }
 
-    pub async fn queue_webhook_deliveries(
-        &self,
-        event: &IndexedEvent,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn queue_webhook_deliveries(&self, event: &IndexedEvent) -> Result<(), sqlx::Error> {
         let subs = self.list_subscriptions().await?;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -305,7 +343,7 @@ impl Database {
 
     pub async fn get_pending_deliveries(&self) -> Result<Vec<WebhookDelivery>, sqlx::Error> {
         let now = chrono::Utc::now().to_rfc3339();
-        let rows: Vec<(String, String, String, String, i32, Option<String>, Option<String>, String)> =
+        let rows: Vec<WebhookDeliveryRow> =
             sqlx::query_as(
                 "SELECT id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at
                  FROM webhook_deliveries
@@ -318,8 +356,8 @@ impl Database {
 
         Ok(rows
             .into_iter()
-            .map(|(id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at)| {
-                WebhookDelivery {
+            .map(
+                |(
                     id,
                     subscription_id,
                     event_id,
@@ -328,8 +366,19 @@ impl Database {
                     next_retry_at,
                     last_error,
                     created_at,
-                }
-            })
+                )| {
+                    WebhookDelivery {
+                        id,
+                        subscription_id,
+                        event_id,
+                        status,
+                        attempts,
+                        next_retry_at,
+                        last_error,
+                        created_at,
+                    }
+                },
+            )
             .collect())
     }
 
@@ -395,10 +444,9 @@ impl Database {
     }
 
     pub async fn get_stats(&self) -> Result<serde_json::Value, sqlx::Error> {
-        let total_events: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM events")
-                .fetch_one(&self.pool)
-                .await?;
+        let total_events: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events")
+            .fetch_one(&self.pool)
+            .await?;
 
         let total_subs: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM subscriptions WHERE active = 1")
@@ -452,5 +500,100 @@ fn row_to_event(
         tx_hash,
         timestamp,
         data: serde_json::from_str(&data).unwrap_or(serde_json::Value::Null),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::IndexedEvent;
+
+    /// Create an in-memory SQLite database and run migrations.
+    async fn setup_db() -> Database {
+        let db = Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        db
+    }
+
+    /// Build a minimal `IndexedEvent` with the given id.
+    fn make_event(id: &str) -> IndexedEvent {
+        IndexedEvent {
+            id: id.to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 100,
+            contract_id: "CONTRACT_A".to_string(),
+            tx_hash: "deadbeef".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({ "amount": "1000" }),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 2 — INSERT OR IGNORE deduplication
+    // -----------------------------------------------------------------------
+
+    /// Inserting the same event twice must be a no-op: only one row should exist.
+    #[tokio::test]
+    async fn test_insert_duplicate_event_is_ignored() {
+        let db = setup_db().await;
+        let event = make_event("evt-001");
+
+        db.insert_event(&event).await.expect("first insert");
+        // Second insert of the same id should silently do nothing (INSERT OR IGNORE).
+        db.insert_event(&event)
+            .await
+            .expect("duplicate insert must not error");
+
+        let rows = db.list_events(10, 0).await.expect("list_events");
+        assert_eq!(rows.len(), 1, "duplicate insert must leave exactly one row");
+        assert_eq!(rows[0].id, "evt-001");
+    }
+
+    /// Two events with *different* ids must both persist.
+    #[tokio::test]
+    async fn test_insert_two_distinct_events_both_persist() {
+        let db = setup_db().await;
+
+        db.insert_event(&make_event("evt-001"))
+            .await
+            .expect("first insert");
+        db.insert_event(&make_event("evt-002"))
+            .await
+            .expect("second insert");
+
+        let rows = db.list_events(10, 0).await.expect("list_events");
+        assert_eq!(rows.len(), 2, "two distinct events must both be stored");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 2 — Deterministic ID from parse_contract_event (regression guard)
+    // -----------------------------------------------------------------------
+
+    /// `parse_contract_event` must produce the same id when called twice with
+    /// the identical raw event payload.  If it generates a random UUID every
+    /// time, this test will fail — which is exactly the bug this PR fixes.
+    #[test]
+    fn test_parse_contract_event_produces_deterministic_id() {
+        use crate::poller::parse_contract_event_for_test;
+
+        let raw = serde_json::json!({
+            "topic": ["CAddressFunded", "GSOURCE", "CTARGET"],
+            "ledger": 42,
+            "txHash": "abcdef1234567890",
+            "createdAt": "2024-01-01T00:00:00Z",
+            "value": { "amount": "500" }
+        });
+
+        let id1 = parse_contract_event_for_test(&raw, "CONTRACT_A")
+            .expect("first parse must succeed")
+            .id;
+        let id2 = parse_contract_event_for_test(&raw, "CONTRACT_A")
+            .expect("second parse must succeed")
+            .id;
+
+        assert_eq!(
+            id1, id2,
+            "parse_contract_event must produce the same id for the same input"
+        );
     }
 }

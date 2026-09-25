@@ -4,7 +4,8 @@
   "description": "C-Address Onboarding Bridge - Soroban smart contract + TypeScript SDK",
   "private": true,
   "workspaces": [
-    "sdk"
+    "sdk",
+    "relayer"
   ],
   "engines": {
     "node": ">=18.0.0",

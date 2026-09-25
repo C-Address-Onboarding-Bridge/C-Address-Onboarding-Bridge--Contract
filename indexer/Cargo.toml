@@ -1,3 +1,9 @@
+# The root Cargo workspace builds only the Soroban contract, so the indexer is
+# its own workspace root. Without this, `cargo build`/`cargo test` in this
+# directory fails with "current package believes it's in a workspace when it's
+# not".
+[workspace]
+
 [package]
 name = "bridge-indexer"
 version = "0.1.0"
@@ -5,6 +11,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 reqwest = { version = "0.11", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -17,3 +24,4 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.21"
 hex = "0.4"
+url = "2"

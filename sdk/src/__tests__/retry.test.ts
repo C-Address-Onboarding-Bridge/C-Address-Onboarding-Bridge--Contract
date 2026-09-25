@@ -132,6 +132,74 @@ describe('withRetry', () => {
     expect(onRetry).toHaveBeenCalledTimes(3);
   });
 
+  it('does not run the operation at all when the signal is already aborted', async () => {
+    const { sleep } = recordingSleep();
+    const controller = new AbortController();
+    controller.abort();
+    const fn = jest.fn().mockResolvedValue('ok');
+
+    await expect(withRetry(fn, { sleep, signal: controller.signal })).rejects.toThrow();
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('stops retrying once the signal is aborted between attempts', async () => {
+    const controller = new AbortController();
+    const fn = jest.fn().mockRejectedValue(RETRYABLE);
+    // Abort while the first backoff is pending.
+    const sleep = jest.fn(async () => {
+      controller.abort();
+    });
+
+    await expect(
+      withRetry(fn, { sleep, maxRetries: 5, signal: controller.signal }),
+    ).rejects.toThrow();
+    // Initial attempt only — the abort lands before the second one starts.
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('interrupts a long backoff instead of waiting it out', async () => {
+    const controller = new AbortController();
+    const fn = jest.fn().mockRejectedValue(RETRYABLE);
+    // A real 30s sleep: the test only finishes promptly if the abort cuts it short.
+    const start = Date.now();
+
+    const promise = withRetry(fn, {
+      maxRetries: 3,
+      baseDelayMs: 30000,
+      maxDelayMs: 30000,
+      jitter: false,
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(), 10);
+
+    await expect(promise).rejects.toThrow();
+    expect(Date.now() - start).toBeLessThan(1000);
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects with the abort reason when one is supplied', async () => {
+    const { sleep } = recordingSleep();
+    const reason = new Error('component unmounted');
+    const controller = new AbortController();
+    const fn = jest.fn().mockRejectedValue(RETRYABLE);
+
+    const promise = withRetry(fn, { sleep, maxRetries: 5, signal: controller.signal });
+    controller.abort(reason);
+
+    await expect(promise).rejects.toThrow('component unmounted');
+  });
+
+  it('leaves unaborted retries untouched', async () => {
+    const { sleep, delays } = recordingSleep();
+    const controller = new AbortController();
+    const fn = jest.fn().mockRejectedValueOnce(RETRYABLE).mockResolvedValue('ok');
+
+    await expect(
+      withRetry(fn, { sleep, jitter: false, signal: controller.signal }),
+    ).resolves.toBe('ok');
+    expect(delays).toEqual([1000]);
+  });
+
   it('honours maxRetries: 0 (retries disabled)', async () => {
     const { sleep } = recordingSleep();
     const fn = jest.fn().mockRejectedValue(RETRYABLE);

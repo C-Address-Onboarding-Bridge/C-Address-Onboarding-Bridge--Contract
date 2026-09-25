@@ -63,3 +63,31 @@ export function assertContractAddress(address: string, field: string): void {
     );
   }
 }
+
+/**
+ * Assert that `pubkeyHex` is a valid 32-byte Ed25519 public key as a lowercase
+ * hex string (64 hex characters).
+ *
+ * Throws an {@link Error} with a descriptive message including `field` if
+ * validation fails.
+ *
+ * @param pubkeyHex - The hex-encoded public key to validate.
+ * @param field     - A human-readable field name used in the error message
+ *                    (e.g. `'pubkey'`).
+ *
+ * @throws {Error} When `pubkeyHex` is not a 64-character lowercase hex string.
+ *
+ * @example
+ * ```ts
+ * assertRelayerPubkey('00'.repeat(32), 'pubkey');   // passes silently
+ * assertRelayerPubkey('short', 'pubkey');            // throws
+ * assertRelayerPubkey('GG...invalid...', 'pubkey');  // throws
+ * ```
+ */
+export function assertRelayerPubkey(pubkeyHex: string, field: string): void {
+  if (typeof pubkeyHex !== 'string' || !/^[0-9a-f]{64}$/.test(pubkeyHex)) {
+    throw new Error(
+      `Invalid relayer pubkey for "${field}": expected a 64-character lowercase hex string (32 bytes), got "${pubkeyHex}"`,
+    );
+  }
+}

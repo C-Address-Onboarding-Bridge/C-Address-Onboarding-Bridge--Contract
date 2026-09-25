@@ -367,6 +367,42 @@ describe('OffRampIntegration', () => {
       expect(comparison.banxa).toBeUndefined();
     });
 
+    it('throws for malformed amount (non-numeric)', () => {
+      const offramp = new OffRampIntegration({});
+
+      expect(() => offramp.compareProviders('abc', 'XLM', 'USD'))
+        .toThrow(/amount must be a well-formed positive numeric string/);
+    });
+
+    it('throws for empty amount string', () => {
+      const offramp = new OffRampIntegration({});
+
+      expect(() => offramp.compareProviders('', 'XLM', 'USD'))
+        .toThrow(/amount must be a well-formed positive numeric string/);
+    });
+
+    it('throws for negative amount', () => {
+      const offramp = new OffRampIntegration({});
+
+      expect(() => offramp.compareProviders('-100', 'XLM', 'USD'))
+        .toThrow(/amount must be a well-formed positive numeric string/);
+    });
+
+    it('throws for zero amount', () => {
+      const offramp = new OffRampIntegration({});
+
+      expect(() => offramp.compareProviders('0', 'XLM', 'USD'))
+        .toThrow(/amount must be a well-formed positive numeric string/);
+    });
+
+    it('does not throw for valid amount formats', () => {
+      const offramp = new OffRampIntegration({});
+
+      expect(() => offramp.compareProviders('100', 'XLM', 'USD')).not.toThrow();
+      expect(() => offramp.compareProviders('100.50', 'XLM', 'USD')).not.toThrow();
+      expect(() => offramp.compareProviders('0.01', 'XLM', 'USD')).not.toThrow();
+    });
+
     it('returns empty when no provider supports asset/fiat combo', () => {
       const offramp = new OffRampIntegration({});
       
@@ -460,6 +496,54 @@ describe('OffRampIntegration', () => {
       expect(url).toContain('apiKey=');
     });
 
+    it('getOnRampUrl rejects invalid cAddress format', () => {
+      const offramp = new OffRampIntegration({ moonpayApiKey: 'test', testMode: false });
+
+      expect(() => offramp.getOnRampUrl({
+        provider: 'moonpay',
+        amount: '100',
+        fiatCurrency: 'USD',
+        asset: 'XLM',
+        cAddress: 'not-a-c-address',
+      })).toThrow(/Invalid contract address for "cAddress"/);
+    });
+
+    it('getOnRampUrl rejects G-address as cAddress', () => {
+      const offramp = new OffRampIntegration({ moonpayApiKey: 'test', testMode: false });
+
+      expect(() => offramp.getOnRampUrl({
+        provider: 'moonpay',
+        amount: '100',
+        fiatCurrency: 'USD',
+        asset: 'XLM',
+        cAddress: SOURCE_G_ADDRESS,
+      })).toThrow(/Invalid contract address for "cAddress"/);
+    });
+
+    it('getOffRampUrl rejects invalid gAddress format', () => {
+      const offramp = new OffRampIntegration({ moonpayApiKey: 'test', testMode: false });
+
+      expect(() => offramp.getOffRampUrl({
+        provider: 'moonpay',
+        amount: '100',
+        asset: 'XLM',
+        fiatCurrency: 'USD',
+        gAddress: 'not-a-g-address',
+      })).toThrow(/Invalid account address for "gAddress"/);
+    });
+
+    it('getOffRampUrl rejects C-address as gAddress', () => {
+      const offramp = new OffRampIntegration({ moonpayApiKey: 'test', testMode: false });
+
+      expect(() => offramp.getOffRampUrl({
+        provider: 'moonpay',
+        amount: '100',
+        asset: 'XLM',
+        fiatCurrency: 'USD',
+        gAddress: TARGET_C_ADDRESS,
+      })).toThrow(/Invalid account address for "gAddress"/);
+    });
+
     it('getOffRampUrl works without api keys', () => {
       const offramp = new OffRampIntegration({ testMode: false });
       
@@ -488,12 +572,12 @@ describe('OffRampIntegration', () => {
     it('compareProviders handles edge cases', () => {
       const offramp = new OffRampIntegration({});
       
-      // Zero amount
-      let comparison = offramp.compareProviders('0', 'XLM', 'USD');
-      expect(comparison.moonpay?.feeAmount).toBe('0.00');
-      
+      // Zero amount now throws (validated as non-positive)
+      expect(() => offramp.compareProviders('0', 'XLM', 'USD'))
+        .toThrow(/amount must be a well-formed positive numeric string/);
+
       // Very large amount - floating point precision may vary
-      comparison = offramp.compareProviders('999999999', 'XLM', 'USD');
+      let comparison = offramp.compareProviders('999999999', 'XLM', 'USD');
       expect(parseFloat(comparison.moonpay?.feeAmount || '0')).toBeCloseTo(44999999.96, 1);
       
       // Decimal amount
