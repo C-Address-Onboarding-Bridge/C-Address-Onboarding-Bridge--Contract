@@ -104,7 +104,7 @@ graph TD
 | Access control | `query_allowlist_mode` | Check whether allowlist mode is enabled |
 | Asset and pool lists | `add_asset` | Whitelist a token asset |
 | Asset and pool lists | `remove_asset` | Remove a token asset from the whitelist |
-| Asset and pool lists | `query_is_asset_whitelisted` | Check whether an asset is whitelisted |
+| Asset and pool lists | `query_is_asset_whitelisted` | Check whether an asset is whitelisted using a per-address storage entry |
 | Asset and pool lists | `query_whitelisted_assets` | List whitelisted assets |
 | Asset and pool lists | `add_swap_pool` | Whitelist a swap pool |
 | Asset and pool lists | `remove_swap_pool` | Remove a swap pool from the whitelist |

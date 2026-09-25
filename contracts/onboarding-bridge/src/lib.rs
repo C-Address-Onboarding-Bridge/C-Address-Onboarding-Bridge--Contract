@@ -255,6 +255,8 @@ pub enum DataKey {
     Deactivated,
     // Admin-managed whitelist of DEX pool addresses usable in `swap_route`.
     PoolWhitelist,
+    AssetWhitelistEntry(Address),
+    PoolWhitelistEntry(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -714,23 +716,21 @@ fn check_access(env: &Env, target: &Address) -> Result<(), BridgeError> {
     Ok(())
 }
 
-#[inline(never)]
-fn read_whitelist(env: &Env) -> Map<Address, bool> {
+fn read_whitelist(env: &Env, asset: &Address) -> bool {
     env.storage()
         .instance()
-        .get(&DataKey::AssetWhitelist)
-        .unwrap_or_else(|| Map::new(env))
+        .get(&DataKey::AssetWhitelistEntry(asset.clone()))
+        .unwrap_or(false)
 }
 
-#[inline(never)]
-fn save_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
+fn save_whitelist(env: &Env, asset: &Address, whitelisted: bool) {
     env.storage()
         .instance()
-        .set(&DataKey::AssetWhitelist, whitelist);
+        .set(&DataKey::AssetWhitelistEntry(asset.clone()), &whitelisted);
 }
 
 fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError> {
-    if !read_whitelist(env).get(asset.clone()).unwrap_or(false) {
+    if !read_whitelist(env, asset) {
         return Err(BridgeError::AssetNotWhitelisted);
     }
     Ok(())
@@ -738,23 +738,21 @@ fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError
 
 // fund_c_address_with_swap must not invoke arbitrary caller-supplied pool
 // addresses. Mirrors the asset whitelist pattern above.
-#[inline(never)]
-fn read_pool_whitelist(env: &Env) -> Map<Address, bool> {
+fn read_pool_whitelist(env: &Env, pool: &Address) -> bool {
     env.storage()
         .instance()
-        .get(&DataKey::PoolWhitelist)
-        .unwrap_or_else(|| Map::new(env))
+        .get(&DataKey::PoolWhitelistEntry(pool.clone()))
+        .unwrap_or(false)
 }
 
-#[inline(never)]
-fn save_pool_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
+fn save_pool_whitelist(env: &Env, pool: &Address, whitelisted: bool) {
     env.storage()
         .instance()
-        .set(&DataKey::PoolWhitelist, whitelist);
+        .set(&DataKey::PoolWhitelistEntry(pool.clone()), &whitelisted);
 }
 
 fn check_pool_whitelisted(env: &Env, pool: &Address) -> Result<(), BridgeError> {
-    if !read_pool_whitelist(env).get(pool.clone()).unwrap_or(false) {
+    if !read_pool_whitelist(env, pool) {
         return Err(BridgeError::PoolNotWhitelisted);
     }
     Ok(())
@@ -3223,9 +3221,7 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
-        let mut whitelist = read_whitelist(&env);
-        whitelist.set(asset, true);
-        save_whitelist(&env, &whitelist);
+        save_whitelist(&env, &asset, true);
         Ok(())
     }
 
