@@ -2564,6 +2564,7 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
 
         set_paused(&env, true);
+        extend_instance_ttl(&env);
 
         env.events().publish(("ContractPaused",), (admin,));
         Ok(())
@@ -2594,6 +2595,7 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
 
         set_paused(&env, false);
+        extend_instance_ttl(&env);
 
         env.events().publish(("ContractUnpaused",), (admin,));
         Ok(())
@@ -2928,6 +2930,7 @@ impl OnboardingBridge {
         env.storage()
             .persistent()
             .set(&DataKey::Blocked(address), &true);
+        extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -2959,6 +2962,7 @@ impl OnboardingBridge {
         env.storage()
             .persistent()
             .remove(&DataKey::Blocked(address));
+        extend_instance_ttl(&env);
 
         Ok(())
     }
@@ -2994,6 +2998,7 @@ impl OnboardingBridge {
         env.storage()
             .persistent()
             .set(&DataKey::Allowlisted(address), &true);
+        extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -3028,6 +3033,7 @@ impl OnboardingBridge {
         env.storage()
             .persistent()
             .remove(&DataKey::Allowlisted(address));
+        extend_instance_ttl(&env);
 
         Ok(())
     }
@@ -3063,6 +3069,7 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         set_allowlist_mode_flag(&env, enabled);
+        extend_instance_ttl(&env);
         Ok(())
     }
 
