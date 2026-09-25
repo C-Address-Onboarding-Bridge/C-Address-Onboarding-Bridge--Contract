@@ -183,6 +183,8 @@ pub enum BridgeError {
     InvalidTtl = 48,
     /// The supplied pubkey is not the registered meta-signer for `source`.
     MetaTxPubkeySourceMismatch = 49,
+    /// The meta-transaction network identifier is not configured.
+    MetaTxNetworkIdNotConfigured = 50,
     // Next free discriminant: 50. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
@@ -252,6 +254,7 @@ pub enum DataKey {
     // Registry binding a source address to the one Ed25519 pubkey it will
     // accept meta-transaction signatures from.
     MetaSigner(Address),
+    MetaTxNetworkId,
     Deactivated,
     // Admin-managed whitelist of DEX pool addresses usable in `swap_route`.
     PoolWhitelist,
@@ -1042,6 +1045,10 @@ fn read_meta_signer(env: &Env, source: &Address) -> Option<BytesN<32>> {
     env.storage()
         .persistent()
         .get(&DataKey::MetaSigner(source.clone()))
+}
+
+fn read_meta_tx_network_id(env: &Env) -> Option<BytesN<32>> {
+    env.storage().instance().get(&DataKey::MetaTxNetworkId)
 }
 
 fn relayer_threshold(env: &Env) -> u32 {
@@ -4598,6 +4605,23 @@ impl OnboardingBridge {
         read_meta_signer(&env, &source)
     }
 
+    /// Configures the network identifier included in every meta-transaction
+    /// signature. The value should be the canonical identifier of the network
+    /// where this contract is deployed.
+    pub fn set_meta_tx_network_id(
+        env: Env,
+        network_id: BytesN<32>,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::MetaTxNetworkId, &network_id);
+        extend_instance_ttl(&env);
+        Ok(())
+    }
+
     /// Execute a fund_c_address on behalf of a user who signed the parameters
     /// off-chain.
     ///
@@ -4607,6 +4631,8 @@ impl OnboardingBridge {
     ///    ```text
     ///    payload = sha256(
     ///        "meta_fund"           (8 bytes, ASCII)
+    ///        || network_id         (32 bytes)
+    ///        || current_contract_address (address bytes)
     ///        || source_strkey      (sha256 of strkey bytes, 32 bytes)
     ///        || target_strkey      (sha256 of strkey bytes, 32 bytes)
     ///        || asset_strkey       (sha256 of strkey bytes, 32 bytes)
@@ -4702,12 +4728,28 @@ impl OnboardingBridge {
             _ => return Err(BridgeError::MetaTxPubkeySourceMismatch),
         }
 
-        // 5. Build canonical payload hash and verify signature
-        //    payload = sha256(domain || source_hash || target_hash || asset_hash
-        //                     || amount_be16 || nonce_be8 || deadline_be8)
-        let domain: soroban_sdk::Bytes = soroban_sdk::Bytes::from_slice(&env, b"meta_fund");
+        let network_id =
+            read_meta_tx_network_id(&env).ok_or(BridgeError::MetaTxNetworkIdNotConfigured)?;
+        if params.network_id != network_id {
+            return Err(BridgeError::MetaTxInvalidSignature);
+        }
 
+        // 5. Build canonical payload hash and verify signature
+        //    payload = sha256(domain || network_id || contract_address ||
+        //                     source_hash || target_hash || asset_hash ||
+        //                     amount_be16 || nonce_be8 || deadline_be8)
+        let domain: soroban_sdk::Bytes = soroban_sdk::Bytes::from_slice(&env, b"meta_fund");
         let mut addr_buf = [0u8; MAX_STRKEY_LEN];
+        let contract_address = env.current_contract_address();
+        let contract_str = contract_address.to_string();
+        let contract_len = contract_str.len() as usize;
+        if contract_len > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
+        contract_str.copy_into_slice(&mut addr_buf[..contract_len]);
+        let contract_raw =
+            soroban_sdk::Bytes::from_slice(&env, &addr_buf[..contract_len]);
+        let contract_hash: BytesN<32> = env.crypto().sha256(&contract_raw).into();
 
         let src_str = params.source.clone().to_string();
         let slen = src_str.len() as usize;
@@ -4738,6 +4780,8 @@ impl OnboardingBridge {
 
         let mut payload = soroban_sdk::Bytes::new(&env);
         payload.append(&domain);
+        payload.append(&network_id.clone().into());
+        payload.append(&contract_hash.into());
         payload.append(&src_hash.into());
         payload.append(&tgt_hash.into());
         payload.append(&ast_hash.into());
@@ -4821,6 +4865,8 @@ impl OnboardingBridge {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetaFundParams {
+    /// Network identifier configured by the bridge admin.
+    pub network_id: BytesN<32>,
     /// The user's Stellar address (source of funds). `pubkey` must be the key
     /// registered for this address via `register_meta_signer` — enforced by
     /// `execute_meta_fund`, not merely documented here.

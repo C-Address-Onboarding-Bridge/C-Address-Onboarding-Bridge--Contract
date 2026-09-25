@@ -4570,6 +4570,7 @@ fn test_meta_fund_rejects_pubkey_source_mismatch() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
+    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
@@ -4589,6 +4590,7 @@ fn test_meta_fund_rejects_pubkey_source_mismatch() {
     let bogus_signature = BytesN::from_array(&env, &[0u8; 64]);
 
     let params = MetaFundParams {
+        network_id: network_id.clone(),
         source: user.clone(),
         target,
         asset: token_id.clone(),
@@ -4615,6 +4617,7 @@ fn test_meta_fund_rejects_unregistered_source() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
+    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
@@ -4626,6 +4629,7 @@ fn test_meta_fund_rejects_unregistered_source() {
     let bogus_signature = BytesN::from_array(&env, &[0u8; 64]);
 
     let params = MetaFundParams {
+        network_id: network_id.clone(),
         source: user.clone(),
         target,
         asset: token_id.clone(),
@@ -4644,6 +4648,7 @@ fn test_meta_fund_rejects_unregistered_source() {
 /// so tests can produce valid Ed25519 signatures.
 fn build_meta_fund_payload_hash(
     env: &Env,
+    network_id: &BytesN<32>,
     source: &Address,
     target: &Address,
     asset: &Address,
@@ -4654,6 +4659,10 @@ fn build_meta_fund_payload_hash(
     let domain = Bytes::from_slice(env, b"meta_fund");
 
     let mut addr_buf = [0u8; 64];
+    let contract_str = env.current_contract_address().to_string();
+    contract_str.copy_into_slice(&mut addr_buf[..contract_str.len() as usize]);
+    let contract_raw = Bytes::from_slice(env, &addr_buf[..contract_str.len() as usize]);
+    let contract_hash: BytesN<32> = env.crypto().sha256(&contract_raw).into();
 
     let src_str = source.clone().to_string();
     let slen = src_str.len() as usize;
@@ -4675,6 +4684,8 @@ fn build_meta_fund_payload_hash(
 
     let mut payload = Bytes::new(env);
     payload.append(&domain);
+    payload.append(&network_id.clone().into());
+    payload.append(&contract_hash.into());
     payload.append(&src_hash.into());
     payload.append(&tgt_hash.into());
     payload.append(&ast_hash.into());
@@ -4706,9 +4717,11 @@ fn test_meta_fund_happy_path() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
+    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.set_meta_tx_network_id(&network_id);
     bridge.add_asset(&token_id, &None);
     mint_tokens(&env, &token_id, &user, 1000i128);
 
@@ -4725,10 +4738,20 @@ fn test_meta_fund_happy_path() {
     let deadline: u64 = 2_000_000;
 
     let payload_hash =
-        build_meta_fund_payload_hash(&env, &user, &target, &token_id, amount, nonce, deadline);
+        build_meta_fund_payload_hash(
+            &env,
+            &network_id,
+            &user,
+            &target,
+            &token_id,
+            amount,
+            nonce,
+            deadline,
+        );
     let signature = sign_meta_fund_payload(&env, &signing_key, &payload_hash);
 
     let params = MetaFundParams {
+        network_id: network_id.clone(),
         source: user.clone(),
         target: target.clone(),
         asset: token_id.clone(),
@@ -4751,9 +4774,11 @@ fn test_meta_fund_expired_deadline_fails() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
+    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.set_meta_tx_network_id(&network_id);
     bridge.add_asset(&token_id, &None);
     mint_tokens(&env, &token_id, &user, 1000i128);
 
@@ -4769,10 +4794,11 @@ fn test_meta_fund_expired_deadline_fails() {
     let deadline: u64 = 1_999; // already passed (ledger timestamp = 2_000)
 
     let payload_hash =
-        build_meta_fund_payload_hash(&env, &user, &target, &token_id, amount, nonce, deadline);
+        build_meta_fund_payload_hash(&env, &network_id, &user, &target, &token_id, amount, nonce, deadline);
     let signature = sign_meta_fund_payload(&env, &signing_key, &payload_hash);
 
     let params = MetaFundParams {
+        network_id: network_id.clone(),
         source: user.clone(),
         target,
         asset: token_id.clone(),
@@ -4794,9 +4820,11 @@ fn test_meta_fund_nonce_replay_rejected() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
+    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.set_meta_tx_network_id(&network_id);
     bridge.add_asset(&token_id, &None);
     mint_tokens(&env, &token_id, &user, 2000i128);
 
@@ -4813,10 +4841,20 @@ fn test_meta_fund_nonce_replay_rejected() {
     let deadline: u64 = 2_000_000;
 
     let payload_hash =
-        build_meta_fund_payload_hash(&env, &user, &target1, &token_id, amount, nonce, deadline);
+        build_meta_fund_payload_hash(
+            &env,
+            &network_id,
+            &user,
+            &target1,
+            &token_id,
+            amount,
+            nonce,
+            deadline,
+        );
     let signature = sign_meta_fund_payload(&env, &signing_key, &payload_hash);
 
     let params = MetaFundParams {
+        network_id: network_id.clone(),
         source: user.clone(),
         target: target1.clone(),
         asset: token_id.clone(),
@@ -4831,6 +4869,7 @@ fn test_meta_fund_nonce_replay_rejected() {
 
     // Replay with same (source, nonce) must be rejected.
     let params2 = MetaFundParams {
+        network_id: network_id.clone(),
         source: user.clone(),
         target: target2,
         asset: token_id.clone(),
@@ -4852,9 +4891,11 @@ fn test_meta_fund_invalid_signature_fails() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
+    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.set_meta_tx_network_id(&network_id);
     bridge.add_asset(&token_id, &None);
     mint_tokens(&env, &token_id, &user, 1000i128);
 
@@ -4875,6 +4916,7 @@ fn test_meta_fund_invalid_signature_fails() {
     let forged_signature = BytesN::from_array(&env, &[0u8; 64]);
 
     let params = MetaFundParams {
+        network_id,
         source: user.clone(),
         target,
         asset: token_id.clone(),
