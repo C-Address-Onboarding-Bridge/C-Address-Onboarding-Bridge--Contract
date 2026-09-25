@@ -2652,6 +2652,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -2791,6 +2792,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;

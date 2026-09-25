@@ -815,6 +815,28 @@ fn test_execute_upgrade_not_initialized_fails() {
 }
 
 #[test]
+fn test_upgrade_paths_reject_deactivated_contract() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let wasm_hash = BytesN::from_array(&env, &[1u8; 32]);
+    bridge.schedule_upgrade(&wasm_hash, &None);
+    bridge.emergency_migrate(&Address::generate(&env), &false);
+
+    assert_eq!(
+        bridge.try_upgrade(&wasm_hash, &None),
+        Err(Ok(BridgeError::ContractDeactivated))
+    );
+    assert_eq!(
+        bridge.try_execute_upgrade(&wasm_hash, &None),
+        Err(Ok(BridgeError::ContractDeactivated))
+    );
+}
+
+#[test]
 fn test_execute_upgrade_not_scheduled_fails() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
