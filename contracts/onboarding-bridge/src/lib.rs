@@ -1731,7 +1731,17 @@ impl OnboardingBridge {
             total = safe_math::safe_add(total, amount)?;
         }
 
-        check_daily_limit(&env, &source, &asset, total)?;
+        // Only entries that can actually be delivered consume daily-limit
+        // capacity and source volume. Blocked entries are refunded below.
+        let mut successful_total: i128 = 0;
+        for i in 0..targets.len() {
+            let target = targets.get(i).unwrap();
+            if check_access(&env, &target).is_ok() {
+                successful_total =
+                    safe_math::safe_add(successful_total, amounts.get(i).unwrap())?;
+            }
+        }
+        check_daily_limit(&env, &source, &asset, successful_total)?;
 
         source.require_auth();
         consume_nonce(&env, &source, nonce)?;
@@ -1792,7 +1802,7 @@ impl OnboardingBridge {
             token_client.transfer(&contract_addr, &source, &refund_total);
         }
 
-        increment_source_bridged_volume(&env, &source, total)?;
+        increment_source_bridged_volume(&env, &source, successful_total)?;
         extend_instance_ttl(&env);
         mint_loyalty_tokens(&env, &source);
 
@@ -2418,6 +2428,8 @@ impl OnboardingBridge {
     /// * `amount` (`i128`) — Gross amount. Must be > 0.
     /// * `referrer` (`Option<Address>`) — Address to receive the referral cut,
     ///   or `None` for no referral.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for `source`.
+    /// * `deadline` (`Option<u64>`) — Optional Unix timestamp cutoff.
     ///
     /// # Authorization
     ///
@@ -2444,16 +2456,14 @@ impl OnboardingBridge {
     ///
     /// # Security Considerations
     ///
-    /// Unlike `fund_c_address`, this function does not accept a `nonce` or
-    /// `deadline` parameter. Callers relying on replay protection should use
-    /// `verify_auth_entry` in conjunction with this call, or use the standard
-    /// Stellar transaction sequence-number mechanism.
+    /// As with the other funding entry points, callers may provide a `nonce`
+    /// and `deadline` for ordered replay protection and expiry.
     ///
     /// # Examples
     ///
     /// ```rust,no_run
     /// // bridge.fund_c_address_with_referral(
-    /// //     &source, &target, &usdc, &1000i128, &Some(referrer),
+    /// //     &source, &target, &usdc, &1000i128, &Some(referrer), &None, &None,
     /// // );
     /// ```
     pub fn fund_c_address_with_referral(
@@ -2463,11 +2473,17 @@ impl OnboardingBridge {
         asset: Address,
         amount: i128,
         referrer: Option<Address>,
+        nonce: Option<u64>,
+        deadline: Option<u64>,
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
-        source.require_auth();
+        if let Some(dl) = deadline {
+            if env.ledger().timestamp() > dl {
+                return Err(BridgeError::TransactionExpired);
+            }
+        }
 
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
@@ -2478,6 +2494,9 @@ impl OnboardingBridge {
         }
 
         check_access(&env, &target)?;
+        if let Some(referrer_addr) = referrer.clone() {
+            check_access(&env, &referrer_addr)?;
+        }
         check_asset_whitelisted(&env, &asset)?;
         check_daily_limit(&env, &source, &asset, amount)?;
         if let Some(referrer_addr) = &referrer {
