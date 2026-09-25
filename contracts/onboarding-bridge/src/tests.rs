@@ -2620,6 +2620,7 @@ fn test_batch_blocked_target_skipped_and_refunded() {
     let good = Address::generate(&env);
     let blocked = Address::generate(&env);
     bridge.add_to_blocklist(&blocked, &None);
+    bridge.set_source_daily_limit(&user, &token_id, &1000i128, &None);
 
     let targets = Vec::from_array(&env, [good.clone(), blocked.clone()]);
     let amounts = Vec::from_array(&env, [1000i128, 500i128]);
@@ -2656,6 +2657,7 @@ fn test_batch_all_blocked_full_refund() {
     let t2 = Address::generate(&env);
     bridge.add_to_blocklist(&t1, &None);
     bridge.add_to_blocklist(&t2, &None);
+    bridge.set_source_daily_limit(&user, &token_id, &1i128, &None);
 
     let targets = Vec::from_array(&env, [t1.clone(), t2.clone()]);
     let amounts = Vec::from_array(&env, [400i128, 600i128]);
@@ -3716,6 +3718,8 @@ fn test_fund_with_referral_splits_fee() {
         &token_id,
         &1000i128,
         &Some(referrer.clone()),
+        &None,
+        &None,
     );
 
     // gross = 1000, fee = 10 (1%), referral_fee = 2 (20% of 10), protocol_fee = 8
@@ -3724,6 +3728,8 @@ fn test_fund_with_referral_splits_fee() {
     assert_eq!(check_balance(&env, &token_id, &referrer), 2i128);
     // contract holds protocol fee (8)
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 8i128);
+    assert_eq!(bridge.query_accrued_fees(&token_id), 8i128);
+    assert_eq!(bridge.query_total_fees_collected(&token_id), 10i128);
 }
 
 #[test]
@@ -3741,11 +3747,46 @@ fn test_fund_with_no_referrer_accrues_full_fee() {
     mint_tokens(&env, &token_id, &user, 1000i128);
     let target = Address::generate(&env);
 
-    bridge.fund_c_address_with_referral(&user, &target, &token_id, &1000i128, &None);
+    bridge.fund_c_address_with_referral(
+        &user, &target, &token_id, &1000i128, &None, &None, &None,
+    );
 
     // No referrer — full fee (10) stays in contract
     assert_eq!(check_balance(&env, &token_id, &target), 990i128);
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 10i128);
+}
+
+#[test]
+fn test_fund_with_blocked_referrer_fails_before_transfer() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_referral_rate(&2000u32, &None);
+
+    mint_tokens(&env, &token_id, &user, 1000i128);
+    let target = Address::generate(&env);
+    let referrer = Address::generate(&env);
+    bridge.add_to_blocklist(&referrer, &None);
+
+    assert_eq!(
+        bridge.try_fund_c_address_with_referral(
+            &user,
+            &target,
+            &token_id,
+            &1000i128,
+            &Some(referrer),
+            &None,
+            &None,
+        ),
+        Err(Ok(BridgeError::AddressBlocked))
+    );
+    assert_eq!(check_balance(&env, &token_id, &user), 1000i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge_id), 0i128);
 }
 
 #[test]
@@ -3770,6 +3811,8 @@ fn test_fund_with_referral_zero_referral_rate() {
         &token_id,
         &1000i128,
         &Some(referrer.clone()),
+        &None,
+        &None,
     );
 
     // referral_rate = 0, so referrer gets nothing, full fee in contract
@@ -3796,7 +3839,9 @@ fn test_referral_fund_mints_loyalty() {
     mint_tokens(&env, &token_id, &user, 1000i128);
 
     let target = Address::generate(&env);
-    bridge.fund_c_address_with_referral(&user, &target, &token_id, &1000i128, &None);
+    bridge.fund_c_address_with_referral(
+        &user, &target, &token_id, &1000i128, &None, &None, &None,
+    );
 
     assert_eq!(check_balance(&env, &loyalty_token_id, &user), 6i128);
 }
@@ -3816,7 +3861,9 @@ fn test_referral_fund_rejects_below_minimum() {
 
     let target = Address::generate(&env);
     assert_eq!(
-        bridge.try_fund_c_address_with_referral(&user, &target, &token_id, &50i128, &None),
+        bridge.try_fund_c_address_with_referral(
+            &user, &target, &token_id, &50i128, &None, &None, &None
+        ),
         Err(Ok(BridgeError::InvalidAmount))
     );
 }
@@ -5275,7 +5322,9 @@ fn test_referral_fund_applies_tiered_fee() {
     mint_tokens(&env, &token_id, &user, 1000i128);
     let target = Address::generate(&env);
 
-    bridge.fund_c_address_with_referral(&user, &target, &token_id, &1000i128, &None);
+    bridge.fund_c_address_with_referral(
+        &user, &target, &token_id, &1000i128, &None, &None, &None,
+    );
 
     // Tiered fee (10 bps) on 1000 = 1, not the flat global rate (100 bps = 10).
     assert_eq!(check_balance(&env, &token_id, &target), 999i128);
