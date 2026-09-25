@@ -779,6 +779,7 @@ fn test_execute_upgrade_succeeds_at_timelock_boundary_and_clears_pending() {
         Some(crate::PendingUpgrade {
             new_wasm_hash: wasm_hash.clone(),
             executable_after_ledger,
+            expires_after_ledger: executable_after_ledger + 17_280,
         })
     );
 
@@ -884,6 +885,34 @@ fn test_execute_upgrade_one_ledger_before_boundary_fails() {
     assert_eq!(
         bridge.try_execute_upgrade(&wasm_hash, &None),
         Err(Ok(BridgeError::UpgradeTimelockActive))
+    );
+}
+
+#[test]
+fn test_execute_upgrade_after_execution_window_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let wasm_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let executable_after_ledger = bridge.schedule_upgrade(&wasm_hash, &None);
+    let expires_after_ledger = executable_after_ledger + 17_280;
+    advance_ledger_sequence(&env, expires_after_ledger);
+
+    assert_eq!(
+        bridge.try_execute_upgrade(&wasm_hash, &None),
+        Err(Ok(BridgeError::UpgradeTimelockExpired))
+    );
+    assert_eq!(
+        bridge.query_pending_upgrade(),
+        Some(crate::PendingUpgrade {
+            new_wasm_hash: wasm_hash,
+            executable_after_ledger,
+            expires_after_ledger,
+        })
     );
 }
 

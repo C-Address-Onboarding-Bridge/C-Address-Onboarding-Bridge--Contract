@@ -2065,10 +2065,13 @@ export class OnboardingBridgeSDK {
     const wasmHash = pending.new_wasm_hash ?? pending.newWasmHash;
     const executableAfterLedger =
       pending.executable_after_ledger ?? pending.executableAfterLedger;
+    const expiresAfterLedger =
+      pending.expires_after_ledger ?? pending.expiresAfterLedger;
 
     return {
       newWasmHash: this.bytesToHex(wasmHash),
       executableAfterLedger: Number(executableAfterLedger),
+      expiresAfterLedger: Number(expiresAfterLedger),
     };
   }
 
