@@ -4418,7 +4418,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::InvalidAmount`] — `source_amount` or `min_target_amount` ≤ 0.
     /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode is on and `target` is not listed.
-    /// * [`BridgeError::AssetNotWhitelisted`] — `target_asset` is not whitelisted.
+    /// * [`BridgeError::AssetNotWhitelisted`] — `source_asset` or `target_asset`
+    ///   is not whitelisted.
     /// * [`BridgeError::MultiHopNotSupported`] — `swap_route` does not contain
     ///   exactly one pool.
     /// * [`BridgeError::PoolNotWhitelisted`] — The pool in `swap_route` is not
@@ -4471,7 +4472,7 @@ impl OnboardingBridge {
         }
 
         check_access(&env, &target)?;
-        // Only the output asset needs to be whitelisted (what arrives at target).
+        check_asset_whitelisted(&env, &source_asset)?;
         check_asset_whitelisted(&env, &target_asset)?;
 
         // Multi-hop routes are out of scope: the contract cannot verify which
