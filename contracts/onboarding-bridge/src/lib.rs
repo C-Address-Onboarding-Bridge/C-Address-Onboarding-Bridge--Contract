@@ -3885,7 +3885,7 @@ impl OnboardingBridge {
     ///
     /// * `("CommitmentTtlExtended",)` — data: `(admin, id, actual_ttl)`
     pub fn extend_commitment_ttl(env: Env, id: u64, ttl: u32) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -3927,7 +3927,7 @@ impl OnboardingBridge {
     ///
     /// * `("RelayerTtlExtended",)` — data: `(admin, pubkey, actual_ttl)`
     pub fn extend_relayer_ttl(env: Env, pubkey: BytesN<32>, ttl: u32) -> Result<(), BridgeError> {
-        let _guard = ReentrancyGuard::enter(&env);
+        let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
