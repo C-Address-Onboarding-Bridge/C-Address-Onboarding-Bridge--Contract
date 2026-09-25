@@ -2255,7 +2255,7 @@ export class OnboardingBridgeSDK {
    * cross-chain events via `fundCrosschain`.  After adding, update the threshold
    * with `setRelayerThreshold` if needed.
    *
-   * @param options      - Contains the 32-byte Ed25519 pubkey as a hex string.
+   * @param options      - Contains the pubkey and optional admin nonce.
    * @param adminKeypair - Keypair of the admin account.
    *
    * @returns A {@link TransactionResult}.
@@ -2277,7 +2277,11 @@ export class OnboardingBridgeSDK {
             () => this.provider.getAccount(adminKeypair.publicKey()),
           );
           const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
-            .addOperation(this.contract.call('add_relayer', xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex'))))
+            .addOperation(this.contract.call(
+              'add_relayer',
+              xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex')),
+              this.optionalNonceToScVal(options.nonce),
+            ))
             .setTimeout(this.config.timeout ?? 30)
             .build();
           const preparedTx = await withRpcHook(

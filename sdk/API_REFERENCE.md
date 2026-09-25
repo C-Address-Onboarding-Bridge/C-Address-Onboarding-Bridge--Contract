@@ -283,7 +283,9 @@ async addRelayer(
   adminKeypair: Keypair
 ): Promise<TransactionResult>
 ```
-Registers an authorized relayer public key (admin only).
+Registers an authorized relayer public key (admin only). The operation
+supports an optional sequential admin nonce and remains available while the
+bridge is paused for incident response.
 - **Parameters**:
   - `options`: `RelayerManagementOptions`
   - `adminKeypair`: `Keypair`

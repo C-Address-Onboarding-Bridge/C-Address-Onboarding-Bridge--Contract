@@ -3509,6 +3509,7 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `pubkey` (`BytesN<32>`) — Ed25519 public key of the relayer.
+    /// * `nonce` (`Option<u64>`) — Optional sequential admin nonce.
     ///
     /// # Authorization
     ///
@@ -3517,13 +3518,25 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn add_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` does not match the stored
+    ///   admin nonce.
+    ///
+    /// # Events
+    ///
+    /// * `("RelayerAdded",)` — data: `(admin, pubkey)`
+    pub fn add_relayer(
+        env: Env,
+        pubkey: BytesN<32>,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
-        read_admin(&env).require_auth();
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         add_relayer(&env, &pubkey);
+        env.events().publish(("RelayerAdded",), (admin, pubkey));
         Ok(())
     }
 
