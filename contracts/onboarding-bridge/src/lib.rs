@@ -202,10 +202,7 @@ pub enum DataKey {
     Blocked(Address),
     Allowlisted(Address),
     AllowlistMode,
-    AccruedFees(Address),
     AssetWhitelist,
-    TotalBridged(Address),
-    TotalFeesCollected(Address),
     SourceDailyLimit(Address, Address),
     AssetFeeCap(Address),
     Nonce(Address),
@@ -769,21 +766,6 @@ fn check_pool_whitelisted(env: &Env, pool: &Address) -> Result<(), BridgeError> 
     Ok(())
 }
 
-// Issue #96: SAC native token (XLM) support
-//
-// Native SAC tokens (e.g., XLM) use the same token interface but may have
-// different behavior in the Soroban environment. This helper detects native
-// tokens so we can handle them appropriately if needed in the future.
-#[inline]
-fn is_native_sac_token(env: &Env, asset: &Address) -> bool {
-    // In Soroban testnet/mainnet, the native XLM token has a canonical address.
-    // We can use env.invoker() to determine if this is the native SAC.
-    // For now, we treat all assets uniformly through token::Client.
-    // Future enhancement: detect native token via stellar contract protocol.
-    let _ = (env, asset);
-    false
-}
-
 fn read_asset_counters(env: &Env, asset: &Address) -> AssetCounters {
     env.storage()
         .persistent()
@@ -814,17 +796,6 @@ fn save_asset_counters(env: &Env, asset: &Address, counters: &AssetCounters) {
     env.storage()
         .persistent()
         .set(&DataKey::AssetStats(asset.clone()), counters);
-    env.storage()
-        .persistent()
-        .set(&DataKey::AccruedFees(asset.clone()), &counters.accrued_fees);
-    env.storage().persistent().set(
-        &DataKey::TotalBridged(asset.clone()),
-        &counters.total_bridged,
-    );
-    env.storage().persistent().set(
-        &DataKey::TotalFeesCollected(asset.clone()),
-        &counters.total_fees_collected,
-    );
 }
 
 fn read_accrued_fees(env: &Env, asset: &Address) -> i128 {
@@ -2426,9 +2397,7 @@ impl OnboardingBridge {
         }
 
         increment_user_deposit(&env, &source, &asset, amount)?;
-        increment_accrued_fees(&env, &asset, protocol_fee)?;
-        increment_total_bridged(&env, &asset, net_amount)?;
-        increment_total_fees_collected(&env, &asset, protocol_fee)?;
+        update_asset_counters(&env, &asset, protocol_fee, net_amount)?;
         increment_source_bridged_volume(&env, &source, amount)?;
 
         extend_instance_ttl(&env);
@@ -2522,16 +2491,21 @@ impl OnboardingBridge {
     /// Returns the contract's total token balance for `asset`.
     ///
     /// This includes both accrued fees and any tokens held for other purposes
-    /// (e.g. timelocked funds). Use `query_accrued_fees` to isolate just the
-    /// fee portion.
+    /// (e.g. timelocked funds). Use `query_accrued_fees` to isolate the fee
+    /// portion.
     ///
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_fee_balance(env: Env, asset: Address) -> Result<i128, BridgeError> {
+    pub fn query_contract_balance(env: Env, asset: Address) -> Result<i128, BridgeError> {
         check_initialized(&env)?;
         let token_client = token::Client::new(&env, &asset);
         Ok(token_client.balance(&env.current_contract_address()))
+    }
+
+    /// Deprecated compatibility alias for [`query_contract_balance`].
+    pub fn query_fee_balance(env: Env, asset: Address) -> Result<i128, BridgeError> {
+        Self::query_contract_balance(env, asset)
     }
 
     /// Returns `true` if the contract has been initialised.
@@ -3861,6 +3835,7 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `pubkey` (`BytesN<32>`) — Ed25519 public key of the relayer.
+    /// * `nonce` (`Option<u64>`) — Optional sequential admin nonce.
     ///
     /// # Authorization
     ///
@@ -3869,13 +3844,25 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn add_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` does not match the stored
+    ///   admin nonce.
+    ///
+    /// # Events
+    ///
+    /// * `("RelayerAdded",)` — data: `(admin, pubkey)`
+    pub fn add_relayer(
+        env: Env,
+        pubkey: BytesN<32>,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
-        read_admin(&env).require_auth();
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         add_relayer(&env, &pubkey);
+        env.events().publish(("RelayerAdded",), (admin, pubkey));
         Ok(())
     }
 
@@ -4646,7 +4633,7 @@ impl OnboardingBridge {
     ///
     /// Accrued fees accumulate on every `fund_c_address` call and are
     /// decremented when `withdraw_fees` is called. This value is always
-    /// ≤ `query_fee_balance` (the contract's actual token balance).
+    /// ≤ `query_contract_balance` (the contract's actual token balance).
     ///
     /// # Arguments
     ///
@@ -4855,9 +4842,7 @@ impl OnboardingBridge {
             token_client.transfer(&contract_addr, &target, &net_amount);
         }
 
-        increment_accrued_fees(&env, &asset, fee)?;
-        increment_total_bridged(&env, &asset, net_amount)?;
-        increment_total_fees_collected(&env, &asset, fee)?;
+        update_asset_counters(&env, &asset, fee, net_amount)?;
         increment_source_bridged_volume(&env, &source, amount)?;
         extend_instance_ttl(&env);
 
@@ -5032,9 +5017,7 @@ impl OnboardingBridge {
             target_token.transfer(&contract_addr, &target, &net_amount);
         }
 
-        increment_accrued_fees(&env, &target_asset, fee)?;
-        increment_total_bridged(&env, &target_asset, net_amount)?;
-        increment_total_fees_collected(&env, &target_asset, fee)?;
+        update_asset_counters(&env, &target_asset, fee, net_amount)?;
         increment_source_bridged_volume(&env, &source, source_amount)?;
 
         mint_loyalty_tokens(&env, &source);
@@ -5276,9 +5259,7 @@ impl OnboardingBridge {
         }
 
         increment_user_deposit(&env, &params.source, &params.asset, params.amount)?;
-        increment_accrued_fees(&env, &params.asset, fee)?;
-        increment_total_bridged(&env, &params.asset, net_amount)?;
-        increment_total_fees_collected(&env, &params.asset, fee)?;
+        update_asset_counters(&env, &params.asset, fee, net_amount)?;
         increment_source_bridged_volume(&env, &params.source, params.amount)?;
 
         extend_instance_ttl(&env);
