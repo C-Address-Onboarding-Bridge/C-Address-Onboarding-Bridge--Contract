@@ -32,6 +32,7 @@ import {
 } from '@stellar/stellar-sdk';
 import * as fs from 'fs';
 import * as path from 'path';
+import { createHash } from 'crypto';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -210,6 +211,7 @@ async function initialize(
   cfg: DeployConfig,
   admin: Keypair,
   contractId: string,
+  wasmHash: Buffer,
 ): Promise<void> {
   console.log(`Initializing contract ${contractId}…`);
   const contract = new Contract(contractId);
@@ -226,6 +228,7 @@ async function initialize(
         Address.fromString(cfg.feeCollectorPublicKey).toScVal(),
         nativeToScVal(cfg.feeBps, { type: 'u32' }),
         nativeToScVal(null),
+        nativeToScVal(wasmHash, { type: 'bytes' }),
       ),
     )
     .setTimeout(30)
@@ -273,7 +276,8 @@ async function main(): Promise<void> {
   if (command === 'deploy' || command === 'all') {
     const contractId = await deployContract(provider, cfg, admin);
     if (command === 'all') {
-      await initialize(provider, cfg, admin, contractId);
+      const wasmHash = createHash('sha256').update(fs.readFileSync(cfg.wasmPath)).digest();
+      await initialize(provider, cfg, admin, contractId, wasmHash);
       console.log(`\nDeployment complete. CONTRACT_ID=${contractId}`);
     } else {
       console.log(`\nDeploy complete. Run init with: npx ts-node scripts/deploy.ts init ${contractId} --network ${network}`);
@@ -286,7 +290,8 @@ async function main(): Promise<void> {
       console.error('Usage: npx ts-node scripts/deploy.ts init <contract_id> [--network <network>]');
       process.exit(1);
     }
-    await initialize(provider, cfg, admin, customId);
+    const wasmHash = createHash('sha256').update(fs.readFileSync(cfg.wasmPath)).digest();
+    await initialize(provider, cfg, admin, customId, wasmHash);
     return;
   }
 
