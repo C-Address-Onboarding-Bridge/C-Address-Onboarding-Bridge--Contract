@@ -4331,6 +4331,11 @@ impl OnboardingBridge {
             return Err(BridgeError::InvalidAmount);
         }
 
+        // Revalidate mutable policy state at settlement time. A commitment
+        // may outlive changes to the target blocklist or asset whitelist.
+        check_access(&env, &target)?;
+        check_asset_whitelisted(&env, &asset)?;
+
         source.require_auth();
 
         // Mark revealed before the transfer to prevent re-entrancy replay.

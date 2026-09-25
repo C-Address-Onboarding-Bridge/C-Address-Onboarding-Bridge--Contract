@@ -3181,6 +3181,44 @@ mod commit_reveal_tests {
     }
 
     #[test]
+    fn test_reveal_rechecks_asset_whitelist() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+        let hash = amount_hash(&env, 500i128, 43u64);
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
+
+        bridge.remove_asset(&token_id, &None);
+        advance_past_min_delay(&env);
+
+        assert_eq!(
+            bridge.try_reveal_fund(&id, &user, &target, &token_id, &500i128, &43u64),
+            Err(Ok(BridgeError::AssetNotWhitelisted))
+        );
+        assert_eq!(check_balance(&env, &token_id, &target), 0i128);
+    }
+
+    #[test]
+    fn test_reveal_rechecks_target_access() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+        let hash = amount_hash(&env, 500i128, 44u64);
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
+
+        bridge.add_to_blocklist(&target, &None);
+        advance_past_min_delay(&env);
+
+        assert_eq!(
+            bridge.try_reveal_fund(&id, &user, &target, &token_id, &500i128, &44u64),
+            Err(Ok(BridgeError::AddressBlocked))
+        );
+        assert_eq!(check_balance(&env, &token_id, &target), 0i128);
+    }
+
+    #[test]
     fn test_reveal_before_min_delay_fails() {
         let env = Env::default();
         env.ledger().set_timestamp(1_000);
