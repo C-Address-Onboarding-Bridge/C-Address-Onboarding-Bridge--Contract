@@ -180,7 +180,17 @@ Queries the balance of a C-address for a specific whitelisted token.
 ```ts
 async getFeeBalance(asset: string): Promise<string>
 ```
-Queries the accumulated fee balance for a given token contract.
+Queries accrued, uncollected protocol fees for a given token contract.
+- **Parameters**:
+  - `asset`: `string` — Token contract address.
+- **Returns**: `Promise<string>`
+
+##### `getContractBalance`
+```ts
+async getContractBalance(asset: string): Promise<string>
+```
+Queries the contract's raw token balance for a given asset. This includes
+accrued fees, timelocked funds, loyalty reserves, and stray tokens.
 - **Parameters**:
   - `asset`: `string` — Token contract address.
 - **Returns**: `Promise<string>`
@@ -273,7 +283,9 @@ async addRelayer(
   adminKeypair: Keypair
 ): Promise<TransactionResult>
 ```
-Registers an authorized relayer public key (admin only).
+Registers an authorized relayer public key (admin only). The operation
+supports an optional sequential admin nonce and remains available while the
+bridge is paused for incident response.
 - **Parameters**:
   - `options`: `RelayerManagementOptions`
   - `adminKeypair`: `Keypair`

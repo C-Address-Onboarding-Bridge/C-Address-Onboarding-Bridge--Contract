@@ -793,6 +793,7 @@ describe("OnboardingBridgeSDK", () => {
       (scValToNative as jest.Mock).mockReturnValue({
         new_wasm_hash: Buffer.from(wasmHash, "hex"),
         executable_after_ledger: 123,
+        expires_after_ledger: 456,
       });
       mockProvider.simulateTransaction.mockResolvedValue({
         results: [{ retval: {} }],
@@ -803,6 +804,7 @@ describe("OnboardingBridgeSDK", () => {
       expect(pending).toEqual({
         newWasmHash: wasmHash,
         executableAfterLedger: 123,
+        expiresAfterLedger: 456,
       });
     });
   });
