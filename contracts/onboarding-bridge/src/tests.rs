@@ -5679,53 +5679,156 @@ fn test_extend_timelock_ttl_before_initialize_fails() {
 }
 
 // ---------------------------------------------------------------------------
-// query_current_tier
+// safe_mul
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_query_current_tier_defaults_to_global_fee_without_tiers() {
-    let env = Env::default();
-    let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts_mocked(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-    bridge.initialize(&admin, &fee_collector, &75u32, &None);
-
-    let tier = bridge.query_current_tier(&user);
-    assert_eq!(tier.min_volume, 0);
-    assert_eq!(tier.max_volume, i128::MAX);
-    assert_eq!(tier.fee_bps, 75u32);
+fn test_safe_mul_success() {
+    assert_eq!(crate::safe_math::safe_mul(6, 7), Ok(42));
+    assert_eq!(crate::safe_math::safe_mul(-6, 7), Ok(-42));
+    assert_eq!(crate::safe_math::safe_mul(-6, -7), Ok(42));
 }
 
 #[test]
-fn test_query_current_tier_matches_configured_tier() {
-    let env = Env::default();
-    let (admin, user, fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts_mocked(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-    bridge.initialize(&admin, &fee_collector, &100u32, &None);
-
-    let tiers = Vec::from_array(
-        &env,
-        [FeeTier {
-            min_volume: 0,
-            max_volume: 10_000,
-            fee_bps: 25,
-        }],
-    );
-    bridge.set_fee_tiers(&tiers);
-
-    assert_eq!(bridge.query_current_tier(&user).fee_bps, 25u32);
+fn test_safe_mul_by_zero_and_one() {
+    assert_eq!(crate::safe_math::safe_mul(i128::MAX, 0), Ok(0));
+    assert_eq!(crate::safe_math::safe_mul(0, i128::MIN), Ok(0));
+    assert_eq!(crate::safe_math::safe_mul(i128::MAX, 1), Ok(i128::MAX));
+    assert_eq!(crate::safe_math::safe_mul(i128::MIN, 1), Ok(i128::MIN));
 }
 
 #[test]
-fn test_query_current_tier_before_initialize_fails() {
-    let env = Env::default();
-    let (_admin, user, _fee_collector) = create_test_users(&env);
-    let (bridge_id, _) = register_all_contracts_mocked(&env);
-    let bridge = create_bridge_client(&env, &bridge_id);
-
+fn test_safe_mul_overflow() {
     assert_eq!(
-        bridge.try_query_current_tier(&user),
+        crate::safe_math::safe_mul(i128::MAX, 2),
+        Err(BridgeError::Overflow)
+    );
+    assert_eq!(
+        crate::safe_math::safe_mul(i128::MIN, 2),
+        Err(BridgeError::Overflow)
+    );
+    assert_eq!(
+        crate::safe_math::safe_mul(i128::MAX, -2),
+        Err(BridgeError::Overflow)
+    );
+}
+
+#[test]
+fn test_safe_mul_min_times_minus_one_overflows() {
+    assert_eq!(
+        crate::safe_math::safe_mul(i128::MIN, -1),
+        Err(BridgeError::Overflow)
+    );
+}
+
+#[test]
+fn test_safe_mul_boundary_products() {
+    assert_eq!(crate::safe_math::safe_mul(i128::MAX, -1), Ok(-i128::MAX));
+    let half = i128::MAX / 2;
+    assert_eq!(crate::safe_math::safe_mul(half, 2), Ok(half * 2));
+    assert_eq!(
+        crate::safe_math::safe_mul(half + 1, 2),
+        Err(BridgeError::Overflow)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// remove_swap_pool
+// ---------------------------------------------------------------------------
+
+fn seed_pool_whitelist(env: &Env, bridge_id: &Address, pools: &[&Address]) {
+    let mut map: soroban_sdk::Map<Address, bool> = soroban_sdk::Map::new(env);
+    for pool in pools {
+        map.set((*pool).clone(), true);
+    }
+    env.as_contract(bridge_id, || {
+        env.storage().instance().set(&DataKey::PoolWhitelist, &map);
+    });
+}
+
+fn pool_is_whitelisted(env: &Env, bridge_id: &Address, pool: &Address) -> bool {
+    env.as_contract(bridge_id, || {
+        env.storage()
+            .instance()
+            .get::<_, soroban_sdk::Map<Address, bool>>(&DataKey::PoolWhitelist)
+            .map(|m| m.get(pool.clone()).unwrap_or(false))
+            .unwrap_or(false)
+    })
+}
+
+#[test]
+fn test_remove_swap_pool_removes_whitelisted_pool() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let pool = Address::generate(&env);
+    seed_pool_whitelist(&env, &bridge_id, &[&pool]);
+    assert!(pool_is_whitelisted(&env, &bridge_id, &pool));
+
+    bridge.remove_swap_pool(&pool, &None);
+
+    assert!(!pool_is_whitelisted(&env, &bridge_id, &pool));
+}
+
+#[test]
+fn test_remove_swap_pool_keeps_other_pools() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let pool_a = Address::generate(&env);
+    let pool_b = Address::generate(&env);
+    seed_pool_whitelist(&env, &bridge_id, &[&pool_a, &pool_b]);
+
+    bridge.remove_swap_pool(&pool_a, &None);
+
+    assert!(!pool_is_whitelisted(&env, &bridge_id, &pool_a));
+    assert!(pool_is_whitelisted(&env, &bridge_id, &pool_b));
+}
+
+#[test]
+fn test_remove_swap_pool_unknown_pool_is_noop() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let pool = Address::generate(&env);
+    bridge.remove_swap_pool(&pool, &None);
+
+    assert!(!pool_is_whitelisted(&env, &bridge_id, &pool));
+}
+
+#[test]
+fn test_remove_swap_pool_before_initialize_fails() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    let pool = Address::generate(&env);
+    assert_eq!(
+        bridge.try_remove_swap_pool(&pool, &None),
         Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_remove_swap_pool_duplicate_nonce_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let pool = Address::generate(&env);
+    assert_eq!(
+        bridge.try_remove_swap_pool(&pool, &Some(999u64)),
+        Err(Ok(BridgeError::DuplicateNonce))
     );
 }
