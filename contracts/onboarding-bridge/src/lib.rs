@@ -139,6 +139,8 @@ pub enum BridgeError {
     UpgradeHashMismatch = 26,
     /// The scheduled upgrade's timelock period has not yet elapsed.
     UpgradeTimelockActive = 27,
+    /// The scheduled upgrade's execution window has elapsed.
+    UpgradeTimelockExpired = 50,
     // Issue #23: max withdraw per tx
     WithdrawExceedsLimit = 28,
     /// An arithmetic operation overflowed i128 bounds.
@@ -283,6 +285,8 @@ const MIN_ALLOWED_TTL: u32 = 120_960;
 const CRITICAL_ENTRY_TTL_THRESHOLD: u32 = 100_000;
 /// Minimum ledgers that must pass before a scheduled upgrade becomes executable (~24 h at 5 s/ledger).
 const UPGRADE_TIMELOCK_LEDGERS: u32 = 17_280;
+/// Maximum ledgers an upgrade remains executable after its timelock elapses (~24 h at 5 s/ledger).
+const UPGRADE_EXECUTION_WINDOW_LEDGERS: u32 = UPGRADE_TIMELOCK_LEDGERS;
 /// Minimum ledgers between commit_fund and reveal_fund (~25 s at 5 s/ledger).
 const COMMIT_REVEAL_MIN_DELAY_LEDGERS: u32 = 5;
 /// Size of the stack buffer used to hold an address's strkey while hashing it.
@@ -394,6 +398,8 @@ pub struct PendingUpgrade {
     pub new_wasm_hash: BytesN<32>,
     /// Ledger sequence at or after which `execute_upgrade` may be called.
     pub executable_after_ledger: u32,
+    /// Ledger sequence after which the scheduled upgrade can no longer be executed.
+    pub expires_after_ledger: u32,
 }
 
 /// A pending commit-reveal entry created by `commit_fund`.
@@ -2848,6 +2854,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -2871,7 +2878,8 @@ impl OnboardingBridge {
     ///
     /// The upgrade is executable once
     /// `env.ledger().sequence() ≥ current_sequence + UPGRADE_TIMELOCK_LEDGERS`
-    /// (17 280 ledgers at 5 s/ledger ≈ 24 hours).
+    /// (17 280 ledgers at 5 s/ledger ≈ 24 hours), and remains executable for
+    /// one additional timelock-length window.
     ///
     /// Only one pending upgrade may exist at a time. Call `cancel_upgrade`
     /// first if you need to replace a pending upgrade.
@@ -2931,10 +2939,13 @@ impl OnboardingBridge {
             .ledger()
             .sequence()
             .saturating_add(UPGRADE_TIMELOCK_LEDGERS);
+        let expires_after_ledger = executable_after_ledger
+            .saturating_add(UPGRADE_EXECUTION_WINDOW_LEDGERS);
 
         let pending = PendingUpgrade {
             new_wasm_hash: new_wasm_hash.clone(),
             executable_after_ledger,
+            expires_after_ledger,
         };
         save_pending_upgrade(&env, &pending);
 
@@ -2971,6 +2982,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::UpgradeHashMismatch`] — `expected_hash` does not match
     ///   the scheduled hash.
     /// * [`BridgeError::UpgradeTimelockActive`] — The timelock has not yet elapsed.
+    /// * [`BridgeError::UpgradeTimelockExpired`] — The execution window has elapsed.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     ///
     /// # Events
@@ -2982,6 +2994,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -2993,6 +3006,9 @@ impl OnboardingBridge {
         }
         if env.ledger().sequence() < pending.executable_after_ledger {
             return Err(BridgeError::UpgradeTimelockActive);
+        }
+        if env.ledger().sequence() >= pending.expires_after_ledger {
+            return Err(BridgeError::UpgradeTimelockExpired);
         }
 
         clear_pending_upgrade(&env);
@@ -4684,8 +4700,8 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `source` (`Address`) — The address to query.
-    pub fn query_auth_nonce(_env: Env, _source: Address) -> u64 {
-        todo!("implement: query_auth_nonce")
+    pub fn query_auth_nonce(env: Env, source: Address) -> u64 {
+        read_auth_nonce(&env, &source)
     }
 
     /// Returns `true` if a specific auth nonce has already been consumed for `source`.
