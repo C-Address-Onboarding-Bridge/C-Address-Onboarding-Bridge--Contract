@@ -5242,7 +5242,7 @@ impl OnboardingBridge {
         }
 
         update_asset_counters(&env, &target_asset, fee, net_amount)?;
-        increment_source_bridged_volume(&env, &source, source_amount)?;
+        increment_source_bridged_volume(&env, &source, received_amount)?;
 
         mint_loyalty_tokens(&env, &source);
 
