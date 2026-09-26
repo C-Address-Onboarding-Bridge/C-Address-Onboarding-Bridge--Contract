@@ -268,7 +268,9 @@ graph LR
 A Rust service (axum HTTP server + SQLite) that:
 
 - Polls the Soroban RPC (`poller.rs`) for `OnboardingBridge` contract events
-  (`events.rs`) — funding, batch completion, fee withdrawals, admin changes.
+  (`events.rs`) — funding, batch completion, fee withdrawals, admin changes,
+  initialization, upgrade lifecycle, emergency migrations, and referral-rate
+  changes.
 - Persists every event to its own database (`db.rs`) so historical event
   data survives independently of the chain's own retention/pruning.
 - Delivers webhooks (`webhook.rs`) to subscribers (dashboards, alerting,

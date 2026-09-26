@@ -42,6 +42,12 @@ pub enum BridgeEventType {
     AddressAllowlisted,
     AddressUnallowlisted,
     AllowlistModeChanged,
+    Initialized,
+    UpgradeScheduled,
+    UpgradeCancelled,
+    ContractUpgraded,
+    EmergencyMigrated,
+    ReferralRateChanged,
 }
 
 impl BridgeEventType {
@@ -70,6 +76,12 @@ impl BridgeEventType {
             "AddressAllowlisted" => Some(Self::AddressAllowlisted),
             "AddressUnallowlisted" => Some(Self::AddressUnallowlisted),
             "AllowlistModeChanged" => Some(Self::AllowlistModeChanged),
+            "Initialized" => Some(Self::Initialized),
+            "UpgradeScheduled" => Some(Self::UpgradeScheduled),
+            "UpgradeCancelled" => Some(Self::UpgradeCancelled),
+            "ContractUpgraded" => Some(Self::ContractUpgraded),
+            "EmergencyMigrated" => Some(Self::EmergencyMigrated),
+            "ReferralRateChanged" => Some(Self::ReferralRateChanged),
             _ => None,
         }
     }
@@ -99,6 +111,12 @@ impl BridgeEventType {
             Self::AddressAllowlisted => "AddressAllowlisted",
             Self::AddressUnallowlisted => "AddressUnallowlisted",
             Self::AllowlistModeChanged => "AllowlistModeChanged",
+            Self::Initialized => "Initialized",
+            Self::UpgradeScheduled => "UpgradeScheduled",
+            Self::UpgradeCancelled => "UpgradeCancelled",
+            Self::ContractUpgraded => "ContractUpgraded",
+            Self::EmergencyMigrated => "EmergencyMigrated",
+            Self::ReferralRateChanged => "ReferralRateChanged",
         }
     }
 }
@@ -138,6 +156,12 @@ mod tests {
             ("AddressAllowlisted", "AddressAllowlisted"),
             ("AddressUnallowlisted", "AddressUnallowlisted"),
             ("AllowlistModeChanged", "AllowlistModeChanged"),
+            ("Initialized", "Initialized"),
+            ("UpgradeScheduled", "UpgradeScheduled"),
+            ("UpgradeCancelled", "UpgradeCancelled"),
+            ("ContractUpgraded", "ContractUpgraded"),
+            ("EmergencyMigrated", "EmergencyMigrated"),
+            ("ReferralRateChanged", "ReferralRateChanged"),
         ];
 
         for (topic, expected_str) in cases {
