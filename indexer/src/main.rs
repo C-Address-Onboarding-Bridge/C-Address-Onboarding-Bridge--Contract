@@ -6,19 +6,24 @@ mod webhook;
 use axum::{
     extract::State,
     http::{header, Method, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
 use tower_http::cors::{Any, CorsLayer};
+use tracing_subscriber::EnvFilter;
 
 pub struct AppState {
     pub db: db::Database,
     pub rpc_url: String,
     pub contract_id: String,
     pub webhook_client: reqwest::Client,
+    pub api_key_hash: String,
     /// Number of ledgers to look back from the RPC tip on first run (no
     /// persisted `last_ledger`).  Set via `LOOKBACK_LEDGERS` env var
     /// (default: 720 ≈ 1 hour at ~5 s/ledger).
@@ -61,13 +66,10 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(poller::DEFAULT_LOOKBACK_LEDGERS);
 
-    // TODO(next-bounty): API-key auth was never implemented. `sha256_hex` and the
-    // `require_api_key` middleware below do not exist anywhere in this repo or its
-    // history, which is why the indexer binary has never compiled. Commented out
-    // rather than invented -- writing auth is not a CI cleanup.
-    // let api_key_raw = std::env::var("API_KEY").expect("API_KEY must be set");
-    // let api_key_hash = sha256_hex(&api_key_raw);
-    // drop(api_key_raw); // discard the plaintext immediately
+    let api_key_raw = std::env::var("API_KEY").expect("API_KEY must be set");
+    assert!(!api_key_raw.is_empty(), "API_KEY must not be empty");
+    let api_key_hash = sha256_hex(&api_key_raw);
+    drop(api_key_raw);
 
     let database = db::Database::new(&db_url).await;
     database.migrate().await;
@@ -77,6 +79,7 @@ async fn main() {
         rpc_url,
         contract_id,
         webhook_client: reqwest::Client::new(),
+        api_key_hash,
         lookback_ledgers,
     });
 
@@ -109,23 +112,16 @@ async fn main() {
         .route("/api/stats", get(get_stats))
         .route("/health", get(health));
 
-    // Mutating routes.
-    //
-    // SECURITY TODO(next-bounty): these are NOT authenticated. They were meant to
-    // sit behind a `require_api_key` middleware that was never written, so the
-    // route_layer below is commented out to let the binary compile. Do not run
-    // this indexer anywhere reachable until the middleware exists.
+    // Mutating routes require an API key; read-only routes remain public.
     let protected_routes = Router::new()
         .route("/api/subscriptions", post(create_subscription))
         .route("/api/subscriptions/:id", delete(delete_subscription))
-        .route("/api/replay", post(replay_events));
-    // .route_layer(middleware::from_fn_with_state(
-    //     Arc::clone(&state),
-    //     require_api_key,
-    // ));
+        .route("/api/replay", post(replay_events))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_api_key,
+        ));
 
-    // TODO(next-bounty): `build_cors_layer()` was never written either; tower-http
-    // is still a dependency, so add the helper and restore this layer.
     let app = public_routes
         .merge(protected_routes)
         .layer(build_cors_layer())
@@ -179,6 +175,43 @@ fn build_cors_layer() -> CorsLayer {
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST, Method::DELETE])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+}
+
+fn sha256_hex(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+async fn require_api_key(
+    State(state): State<Arc<AppState>>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let provided_key = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            let (scheme, token) = value.split_once(' ')?;
+            (scheme.eq_ignore_ascii_case("Bearer") && !token.is_empty()).then_some(token)
+        });
+
+    let authorized = provided_key
+        .map(|key| {
+            let provided_hash = sha256_hex(key);
+            bool::from(
+                state
+                    .api_key_hash
+                    .as_bytes()
+                    .ct_eq(provided_hash.as_bytes()),
+            )
+        })
+        .unwrap_or(false);
+
+    if !authorized {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    next.run(request).await
 }
 
 async fn health() -> &'static str {
@@ -297,13 +330,6 @@ async fn get_stats(
 // Auth middleware tests
 // ---------------------------------------------------------------------------
 
-// TODO(next-bounty): this entire module tests the API-key middleware that was
-// never written (`require_api_key`, `sha256_hex`, and an `AppState.api_key_hash`
-// field), and it also needs a `tower` dev-dependency the indexer does not
-// declare. `#[cfg(any())]` is always false, so the module is compiled out while
-// staying readable and diffable -- delete that one attribute to bring all seven
-// tests back once the middleware exists. See the SECURITY TODO in main().
-#[cfg(any())]
 #[cfg(test)]
 mod auth_tests {
     use super::*;
@@ -325,6 +351,7 @@ mod auth_tests {
             contract_id: "C_TEST".to_string(),
             webhook_client: reqwest::Client::new(),
             api_key_hash: sha256_hex(api_key),
+            lookback_ledgers: poller::DEFAULT_LOOKBACK_LEDGERS,
         });
 
         let public_routes = Router::new()
@@ -340,7 +367,10 @@ mod auth_tests {
                 require_api_key,
             ));
 
-        public_routes.merge(protected_routes).with_state(state)
+        public_routes
+            .merge(protected_routes)
+            .layer(build_cors_layer())
+            .with_state(state)
     }
 
     #[tokio::test]
@@ -484,6 +514,30 @@ mod auth_tests {
             response.status(),
             StatusCode::OK,
             "GET /health must be publicly accessible"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cors_allows_browser_preflight() {
+        let app = test_app("secret-key").await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/events")
+                    .header("Origin", "https://client.example")
+                    .header("Access-Control-Request-Method", "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("Access-Control-Allow-Origin").unwrap(),
+            "*"
         );
     }
 

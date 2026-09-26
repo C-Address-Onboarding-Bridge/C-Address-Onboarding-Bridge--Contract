@@ -275,8 +275,11 @@ A Rust service (axum HTTP server + SQLite) that:
   accounting systems) whenever a new event is indexed, so consumers don't
   need to poll the chain themselves.
 
-Configured via `SOROBAN_RPC_URL`, `CONTRACT_ID`, `DATABASE_URL`, and
-`LISTEN_ADDR` environment variables (see `indexer/src/main.rs`).
+Configured via `SOROBAN_RPC_URL`, `CONTRACT_ID`, `DATABASE_URL`, `LISTEN_ADDR`,
+and `API_KEY` environment variables (see `indexer/src/main.rs`). Read-only
+endpoints are public; subscription creation/deletion and event replay require
+`Authorization: Bearer <API_KEY>`. CORS accepts requests from any origin, but
+does not replace API-key authentication.
 
 #### Relayer (`relayer/`)
 
