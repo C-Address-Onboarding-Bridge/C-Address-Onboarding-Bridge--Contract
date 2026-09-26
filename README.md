@@ -268,15 +268,20 @@ graph LR
 A Rust service (axum HTTP server + SQLite) that:
 
 - Polls the Soroban RPC (`poller.rs`) for `OnboardingBridge` contract events
-  (`events.rs`) — funding, batch completion, fee withdrawals, admin changes.
+  (`events.rs`) — funding, batch completion, fee withdrawals, admin changes,
+  initialization, upgrade lifecycle, emergency migrations, and referral-rate
+  changes.
 - Persists every event to its own database (`db.rs`) so historical event
   data survives independently of the chain's own retention/pruning.
 - Delivers webhooks (`webhook.rs`) to subscribers (dashboards, alerting,
   accounting systems) whenever a new event is indexed, so consumers don't
   need to poll the chain themselves.
 
-Configured via `SOROBAN_RPC_URL`, `CONTRACT_ID`, `DATABASE_URL`, and
-`LISTEN_ADDR` environment variables (see `indexer/src/main.rs`).
+Configured via `SOROBAN_RPC_URL`, `CONTRACT_ID`, `DATABASE_URL`, `LISTEN_ADDR`,
+and `API_KEY` environment variables (see `indexer/src/main.rs`). Read-only
+endpoints are public; subscription creation/deletion and event replay require
+`Authorization: Bearer <API_KEY>`. CORS accepts requests from any origin, but
+does not replace API-key authentication.
 
 #### Relayer (`relayer/`)
 
