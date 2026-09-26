@@ -2482,7 +2482,6 @@ fn test_query_effective_fee_with_cap_and_tier() {
 
 /********** cumulative counters tests **********/
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_total_bridged_and_fees_collected() {
     let env = Env::default();
@@ -2505,7 +2504,6 @@ fn test_query_total_bridged_and_fees_collected() {
     assert_eq!(total_fees, 5i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_total_bridged_accumulates() {
     let env = Env::default();
@@ -2531,7 +2529,6 @@ fn test_query_total_bridged_accumulates() {
     assert_eq!(total_fees, 10i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_total_bridged_batch() {
     let env = Env::default();
@@ -2558,7 +2555,6 @@ fn test_query_total_bridged_batch() {
     assert_eq!(total_fees, 15i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_total_bridged_zero() {
     let env = Env::default();
@@ -5769,7 +5765,6 @@ fn test_extend_source_persistent_ttl_caps_at_max_allowed_ttl() {
     assert!(ttl <= MAX_ALLOWED_TTL);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_set_max_ttl_updates_config() {
     let env = Env::default();
@@ -5794,7 +5789,6 @@ fn test_set_max_ttl_updates_config() {
     assert_eq!(critical_threshold, CRITICAL_ENTRY_TTL_THRESHOLD);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_ttl_config_returns_current_settings() {
     let env = Env::default();
@@ -5950,7 +5944,6 @@ fn test_asset_fee_cap_overrides_global_rate() {
     assert_eq!(bridge.query_accrued_fees(&token_id), 5i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_asset_fee_cap_returns_configured_value() {
     let env = Env::default();
@@ -6468,5 +6461,71 @@ fn test_remove_swap_pool_duplicate_nonce_fails() {
     assert_eq!(
         bridge.try_remove_swap_pool(&pool, &Some(999u64)),
         Err(Ok(BridgeError::DuplicateNonce))
+    );
+}
+
+/********** verify_auth_entry tests (#580) **********/
+
+#[test]
+fn test_verify_auth_entry_success() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let seq = env.ledger().sequence();
+    // Should succeed: nonce 0 is fresh, ledger is within the window
+    bridge.verify_auth_entry(&user, &0u64, &0u32, &(seq + 100));
+
+    // The nonce must now be marked used; replaying it must fail
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &0u64, &0u32, &(seq + 100)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+}
+
+#[test]
+fn test_verify_auth_entry_not_initialized_fails() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    let user = Address::generate(&env);
+    let seq = env.ledger().sequence();
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &0u64, &0u32, &(seq + 100)),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_verify_auth_entry_paused_fails() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+
+    let seq = env.ledger().sequence();
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &0u64, &0u32, &(seq + 100)),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_verify_auth_entry_expired_window_fails() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // Current ledger sequence is 0; window [10, 20) excludes it
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &0u64, &10u32, &20u32),
+        Err(Ok(BridgeError::AuthNonceExpired))
     );
 }
