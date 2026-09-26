@@ -5,13 +5,14 @@ mod webhook;
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{header, Method, StatusCode},
     routing::{delete, get, post},
     Json, Router,
 };
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+use tower_http::cors::{Any, CorsLayer};
 
 pub struct AppState {
     pub db: db::Database,
@@ -127,7 +128,7 @@ async fn main() {
     // is still a dependency, so add the helper and restore this layer.
     let app = public_routes
         .merge(protected_routes)
-        // .layer(build_cors_layer())
+        .layer(build_cors_layer())
         .with_state(state);
 
     tracing::info!("Indexer listening on {}", listen_addr);
@@ -171,6 +172,13 @@ async fn main() {
     // returns. Restore the join once the workers honour the token.
     // let _ = tokio::join!(poller_handle, webhook_handle);
     tracing::info!("Indexer shut down cleanly");
+}
+
+fn build_cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::DELETE])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
 async fn health() -> &'static str {
