@@ -21,8 +21,10 @@ pub struct EventQuery {
 pub enum BridgeEventType {
     CAddressFunded,
     FeesWithdrawn,
-    AdminChanged,
-    FeeCollectorChanged,
+    AdminProposed,
+    AdminTransferred,
+    FeeCollectorTransferProposed,
+    FeeCollectorTransferred,
     FeeBpsChanged,
     ContractPaused,
     ContractUnpaused,
@@ -49,8 +51,10 @@ impl BridgeEventType {
         match topic {
             "CAddressFunded" => Some(Self::CAddressFunded),
             "FeesWithdrawn" => Some(Self::FeesWithdrawn),
-            "AdminChanged" => Some(Self::AdminChanged),
-            "FeeCollectorChanged" => Some(Self::FeeCollectorChanged),
+            "AdminProposed" => Some(Self::AdminProposed),
+            "AdminTransferred" => Some(Self::AdminTransferred),
+            "FeeCollectorTransferProposed" => Some(Self::FeeCollectorTransferProposed),
+            "FeeCollectorTransferred" => Some(Self::FeeCollectorTransferred),
             "FeeBpsChanged" => Some(Self::FeeBpsChanged),
             "ContractPaused" => Some(Self::ContractPaused),
             "ContractUnpaused" => Some(Self::ContractUnpaused),
@@ -78,8 +82,10 @@ impl BridgeEventType {
         match self {
             Self::CAddressFunded => "CAddressFunded",
             Self::FeesWithdrawn => "FeesWithdrawn",
-            Self::AdminChanged => "AdminChanged",
-            Self::FeeCollectorChanged => "FeeCollectorChanged",
+            Self::AdminProposed => "AdminProposed",
+            Self::AdminTransferred => "AdminTransferred",
+            Self::FeeCollectorTransferProposed => "FeeCollectorTransferProposed",
+            Self::FeeCollectorTransferred => "FeeCollectorTransferred",
             Self::FeeBpsChanged => "FeeBpsChanged",
             Self::ContractPaused => "ContractPaused",
             Self::ContractUnpaused => "ContractUnpaused",
@@ -117,8 +123,11 @@ mod tests {
         let cases: &[(&str, &str)] = &[
             ("CAddressFunded", "CAddressFunded"),
             ("FeesWithdrawn", "FeesWithdrawn"),
-            ("AdminChanged", "AdminChanged"),
-            ("FeeCollectorChanged", "FeeCollectorChanged"),
+            // #641: contract emits these four role-change topics, not AdminChanged / FeeCollectorChanged
+            ("AdminProposed", "AdminProposed"),
+            ("AdminTransferred", "AdminTransferred"),
+            ("FeeCollectorTransferProposed", "FeeCollectorTransferProposed"),
+            ("FeeCollectorTransferred", "FeeCollectorTransferred"),
             ("FeeBpsChanged", "FeeBpsChanged"),
             ("ContractPaused", "ContractPaused"),
             ("ContractUnpaused", "ContractUnpaused"),
@@ -149,6 +158,19 @@ mod tests {
                 "as_str() mismatch for topic '{topic}'"
             );
         }
+    }
+
+    /// #641: The old incorrect topic strings must NOT be recognised.
+    #[test]
+    fn test_from_topic_rejects_old_incorrect_role_change_topic_strings() {
+        assert!(
+            BridgeEventType::from_topic("AdminChanged").is_none(),
+            "'AdminChanged' was never emitted by the contract and must yield None"
+        );
+        assert!(
+            BridgeEventType::from_topic("FeeCollectorChanged").is_none(),
+            "'FeeCollectorChanged' was never emitted by the contract and must yield None"
+        );
     }
 
     /// An unknown topic string must return None (no panic, no default).

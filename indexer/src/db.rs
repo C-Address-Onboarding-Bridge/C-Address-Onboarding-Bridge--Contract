@@ -304,25 +304,25 @@ impl Database {
             }
 
             let data = &event.data;
+
+            // #640: filters must fail CLOSED — if the event does not carry the
+            // filtered field at all, it does NOT match the subscription.
             if let Some(ref af) = sub.asset_filter {
-                if let Some(asset) = data.get("asset").and_then(|v| v.as_str()) {
-                    if asset != af {
-                        continue;
-                    }
+                match data.get("asset").and_then(|v| v.as_str()) {
+                    Some(asset) if asset == af => {} // field present and matches → keep going
+                    _ => continue,                   // missing or non-matching → skip
                 }
             }
             if let Some(ref sf) = sub.source_filter {
-                if let Some(source) = data.get("source").and_then(|v| v.as_str()) {
-                    if source != sf {
-                        continue;
-                    }
+                match data.get("source").and_then(|v| v.as_str()) {
+                    Some(source) if source == sf => {}
+                    _ => continue,
                 }
             }
             if let Some(ref tf) = sub.target_filter {
-                if let Some(target) = data.get("target").and_then(|v| v.as_str()) {
-                    if target != tf {
-                        continue;
-                    }
+                match data.get("target").and_then(|v| v.as_str()) {
+                    Some(target) if target == tf => {}
+                    _ => continue,
                 }
             }
 
@@ -577,7 +577,7 @@ mod tests {
         use crate::poller::parse_contract_event_for_test;
 
         let raw = serde_json::json!({
-            "topic": ["CAddressFunded", "GSOURCE", "CTARGET"],
+            "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
             "ledger": 42,
             "txHash": "abcdef1234567890",
             "createdAt": "2024-01-01T00:00:00Z",
@@ -594,6 +594,161 @@ mod tests {
         assert_eq!(
             id1, id2,
             "parse_contract_event must produce the same id for the same input"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #640 — subscription filters must fail CLOSED
+    // -----------------------------------------------------------------------
+
+    /// Build a subscription row for filter tests.
+    fn make_subscription(
+        id: &str,
+        asset_filter: Option<&str>,
+        source_filter: Option<&str>,
+        target_filter: Option<&str>,
+    ) -> Subscription {
+        Subscription {
+            id: id.to_string(),
+            url: "http://example.com/hook".to_string(),
+            event_type: None,
+            asset_filter: asset_filter.map(str::to_string),
+            source_filter: source_filter.map(str::to_string),
+            target_filter: target_filter.map(str::to_string),
+            active: true,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    /// Helper: insert a subscription and an event, then return the pending delivery count.
+    async fn delivery_count_after_queue(
+        db: &Database,
+        sub: Subscription,
+        event: IndexedEvent,
+    ) -> usize {
+        // Insert subscription directly via create_subscription is not available
+        // here without a CreateSubscription struct, so insert via raw SQL.
+        sqlx::query(
+            "INSERT INTO subscriptions (id, url, event_type, asset_filter, source_filter, target_filter, active, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+        )
+        .bind(&sub.id)
+        .bind(&sub.url)
+        .bind(&sub.event_type)
+        .bind(&sub.asset_filter)
+        .bind(&sub.source_filter)
+        .bind(&sub.target_filter)
+        .bind(&sub.created_at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        db.insert_event(&event).await.unwrap();
+        db.queue_webhook_deliveries(&event).await.unwrap();
+
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM webhook_deliveries")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        count as usize
+    }
+
+    /// #640: asset_filter matches when data["asset"] equals the filter value.
+    #[tokio::test]
+    async fn test_asset_filter_matches_when_asset_field_equals_filter() {
+        let db = setup_db().await;
+        let sub = make_subscription("sub-1", Some("CASSET"), None, None);
+        let event = IndexedEvent {
+            id: "evt-af-match".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 1,
+            contract_id: "C1".to_string(),
+            tx_hash: "tx1".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({ "asset": "CASSET", "source": "GSRC", "target": "CTGT" }),
+        };
+        assert_eq!(delivery_count_after_queue(&db, sub, event).await, 1);
+    }
+
+    /// #640: asset_filter does NOT match when data["asset"] differs.
+    #[tokio::test]
+    async fn test_asset_filter_blocks_when_asset_field_differs() {
+        let db = setup_db().await;
+        let sub = make_subscription("sub-2", Some("CASSET"), None, None);
+        let event = IndexedEvent {
+            id: "evt-af-no-match".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 1,
+            contract_id: "C1".to_string(),
+            tx_hash: "tx2".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({ "asset": "CDIFFERENT", "source": "GSRC", "target": "CTGT" }),
+        };
+        assert_eq!(delivery_count_after_queue(&db, sub, event).await, 0);
+    }
+
+    /// #640: asset_filter fails CLOSED — if data["asset"] is absent the delivery
+    /// is NOT queued (old behaviour: it was silently skipped, so every event matched).
+    #[tokio::test]
+    async fn test_asset_filter_fails_closed_when_asset_field_missing() {
+        let db = setup_db().await;
+        let sub = make_subscription("sub-3", Some("CASSET"), None, None);
+        // Event has no "asset" key in data — e.g. a FeesWithdrawn event.
+        let event = IndexedEvent {
+            id: "evt-af-missing".to_string(),
+            event_type: "FeesWithdrawn".to_string(),
+            ledger_sequence: 1,
+            contract_id: "C1".to_string(),
+            tx_hash: "tx3".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({ "fee_collector": "GCOL" }),
+        };
+        assert_eq!(
+            delivery_count_after_queue(&db, sub, event).await,
+            0,
+            "asset_filter must fail closed when data['asset'] is absent"
+        );
+    }
+
+    /// #640: source_filter fails CLOSED — missing field means no delivery.
+    #[tokio::test]
+    async fn test_source_filter_fails_closed_when_source_field_missing() {
+        let db = setup_db().await;
+        let sub = make_subscription("sub-4", None, Some("GSRC"), None);
+        let event = IndexedEvent {
+            id: "evt-sf-missing".to_string(),
+            event_type: "FeesWithdrawn".to_string(),
+            ledger_sequence: 1,
+            contract_id: "C1".to_string(),
+            tx_hash: "tx4".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({ "fee_collector": "GCOL" }),
+        };
+        assert_eq!(
+            delivery_count_after_queue(&db, sub, event).await,
+            0,
+            "source_filter must fail closed when data['source'] is absent"
+        );
+    }
+
+    /// #640: target_filter fails CLOSED — missing field means no delivery.
+    #[tokio::test]
+    async fn test_target_filter_fails_closed_when_target_field_missing() {
+        let db = setup_db().await;
+        let sub = make_subscription("sub-5", None, None, Some("CTGT"));
+        let event = IndexedEvent {
+            id: "evt-tf-missing".to_string(),
+            event_type: "FeesWithdrawn".to_string(),
+            ledger_sequence: 1,
+            contract_id: "C1".to_string(),
+            tx_hash: "tx5".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({ "fee_collector": "GCOL" }),
+        };
+        assert_eq!(
+            delivery_count_after_queue(&db, sub, event).await,
+            0,
+            "target_filter must fail closed when data['target'] is absent"
         );
     }
 }

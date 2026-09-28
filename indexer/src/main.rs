@@ -18,6 +18,14 @@ pub struct AppState {
     pub rpc_url: String,
     pub contract_id: String,
     pub webhook_client: reqwest::Client,
+    /// Dedicated HTTP client for all Soroban RPC calls (fetch_latest_ledger,
+    /// poll_once).  Built with connect and request timeouts so a hung RPC node
+    /// cannot stall the poll loop indefinitely.
+    ///
+    /// Timeouts are configurable via env vars:
+    ///   `RPC_CONNECT_TIMEOUT_SECS`  — TCP/TLS handshake timeout (default: 10 s)
+    ///   `RPC_REQUEST_TIMEOUT_SECS`  — full request/response timeout (default: 30 s)
+    pub rpc_client: reqwest::Client,
     /// Number of ledgers to look back from the RPC tip on first run (no
     /// persisted `last_ledger`).  Set via `LOOKBACK_LEDGERS` env var
     /// (default: 720 ≈ 1 hour at ~5 s/ledger).
@@ -71,11 +79,28 @@ async fn main() {
     let database = db::Database::new(&db_url).await;
     database.migrate().await;
 
+    // Build a dedicated RPC client with timeouts so a hung RPC node cannot
+    // stall the poll loop indefinitely (#638).
+    let rpc_connect_timeout_secs: u64 = std::env::var("RPC_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let rpc_request_timeout_secs: u64 = std::env::var("RPC_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let rpc_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(rpc_connect_timeout_secs))
+        .timeout(std::time::Duration::from_secs(rpc_request_timeout_secs))
+        .build()
+        .expect("failed to build RPC HTTP client");
+
     let state = Arc::new(AppState {
         db: database,
         rpc_url,
         contract_id,
         webhook_client: reqwest::Client::new(),
+        rpc_client,
         lookback_ledgers,
     });
 
