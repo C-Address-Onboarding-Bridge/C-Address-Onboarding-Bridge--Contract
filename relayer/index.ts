@@ -435,6 +435,12 @@ export class EthChainListener implements ChainListener {
   }
 
   start(onEvent: (event: BridgeEvent) => void): void {
+    // Fire-and-forget: confirm the configured chainId actually matches the
+    // node we're polling before we start emitting events signed for it.
+    this.verifyChainId().catch((err: any) => {
+      console.error(`[eth-listener] chainId verification failed: ${err.message}`);
+    });
+
     const poll = async () => {
       try {
         const logs = await this.getLogs();
@@ -460,6 +466,35 @@ export class EthChainListener implements ChainListener {
 
   stop(): void {
     if (this.timer) clearInterval(this.timer);
+  }
+
+  /**
+   * Cross-check `config.chainId` against the RPC node's own `eth_chainId`.
+   * Prevents signing/relaying testnet events (Sepolia, Base, …) with a
+   * chainId configured for a different network (e.g. mainnet's `1`).
+   */
+  private async verifyChainId(): Promise<void> {
+    const body = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'eth_chainId',
+      params: [],
+    });
+
+    const res = await fetch(this.config.rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+    const json: any = await res.json();
+    const remoteChainId = parseInt(json.result, 16);
+
+    if (Number.isFinite(remoteChainId) && remoteChainId !== this.config.chainId) {
+      console.error(
+        `[eth-listener] chainId mismatch: configured=${this.config.chainId} ` +
+          `rpc-reported=${remoteChainId}. Signed payloads will use the wrong chainId.`,
+      );
+    }
   }
 
   private async getLogs(): Promise<any[]> {
@@ -1044,6 +1079,24 @@ export function test_signature_from_known_seed_is_deterministic(): void {
  *
  * Exported so it can be unit-tested independently of process.exit.
  */
+/**
+ * Parse a required chain-id environment variable as a positive integer.
+ * Used for `ETH_CHAIN_ID` / `SOLANA_CHAIN_ID`, which are only required when
+ * the corresponding listener is enabled (Issue: chain ids were previously
+ * hard-coded to 1 / 101, which silently signs testnet events as mainnet).
+ */
+export function requireChainId(env: NodeJS.ProcessEnv, name: string): number {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === '') {
+    throw new Error(`${name} is required but was not set`);
+  }
+  const chainId = parseInt(raw.trim(), 10);
+  if (!Number.isInteger(chainId) || chainId < 0) {
+    throw new Error(`${name} must be a non-negative integer, got: "${raw}"`);
+  }
+  return chainId;
+}
+
 export function validateEnv(env: NodeJS.ProcessEnv = process.env): {
   contractId: string;
   rpcUrl: string;
@@ -1154,6 +1207,28 @@ export function test_zero_threshold_is_rejected(): void {
   }
 }
 
+export function test_missing_chain_id_throws(): void {
+  try {
+    requireChainId({}, 'ETH_CHAIN_ID');
+    throw new Error('Expected requireChainId to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('ETH_CHAIN_ID'), `expected ETH_CHAIN_ID error, got: ${e.message}`);
+  }
+}
+
+export function test_non_numeric_chain_id_throws(): void {
+  try {
+    requireChainId({ SOLANA_CHAIN_ID: 'not-a-number' }, 'SOLANA_CHAIN_ID');
+    throw new Error('Expected requireChainId to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('SOLANA_CHAIN_ID'), `expected SOLANA_CHAIN_ID error, got: ${e.message}`);
+  }
+}
+
+export function test_valid_chain_id_parses_correctly(): void {
+  assertEqual(requireChainId({ ETH_CHAIN_ID: '11155111' }, 'ETH_CHAIN_ID'), 11155111, 'ETH_CHAIN_ID');
+}
+
 export function test_valid_env_parses_correctly(): void {
   const env: NodeJS.ProcessEnv = {
     CONTRACT_ID: 'C_TEST',
@@ -1188,6 +1263,10 @@ async function runRelayerSelfTests(): Promise<void> {
   test_nan_threshold_is_rejected();
   test_zero_threshold_is_rejected();
   test_valid_env_parses_correctly();
+  // Issue #672: chain ids must come from env, not be hard-coded to 1/101.
+  test_missing_chain_id_throws();
+  test_non_numeric_chain_id_throws();
+  test_valid_chain_id_parses_correctly();
   console.log('[relayer] self-tests passed');
 }
 
@@ -1214,12 +1293,12 @@ if (require.main === module) {
           rpcUrl: process.env.ETH_RPC_URL,
           bridgeContractAddress: process.env.ETH_BRIDGE_CONTRACT!,
           eventTopic: process.env.ETH_EVENT_TOPIC!,
-          chainId: 1,
+          chainId: requireChainId(process.env, 'ETH_CHAIN_ID'),
         })] : []),
         ...(process.env.SOLANA_WS_URL ? [new SolanaChainListener({
           wsUrl: process.env.SOLANA_WS_URL,
           programId: process.env.SOLANA_PROGRAM_ID!,
-          chainId: 101,
+          chainId: requireChainId(process.env, 'SOLANA_CHAIN_ID'),
         })] : []),
       ],
     });
