@@ -87,10 +87,9 @@ fn unwrap_ipv4_mapped_or_compatible(ip: IpAddr) -> IpAddr {
 ///   2. Scheme must be `http` or `https`.
 ///   3. Host must not resolve to a private/link-local/reserved IP address.
 ///
-/// DNS resolution is intentionally synchronous (via `std::net::ToSocketAddrs`)
-/// so this can be called from a synchronous context without an async executor.
-/// For a production service you would use `tokio::net::lookup_host` instead.
-pub fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
+/// DNS resolution is performed asynchronously using `tokio::net::lookup_host`
+/// to avoid blocking async handlers.
+pub async fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
     // --- 1. Parse the URL ---------------------------------------------------
     let parsed = url::Url::parse(url).map_err(|e| UrlValidationError::InvalidUrl(e.to_string()))?;
 
@@ -126,7 +125,8 @@ pub fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
     }
 
     let port = parsed.port_or_known_default().unwrap_or(80);
-    let addrs = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
         .map_err(|_| UrlValidationError::UnresolvableHost(host.to_string()))?;
 
     for addr in addrs {
@@ -324,19 +324,19 @@ mod tests {
     // Issue 1 — SSRF URL validation
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_valid_https_url_is_accepted() {
-        assert!(validate_webhook_url("https://example.com/hook").is_ok());
+    #[tokio::test]
+    async fn test_valid_https_url_is_accepted() {
+        assert!(validate_webhook_url("https://example.com/hook").await.is_ok());
     }
 
-    #[test]
-    fn test_valid_http_url_is_accepted() {
-        assert!(validate_webhook_url("http://example.com/hook").is_ok());
+    #[tokio::test]
+    async fn test_valid_http_url_is_accepted() {
+        assert!(validate_webhook_url("http://example.com/hook").await.is_ok());
     }
 
-    #[test]
-    fn test_non_http_scheme_is_rejected() {
-        let err = validate_webhook_url("ftp://example.com/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_non_http_scheme_is_rejected() {
+        let err = validate_webhook_url("ftp://example.com/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::ForbiddenScheme(_)),
             "got: {:?}",
@@ -344,9 +344,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_file_scheme_is_rejected() {
-        let err = validate_webhook_url("file:///etc/passwd").unwrap_err();
+    #[tokio::test]
+    async fn test_file_scheme_is_rejected() {
+        let err = validate_webhook_url("file:///etc/passwd").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::ForbiddenScheme(_)),
             "got: {:?}",
@@ -354,9 +354,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_localhost_host_is_rejected() {
-        let err = validate_webhook_url("http://localhost/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_localhost_host_is_rejected() {
+        let err = validate_webhook_url("http://localhost/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -364,9 +364,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_loopback_ipv4_is_rejected() {
-        let err = validate_webhook_url("http://127.0.0.1/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_loopback_ipv4_is_rejected() {
+        let err = validate_webhook_url("http://127.0.0.1/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -374,9 +374,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_private_10_block_is_rejected() {
-        let err = validate_webhook_url("http://10.0.0.1/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_private_10_block_is_rejected() {
+        let err = validate_webhook_url("http://10.0.0.1/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -384,9 +384,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_private_172_block_is_rejected() {
-        let err = validate_webhook_url("http://172.16.0.1/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_private_172_block_is_rejected() {
+        let err = validate_webhook_url("http://172.16.0.1/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -394,9 +394,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_private_192_168_block_is_rejected() {
-        let err = validate_webhook_url("http://192.168.1.1/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_private_192_168_block_is_rejected() {
+        let err = validate_webhook_url("http://192.168.1.1/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -404,10 +404,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_link_local_metadata_ip_is_rejected() {
+    #[tokio::test]
+    async fn test_link_local_metadata_ip_is_rejected() {
         // 169.254.169.254 is the EC2 / GCP instance metadata endpoint
-        let err = validate_webhook_url("http://169.254.169.254/latest/meta-data/").unwrap_err();
+        let err = validate_webhook_url("http://169.254.169.254/latest/meta-data/").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -415,9 +415,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_link_local_range_is_rejected() {
-        let err = validate_webhook_url("http://169.254.0.1/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_link_local_range_is_rejected() {
+        let err = validate_webhook_url("http://169.254.0.1/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -425,9 +425,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_ipv6_loopback_is_rejected() {
-        let err = validate_webhook_url("http://[::1]/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_ipv6_loopback_is_rejected() {
+        let err = validate_webhook_url("http://[::1]/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -435,9 +435,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_malformed_url_is_rejected() {
-        let err = validate_webhook_url("not-a-url").unwrap_err();
+    #[tokio::test]
+    async fn test_malformed_url_is_rejected() {
+        let err = validate_webhook_url("not-a-url").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::InvalidUrl(_)),
             "got: {:?}",
@@ -445,10 +445,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_ipv4_mapped_ipv6_loopback_is_rejected() {
+    #[tokio::test]
+    async fn test_ipv4_mapped_ipv6_loopback_is_rejected() {
         // ::ffff:127.0.0.1 is IPv4-mapped loopback
-        let err = validate_webhook_url("http://[::ffff:127.0.0.1]/hook").unwrap_err();
+        let err = validate_webhook_url("http://[::ffff:127.0.0.1]/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -456,10 +456,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_ipv4_mapped_ipv6_metadata_is_rejected() {
+    #[tokio::test]
+    async fn test_ipv4_mapped_ipv6_metadata_is_rejected() {
         // ::ffff:169.254.169.254 is IPv4-mapped EC2 metadata endpoint
-        let err = validate_webhook_url("http://[::ffff:169.254.169.254]/hook").unwrap_err();
+        let err = validate_webhook_url("http://[::ffff:169.254.169.254]/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -467,10 +467,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_ipv6_multicast_is_rejected() {
+    #[tokio::test]
+    async fn test_ipv6_multicast_is_rejected() {
         // ff02::1 is IPv6 multicast
-        let err = validate_webhook_url("http://[ff02::1]/hook").unwrap_err();
+        let err = validate_webhook_url("http://[ff02::1]/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -478,10 +478,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_ipv4_multicast_is_rejected() {
+    #[tokio::test]
+    async fn test_ipv4_multicast_is_rejected() {
         // 224.0.0.1 is multicast
-        let err = validate_webhook_url("http://224.0.0.1/hook").unwrap_err();
+        let err = validate_webhook_url("http://224.0.0.1/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -489,10 +489,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_ipv4_zero_range_is_rejected() {
+    #[tokio::test]
+    async fn test_ipv4_zero_range_is_rejected() {
         // 0.0.0.1 is in 0.0.0.0/8
-        let err = validate_webhook_url("http://0.0.0.1/hook").unwrap_err();
+        let err = validate_webhook_url("http://0.0.0.1/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
