@@ -207,20 +207,33 @@ fn parse_contract_event(
         data.insert("value".to_string(), decode_rpc_scval(value));
     }
 
-    if decoded_topics.len() > 1 {
-        if let Some(source) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-            data.insert(
-                "source".to_string(),
-                serde_json::Value::String(source.to_string()),
-            );
+    // Topic position of the asset/source/target/referrer party fields varies
+    // by event: most events publish (name, source, target), but some funding
+    // paths interleave an asset (or two, for swaps) before the parties. Map
+    // each event type to its actual topic layout so `data` gets correctly
+    // labelled fields instead of a generic, sometimes-wrong source/target.
+    // See #642.
+    match &event_type {
+        BridgeEventType::SwapAndFunded => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "source_asset");
+            insert_topic_str(&mut data, &decoded_topics, 2, "target_asset");
+            insert_topic_str(&mut data, &decoded_topics, 3, "source");
+            insert_topic_str(&mut data, &decoded_topics, 4, "target");
         }
-    }
-    if decoded_topics.len() > 2 {
-        if let Some(target) = decoded_topics.get(2).and_then(|t| t.as_str()) {
-            data.insert(
-                "target".to_string(),
-                serde_json::Value::String(target.to_string()),
-            );
+        BridgeEventType::CommitRevealFunded | BridgeEventType::MetaFundExecuted => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "asset");
+            insert_topic_str(&mut data, &decoded_topics, 2, "source");
+            insert_topic_str(&mut data, &decoded_topics, 3, "target");
+        }
+        BridgeEventType::ReferralPaid => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "source");
+            insert_topic_str(&mut data, &decoded_topics, 2, "referrer");
+        }
+        _ => {
+            // CAddressFunded, CommitFund, BatchTransferFailed, and the
+            // remaining admin/config events all publish (name, source, target).
+            insert_topic_str(&mut data, &decoded_topics, 1, "source");
+            insert_topic_str(&mut data, &decoded_topics, 2, "target");
         }
     }
 
@@ -250,6 +263,20 @@ fn parse_contract_event(
         timestamp,
         data: serde_json::Value::Object(data),
     })
+}
+
+/// Insert `topics[idx]` into `data[key]` as a string, if present. Used to
+/// label the asset/source/target/referrer fields at their event-specific
+/// topic position (see the `match event_type` above).
+fn insert_topic_str(
+    data: &mut serde_json::Map<String, serde_json::Value>,
+    topics: &[serde_json::Value],
+    idx: usize,
+    key: &str,
+) {
+    if let Some(value) = topics.get(idx).and_then(serde_json::Value::as_str) {
+        data.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+    }
 }
 
 /// Decode the base64 XDR representation returned by Soroban RPC. Older test
@@ -506,6 +533,98 @@ mod tests {
         let id1 = parse_contract_event(&raw, "C1", 0).unwrap().id;
         let id2 = parse_contract_event(&raw, "C1", 0).unwrap().id;
         assert_eq!(id1, id2, "IDs must be identical for the same raw event");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #642 — funding-path events (commit-reveal, swap, meta-tx, referral)
+    // -----------------------------------------------------------------------
+
+    /// `CommitFund` uses the generic (name, source, target) layout.
+    #[test]
+    fn test_parse_commit_fund_extracts_source_and_target() {
+        let raw = raw_event(serde_json::json!(["CommitFund", "GSRC", "CTGT"]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.event_type, "CommitFund");
+        assert_eq!(event.data["source"].as_str(), Some("GSRC"));
+        assert_eq!(event.data["target"].as_str(), Some("CTGT"));
+    }
+
+    /// `CommitRevealFunded` publishes (name, asset, source, target) — the
+    /// asset must not be mislabelled as the source.
+    #[test]
+    fn test_parse_commit_reveal_funded_extracts_asset_source_target() {
+        let raw = raw_event(serde_json::json!([
+            "CommitRevealFunded",
+            "CASSET",
+            "GSRC",
+            "CTGT"
+        ]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.event_type, "CommitRevealFunded");
+        assert_eq!(event.data["asset"].as_str(), Some("CASSET"));
+        assert_eq!(event.data["source"].as_str(), Some("GSRC"));
+        assert_eq!(event.data["target"].as_str(), Some("CTGT"));
+    }
+
+    /// `MetaFundExecuted` shares the (name, asset, source, target) layout.
+    #[test]
+    fn test_parse_meta_fund_executed_extracts_asset_source_target() {
+        let raw = raw_event(serde_json::json!([
+            "MetaFundExecuted",
+            "CASSET",
+            "GSRC",
+            "CTGT"
+        ]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.event_type, "MetaFundExecuted");
+        assert_eq!(event.data["asset"].as_str(), Some("CASSET"));
+        assert_eq!(event.data["source"].as_str(), Some("GSRC"));
+        assert_eq!(event.data["target"].as_str(), Some("CTGT"));
+    }
+
+    /// `SwapAndFunded` publishes (name, source_asset, target_asset, source,
+    /// target) — five topics in total.
+    #[test]
+    fn test_parse_swap_and_funded_extracts_all_parties() {
+        let raw = raw_event(serde_json::json!([
+            "SwapAndFunded",
+            "CSRCASSET",
+            "CTGTASSET",
+            "GSRC",
+            "CTGT"
+        ]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.event_type, "SwapAndFunded");
+        assert_eq!(event.data["source_asset"].as_str(), Some("CSRCASSET"));
+        assert_eq!(event.data["target_asset"].as_str(), Some("CTGTASSET"));
+        assert_eq!(event.data["source"].as_str(), Some("GSRC"));
+        assert_eq!(event.data["target"].as_str(), Some("CTGT"));
+    }
+
+    /// `ReferralPaid` publishes (name, source, referrer) — the second party
+    /// is a referrer, not a funding target.
+    #[test]
+    fn test_parse_referral_paid_extracts_source_and_referrer() {
+        let raw = raw_event(serde_json::json!(["ReferralPaid", "GSRC", "GREFERRER"]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.event_type, "ReferralPaid");
+        assert_eq!(event.data["source"].as_str(), Some("GSRC"));
+        assert_eq!(event.data["referrer"].as_str(), Some("GREFERRER"));
+        assert!(event.data["target"].is_null());
+    }
+
+    /// `BatchTransferFailed` uses the generic (name, source, target) layout.
+    #[test]
+    fn test_parse_batch_transfer_failed_extracts_source_and_target() {
+        let raw = raw_event(serde_json::json!([
+            "BatchTransferFailed",
+            "GSRC",
+            "CTGT"
+        ]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.event_type, "BatchTransferFailed");
+        assert_eq!(event.data["source"].as_str(), Some("GSRC"));
+        assert_eq!(event.data["target"].as_str(), Some("CTGT"));
     }
 
     /// Deterministic ID: different tx_hash → different id.
