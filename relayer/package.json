@@ -7,6 +7,8 @@
   "scripts": {
     "start": "ts-node index.ts",
     "self-test": "ts-node index.ts --self-test",
+    "signer": "ts-node signer-service.ts",
+    "signer:self-test": "ts-node signer-service.ts --self-test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -45,10 +45,62 @@ export interface ChainListener {
   stop(): void;
 }
 
-/** Config for one relayer node (holds its own signing key). */
-export interface RelayerNodeConfig {
-  /** Ed25519 private key as 32-byte hex string (seed). */
-  privateKey: string;
+/**
+ * Config for one relayer node/signer.
+ *
+ * Two shapes are supported:
+ *
+ * - `{ signerUrl }` (recommended): the key never enters this process. The
+ *   relayer POSTs the payload hash to an independent signer service — run by
+ *   the operator that owns that key, on its own host/process — and receives
+ *   back a signature. See `relayer/signer-service.ts` and
+ *   `adr/ADR-007-signer-key-isolation.md`.
+ * - `{ privateKey }` (legacy/dev only): the key is loaded directly into this
+ *   process. Kept for local development and backwards compatibility, but
+ *   using it for more than one node defeats the multi-sig threshold, since
+ *   compromising this one process then yields every key. A deprecation
+ *   warning is logged whenever it's used with more than one configured node.
+ */
+export type RelayerNodeConfig =
+  | { privateKey: string; signerUrl?: undefined }
+  | { signerUrl: string; privateKey?: undefined };
+
+/** Timeout for a remote signer HTTP call, in ms. */
+const SIGNER_REQUEST_TIMEOUT_MS = 5_000;
+
+/**
+ * Request a signature from an independent per-operator signer service that
+ * holds exactly one key. The relayer process never sees that key's material.
+ */
+async function requestRemoteSignature(signerUrl: string, payloadHash: Buffer): Promise<RelayerSig> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SIGNER_REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${signerUrl.replace(/\/$/, '')}/sign`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payloadHash: payloadHash.toString('hex') }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`signer at ${signerUrl} responded ${res.status}`);
+    }
+    const json: any = await res.json();
+    if (typeof json.pubkey !== 'string' || typeof json.signature !== 'string') {
+      throw new Error(`signer at ${signerUrl} returned a malformed response`);
+    }
+    return { pubkey: json.pubkey, signature: json.signature };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** Sign the payload hash with a single node, using whichever custody mode it's configured for. */
+async function signWithNode(node: RelayerNodeConfig, payloadHash: Buffer): Promise<RelayerSig> {
+  if (node.signerUrl) {
+    return requestRemoteSignature(node.signerUrl, payloadHash);
+  }
+  return signPayload(node.privateKey!, payloadHash);
 }
 
 export interface RelayerServiceConfig {
@@ -250,6 +302,17 @@ export class RelayerService {
       networkPassphrase: config.networkPassphrase,
     });
     this.submitterKeypair = Keypair.fromSecret(config.submitterSecretKey);
+
+    const inProcessKeyCount = config.nodes.filter((n) => n.privateKey !== undefined).length;
+    if (inProcessKeyCount > 1) {
+      console.warn(
+        `[relayer] WARNING: ${inProcessKeyCount} relayer private keys are loaded directly into ` +
+          'this process. This defeats the multi-sig threshold — compromising this one process ' +
+          'yields every key. Configure each node with a `signerUrl` pointing at an independent ' +
+          'signer service instead (see relayer/signer-service.ts and ' +
+          'adr/ADR-007-signer-key-isolation.md). `privateKey` remains only for local dev.',
+      );
+    }
   }
 
   start(): void {
@@ -325,8 +388,8 @@ export class RelayerService {
     // relayer infrastructure.  A config mistake (two nodes sharing a key) or a
     // malicious injection must not inflate the effective signature count past
     // what distinct keys actually authorize.
-    const rawSigs: RelayerSig[] = this.config.nodes.map((node) =>
-      signPayload(node.privateKey, payloadHash),
+    const rawSigs: RelayerSig[] = await Promise.all(
+      this.config.nodes.map((node) => signWithNode(node, payloadHash)),
     );
     const seenPubkeys = new Set<string>();
     const sigs: RelayerSig[] = rawSigs.filter((sig) => {
@@ -1028,6 +1091,70 @@ export async function test_successful_retry_removes_dlq_entry(): Promise<void> {
   assertEqual(service.dlq.size(), 0, 'a successful retry should remove the DLQ entry');
 }
 
+// ---------------------------------------------------------------------------
+// Issue #661: regression tests — per-signer key isolation via signerUrl nodes
+// ---------------------------------------------------------------------------
+
+export async function test_signer_url_node_signs_via_remote_call_not_local_key(): Promise<void> {
+  const originalFetch = (globalThis as any).fetch;
+  let calledUrl = '';
+  let sentBody: any = null;
+  (globalThis as any).fetch = async (url: string, opts: any) => {
+    calledUrl = url;
+    sentBody = JSON.parse(opts.body);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ pubkey: 'aa'.repeat(32), signature: 'bb'.repeat(64) }),
+    };
+  };
+  try {
+    let capturedSigCount = 0;
+    const service = makeTestService({
+      threshold: 1,
+      nodes: [{ signerUrl: 'http://signer-a.internal:4000' }],
+      fundCrosschain: async (options: CrossChainFundOptions) => {
+        capturedSigCount = options.sigs.length;
+        return { status: 'pending', hash: 'hash' };
+      },
+    });
+
+    await (service as any).handleEvent(makeTestEvent());
+
+    assertEqual(calledUrl, 'http://signer-a.internal:4000/sign', 'should POST to the configured signer service');
+    assert(typeof sentBody.payloadHash === 'string', 'request body must carry the payload hash, never a private key');
+    assertEqual(capturedSigCount, 1, 'the remote signature should reach the SDK call');
+  } finally {
+    (globalThis as any).fetch = originalFetch;
+  }
+}
+
+export async function test_mixed_signer_url_and_private_key_nodes_meet_threshold(): Promise<void> {
+  const originalFetch = (globalThis as any).fetch;
+  (globalThis as any).fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ pubkey: 'cc'.repeat(32), signature: 'dd'.repeat(64) }),
+  });
+  try {
+    let calls = 0;
+    const service = makeTestService({
+      threshold: 2,
+      nodes: [{ signerUrl: 'http://signer-b.internal:4000' }, { privateKey: '05'.repeat(32) }],
+      fundCrosschain: async () => {
+        calls += 1;
+        return { status: 'pending', hash: 'hash' };
+      },
+    });
+
+    await (service as any).handleEvent(makeTestEvent());
+
+    assertEqual(calls, 1, 'a mix of remote and local signers should still meet the threshold');
+  } finally {
+    (globalThis as any).fetch = originalFetch;
+  }
+}
+
 function word(hex: string): string {
   return hex.padStart(64, '0');
 }
@@ -1464,6 +1591,8 @@ async function runRelayerSelfTests(): Promise<void> {
   await test_below_threshold_event_is_enqueued_to_dlq();
   await test_failed_submission_is_enqueued_to_dlq();
   await test_successful_retry_removes_dlq_entry();
+  await test_signer_url_node_signs_via_remote_call_not_local_key();
+  await test_mixed_signer_url_and_private_key_nodes_meet_threshold();
   test_eth_listener_decodes_realistic_abi_log_fixture();
   test_eth_listener_rejects_malformed_truncated_log_payload();
   await test_eth_listener_resolves_latest_to_concrete_block_on_first_poll();
@@ -1501,7 +1630,12 @@ if (require.main === module) {
       networkPassphrase: process.env.NETWORK_PASSPHRASE!,
       submitterSecretKey: process.env.RELAYER_SECRET_KEY!,
       threshold: parseInt(process.env.THRESHOLD ?? '1', 10),
-      nodes: (process.env.RELAYER_PRIVATE_KEYS ?? '').split(',').map((pk) => ({ privateKey: pk.trim() })),
+      // Prefer independent per-operator signer services (RELAYER_SIGNER_URLS)
+      // over in-process keys (RELAYER_PRIVATE_KEYS, legacy/dev only — see
+      // adr/ADR-007-signer-key-isolation.md).
+      nodes: process.env.RELAYER_SIGNER_URLS
+        ? process.env.RELAYER_SIGNER_URLS.split(',').map((url) => ({ signerUrl: url.trim() }))
+        : (process.env.RELAYER_PRIVATE_KEYS ?? '').split(',').map((pk) => ({ privateKey: pk.trim() })),
       listeners: [
         ...(process.env.ETH_RPC_URL ? [new EthChainListener({
           rpcUrl: process.env.ETH_RPC_URL,
