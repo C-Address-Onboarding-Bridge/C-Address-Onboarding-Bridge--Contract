@@ -3,6 +3,7 @@ use crate::AppState;
 use base64::Engine;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 const POLL_INTERVAL_MS: u64 = 5000;
 const MAX_EVENTS_PER_POLL: usize = 100;
@@ -13,14 +14,25 @@ const MAX_EVENTS_PER_POLL: usize = 100;
 /// ~5 s per ledger) and can be overridden via the `LOOKBACK_LEDGERS` env var.
 pub const DEFAULT_LOOKBACK_LEDGERS: i64 = 720;
 
-pub async fn run_poller(state: Arc<AppState>) {
+/// Runs the poll loop until `token` is cancelled. Cancellation is observed
+/// between iterations (via `select!` on the inter-poll sleep) so an
+/// in-flight `poll_once` always finishes cleanly before the worker returns.
+/// See #646.
+pub async fn run_poller(state: Arc<AppState>, token: CancellationToken) {
     tracing::info!("Starting event poller for contract {}", state.contract_id);
 
     loop {
         if let Err(e) = poll_once(&state).await {
             tracing::error!("Poller error: {}", e);
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+
+        tokio::select! {
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)) => {}
+            _ = token.cancelled() => {
+                tracing::info!("Poller received shutdown signal, exiting");
+                return;
+            }
+        }
     }
 }
 
@@ -645,5 +657,37 @@ mod tests {
         let id1 = parse_contract_event(&raw1, "C1", 0).unwrap().id;
         let id2 = parse_contract_event(&raw2, "C1", 0).unwrap().id;
         assert_ne!(id1, id2, "different tx_hash must produce different IDs");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #646 — cooperative shutdown
+    // -----------------------------------------------------------------------
+
+    /// Cancelling the token must make `run_poller` return instead of looping
+    /// forever, so the background task can be joined on shutdown.
+    #[tokio::test]
+    async fn test_run_poller_returns_when_cancelled() {
+        let db = crate::db::Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        let state = Arc::new(crate::AppState {
+            db,
+            // Unroutable in test sandboxes / CI, so `poll_once` fails fast and
+            // the loop reaches the cancellable sleep quickly.
+            rpc_url: "http://127.0.0.1:1".to_string(),
+            contract_id: "C_TEST".to_string(),
+            webhook_client: reqwest::Client::new(),
+            lookback_ledgers: 720,
+        });
+        let token = CancellationToken::new();
+        let worker_token = token.clone();
+
+        let handle = tokio::spawn(run_poller(state, worker_token));
+
+        token.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("worker must return promptly after cancellation")
+            .expect("worker task must not panic");
     }
 }

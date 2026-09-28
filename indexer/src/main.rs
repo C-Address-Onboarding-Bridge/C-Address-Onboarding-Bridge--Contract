@@ -84,20 +84,16 @@ async fn main() {
     // cleanly before the axum server drains in-flight HTTP requests.
     let token = CancellationToken::new();
 
-    // TODO(next-bounty): run_poller and run_delivery_worker each take only
-    // `state` -- neither accepts a CancellationToken, so the tokens below cannot
-    // be passed yet and cooperative shutdown of the background workers is not
-    // wired up. Give both workers a token parameter, then restore these.
     let poller_state = Arc::clone(&state);
-    // let poller_token = token.clone();
-    let _poller_handle = tokio::spawn(async move {
-        poller::run_poller(poller_state).await;
+    let poller_token = token.clone();
+    let poller_handle = tokio::spawn(async move {
+        poller::run_poller(poller_state, poller_token).await;
     });
 
     let webhook_state = Arc::clone(&state);
-    // let webhook_token = token.clone();
-    let _webhook_handle = tokio::spawn(async move {
-        webhook::run_delivery_worker(webhook_state).await;
+    let webhook_token = token.clone();
+    let webhook_handle = tokio::spawn(async move {
+        webhook::run_delivery_worker(webhook_state, webhook_token).await;
     });
 
     // Public read-only routes — no auth required.
@@ -165,11 +161,11 @@ async fn main() {
         .await
         .unwrap();
 
-    // TODO(next-bounty): joining the worker handles here would block forever --
-    // both workers loop indefinitely and have no cancellation token to observe
-    // (see the spawn sites above). The tokio runtime drops them when main
-    // returns. Restore the join once the workers honour the token.
-    // let _ = tokio::join!(poller_handle, webhook_handle);
+    // `with_graceful_shutdown` above already cancelled `token` once SIGTERM/
+    // SIGINT arrived, so both workers are winding down (or already have).
+    // Join them so `main` does not return -- and the process does not exit --
+    // until they have actually stopped. See #646.
+    let _ = tokio::join!(poller_handle, webhook_handle);
     tracing::info!("Indexer shut down cleanly");
 }
 
