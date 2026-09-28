@@ -71,11 +71,16 @@ async fn main() {
     let database = db::Database::new(&db_url).await;
     database.migrate().await;
 
+    let webhook_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("Failed to build webhook client");
+
     let state = Arc::new(AppState {
         db: database,
         rpc_url,
         contract_id,
-        webhook_client: reqwest::Client::new(),
+        webhook_client,
         lookback_ledgers,
     });
 

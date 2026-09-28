@@ -226,6 +226,21 @@ async fn deliver_pending(state: &AppState) -> Result<(), Box<dyn std::error::Err
             }
         };
 
+        // Re-validate the URL before delivery to detect DNS rebinding attacks
+        // and ensure the destination has not changed to a private/reserved address.
+        if let Err(e) = validate_webhook_url(&url).await {
+            state
+                .db
+                .mark_delivery_dead(&delivery.id, &format!("URL validation failed: {}", e))
+                .await?;
+            tracing::warn!(
+                "Webhook delivery {} failed validation at delivery time: {}",
+                delivery.id,
+                e
+            );
+            continue;
+        }
+
         let event = match state.db.get_event_by_id(&delivery.event_id).await? {
             Some(e) => e,
             None => {
@@ -260,6 +275,11 @@ async fn deliver_pending(state: &AppState) -> Result<(), Box<dyn std::error::Err
             Ok(resp) if resp.status().is_success() => {
                 state.db.mark_delivery_success(&delivery.id).await?;
                 tracing::debug!("Delivered webhook {} to {}", delivery.id, url);
+            }
+            Ok(resp) if resp.status().is_redirection() => {
+                // Redirects are not followed; treat as delivery failure
+                let error = format!("HTTP {}: redirects not allowed", resp.status());
+                handle_retry(state, &delivery, &error).await?;
             }
             Ok(resp) => {
                 let error = format!("HTTP {}", resp.status());
