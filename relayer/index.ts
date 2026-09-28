@@ -405,6 +405,14 @@ export interface EthListenerConfig {
    * directory when not provided.
    */
   blockStorePath?: string;
+  /**
+   * Maximum number of blocks requested in a single `eth_getLogs` call.
+   * Most providers reject overly large ranges (e.g. "block range too large" /
+   * "query returned more than 10000 results"), so a long gap since the last
+   * checkpoint is walked forward in chunks of at most this size rather than
+   * in one unbounded request. Defaults to 2 000 blocks.
+   */
+  maxBlockRange?: number;
 }
 
 /**
@@ -437,19 +445,23 @@ export class EthChainListener implements ChainListener {
   start(onEvent: (event: BridgeEvent) => void): void {
     const poll = async () => {
       try {
-        const logs = await this.getLogs();
+        const { logs, queriedToBlock } = await this.getLogs();
         for (const log of logs) {
           const event = this.decode(log);
           if (event) onEvent(event);
         }
-        if (logs.length > 0) {
-          // advance fromBlock past the last processed block
-          const lastBlock = parseInt(logs[logs.length - 1].blockNumber, 16);
-          this.fromBlock = '0x' + (lastBlock + 1).toString(16);
+        if (queriedToBlock !== null) {
+          // Advance past the whole queried chunk, even when it contained no
+          // logs, so a large gap since the last checkpoint is walked forward
+          // chunk-by-chunk instead of re-querying the same empty range forever.
+          this.fromBlock = '0x' + (queriedToBlock + 1).toString(16);
           // Persist so a restart resumes from here
           this.blockStore.save(this.fromBlock);
         }
       } catch (err: any) {
+        // Surfaced (not swallowed): a JSON-RPC error (e.g. block range too
+        // large, rate limited) is logged and retried on the next poll tick
+        // without advancing fromBlock, so no events are skipped.
         console.error(`[eth-listener] poll error: ${err.message}`);
       }
     };
@@ -462,26 +474,52 @@ export class EthChainListener implements ChainListener {
     if (this.timer) clearInterval(this.timer);
   }
 
-  private async getLogs(): Promise<any[]> {
-    const body = JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'eth_getLogs',
-      params: [{
-        fromBlock: this.fromBlock,
-        toBlock: 'latest',
-        address: this.config.bridgeContractAddress,
-        topics: [this.config.eventTopic],
-      }],
-    });
-
+  private async rpcCall(method: string, params: unknown[]): Promise<any> {
+    const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
     const res = await fetch(this.config.rpcUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body,
     });
     const json: any = await res.json();
-    return json.result ?? [];
+    if (json.error) {
+      const message = typeof json.error?.message === 'string' ? json.error.message : JSON.stringify(json.error);
+      throw new Error(`${method} RPC error: ${message}`);
+    }
+    return json.result;
+  }
+
+  /**
+   * Fetch logs in the range [fromBlock, latest], walking forward in chunks of
+   * at most `maxBlockRange` blocks so that a large gap since the last
+   * checkpoint (e.g. after downtime) never produces a single unbounded
+   * `eth_getLogs` request that most providers would reject outright.
+   *
+   * A JSON-RPC `error` is thrown (not swallowed as "no logs") so callers can
+   * see and retry it.
+   */
+  private async getLogs(): Promise<{ logs: any[]; queriedToBlock: number | null }> {
+    const maxRange = this.config.maxBlockRange ?? 2_000;
+
+    const latestHex: string = await this.rpcCall('eth_blockNumber', []);
+    const latestBlock = parseInt(latestHex, 16);
+
+    const startBlock =
+      this.fromBlock === 'latest' ? latestBlock : parseInt(this.fromBlock, 16);
+    if (!Number.isFinite(startBlock) || startBlock > latestBlock) {
+      return { logs: [], queriedToBlock: null };
+    }
+
+    const endBlock = Math.min(startBlock + maxRange - 1, latestBlock);
+
+    const result = await this.rpcCall('eth_getLogs', [{
+      fromBlock: '0x' + startBlock.toString(16),
+      toBlock: '0x' + endBlock.toString(16),
+      address: this.config.bridgeContractAddress,
+      topics: [this.config.eventTopic],
+    }]);
+
+    return { logs: Array.isArray(result) ? result : [], queriedToBlock: endBlock };
   }
 
   /**
@@ -909,6 +947,68 @@ export function test_eth_listener_decodes_realistic_abi_log_fixture(): void {
   assertEqual(event.amount, '123456789', 'amount should decode');
 }
 
+/**
+ * Issue #664 regression: a JSON-RPC `error` (e.g. "block range too large")
+ * must be thrown, not silently treated as "no logs".
+ */
+export async function test_eth_listener_throws_on_rpc_error(): Promise<void> {
+  const originalFetch = (globalThis as any).fetch;
+  (globalThis as any).fetch = async () => ({
+    json: async () => ({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'block range too large' } }),
+  });
+  try {
+    const listener = new EthChainListener({
+      rpcUrl: 'http://localhost',
+      bridgeContractAddress: '0xbridge',
+      eventTopic: '0xtopic',
+      chainId: 1,
+    });
+    let threw = false;
+    try {
+      await (listener as any).rpcCall('eth_getLogs', [{}]);
+    } catch {
+      threw = true;
+    }
+    assert(threw, 'a JSON-RPC error result must be thrown, not swallowed as an empty log list');
+  } finally {
+    (globalThis as any).fetch = originalFetch;
+  }
+}
+
+/**
+ * Issue #664 regression: a single `getLogs()` call must never request more
+ * than `maxBlockRange` blocks, even when the checkpoint is far behind head.
+ */
+export async function test_eth_listener_bounds_block_range(): Promise<void> {
+  const originalFetch = (globalThis as any).fetch;
+  const requestedRanges: Array<{ fromBlock: string; toBlock: string }> = [];
+  (globalThis as any).fetch = async (_url: string, init: any) => {
+    const body = JSON.parse(init.body);
+    if (body.method === 'eth_blockNumber') {
+      return { json: async () => ({ jsonrpc: '2.0', id: 1, result: '0x' + (100_000).toString(16) }) };
+    }
+    requestedRanges.push(body.params[0]);
+    return { json: async () => ({ jsonrpc: '2.0', id: 1, result: [] }) };
+  };
+  try {
+    const listener = new EthChainListener({
+      rpcUrl: 'http://localhost',
+      bridgeContractAddress: '0xbridge',
+      eventTopic: '0xtopic',
+      chainId: 1,
+      maxBlockRange: 500,
+    });
+    (listener as any).fromBlock = '0x0';
+    const { queriedToBlock } = await (listener as any).getLogs();
+    assertEqual(queriedToBlock, 499, 'queried range must be capped at maxBlockRange - 1');
+    assertEqual(requestedRanges.length, 1, 'exactly one eth_getLogs call should be made');
+    assertEqual(requestedRanges[0].fromBlock, '0x0', 'fromBlock should be the checkpoint');
+    assertEqual(requestedRanges[0].toBlock, '0x' + (499).toString(16), 'toBlock must not exceed maxBlockRange');
+  } finally {
+    (globalThis as any).fetch = originalFetch;
+  }
+}
+
 export function test_eth_listener_rejects_malformed_truncated_log_payload(): void {
   const listener = new EthChainListener({
     rpcUrl: 'http://localhost',
@@ -1176,6 +1276,8 @@ async function runRelayerSelfTests(): Promise<void> {
   await test_duplicate_pubkey_nodes_do_not_inflate_sig_count();
   await test_mixed_duplicate_and_unique_pubkeys_meet_threshold();
   test_eth_listener_decodes_realistic_abi_log_fixture();
+  await test_eth_listener_throws_on_rpc_error();
+  await test_eth_listener_bounds_block_range();
   test_eth_listener_rejects_malformed_truncated_log_payload();
   test_solana_listener_rejects_bad_log_lines();
   test_payload_hash_matches_onchain_algorithm();
