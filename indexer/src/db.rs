@@ -1,6 +1,7 @@
 use crate::events::IndexedEvent;
 use crate::webhook::{CreateSubscription, Subscription, WebhookDelivery};
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{Sqlite, SqlitePool, SqlitePoolOptions};
+use sqlx::Transaction;
 
 /// Raw column tuple for a `subscriptions` row, in SELECT order:
 /// id, url, event_type, asset_filter, source_filter, target_filter, active, created_at.
@@ -160,6 +161,110 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Inserts `event` and, if it was newly indexed (not a re-poll of an
+    /// already-seen event), queues its webhook deliveries -- both inside one
+    /// SQLite transaction.
+    ///
+    /// `insert_event` and `queue_webhook_deliveries` used to run as two
+    /// separate statements. If the process died (or `queue_webhook_deliveries`
+    /// errored) between them, the event was committed but its deliveries were
+    /// not; the next poll would then see the event as a duplicate
+    /// (`insert_event` returns false) and never queue it, permanently losing
+    /// those webhooks. Doing both under one transaction means either both
+    /// happen or neither does. See #647.
+    pub async fn insert_event_and_queue_deliveries(
+        &self,
+        event: &IndexedEvent,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+
+        let data_str = serde_json::to_string(&event.data).unwrap_or_default();
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO events (id, event_type, ledger_sequence, contract_id, tx_hash, timestamp, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(&event.id)
+        .bind(&event.event_type)
+        .bind(event.ledger_sequence)
+        .bind(&event.contract_id)
+        .bind(&event.tx_hash)
+        .bind(&event.timestamp)
+        .bind(&data_str)
+        .execute(&mut tx)
+        .await?;
+        let inserted = result.rows_affected() > 0;
+
+        if inserted {
+            Self::queue_webhook_deliveries_tx(&mut tx, event).await?;
+        }
+
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    /// Same subscription-matching and insert logic as
+    /// [`Database::queue_webhook_deliveries`], but run against an open
+    /// transaction so callers can commit it atomically alongside another
+    /// write (see [`Database::insert_event_and_queue_deliveries`]).
+    async fn queue_webhook_deliveries_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        event: &IndexedEvent,
+    ) -> Result<(), sqlx::Error> {
+        let subs: Vec<SubscriptionRow> = sqlx::query_as(
+            "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, created_at
+             FROM subscriptions WHERE active = 1",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let data = &event.data;
+
+        for (sub_id, _url, event_type, asset_filter, source_filter, target_filter, _active, _created_at) in
+            subs
+        {
+            if let Some(ref et) = event_type {
+                if et != &event.event_type {
+                    continue;
+                }
+            }
+            if let Some(ref af) = asset_filter {
+                if let Some(asset) = data.get("asset").and_then(|v| v.as_str()) {
+                    if asset != af {
+                        continue;
+                    }
+                }
+            }
+            if let Some(ref sf) = source_filter {
+                if let Some(source) = data.get("source").and_then(|v| v.as_str()) {
+                    if source != sf {
+                        continue;
+                    }
+                }
+            }
+            if let Some(ref tf) = target_filter {
+                if let Some(target) = data.get("target").and_then(|v| v.as_str()) {
+                    if target != tf {
+                        continue;
+                    }
+                }
+            }
+
+            let delivery_id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
+                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)",
+            )
+            .bind(&delivery_id)
+            .bind(&sub_id)
+            .bind(&event.id)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn list_events(
@@ -594,6 +699,123 @@ mod tests {
         assert_eq!(
             id1, id2,
             "parse_contract_event must produce the same id for the same input"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #647 — atomic event insert + webhook queueing
+    // -----------------------------------------------------------------------
+
+    /// Happy path: a newly-indexed event with a matching subscription must
+    /// end up both inserted and with a pending delivery queued.
+    #[tokio::test]
+    async fn test_insert_and_queue_deliveries_happy_path() {
+        let db = setup_db().await;
+        db.create_subscription(CreateSubscription {
+            url: "http://example.com/hook".to_string(),
+            event_type: None,
+            asset_filter: None,
+            source_filter: None,
+            target_filter: None,
+        })
+        .await
+        .expect("create subscription");
+
+        let event = make_event("evt-atomic-happy");
+        let inserted = db
+            .insert_event_and_queue_deliveries(&event)
+            .await
+            .expect("insert_event_and_queue_deliveries");
+        assert!(inserted, "first insert of a new event must report true");
+
+        let rows = db.list_events(10, 0).await.expect("list_events");
+        assert_eq!(rows.len(), 1, "event must be persisted");
+
+        let pending = db
+            .get_pending_deliveries()
+            .await
+            .expect("get_pending_deliveries");
+        assert_eq!(
+            pending.len(),
+            1,
+            "matching subscription must have a queued delivery"
+        );
+    }
+
+    /// Re-polling an already-indexed event must not queue duplicate deliveries.
+    #[tokio::test]
+    async fn test_insert_and_queue_deliveries_skips_duplicate_event() {
+        let db = setup_db().await;
+        db.create_subscription(CreateSubscription {
+            url: "http://example.com/hook".to_string(),
+            event_type: None,
+            asset_filter: None,
+            source_filter: None,
+            target_filter: None,
+        })
+        .await
+        .expect("create subscription");
+
+        let event = make_event("evt-atomic-dup");
+        db.insert_event_and_queue_deliveries(&event)
+            .await
+            .expect("first insert");
+        let inserted_again = db
+            .insert_event_and_queue_deliveries(&event)
+            .await
+            .expect("second insert must not error");
+        assert!(
+            !inserted_again,
+            "re-inserting the same event id must report false"
+        );
+
+        let pending = db
+            .get_pending_deliveries()
+            .await
+            .expect("get_pending_deliveries");
+        assert_eq!(
+            pending.len(),
+            1,
+            "duplicate insert must not queue a second delivery"
+        );
+    }
+
+    /// Simulates a failure between the insert and the webhook-queueing step
+    /// (dropping the table the second half writes to). The whole transaction
+    /// must roll back, so the event is NOT left indexed with no delivery
+    /// queued -- the exact bug #647 reports.
+    #[tokio::test]
+    async fn test_insert_and_queue_deliveries_rolls_back_event_on_queue_failure() {
+        let db = setup_db().await;
+        db.create_subscription(CreateSubscription {
+            url: "http://example.com/hook".to_string(),
+            event_type: None,
+            asset_filter: None,
+            source_filter: None,
+            target_filter: None,
+        })
+        .await
+        .expect("create subscription");
+
+        // Force the queueing half of the transaction to fail.
+        sqlx::query("DROP TABLE webhook_deliveries")
+            .execute(&db.pool)
+            .await
+            .expect("drop webhook_deliveries table");
+
+        let event = make_event("evt-atomic-rollback");
+        let result = db.insert_event_and_queue_deliveries(&event).await;
+        assert!(
+            result.is_err(),
+            "a failure while queueing deliveries must propagate as an error"
+        );
+
+        let rows = db.list_events(10, 0).await.expect("list_events");
+        assert!(
+            rows.is_empty(),
+            "the event insert must be rolled back when queueing fails, so a \
+             retry can insert AND queue it instead of silently treating it as \
+             an already-seen duplicate"
         );
     }
 }

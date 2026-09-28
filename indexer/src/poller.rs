@@ -150,10 +150,12 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
         *counter += 1;
 
         if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id, event_index) {
+            // Insert the event and queue its webhook deliveries atomically
+            // (one SQLite transaction) so a crash between the two can never
+            // leave an indexed event with no deliveries queued. See #647.
             // Only fan out webhooks for events we have not indexed before;
             // otherwise a re-poll would re-deliver every event in the range.
-            if state.db.insert_event(&indexed).await? {
-                state.db.queue_webhook_deliveries(&indexed).await?;
+            if state.db.insert_event_and_queue_deliveries(&indexed).await? {
                 tracing::info!(
                     "Indexed event: {} at ledger {}",
                     indexed.event_type,
