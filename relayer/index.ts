@@ -14,6 +14,8 @@
 
 import * as crypto from 'crypto';
 import * as http from 'http';
+import * as fs from 'fs';
+import * as path from 'path';
 import { Keypair } from '@stellar/stellar-sdk';
 import { OnboardingBridgeSDK } from '../sdk/src/bridge';
 import { CrossChainFundOptions, RelayerSig } from '../sdk/src/types';
@@ -422,6 +424,7 @@ export class EthChainListener implements ChainListener {
   private fromBlock: string;
   private config: EthListenerConfig;
   private blockStore: BlockStore;
+  private onEvent: ((event: BridgeEvent) => void) | null = null;
 
   constructor(config: EthListenerConfig) {
     this.config = config;
@@ -435,41 +438,77 @@ export class EthChainListener implements ChainListener {
   }
 
   start(onEvent: (event: BridgeEvent) => void): void {
-    const poll = async () => {
-      try {
-        const logs = await this.getLogs();
-        for (const log of logs) {
-          const event = this.decode(log);
-          if (event) onEvent(event);
-        }
-        if (logs.length > 0) {
-          // advance fromBlock past the last processed block
-          const lastBlock = parseInt(logs[logs.length - 1].blockNumber, 16);
-          this.fromBlock = '0x' + (lastBlock + 1).toString(16);
-          // Persist so a restart resumes from here
-          this.blockStore.save(this.fromBlock);
-        }
-      } catch (err: any) {
-        console.error(`[eth-listener] poll error: ${err.message}`);
-      }
-    };
-
-    this.timer = setInterval(poll, this.config.pollIntervalMs ?? 12_000);
-    poll(); // immediate first poll
+    this.onEvent = onEvent;
+    this.timer = setInterval(() => this.pollOnce(), this.config.pollIntervalMs ?? 12_000);
+    this.pollOnce(); // immediate first poll
   }
 
   stop(): void {
     if (this.timer) clearInterval(this.timer);
   }
 
-  private async getLogs(): Promise<any[]> {
+  /**
+   * Run a single poll cycle. Exposed (not just used from the timer) so tests
+   * can drive it deterministically against a fake RPC.
+   */
+  private async pollOnce(): Promise<void> {
+    try {
+      if (this.fromBlock === 'latest') {
+        // Fresh install: resolve 'latest' to a concrete block number *once*
+        // and persist it, instead of re-querying a single sliding block on
+        // every poll (which misses anything produced between two polls).
+        const current = await this.getBlockNumber();
+        this.fromBlock = current;
+        this.blockStore.save(this.fromBlock);
+        console.log(`[eth-listener] resolved initial block to ${this.fromBlock}`);
+        return;
+      }
+
+      const toBlock = await this.getBlockNumber();
+      const logs = await this.getLogs(toBlock);
+      for (const log of logs) {
+        const event = this.decode(log);
+        if (event && this.onEvent) this.onEvent(event);
+      }
+
+      // Always advance fromBlock past the queried range — even when zero
+      // logs were returned. Otherwise any block produced between two polls
+      // that never contains a matching log is never queried again.
+      const nextFromBlock = '0x' + (parseInt(toBlock, 16) + 1).toString(16);
+      this.fromBlock = nextFromBlock;
+      this.blockStore.save(this.fromBlock);
+    } catch (err: any) {
+      console.error(`[eth-listener] poll error: ${err.message}`);
+    }
+  }
+
+  private async getBlockNumber(): Promise<string> {
+    const body = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'eth_blockNumber',
+      params: [],
+    });
+    const res = await fetch(this.config.rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+    const json: any = await res.json();
+    if (typeof json.result !== 'string') {
+      throw new Error('eth_blockNumber returned no result');
+    }
+    return json.result;
+  }
+
+  private async getLogs(toBlock: string): Promise<any[]> {
     const body = JSON.stringify({
       jsonrpc: '2.0',
       id: 1,
       method: 'eth_getLogs',
       params: [{
         fromBlock: this.fromBlock,
-        toBlock: 'latest',
+        toBlock,
         address: this.config.bridgeContractAddress,
         topics: [this.config.eventTopic],
       }],
@@ -922,6 +961,70 @@ export function test_eth_listener_rejects_malformed_truncated_log_payload(): voi
   assertEqual(event, null, 'truncated ABI log should be rejected');
 }
 
+// ---------------------------------------------------------------------------
+// Issue #663: regression tests — fromBlock resolution and advancement
+// ---------------------------------------------------------------------------
+
+function withFakeFetch<T>(handler: (method: string, params: any) => any, fn: () => Promise<T>): Promise<T> {
+  const original = (globalThis as any).fetch;
+  (globalThis as any).fetch = async (_url: string, opts: any) => {
+    const body = JSON.parse(opts.body);
+    const result = handler(body.method, body.params);
+    return { json: async () => ({ result }) };
+  };
+  return fn().finally(() => {
+    (globalThis as any).fetch = original;
+  });
+}
+
+function tmpBlockStorePath(name: string): string {
+  return path.join(require('os').tmpdir(), `eth-block-${name}-${Date.now()}-${Math.random()}.json`);
+}
+
+export async function test_eth_listener_resolves_latest_to_concrete_block_on_first_poll(): Promise<void> {
+  await withFakeFetch(
+    (method) => (method === 'eth_blockNumber' ? '0x64' : []),
+    async () => {
+      const listener = new EthChainListener({
+        rpcUrl: 'http://localhost',
+        bridgeContractAddress: '0xbridge',
+        eventTopic: '0xtopic',
+        chainId: 1,
+        blockStorePath: tmpBlockStorePath('resolve'),
+      });
+      await (listener as any).pollOnce();
+      assertEqual((listener as any).fromBlock, '0x64', 'fromBlock should resolve to a concrete block number on first poll');
+    },
+  );
+}
+
+export async function test_eth_listener_advances_from_block_even_with_no_logs(): Promise<void> {
+  let blockNumberCalls = 0;
+  await withFakeFetch(
+    (method) => {
+      if (method === 'eth_blockNumber') {
+        blockNumberCalls += 1;
+        return '0x' + (100 + blockNumberCalls).toString(16);
+      }
+      return []; // no matching logs, ever
+    },
+    async () => {
+      const listener = new EthChainListener({
+        rpcUrl: 'http://localhost',
+        bridgeContractAddress: '0xbridge',
+        eventTopic: '0xtopic',
+        chainId: 1,
+        blockStorePath: tmpBlockStorePath('advance'),
+      });
+      await (listener as any).pollOnce(); // resolves 'latest' -> 0x65
+      const afterFirst = (listener as any).fromBlock;
+      await (listener as any).pollOnce(); // queries logs (none), must still advance
+      const afterSecond = (listener as any).fromBlock;
+      assert(afterFirst !== afterSecond, 'fromBlock must advance past the queried range even when no logs are returned');
+    },
+  );
+}
+
 export function test_solana_listener_rejects_bad_log_lines(): void {
   const listener = new SolanaChainListener({
     wsUrl: 'ws://localhost',
@@ -1177,6 +1280,8 @@ async function runRelayerSelfTests(): Promise<void> {
   await test_mixed_duplicate_and_unique_pubkeys_meet_threshold();
   test_eth_listener_decodes_realistic_abi_log_fixture();
   test_eth_listener_rejects_malformed_truncated_log_payload();
+  await test_eth_listener_resolves_latest_to_concrete_block_on_first_poll();
+  await test_eth_listener_advances_from_block_even_with_no_logs();
   test_solana_listener_rejects_bad_log_lines();
   test_payload_hash_matches_onchain_algorithm();
   test_amount_encoding_handles_large_decimals();
