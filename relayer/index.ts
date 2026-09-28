@@ -407,7 +407,19 @@ export interface EthListenerConfig {
    * directory when not provided.
    */
   blockStorePath?: string;
+  /**
+   * Number of blocks to hold back from the chain head before a log is
+   * considered final and acted on. A deposit that is later reorged out on
+   * Ethereum cannot be reversed once it has been paid out on Stellar, so logs
+   * newer than `latest - confirmations` are left for a later poll instead of
+   * being queried at all. Defaults to `DEFAULT_ETH_CONFIRMATIONS` (12 blocks,
+   * ~ the depth generally considered final on Ethereum mainnet).
+   */
+  confirmations?: number;
 }
+
+/** Default confirmation depth applied when `EthListenerConfig.confirmations` is not set. */
+export const DEFAULT_ETH_CONFIRMATIONS = 12;
 
 /**
  * Minimal Ethereum log-polling listener.  Decodes a `BridgeFund` log with
@@ -464,9 +476,24 @@ export class EthChainListener implements ChainListener {
         return;
       }
 
-      const toBlock = await this.getBlockNumber();
+      const latest = await this.getBlockNumber();
+      const confirmations = this.config.confirmations ?? DEFAULT_ETH_CONFIRMATIONS;
+      const safeToBlockNum = Math.max(parseInt(latest, 16) - confirmations, 0);
+      const fromBlockNum = parseInt(this.fromBlock, 16);
+
+      if (safeToBlockNum < fromBlockNum) {
+        // Nothing has reached the required confirmation depth yet — wait for
+        // a later poll instead of acting on unconfirmed (reorg-able) blocks.
+        return;
+      }
+
+      const toBlock = '0x' + safeToBlockNum.toString(16);
       const logs = await this.getLogs(toBlock);
       for (const log of logs) {
+        if (log && log.removed === true) {
+          console.warn(`[eth-listener] skipping reorged log tx=${log.transactionHash ?? '?'}`);
+          continue;
+        }
         const event = this.decode(log);
         if (event && this.onEvent) this.onEvent(event);
       }
@@ -474,7 +501,7 @@ export class EthChainListener implements ChainListener {
       // Always advance fromBlock past the queried range — even when zero
       // logs were returned. Otherwise any block produced between two polls
       // that never contains a matching log is never queried again.
-      const nextFromBlock = '0x' + (parseInt(toBlock, 16) + 1).toString(16);
+      const nextFromBlock = '0x' + (safeToBlockNum + 1).toString(16);
       this.fromBlock = nextFromBlock;
       this.blockStore.save(this.fromBlock);
     } catch (err: any) {
@@ -1025,6 +1052,72 @@ export async function test_eth_listener_advances_from_block_even_with_no_logs():
   );
 }
 
+// ---------------------------------------------------------------------------
+// Issue #662: regression tests — confirmation-depth buffer / reorg protection
+// ---------------------------------------------------------------------------
+
+export async function test_eth_listener_withholds_logs_within_confirmation_depth(): Promise<void> {
+  await withFakeFetch(
+    (method) => (method === 'eth_blockNumber' ? '0x64' : []), // latest = 100
+    async () => {
+      const listener = new EthChainListener({
+        rpcUrl: 'http://localhost',
+        bridgeContractAddress: '0xbridge',
+        eventTopic: '0xtopic',
+        chainId: 1,
+        confirmations: 12,
+        blockStorePath: tmpBlockStorePath('confirm-init'),
+      });
+      await (listener as any).pollOnce(); // resolves fromBlock -> 0x64 (100)
+
+      let getLogsCalled = false;
+      const originalFetch = (globalThis as any).fetch;
+      (globalThis as any).fetch = async (_url: string, opts: any) => {
+        const body = JSON.parse(opts.body);
+        if (body.method === 'eth_blockNumber') return { json: async () => ({ result: '0x65' }) }; // latest = 101, only 1 new block
+        getLogsCalled = true;
+        return { json: async () => ({ result: [] }) };
+      };
+      try {
+        await (listener as any).pollOnce();
+      } finally {
+        (globalThis as any).fetch = originalFetch;
+      }
+
+      assert(!getLogsCalled, 'logs within the confirmation window must not be queried yet');
+      assertEqual((listener as any).fromBlock, '0x64', 'fromBlock must not advance until blocks are confirmed');
+    },
+  );
+}
+
+export async function test_eth_listener_skips_removed_reorged_logs(): Promise<void> {
+  await withFakeFetch(
+    (method) => {
+      if (method === 'eth_blockNumber') return '0x64';
+      return [{ topics: ['0x' + '00'.repeat(32), '0x' + 'cd'.repeat(32)], data: '0x1234', removed: true }];
+    },
+    async () => {
+      const listener = new EthChainListener({
+        rpcUrl: 'http://localhost',
+        bridgeContractAddress: '0xbridge',
+        eventTopic: '0xtopic',
+        chainId: 1,
+        confirmations: 0,
+        blockStorePath: tmpBlockStorePath('removed-init'),
+      });
+      await (listener as any).pollOnce(); // resolve fromBlock
+
+      let emitted = 0;
+      (listener as any).onEvent = () => {
+        emitted += 1;
+      };
+      await (listener as any).pollOnce(); // poll with a removed:true log present
+
+      assertEqual(emitted, 0, 'removed:true (reorged) logs must not be acted on');
+    },
+  );
+}
+
 export function test_solana_listener_rejects_bad_log_lines(): void {
   const listener = new SolanaChainListener({
     wsUrl: 'ws://localhost',
@@ -1282,6 +1375,8 @@ async function runRelayerSelfTests(): Promise<void> {
   test_eth_listener_rejects_malformed_truncated_log_payload();
   await test_eth_listener_resolves_latest_to_concrete_block_on_first_poll();
   await test_eth_listener_advances_from_block_even_with_no_logs();
+  await test_eth_listener_withholds_logs_within_confirmation_depth();
+  await test_eth_listener_skips_removed_reorged_logs();
   test_solana_listener_rejects_bad_log_lines();
   test_payload_hash_matches_onchain_algorithm();
   test_amount_encoding_handles_large_decimals();
@@ -1320,6 +1415,7 @@ if (require.main === module) {
           bridgeContractAddress: process.env.ETH_BRIDGE_CONTRACT!,
           eventTopic: process.env.ETH_EVENT_TOPIC!,
           chainId: 1,
+          confirmations: process.env.ETH_CONFIRMATIONS ? parseInt(process.env.ETH_CONFIRMATIONS, 10) : undefined,
         })] : []),
         ...(process.env.SOLANA_WS_URL ? [new SolanaChainListener({
           wsUrl: process.env.SOLANA_WS_URL,
