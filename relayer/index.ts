@@ -594,6 +594,39 @@ export class EthChainListener implements ChainListener {
 // Solana listener (WebSocket log subscription — no @solana/web3.js required)
 // ---------------------------------------------------------------------------
 
+// Bitcoin/Solana base58 alphabet (no 0, O, I, l).
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const BASE58_MAP: Record<string, number> = Object.fromEntries(
+  BASE58_ALPHABET.split('').map((c, i) => [c, i]),
+);
+
+/**
+ * Decode a base58 string (e.g. a Solana signature or pubkey) into raw bytes.
+ * Throws on any character outside the base58 alphabet. Only stdlib
+ * primitives (BigInt) are used, matching this file's no-extra-deps policy.
+ */
+function base58Decode(input: string): Buffer {
+  if (input.length === 0) throw new Error('empty base58 string');
+
+  let leadingZeros = 0;
+  while (leadingZeros < input.length && input[leadingZeros] === '1') leadingZeros++;
+
+  let num = 0n;
+  for (const ch of input) {
+    const value = BASE58_MAP[ch];
+    if (value === undefined) throw new Error(`invalid base58 character: ${ch}`);
+    num = num * 58n + BigInt(value);
+  }
+
+  const bytes: number[] = [];
+  while (num > 0n) {
+    bytes.unshift(Number(num & 0xffn));
+    num >>= 8n;
+  }
+
+  return Buffer.concat([Buffer.alloc(leadingZeros, 0), Buffer.from(bytes)]);
+}
+
 export interface SolanaListenerConfig {
   /** Solana WebSocket endpoint (wss://...) */
   wsUrl: string;
@@ -702,16 +735,35 @@ export class SolanaChainListener implements ChainListener {
   }
 
   /**
-   * Parse: "Program log: bridge_fund:<txHash>:<target>:<asset>:<amount>"
+   * Parse: "Program log: bridge_fund:<signature>:<target>:<asset>:<amount>"
+   *
+   * `<signature>` is the base58-encoded 64-byte Solana transaction
+   * signature. The payload hash / contract nonce need a 32-byte `txHash`
+   * (see `computeNonce`), so the signature is base58-decoded, validated to
+   * be exactly 64 bytes, and mapped to 32 bytes via `sha256(signature)`
+   * rather than being used as-is (which would silently truncate/garble a
+   * real signature into an arbitrary buffer).
    */
   private decodeLine(line: string): BridgeEvent | null {
     try {
       const payload = line.replace('Program log: bridge_fund:', '');
       const parts = payload.split(':');
       if (parts.length !== 4) return this.rejectLine(line, 'expected 4 fields');
-      const [txHash, target, asset, amount] = parts;
-      if (!txHash || !target || !asset || !amount) return this.rejectLine(line, 'missing field');
+      const [signature, target, asset, amount] = parts;
+      if (!signature || !target || !asset || !amount) return this.rejectLine(line, 'missing field');
       if (!/^\d+$/.test(amount)) return this.rejectLine(line, 'amount is not numeric');
+
+      let sigBytes: Buffer;
+      try {
+        sigBytes = base58Decode(signature);
+      } catch {
+        return this.rejectLine(line, 'signature is not valid base58');
+      }
+      if (sigBytes.length !== 64) {
+        return this.rejectLine(line, `signature must decode to 64 bytes, got ${sigBytes.length}`);
+      }
+      const txHash = crypto.createHash('sha256').update(sigBytes).digest('hex');
+
       return { chainId: this.config.chainId, txHash, target, asset, amount };
     } catch {
       return this.rejectLine(line, 'malformed line');
@@ -1104,6 +1156,56 @@ export function test_eth_listener_rejects_log_missing_transaction_hash(): void {
   assertEqual(event, null, 'log without a transactionHash must be rejected');
 }
 
+/** Minimal base58 encoder, used only to build test fixtures. */
+function base58EncodeForTest(buf: Buffer): string {
+  let num = 0n;
+  for (const byte of buf) num = num * 256n + BigInt(byte);
+
+  let out = '';
+  while (num > 0n) {
+    const rem = Number(num % 58n);
+    out = BASE58_ALPHABET[rem] + out;
+    num = num / 58n;
+  }
+  for (const byte of buf) {
+    if (byte !== 0) break;
+    out = '1' + out;
+  }
+  return out || '1';
+}
+
+/**
+ * Issue #666 regression: a real (64-byte) base58 Solana signature must
+ * decode to a stable 32-byte txHash — sha256 of the raw signature bytes —
+ * instead of being used as an arbitrary/garbled buffer.
+ */
+export function test_solana_listener_decodes_real_signature(): void {
+  const listener = new SolanaChainListener({
+    wsUrl: 'ws://localhost',
+    programId: 'program',
+    chainId: 101,
+  });
+
+  const sigBytes = Buffer.alloc(64, 0);
+  for (let i = 0; i < 64; i++) sigBytes[i] = (i * 7 + 3) % 256;
+  const signature = base58EncodeForTest(sigBytes);
+
+  const line = `Program log: bridge_fund:${signature}:GDESTINATION:CASSET:1000`;
+  const event = (listener as any).decodeLine(line);
+
+  assert(event !== null, 'a valid 64-byte signature should decode');
+  const expectedTxHash = crypto.createHash('sha256').update(sigBytes).digest('hex');
+  assertEqual(event.txHash, expectedTxHash, 'txHash must be sha256(signature bytes)');
+  assertEqual(event.txHash.length, 64, 'txHash must be a 32-byte hex string');
+}
+
+export function test_base58_decode_round_trips(): void {
+  const original = Buffer.from([0, 0, 1, 2, 3, 255, 254, 128]);
+  const encoded = base58EncodeForTest(original);
+  const decoded = base58Decode(encoded);
+  assertEqual(decoded.toString('hex'), original.toString('hex'), 'base58Decode must round-trip base58Encode output');
+}
+
 export function test_solana_listener_rejects_bad_log_lines(): void {
   const listener = new SolanaChainListener({
     wsUrl: 'ws://localhost',
@@ -1115,6 +1217,16 @@ export function test_solana_listener_rejects_bad_log_lines(): void {
   assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset'), null, 'missing amount should be rejected');
   assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset:100:extra'), null, 'extra colon should be rejected');
   assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset:not-a-number'), null, 'non-numeric amount should be rejected');
+  assertEqual(
+    decodeLine('Program log: bridge_fund:tx:target:asset:100'),
+    null,
+    'a signature that does not base58-decode to 64 bytes should be rejected',
+  );
+  assertEqual(
+    decodeLine('Program log: bridge_fund:not*base58!:target:asset:100'),
+    null,
+    'a signature with characters outside the base58 alphabet should be rejected',
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1363,6 +1475,8 @@ async function runRelayerSelfTests(): Promise<void> {
   await test_eth_listener_throws_on_rpc_error();
   await test_eth_listener_bounds_block_range();
   test_eth_listener_rejects_malformed_truncated_log_payload();
+  test_solana_listener_decodes_real_signature();
+  test_base58_decode_round_trips();
   test_solana_listener_rejects_bad_log_lines();
   test_payload_hash_matches_onchain_algorithm();
   test_amount_encoding_handles_large_decimals();
