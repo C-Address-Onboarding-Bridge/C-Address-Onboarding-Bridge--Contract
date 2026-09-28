@@ -1487,6 +1487,68 @@ describe("OnboardingBridgeSDK", () => {
     });
   });
 
+  describe("isBlocked", () => {
+    it("calls query_is_blocked and returns its boolean result", async () => {
+      (scValToNative as jest.Mock).mockReturnValue(true);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const result = await sdk.isBlocked(MOCK_ADDRESS);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith("query_is_blocked", expect.anything());
+      expect(result).toBe(true);
+    });
+
+    it("returns false when no results", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+
+      const result = await sdk.isBlocked(MOCK_ADDRESS);
+
+      expect(result).toBe(false);
+    });
+
+    it("throws on simulation error", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({ error: "fail" });
+
+      await expect(sdk.isBlocked(MOCK_ADDRESS)).rejects.toThrow(
+        "Failed to query blocklist status",
+      );
+    });
+  });
+
+  describe("isAllowlisted", () => {
+    it("calls query_is_allowlisted and returns its boolean result", async () => {
+      (scValToNative as jest.Mock).mockReturnValue(true);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const result = await sdk.isAllowlisted(MOCK_ADDRESS);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith("query_is_allowlisted", expect.anything());
+      expect(result).toBe(true);
+    });
+
+    it("returns false when no results", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+
+      const result = await sdk.isAllowlisted(MOCK_ADDRESS);
+
+      expect(result).toBe(false);
+    });
+
+    it("throws on simulation error", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({ error: "fail" });
+
+      await expect(sdk.isAllowlisted(MOCK_ADDRESS)).rejects.toThrow(
+        "Failed to query allowlist status",
+      );
+    });
+  });
+
   describe("estimateCost minimum balance", () => {
     const ESTIMATE_ARGS = {
       source: MOCK_ADDRESS,
@@ -2158,16 +2220,12 @@ describe("Observability hooks - onRpcCall coverage", () => {
       call: (s: OnboardingBridgeSDK) => s.getWhitelistedAssets(),
     },
     {
-      name: "getFeeExemptAddresses",
-      call: (s: OnboardingBridgeSDK) => s.getFeeExemptAddresses(),
+      name: "isBlocked",
+      call: (s: OnboardingBridgeSDK) => s.isBlocked(MOCK_ADDRESS),
     },
     {
-      name: "getBlocklistedAddresses",
-      call: (s: OnboardingBridgeSDK) => s.getBlocklistedAddresses(),
-    },
-    {
-      name: "getAllowlistedAddresses",
-      call: (s: OnboardingBridgeSDK) => s.getAllowlistedAddresses(),
+      name: "isAllowlisted",
+      call: (s: OnboardingBridgeSDK) => s.isAllowlisted(MOCK_ADDRESS),
     },
     {
       name: "estimateCost",

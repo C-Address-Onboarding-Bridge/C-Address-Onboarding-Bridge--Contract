@@ -2490,21 +2490,6 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Slice a full list into a paginated page.
-   * @internal
-   */
-  private paginate<T>(items: T[], offset: number, limit: number): PaginatedResult<T> {
-    const page = items.slice(offset, offset + limit);
-    const nextOffset = offset + page.length;
-    const hasMore = nextOffset < items.length;
-    return {
-      items: page,
-      cursor: hasMore ? this.encodeCursor(nextOffset) : undefined,
-      hasMore,
-    };
-  }
-
-  /**
    * Return a paginated list of whitelisted asset contract addresses.
    *
    * Only whitelisted assets can be used in `fundCAddress` and batch calls.
@@ -2558,110 +2543,71 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Return a paginated list of fee-exempt addresses.
-   *
-   * Fee-exempt addresses pay zero protocol fee on every transfer regardless of
-   * the configured `fee_bps`.  The full list is fetched from the contract and
-   * paginated client-side.
-   *
-   * @param cursor - Opaque cursor from a previous call.  Omit to start from page 1.
-   * @param limit  - Maximum items per page.  Defaults to 20.
-   *
-   * @returns A {@link PaginatedResult} of address strings.
-   *
-   * @throws {Error} On RPC failure.
-   */
-  async getFeeExemptAddresses(
-    cursor?: string,
-    limit = 20,
-  ): Promise<PaginatedResult<string>> {
-    const result = await withRpcHook(
-      this.hooks,
-      'simulateTransaction',
-      { contractMethod: 'query_fee_exempt_addresses' },
-      () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_fee_exempt_addresses', []),
-      ),
-    );
-    if ('error' in result && result.error) {
-      throw new Error(`Failed to query fee-exempt addresses: ${result.error}`);
-    }
-    const scVal = (result as any).results?.[0]?.retval;
-    const all: string[] = scVal
-      ? (scValToNative(scVal) as Address[]).map((a) => a.toString())
-      : [];
-    return this.paginate(all, this.decodeCursor(cursor), limit);
-  }
-
-  /**
-   * Return a paginated list of addresses on the blocklist.
+   * Check whether an address is on the blocklist.
    *
    * Blocklisted addresses cannot receive funds via `fundCAddress` or batch calls.
    * Transfers to them are silently skipped (in batch) or rejected (single).
    *
-   * @param cursor - Opaque cursor from a previous call.  Omit to start from page 1.
-   * @param limit  - Maximum items per page.  Defaults to 20.
+   * There is no contract call that lists the full blocklist — only a
+   * per-address membership check (`query_is_blocked`) — so this replaces the
+   * previous (non-functional) `getBlocklistedAddresses` listing method. Build
+   * a full listing from indexer events instead, once blocklist events exist.
    *
-   * @returns A {@link PaginatedResult} of address strings.
+   * @param address - The address to check.
+   *
+   * @returns `true` if `address` is blocklisted.
    *
    * @throws {Error} On RPC failure.
    */
-  async getBlocklistedAddresses(
-    cursor?: string,
-    limit = 20,
-  ): Promise<PaginatedResult<string>> {
+  async isBlocked(address: string): Promise<boolean> {
     const result = await withRpcHook(
       this.hooks,
       'simulateTransaction',
-      { contractMethod: 'query_blocklist' },
+      { contractMethod: 'query_is_blocked' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_blocklist', []),
+        this.buildSimulationTx('query_is_blocked', [address]),
       ),
     );
     if ('error' in result && result.error) {
-      throw new Error(`Failed to query blocklist: ${result.error}`);
+      throw new Error(`Failed to query blocklist status: ${result.error}`);
     }
     const scVal = (result as any).results?.[0]?.retval;
-    const all: string[] = scVal
-      ? (scValToNative(scVal) as Address[]).map((a) => a.toString())
-      : [];
-    return this.paginate(all, this.decodeCursor(cursor), limit);
+    return scVal ? Boolean(scValToNative(scVal)) : false;
   }
 
   /**
-   * Return a paginated list of addresses on the allowlist.
+   * Check whether an address is on the allowlist.
    *
    * When the contract is in allowlist mode, only allowlisted addresses can
    * receive funds.  Non-allowlisted targets in batch calls are skipped and
    * their amounts refunded to the source.
    *
-   * @param cursor - Opaque cursor from a previous call.  Omit to start from page 1.
-   * @param limit  - Maximum items per page.  Defaults to 20.
+   * There is no contract call that lists the full allowlist — only a
+   * per-address membership check (`query_is_allowlisted`) — so this replaces
+   * the previous (non-functional) `getAllowlistedAddresses` listing method.
+   * Build a full listing from indexer events instead, once allowlist events
+   * exist.
    *
-   * @returns A {@link PaginatedResult} of address strings.
+   * @param address - The address to check.
+   *
+   * @returns `true` if `address` is allowlisted.
    *
    * @throws {Error} On RPC failure.
    */
-  async getAllowlistedAddresses(
-    cursor?: string,
-    limit = 20,
-  ): Promise<PaginatedResult<string>> {
+  async isAllowlisted(address: string): Promise<boolean> {
     const result = await withRpcHook(
       this.hooks,
       'simulateTransaction',
-      { contractMethod: 'query_allowlist' },
+      { contractMethod: 'query_is_allowlisted' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_allowlist', []),
+        this.buildSimulationTx('query_is_allowlisted', [address]),
       ),
     );
     if ('error' in result && result.error) {
-      throw new Error(`Failed to query allowlist: ${result.error}`);
+      throw new Error(`Failed to query allowlist status: ${result.error}`);
     }
     const scVal = (result as any).results?.[0]?.retval;
-    const all: string[] = scVal
-      ? (scValToNative(scVal) as Address[]).map((a) => a.toString())
-      : [];
-    return this.paginate(all, this.decodeCursor(cursor), limit);
+    return scVal ? Boolean(scValToNative(scVal)) : false;
   }
 
   /**

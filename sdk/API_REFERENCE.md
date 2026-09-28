@@ -351,50 +351,33 @@ async getWhitelistedAssets(
   limit?: number
 ): Promise<PaginatedResult<string>>
 ```
-Queries the list of whitelisted tokens with client-side pagination.
+Queries the list of whitelisted tokens with on-chain pagination (the cursor encodes the offset).
 - **Parameters**:
   - `cursor`: `string` (optional base64 cursor)
   - `limit`: `number` (optional, default 20)
 - **Returns**: `Promise<PaginatedResult<string>>`
 
-##### `getFeeExemptAddresses`
+##### `isBlocked`
 ```ts
-async getFeeExemptAddresses(
-  cursor?: string,
-  limit?: number
-): Promise<PaginatedResult<string>>
+async isBlocked(address: string): Promise<boolean>
 ```
-Queries fee-exempt addresses with client-side pagination.
+Checks whether `address` is on the blocklist. The contract only exposes a
+per-address membership check (`query_is_blocked`) — there is no call that
+lists the full blocklist.
 - **Parameters**:
-  - `cursor`: `string` (optional)
-  - `limit`: `number` (optional)
-- **Returns**: `Promise<PaginatedResult<string>>`
+  - `address`: `string`
+- **Returns**: `Promise<boolean>`
 
-##### `getBlocklistedAddresses`
+##### `isAllowlisted`
 ```ts
-async getBlocklistedAddresses(
-  cursor?: string,
-  limit?: number
-): Promise<PaginatedResult<string>>
+async isAllowlisted(address: string): Promise<boolean>
 ```
-Queries the blocklist with client-side pagination.
+Checks whether `address` is on the allowlist. The contract only exposes a
+per-address membership check (`query_is_allowlisted`) — there is no call that
+lists the full allowlist.
 - **Parameters**:
-  - `cursor`: `string` (optional)
-  - `limit`: `number` (optional)
-- **Returns**: `Promise<PaginatedResult<string>>`
-
-##### `getAllowlistedAddresses`
-```ts
-async getAllowlistedAddresses(
-  cursor?: string,
-  limit?: number
-): Promise<PaginatedResult<string>>
-```
-Queries the allowlist with client-side pagination.
-- **Parameters**:
-  - `cursor`: `string` (optional)
-  - `limit`: `number` (optional)
-- **Returns**: `Promise<PaginatedResult<string>>`
+  - `address`: `string`
+- **Returns**: `Promise<boolean>`
 
 ##### `estimateCost`
 ```ts
