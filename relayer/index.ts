@@ -14,6 +14,8 @@
 
 import * as crypto from 'crypto';
 import * as http from 'http';
+import * as fs from 'fs';
+import * as path from 'path';
 import { Keypair } from '@stellar/stellar-sdk';
 import { OnboardingBridgeSDK, CrossChainFundOptions, RelayerSig } from '@stellar/c-address-onboarding-bridge-sdk';
 
@@ -61,6 +63,18 @@ export interface RelayerServiceConfig {
   threshold: number;
   /** Chain listeners to watch. */
   listeners: ChainListener[];
+  /**
+   * Path to a JSON file used to persist processed (chainId, txHash) nonces
+   * across restarts. Defaults to `.relayer-nonces.json` in the current
+   * working directory when not provided.
+   */
+  nonceStorePath?: string;
+  /**
+   * Path to a JSON file used to persist the dead-letter queue across
+   * restarts. Defaults to `.relayer-dlq.json` in the current working
+   * directory when not provided.
+   */
+  deadLetterStorePath?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -78,11 +92,49 @@ export interface DeadLetterEntry {
 }
 
 /**
- * In-memory dead-letter store for under-threshold events.
- * Replace with a persistent store (e.g. Redis, SQLite) in production.
+ * Atomically write JSON to `filePath`, creating parent directories as needed.
+ * Shared by every file-backed store below so a crash mid-write can never
+ * leave a truncated/corrupt store file behind.
+ */
+function writeJsonFileAtomic(filePath: string, data: unknown): void {
+  const dir = path.dirname(filePath);
+  if (dir && dir !== '.') {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  const tmp = filePath + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
+  fs.renameSync(tmp, filePath);
+}
+
+function readJsonFile<T>(filePath: string): T | null {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8')) as T;
+  } catch {
+    // File missing, unreadable, or invalid JSON — treat as empty/first run.
+    return null;
+  }
+}
+
+/**
+ * Dead-letter store for under-threshold events. Persisted to a local JSON
+ * file (when a `filePath` is supplied) so a process restart does not forget
+ * events that were queued for retry — see issue #670.
  */
 export class DeadLetterQueue {
   private entries: DeadLetterEntry[] = [];
+  private readonly filePath: string | null;
+
+  constructor(filePath?: string) {
+    this.filePath = filePath ?? null;
+    if (this.filePath) {
+      const loaded = readJsonFile<DeadLetterEntry[]>(this.filePath);
+      if (Array.isArray(loaded)) this.entries = loaded;
+    }
+  }
+
+  private persist(): void {
+    if (this.filePath) writeJsonFileAtomic(this.filePath, this.entries);
+  }
 
   enqueue(event: BridgeEvent, available: number, required: number): void {
     this.entries.push({
@@ -91,6 +143,7 @@ export class DeadLetterQueue {
       availableSigners: available,
       requiredSigners: required,
     });
+    this.persist();
     console.warn(
       `[relayer] dead-letter: chain=${event.chainId} tx=${event.txHash} ` +
         `signers=${available}/${required} — stored for retry`,
@@ -107,6 +160,7 @@ export class DeadLetterQueue {
     this.entries = this.entries.filter(
       (e) => !(e.event.chainId === chainId && e.event.txHash === txHash),
     );
+    this.persist();
   }
 
   size(): number {
@@ -197,11 +251,28 @@ function signPayload(privateKeyHex: string, payloadHash: Buffer): RelayerSig {
 }
 
 // ---------------------------------------------------------------------------
-// In-memory nonce deduplication (replace with Redis / DB in production)
+// Nonce deduplication — persisted to a local JSON file (see issue #670) so a
+// restart does not forget which (chainId, txHash) pairs were already
+// submitted and re-process everything since the last persisted block.
 // ---------------------------------------------------------------------------
 
 class NonceStore {
   private seen = new Set<string>();
+  private readonly filePath: string | null;
+
+  constructor(filePath?: string) {
+    this.filePath = filePath ?? null;
+    if (this.filePath) {
+      const loaded = readJsonFile<string[]>(this.filePath);
+      if (Array.isArray(loaded)) {
+        for (const key of loaded) this.seen.add(key);
+      }
+    }
+  }
+
+  private persist(): void {
+    if (this.filePath) writeJsonFileAtomic(this.filePath, [...this.seen]);
+  }
 
   has(chainId: number, txHash: string): boolean {
     return this.seen.has(`${chainId}:${txHash}`);
@@ -209,6 +280,7 @@ class NonceStore {
 
   mark(chainId: number, txHash: string): void {
     this.seen.add(`${chainId}:${txHash}`);
+    this.persist();
   }
 }
 
@@ -220,10 +292,10 @@ export class RelayerService {
   private sdk: OnboardingBridgeSDK;
   private submitterKeypair: ReturnType<typeof Keypair.fromSecret>;
   private config: RelayerServiceConfig;
-  private nonces = new NonceStore();
+  private nonces: NonceStore;
   private startedAt = Date.now();
   private lastEventPerChain: Map<number, string> = new Map();
-  readonly dlq = new DeadLetterQueue();
+  readonly dlq: DeadLetterQueue;
 
   constructor(config: RelayerServiceConfig) {
     this.config = config;
@@ -233,6 +305,8 @@ export class RelayerService {
       networkPassphrase: config.networkPassphrase,
     });
     this.submitterKeypair = Keypair.fromSecret(config.submitterSecretKey);
+    this.nonces = new NonceStore(config.nonceStorePath ?? '.relayer-nonces.json');
+    this.dlq = new DeadLetterQueue(config.deadLetterStorePath ?? '.relayer-dlq.json');
   }
 
   start(): void {
@@ -752,10 +826,10 @@ function makeTestService(params: {
     fundCrosschain: params.fundCrosschain ?? (async () => ({ status: 'pending', hash: 'hash' })),
   };
   (service as any).submitterKeypair = {};
-  (service as any).nonces = new NonceStore();
+  (service as any).nonces = new NonceStore(); // no filePath: in-memory only for tests
   (service as any).startedAt = Date.now();
   (service as any).lastEventPerChain = new Map();
-  (service as any).dlq = new DeadLetterQueue();
+  (service as any).dlq = new DeadLetterQueue(); // no filePath: in-memory only for tests
   return service;
 }
 
@@ -1168,6 +1242,45 @@ export function test_valid_env_parses_correctly(): void {
   assertEqual(result.relayerPrivateKeys.length, 2, 'relayer key count');
 }
 
+// ---------------------------------------------------------------------------
+// Issue #670: regression tests — submission state survives a process restart
+// ---------------------------------------------------------------------------
+
+function tempStorePath(name: string): string {
+  return path.join(require('os').tmpdir(), `relayer-self-test-${name}-${process.pid}-${Date.now()}.json`);
+}
+
+export function test_nonce_store_persists_across_restart(): void {
+  const filePath = tempStorePath('nonces');
+  try {
+    const before = new NonceStore(filePath);
+    assertEqual(before.has(1, 'abcd'), false, 'fresh store should not have the nonce yet');
+    before.mark(1, 'abcd');
+
+    // Simulate a restart: construct a brand-new instance pointed at the same file.
+    const after = new NonceStore(filePath);
+    assert(after.has(1, 'abcd'), 'nonce marked before restart must still be present after restart');
+  } finally {
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+  }
+}
+
+export function test_dead_letter_queue_persists_across_restart(): void {
+  const filePath = tempStorePath('dlq');
+  try {
+    const before = new DeadLetterQueue(filePath);
+    before.enqueue(makeTestEvent(), 1, 2);
+    assertEqual(before.size(), 1, 'entry should be enqueued');
+
+    // Simulate a restart: construct a brand-new instance pointed at the same file.
+    const after = new DeadLetterQueue(filePath);
+    assertEqual(after.size(), 1, 'dead-letter entry must survive a restart');
+    assertEqual(after.all()[0].event.txHash, makeTestEvent().txHash, 'restored entry must match the original event');
+  } finally {
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+  }
+}
+
 async function runRelayerSelfTests(): Promise<void> {
   await test_duplicate_event_ignored_via_nonce_store();
   await test_nonce_marked_only_after_successful_submission();
@@ -1187,6 +1300,9 @@ async function runRelayerSelfTests(): Promise<void> {
   test_nan_threshold_is_rejected();
   test_zero_threshold_is_rejected();
   test_valid_env_parses_correctly();
+  // Issue #670: persisted submission state survives a restart
+  test_nonce_store_persists_across_restart();
+  test_dead_letter_queue_persists_across_restart();
   console.log('[relayer] self-tests passed');
 }
 
@@ -1208,6 +1324,8 @@ if (require.main === module) {
       submitterSecretKey: process.env.RELAYER_SECRET_KEY!,
       threshold: parseInt(process.env.THRESHOLD ?? '1', 10),
       nodes: (process.env.RELAYER_PRIVATE_KEYS ?? '').split(',').map((pk) => ({ privateKey: pk.trim() })),
+      nonceStorePath: process.env.NONCE_STORE_PATH,
+      deadLetterStorePath: process.env.DEAD_LETTER_STORE_PATH,
       listeners: [
         ...(process.env.ETH_RPC_URL ? [new EthChainListener({
           rpcUrl: process.env.ETH_RPC_URL,
