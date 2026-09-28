@@ -64,6 +64,12 @@ export interface RelayerServiceConfig {
   threshold: number;
   /** Chain listeners to watch. */
   listeners: ChainListener[];
+  /**
+   * How often to retry dead-lettered events, in ms. Set to 0 to disable the
+   * automatic retry timer (the DLQ can still be drained manually via
+   * `retryDeadLetters()`). Defaults to 60_000 (1 minute).
+   */
+  dlqRetryIntervalMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -78,25 +84,32 @@ export interface DeadLetterEntry {
   /** How many signers were available vs how many were required. */
   availableSigners: number;
   requiredSigners: number;
+  /** Human-readable reason the event could not be submitted. */
+  reason: string;
 }
 
 /**
- * In-memory dead-letter store for under-threshold events.
- * Replace with a persistent store (e.g. Redis, SQLite) in production.
+ * In-memory dead-letter store for under-threshold events and failed
+ * submissions. Replace with a persistent store (e.g. Redis, SQLite) in
+ * production.
  */
 export class DeadLetterQueue {
   private entries: DeadLetterEntry[] = [];
 
-  enqueue(event: BridgeEvent, available: number, required: number): void {
+  enqueue(event: BridgeEvent, available: number, required: number, reason: string): void {
+    // Replace any stale entry for the same event so retries don't pile up
+    // duplicate rows for the same tx.
+    this.remove(event.chainId, event.txHash);
     this.entries.push({
       event,
       enqueuedAt: new Date().toISOString(),
       availableSigners: available,
       requiredSigners: required,
+      reason,
     });
     console.warn(
       `[relayer] dead-letter: chain=${event.chainId} tx=${event.txHash} ` +
-        `signers=${available}/${required} — stored for retry`,
+        `signers=${available}/${required} reason="${reason}" — stored for retry`,
     );
   }
 
@@ -226,6 +239,7 @@ export class RelayerService {
   private nonces = new NonceStore();
   private startedAt = Date.now();
   private lastEventPerChain: Map<number, string> = new Map();
+  private dlqRetryTimer: ReturnType<typeof setInterval> | null = null;
   readonly dlq = new DeadLetterQueue();
 
   constructor(config: RelayerServiceConfig) {
@@ -242,6 +256,16 @@ export class RelayerService {
     for (const listener of this.config.listeners) {
       listener.start((event) => this.handleEvent(event));
     }
+
+    const retryIntervalMs = this.config.dlqRetryIntervalMs ?? 60_000;
+    if (retryIntervalMs > 0) {
+      this.dlqRetryTimer = setInterval(() => {
+        this.retryDeadLetters().catch((err) =>
+          console.error(`[relayer] dead-letter retry sweep failed: ${err.message}`),
+        );
+      }, retryIntervalMs);
+    }
+
     console.log(`[relayer] started with ${this.config.nodes.length} node(s), threshold=${this.config.threshold}`);
   }
 
@@ -249,7 +273,25 @@ export class RelayerService {
     for (const listener of this.config.listeners) {
       listener.stop();
     }
+    if (this.dlqRetryTimer) {
+      clearInterval(this.dlqRetryTimer);
+      this.dlqRetryTimer = null;
+    }
     console.log('[relayer] stopped');
+  }
+
+  /**
+   * Re-attempt delivery for every event currently in the dead-letter queue.
+   * `handleEvent` re-enqueues (replacing the stale entry) on repeat failure
+   * and removes the entry on success, so this simply drains what it can.
+   */
+  async retryDeadLetters(): Promise<void> {
+    const pending = this.dlq.all();
+    if (pending.length === 0) return;
+    console.log(`[relayer] retrying ${pending.length} dead-lettered event(s)`);
+    for (const entry of pending) {
+      await this.handleEvent(entry.event);
+    }
   }
 
   healthStatus(): HealthStatus {
@@ -298,6 +340,7 @@ export class RelayerService {
 
     if (sigs.length < this.config.threshold) {
       console.warn(`[relayer] not enough signers after dedup: have ${sigs.length}, need ${this.config.threshold}`);
+      this.dlq.enqueue(event, sigs.length, this.config.threshold, 'insufficient signers after dedup');
       return;
     }
 
@@ -315,15 +358,18 @@ export class RelayerService {
 
       if (result.status === 'failed') {
         console.error(`[relayer] fundCrosschain failed: ${result.error}`);
+        this.dlq.enqueue(event, sigs.length, this.config.threshold, `submission failed: ${result.error}`);
         return;
       }
 
       // Mark nonce only after successful submission
       this.nonces.mark(event.chainId, event.txHash);
       this.lastEventPerChain.set(event.chainId, new Date().toISOString());
+      this.dlq.remove(event.chainId, event.txHash);
       console.log(`[relayer] submitted tx=${result.hash} for chain=${event.chainId} src-tx=${event.txHash}`);
     } catch (err: any) {
       console.error(`[relayer] unexpected error: ${err.message}`);
+      this.dlq.enqueue(event, sigs.length, this.config.threshold, `unexpected error: ${err.message}`);
     }
   }
 }
@@ -938,6 +984,50 @@ export async function test_mixed_duplicate_and_unique_pubkeys_meet_threshold(): 
   assert(capturedSigCount <= 2, 'SDK must receive at most threshold sigs after dedup');
 }
 
+// ---------------------------------------------------------------------------
+// Issue #660: regression tests — dead-letter queue is actually written to
+// ---------------------------------------------------------------------------
+
+export async function test_below_threshold_event_is_enqueued_to_dlq(): Promise<void> {
+  const service = makeTestService({ threshold: 2, nodes: [{ privateKey: '01'.repeat(32) }] });
+  const event = makeTestEvent();
+
+  await (service as any).handleEvent(event);
+
+  assertEqual(service.dlq.size(), 1, 'under-threshold event should be enqueued to the DLQ');
+  assertEqual(service.dlq.all()[0].reason, 'insufficient signers after dedup', 'DLQ entry should record the reason');
+}
+
+export async function test_failed_submission_is_enqueued_to_dlq(): Promise<void> {
+  const service = makeTestService({
+    fundCrosschain: async () => ({ status: 'failed', hash: '', error: 'boom' }),
+  });
+  const event = makeTestEvent();
+
+  await (service as any).handleEvent(event);
+
+  assertEqual(service.dlq.size(), 1, 'failed submission should be enqueued to the DLQ');
+}
+
+export async function test_successful_retry_removes_dlq_entry(): Promise<void> {
+  let attempt = 0;
+  const service = makeTestService({
+    fundCrosschain: async () => {
+      attempt += 1;
+      return attempt === 1
+        ? { status: 'failed', hash: '', error: 'boom' }
+        : { status: 'pending', hash: 'hash' };
+    },
+  });
+  const event = makeTestEvent();
+
+  await (service as any).handleEvent(event);
+  assertEqual(service.dlq.size(), 1, 'first failure should enqueue an entry');
+
+  await service.retryDeadLetters();
+  assertEqual(service.dlq.size(), 0, 'a successful retry should remove the DLQ entry');
+}
+
 function word(hex: string): string {
   return hex.padStart(64, '0');
 }
@@ -1371,6 +1461,9 @@ async function runRelayerSelfTests(): Promise<void> {
   await test_below_threshold_short_circuits_before_sdk_call();
   await test_duplicate_pubkey_nodes_do_not_inflate_sig_count();
   await test_mixed_duplicate_and_unique_pubkeys_meet_threshold();
+  await test_below_threshold_event_is_enqueued_to_dlq();
+  await test_failed_submission_is_enqueued_to_dlq();
+  await test_successful_retry_removes_dlq_entry();
   test_eth_listener_decodes_realistic_abi_log_fixture();
   test_eth_listener_rejects_malformed_truncated_log_payload();
   await test_eth_listener_resolves_latest_to_concrete_block_on_first_poll();
