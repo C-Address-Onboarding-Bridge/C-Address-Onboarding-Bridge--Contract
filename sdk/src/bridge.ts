@@ -706,6 +706,8 @@ export class OnboardingBridgeSDK {
         targetAsset: options.targetAsset,
         sourceAmount: options.sourceAmount,
         minTargetAmount: options.minTargetAmount,
+        nonce: options.nonce,
+        deadline: options.deadline,
       },
       async () => {
         try {
@@ -721,6 +723,13 @@ export class OnboardingBridgeSDK {
             { address: options.source },
             () => this.provider.getAccount(options.source),
           );
+
+          const nonceScVal = options.nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+          const deadlineScVal = options.deadline === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
 
           const tx = new TransactionBuilder(sourceAccount, {
             fee: BASE_FEE,
@@ -738,6 +747,8 @@ export class OnboardingBridgeSDK {
                   options.minTargetAmount,
                   options.swapRoute,
                 ]),
+                nonceScVal,
+                deadlineScVal,
               ),
             )
             .setTimeout(this.config.timeout ?? 30)

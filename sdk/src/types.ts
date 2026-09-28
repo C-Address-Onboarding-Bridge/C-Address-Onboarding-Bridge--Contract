@@ -891,6 +891,20 @@ export interface FundCAddressWithSwapOptions {
    * Each pool must implement `swap(min_amount_out: i128, to: Address) → i128`.
    */
   swapRoute: string[];
+
+  /**
+   * Optional sequential nonce for replay protection.
+   * Pass `undefined` to skip nonce enforcement (standard Stellar tx
+   * replay protection via sequence number applies).
+   */
+  nonce?: string | number | bigint;
+
+  /**
+   * Optional Unix timestamp (seconds) deadline.
+   * If provided and the ledger timestamp exceeds this value, the
+   * contract will reject the transaction.
+   */
+  deadline?: string | number | bigint;
 }
 
 // ---------------------------------------------------------------------------
