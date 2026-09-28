@@ -179,7 +179,10 @@ async fn list_events(
 ) -> Result<Json<Vec<events::IndexedEvent>>, StatusCode> {
     state
         .db
-        .list_events(params.limit.unwrap_or(50), params.offset.unwrap_or(0))
+        .list_events(
+            events::clamp_limit(params.limit, 50),
+            events::clamp_offset(params.offset),
+        )
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -194,8 +197,8 @@ async fn list_events_by_type(
         .db
         .list_events_by_type(
             &event_type,
-            params.limit.unwrap_or(50),
-            params.offset.unwrap_or(0),
+            events::clamp_limit(params.limit, 50),
+            events::clamp_offset(params.offset),
         )
         .await
         .map(Json)
@@ -254,7 +257,7 @@ async fn replay_events(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let events = state
         .db
-        .list_events_from_ledger(req.from_ledger, req.limit.unwrap_or(100))
+        .list_events_from_ledger(req.from_ledger, events::clamp_limit(req.limit, 100))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
