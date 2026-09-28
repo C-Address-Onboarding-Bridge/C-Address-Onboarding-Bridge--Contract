@@ -417,7 +417,9 @@ export interface EthListenerConfig {
 
 /**
  * Minimal Ethereum log-polling listener.  Decodes a `BridgeFund` log with
- * ABI: `BridgeFund(bytes32 txHash, string target, string asset, uint256 amount)`.
+ * ABI: `BridgeFund(string target, string asset, uint256 amount)`. The replay
+ * key is derived from the log's own `transactionHash`/`logIndex`, not from
+ * event data (see `decode()`).
  *
  * Persists the last-processed block number to a local file so that a restart
  * resumes from the correct position and never skips events emitted during a
@@ -526,15 +528,34 @@ export class EthChainListener implements ChainListener {
    * Decode a raw eth log into a BridgeEvent.
    * Expected ABI-encoded topics/data:
    *   topic[0]: event signature hash
-   *   topic[1]: bytes32 txHash (indexed)
    *   data:     abi.encode(string target, string asset, uint256 amount)
+   *
+   * The replay key (`txHash`) is derived from the log's own
+   * `transactionHash` + `logIndex` — fields the RPC node/chain attests to —
+   * rather than from any value the emitting contract chose to include in the
+   * event data. Otherwise a buggy or malicious emitter controls the replay
+   * key, and two BridgeFund logs in the same transaction (same
+   * transactionHash) would collide on-chain, where the replay key is
+   * `(chain_id, tx_hash)`.
    */
   private decode(log: any): BridgeEvent | null {
     try {
-      if (!Array.isArray(log.topics) || typeof log.topics[1] !== 'string') return null;
-      const txHashTopic = log.topics[1] as string;
-      if (!txHashTopic.startsWith('0x') || txHashTopic.length !== 66) return null;
-      const txHash = txHashTopic.slice(2); // strip 0x
+      if (typeof log.transactionHash !== 'string' || !log.transactionHash.startsWith('0x') || log.transactionHash.length !== 66) {
+        return null;
+      }
+      const logIndexRaw = log.logIndex;
+      const logIndex =
+        typeof logIndexRaw === 'string' ? parseInt(logIndexRaw, 16) : Number(logIndexRaw);
+      if (!Number.isFinite(logIndex) || logIndex < 0) return null;
+
+      const txHashBytes = Buffer.from(log.transactionHash.slice(2), 'hex');
+      const logIndexBuf = Buffer.alloc(4);
+      logIndexBuf.writeUInt32BE(logIndex);
+      const txHash = crypto
+        .createHash('sha256')
+        .update(txHashBytes)
+        .update(logIndexBuf)
+        .digest('hex');
 
       // ABI-decode non-indexed data: (string target, string asset, uint256 amount)
       if (typeof log.data !== 'string' || !log.data.startsWith('0x')) return null;
@@ -920,13 +941,20 @@ function encodedString(value: string): string {
   return word((hex.length / 2).toString(16)) + hex.padEnd(paddedLength, '0');
 }
 
-function makeAbiLog(target: string, asset: string, amount: bigint): any {
+function makeAbiLog(
+  target: string,
+  asset: string,
+  amount: bigint,
+  overrides: { transactionHash?: string; logIndex?: string } = {},
+): any {
   const targetTail = encodedString(target);
   const assetTail = encodedString(asset);
   const targetOffset = 32 * 3;
   const assetOffset = targetOffset + targetTail.length / 2;
   return {
-    topics: ['0x' + '00'.repeat(32), '0x' + 'cd'.repeat(32)],
+    topics: ['0x' + '00'.repeat(32)],
+    transactionHash: overrides.transactionHash ?? '0x' + 'cd'.repeat(32),
+    logIndex: overrides.logIndex ?? '0x0',
     data: '0x' + word(targetOffset.toString(16)) + word(assetOffset.toString(16)) + word(amount.toString(16)) + targetTail + assetTail,
   };
 }
@@ -939,12 +967,47 @@ export function test_eth_listener_decodes_realistic_abi_log_fixture(): void {
     chainId: 1,
   });
 
-  const event = (listener as any).decode(makeAbiLog('GDESTINATION', 'CASSET', 123456789n));
+  const log = makeAbiLog('GDESTINATION', 'CASSET', 123456789n);
+  const event = (listener as any).decode(log);
 
   assert(event !== null, 'valid ABI log should decode');
   assertEqual(event.target, 'GDESTINATION', 'target should decode');
   assertEqual(event.asset, 'CASSET', 'asset should decode');
   assertEqual(event.amount, '123456789', 'amount should decode');
+
+  const expectedTxHash = crypto
+    .createHash('sha256')
+    .update(Buffer.from((log.transactionHash as string).slice(2), 'hex'))
+    .update(Buffer.alloc(4)) // logIndex 0
+    .digest('hex');
+  assertEqual(event.txHash, expectedTxHash, 'txHash must be derived from log.transactionHash + logIndex');
+}
+
+/**
+ * Issue #665 regression: two BridgeFund logs in the SAME transaction (same
+ * transactionHash, different logIndex) must produce different replay keys,
+ * and the emitted event's own data must have no influence on txHash.
+ */
+export function test_eth_listener_derives_txhash_from_log_not_event_data(): void {
+  const listener = new EthChainListener({
+    rpcUrl: 'http://localhost',
+    bridgeContractAddress: '0xbridge',
+    eventTopic: '0xtopic',
+    chainId: 1,
+  });
+
+  const sameTx = '0x' + 'ab'.repeat(32);
+  const log0 = makeAbiLog('GDESTINATION', 'CASSET', 1n, { transactionHash: sameTx, logIndex: '0x0' });
+  const log1 = makeAbiLog('GDESTINATION', 'CASSET', 1n, { transactionHash: sameTx, logIndex: '0x1' });
+
+  const event0 = (listener as any).decode(log0);
+  const event1 = (listener as any).decode(log1);
+
+  assert(event0 !== null && event1 !== null, 'both logs should decode');
+  assert(
+    event0.txHash !== event1.txHash,
+    'two logs in the same transaction must not collapse to the same replay key',
+  );
 }
 
 /**
@@ -1017,9 +1080,28 @@ export function test_eth_listener_rejects_malformed_truncated_log_payload(): voi
     chainId: 1,
   });
 
-  const event = (listener as any).decode({ topics: ['0x' + '00'.repeat(32), '0x' + 'cd'.repeat(32)], data: '0x1234' });
+  const event = (listener as any).decode({
+    topics: ['0x' + '00'.repeat(32)],
+    transactionHash: '0x' + 'cd'.repeat(32),
+    logIndex: '0x0',
+    data: '0x1234',
+  });
 
   assertEqual(event, null, 'truncated ABI log should be rejected');
+}
+
+export function test_eth_listener_rejects_log_missing_transaction_hash(): void {
+  const listener = new EthChainListener({
+    rpcUrl: 'http://localhost',
+    bridgeContractAddress: '0xbridge',
+    eventTopic: '0xtopic',
+    chainId: 1,
+  });
+
+  const log = makeAbiLog('GDESTINATION', 'CASSET', 1n);
+  delete log.transactionHash;
+  const event = (listener as any).decode(log);
+  assertEqual(event, null, 'log without a transactionHash must be rejected');
 }
 
 export function test_solana_listener_rejects_bad_log_lines(): void {
@@ -1276,6 +1358,8 @@ async function runRelayerSelfTests(): Promise<void> {
   await test_duplicate_pubkey_nodes_do_not_inflate_sig_count();
   await test_mixed_duplicate_and_unique_pubkeys_meet_threshold();
   test_eth_listener_decodes_realistic_abi_log_fixture();
+  test_eth_listener_derives_txhash_from_log_not_event_data();
+  test_eth_listener_rejects_log_missing_transaction_hash();
   await test_eth_listener_throws_on_rpc_error();
   await test_eth_listener_bounds_block_range();
   test_eth_listener_rejects_malformed_truncated_log_payload();
