@@ -295,6 +295,8 @@ export class RelayerService {
   private nonces: NonceStore;
   private startedAt = Date.now();
   private lastEventPerChain: Map<number, string> = new Map();
+  /** Event keys (`chainId:txHash`) currently mid-submission — see issue #669. */
+  private inFlight = new Set<string>();
   readonly dlq: DeadLetterQueue;
 
   constructor(config: RelayerServiceConfig) {
@@ -339,62 +341,79 @@ export class RelayerService {
   }
 
   private async handleEvent(event: BridgeEvent): Promise<void> {
+    const key = `${event.chainId}:${event.txHash}`;
+
     if (this.nonces.has(event.chainId, event.txHash)) {
       console.log(`[relayer] duplicate event ignored: chain=${event.chainId} tx=${event.txHash}`);
       return;
     }
 
-    console.log(`[relayer] event received: chain=${event.chainId} tx=${event.txHash} target=${event.target} amount=${event.amount}`);
-
-    const payloadHash = computePayloadHash(event);
-
-    // Collect signatures from all configured nodes, then deduplicate by pubkey.
-    // The contract does NOT verify that sigs contains distinct pubkeys — the doc
-    // comment on fund_c_address_crosschain explicitly delegates deduplication to
-    // relayer infrastructure.  A config mistake (two nodes sharing a key) or a
-    // malicious injection must not inflate the effective signature count past
-    // what distinct keys actually authorize.
-    const rawSigs: RelayerSig[] = this.config.nodes.map((node) =>
-      signPayload(node.privateKey, payloadHash),
-    );
-    const seenPubkeys = new Set<string>();
-    const sigs: RelayerSig[] = rawSigs.filter((sig) => {
-      if (seenPubkeys.has(sig.pubkey)) {
-        console.warn(`[relayer] duplicate pubkey detected and removed: ${sig.pubkey}`);
-        return false;
-      }
-      seenPubkeys.add(sig.pubkey);
-      return true;
-    });
-
-    if (sigs.length < this.config.threshold) {
-      console.warn(`[relayer] not enough signers after dedup: have ${sigs.length}, need ${this.config.threshold}`);
+    // Two deliveries of the same log (reconnect, overlapping polls) can both
+    // reach here before either one has marked the nonce. Track in-flight
+    // keys so the second delivery skips instead of racing to submit twice —
+    // see issue #669. This check + add is synchronous (no `await` between
+    // them), so it is race-free under Node's single-threaded event loop.
+    if (this.inFlight.has(key)) {
+      console.log(`[relayer] event already in flight, skipping concurrent duplicate: chain=${event.chainId} tx=${event.txHash}`);
       return;
     }
-
-    const options: CrossChainFundOptions = {
-      chainId: event.chainId,
-      txHash: event.txHash,
-      target: event.target,
-      asset: event.asset,
-      amount: event.amount,
-      sigs: sigs.slice(0, this.config.threshold), // submit exactly threshold sigs
-    };
+    this.inFlight.add(key);
 
     try {
-      const result = await this.sdk.fundCrosschain(options, this.submitterKeypair);
+      console.log(`[relayer] event received: chain=${event.chainId} tx=${event.txHash} target=${event.target} amount=${event.amount}`);
 
-      if (result.status === 'failed') {
-        console.error(`[relayer] fundCrosschain failed: ${result.error}`);
+      const payloadHash = computePayloadHash(event);
+
+      // Collect signatures from all configured nodes, then deduplicate by pubkey.
+      // The contract does NOT verify that sigs contains distinct pubkeys — the doc
+      // comment on fund_c_address_crosschain explicitly delegates deduplication to
+      // relayer infrastructure.  A config mistake (two nodes sharing a key) or a
+      // malicious injection must not inflate the effective signature count past
+      // what distinct keys actually authorize.
+      const rawSigs: RelayerSig[] = this.config.nodes.map((node) =>
+        signPayload(node.privateKey, payloadHash),
+      );
+      const seenPubkeys = new Set<string>();
+      const sigs: RelayerSig[] = rawSigs.filter((sig) => {
+        if (seenPubkeys.has(sig.pubkey)) {
+          console.warn(`[relayer] duplicate pubkey detected and removed: ${sig.pubkey}`);
+          return false;
+        }
+        seenPubkeys.add(sig.pubkey);
+        return true;
+      });
+
+      if (sigs.length < this.config.threshold) {
+        console.warn(`[relayer] not enough signers after dedup: have ${sigs.length}, need ${this.config.threshold}`);
         return;
       }
 
-      // Mark nonce only after successful submission
-      this.nonces.mark(event.chainId, event.txHash);
-      this.lastEventPerChain.set(event.chainId, new Date().toISOString());
-      console.log(`[relayer] submitted tx=${result.hash} for chain=${event.chainId} src-tx=${event.txHash}`);
-    } catch (err: any) {
-      console.error(`[relayer] unexpected error: ${err.message}`);
+      const options: CrossChainFundOptions = {
+        chainId: event.chainId,
+        txHash: event.txHash,
+        target: event.target,
+        asset: event.asset,
+        amount: event.amount,
+        sigs: sigs.slice(0, this.config.threshold), // submit exactly threshold sigs
+      };
+
+      try {
+        const result = await this.sdk.fundCrosschain(options, this.submitterKeypair);
+
+        if (result.status === 'failed') {
+          console.error(`[relayer] fundCrosschain failed: ${result.error}`);
+          return;
+        }
+
+        // Mark nonce only after successful submission
+        this.nonces.mark(event.chainId, event.txHash);
+        this.lastEventPerChain.set(event.chainId, new Date().toISOString());
+        console.log(`[relayer] submitted tx=${result.hash} for chain=${event.chainId} src-tx=${event.txHash}`);
+      } catch (err: any) {
+        console.error(`[relayer] unexpected error: ${err.message}`);
+      }
+    } finally {
+      this.inFlight.delete(key);
     }
   }
 }
@@ -829,6 +848,7 @@ function makeTestService(params: {
   (service as any).nonces = new NonceStore(); // no filePath: in-memory only for tests
   (service as any).startedAt = Date.now();
   (service as any).lastEventPerChain = new Map();
+  (service as any).inFlight = new Set<string>();
   (service as any).dlq = new DeadLetterQueue(); // no filePath: in-memory only for tests
   return service;
 }
@@ -847,6 +867,34 @@ export async function test_duplicate_event_ignored_via_nonce_store(): Promise<vo
   await (service as any).handleEvent(event);
 
   assertEqual(calls, 1, 'duplicate event should not call SDK twice');
+}
+
+/**
+ * Issue #669 regression: two concurrent deliveries of the same event (e.g. a
+ * reconnect replay racing a live notification) must only submit once, even
+ * though neither delivery has awaited far enough to mark the nonce yet.
+ */
+export async function test_concurrent_duplicate_events_submit_only_once(): Promise<void> {
+  let calls = 0;
+  let resolveFirst!: () => void;
+  const gate = new Promise<void>((resolve) => { resolveFirst = resolve; });
+  const service = makeTestService({
+    fundCrosschain: async () => {
+      calls += 1;
+      await gate; // hold the first call open so the second one races it
+      return { status: 'pending', hash: 'hash' };
+    },
+  });
+  const event = makeTestEvent();
+
+  // Fire both deliveries "concurrently" (no await between them), then let
+  // the first submission complete.
+  const p1 = (service as any).handleEvent(event);
+  const p2 = (service as any).handleEvent(event);
+  resolveFirst();
+  await Promise.all([p1, p2]);
+
+  assertEqual(calls, 1, 'concurrent duplicate events must only call the SDK once');
 }
 
 export async function test_nonce_marked_only_after_successful_submission(): Promise<void> {
@@ -1283,6 +1331,7 @@ export function test_dead_letter_queue_persists_across_restart(): void {
 
 async function runRelayerSelfTests(): Promise<void> {
   await test_duplicate_event_ignored_via_nonce_store();
+  await test_concurrent_duplicate_events_submit_only_once();
   await test_nonce_marked_only_after_successful_submission();
   await test_below_threshold_short_circuits_before_sdk_call();
   await test_duplicate_pubkey_nodes_do_not_inflate_sig_count();
