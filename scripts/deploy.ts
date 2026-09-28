@@ -24,15 +24,17 @@ import {
   SorobanRpc,
   Contract,
   TransactionBuilder,
+  Operation,
   BASE_FEE,
   nativeToScVal,
   Keypair,
   Address,
   Networks,
+  xdr,
 } from '@stellar/stellar-sdk';
 import * as fs from 'fs';
 import * as path from 'path';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -171,6 +173,29 @@ async function poll(
   throw new Error(`Transaction ${hash} was not confirmed after ${retries * 2}s`);
 }
 
+/**
+ * Build, prepare, sign, and submit a transaction, then poll until confirmed.
+ * Returns the confirmed transaction response.
+ */
+async function submitAndConfirm(
+  provider: SorobanRpc.Server,
+  cfg: DeployConfig,
+  admin: Keypair,
+  build: (account: SorobanRpc.Api.AccountResponse) => ReturnType<TransactionBuilder['build']>,
+): Promise<SorobanRpc.Api.GetTransactionResponse> {
+  const account = await provider.getAccount(admin.publicKey());
+  const tx = build(account);
+  const prepared = await provider.prepareTransaction(tx);
+  prepared.sign(admin);
+  const send = await provider.sendTransaction(prepared);
+  console.log(`  Tx: ${send.hash}`);
+  const result = await poll(provider, send.hash);
+  if (result.status === 'FAILED') {
+    throw new Error(`Transaction ${send.hash} failed: ${JSON.stringify(result)}`);
+  }
+  return result;
+}
+
 // ---------------------------------------------------------------------------
 // Deploy steps
 // ---------------------------------------------------------------------------
@@ -184,15 +209,19 @@ async function deployContract(
   const wasm = fs.readFileSync(cfg.wasmPath);
 
   console.log('Installing WASM…');
-  const installResp = await provider.installContractCode(wasm);
-  const installTx = TransactionBuilder.fromXdr(installResp, cfg.networkPassphrase);
-  installTx.sign(admin);
-  const installSend = await provider.sendTransaction(installTx);
-  console.log(`  Install tx: ${installSend.hash}`);
-  await poll(provider, installSend.hash);
+  const installResult = await submitAndConfirm(provider, cfg, admin, (account) =>
+    new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: cfg.networkPassphrase,
+    })
+      .addOperation(Operation.uploadContractWasm({ wasm }))
+      .setTimeout(30)
+      .build(),
+  );
   console.log('  WASM installed ✓');
 
   console.log('Creating contract instance…');
+  const salt = randomBytes(32);
   const constructorArgs = [
     Address.fromString(admin.publicKey()).toScVal(),
     Address.fromString(cfg.feeCollectorPublicKey).toScVal(),
@@ -200,23 +229,45 @@ async function deployContract(
     nativeToScVal(null),
     nativeToScVal(wasmHash, { type: 'bytes' }),
   ];
-  const createResp = await provider.createContract(
-    wasm,
-    admin.publicKey(),
-    '0'.repeat(64),
-    constructorArgs,
+  const createResult = await submitAndConfirm(provider, cfg, admin, (account) =>
+    new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: cfg.networkPassphrase,
+    })
+      .addOperation(
+        Operation.createCustomContract({
+          address: Address.fromString(admin.publicKey()),
+          wasmHash,
+          salt,
+          constructorArgs,
+        }),
+      )
+      .setTimeout(30)
+      .build(),
   );
-  const createTx = TransactionBuilder.fromXdr(createResp, cfg.networkPassphrase);
-  createTx.sign(admin);
-  const createSend = await provider.sendTransaction(createTx);
-  console.log(`  Create tx: ${createSend.hash}`);
-  const createResult = await poll(provider, createSend.hash);
 
-  if (!createResult.contractId) {
+  const contractId = extractContractId(createResult);
+  if (!contractId) {
     throw new Error('Contract deployment succeeded but returned no contractId');
   }
-  console.log(`  Contract ID: ${createResult.contractId} ✓`);
-  return createResult.contractId;
+  console.log(`  Contract ID: ${contractId} ✓`);
+  return contractId;
+}
+
+/**
+ * Extract the created contract ID from a createCustomContract result.
+ * The contract address is returned as the operation's return value.
+ */
+function extractContractId(result: SorobanRpc.Api.GetTransactionResponse): string | undefined {
+  if (result.status !== 'SUCCESS') return undefined;
+  const meta = result.resultMetaXdr;
+  if (!meta) return undefined;
+  const txMeta = xdr.TransactionMeta.fromXDR(meta, 'base64');
+  const sorobanMeta = txMeta.v3().sorobanMeta();
+  if (!sorobanMeta) return undefined;
+  const returnValue = sorobanMeta.returnValue();
+  if (!returnValue) return undefined;
+  return Address.fromScVal(returnValue).toString();
 }
 
 async function initialize(
@@ -232,86 +283,6 @@ async function initialize(
 
   const tx = new TransactionBuilder(account, {
     fee: BASE_FEE,
-    networkPassphrase: cfg.networkPassphrase,
-  })
-    .addOperation(
-      contract.call(
-        'initialize',
-        Address.fromString(admin.publicKey()).toScVal(),
-        Address.fromString(cfg.feeCollectorPublicKey).toScVal(),
-        nativeToScVal(cfg.feeBps, { type: 'u32' }),
-        nativeToScVal(null),
-        nativeToScVal(wasmHash, { type: 'bytes' }),
-      ),
-    )
-    .setTimeout(30)
-    .build();
+    net
 
-  const prepared = await provider.prepareTransaction(tx);
-  prepared.sign(admin);
-  const resp = await provider.sendTransaction(prepared);
-  console.log(`  Init tx: ${resp.hash}`);
-  await poll(provider, resp.hash);
-  console.log('  Initialized successfully ✓');
-}
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
-async function main(): Promise<void> {
-  // Strip --network and its value from argv so we can parse positional args cleanly.
-  const networkIdx = process.argv.indexOf('--network');
-  const filteredArgv = process.argv.slice(2).filter((_, i, arr) => {
-    if (arr[i - 1] === '--network') return false;
-    if (arr[i] === '--network') return false;
-    return true;
-  });
-
-  const [command, customId] = filteredArgv;
-  const network = parseNetworkArg();
-  const cfg = loadConfig(network);
-
-  if (!cfg.adminSecretKey || cfg.adminSecretKey.startsWith('S...')) {
-    console.error('adminSecretKey is not set in your deploy-config file. Aborting.');
-    process.exit(1);
-  }
-
-  const admin = Keypair.fromSecret(cfg.adminSecretKey);
-  const provider = new SorobanRpc.Server(cfg.rpcUrl, { allowHttp: cfg.network === 'dev' });
-
-  console.log(`\n=== C-Address Onboarding Bridge Deployment ===`);
-  console.log(`Network:  ${cfg.network}`);
-  console.log(`RPC:      ${cfg.rpcUrl}`);
-  console.log(`Admin:    ${admin.publicKey()}`);
-  console.log(`FeeBps:   ${cfg.feeBps}\n`);
-
-  if (command === 'deploy' || command === 'all') {
-    const wasmHash = createHash('sha256').update(fs.readFileSync(cfg.wasmPath)).digest();
-    const contractId = await deployContract(provider, cfg, admin, wasmHash);
-    if (command === 'all') {
-      console.log(`\nDeployment complete. CONTRACT_ID=${contractId}`);
-    } else {
-      console.log(`\nDeployment complete. CONTRACT_ID=${contractId}`);
-    }
-    return;
-  }
-
-  if (command === 'init') {
-    if (!customId) {
-      console.error('Usage: npx ts-node scripts/deploy.ts init <contract_id> [--network <network>]');
-      process.exit(1);
-    }
-    const wasmHash = createHash('sha256').update(fs.readFileSync(cfg.wasmPath)).digest();
-    await initialize(provider, cfg, admin, customId, wasmHash);
-    return;
-  }
-
-  console.error(`Unknown command "${command}". Valid commands: all, deploy, init`);
-  process.exit(1);
-}
-
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+/* … truncated 2866 chars — edit only what you need near the top … */
