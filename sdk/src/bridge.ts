@@ -2880,7 +2880,10 @@ export class OnboardingBridgeSDK {
   }
 
   private metaFundParamsToScVal(params: MetaFundParams): xdr.ScVal {
-    return xdr.ScVal.scvMap([
+    // Soroban `ScMap` entries must be sorted by key (canonical XDR encoding);
+    // the host rejects maps whose keys are out of order. Build the entries
+    // via `scMapEntry` and sort them rather than relying on declaration order.
+    return this.sortedScMap([
       this.scMapEntry('source', new Address(params.source).toScVal()),
       this.scMapEntry('target', new Address(params.target).toScVal()),
       this.scMapEntry('asset', new Address(params.asset).toScVal()),
@@ -2897,6 +2900,22 @@ export class OnboardingBridgeSDK {
     });
   }
 
+  /**
+   * Sorts `ScMapEntry` values by their (symbol) key and wraps them in an
+   * `ScVal` map. Soroban's canonical XDR encoding requires map keys to be
+   * sorted; the host rejects maps whose keys are out of order. Use this
+   * (instead of `xdr.ScVal.scvMap` directly) for every struct encoder that
+   * builds an `ScMap` from field entries.
+   */
+  private sortedScMap(entries: xdr.ScMapEntry[]): xdr.ScVal {
+    const sorted = [...entries].sort((a, b) => {
+      const aKey = a.key().sym().toString();
+      const bKey = b.key().sym().toString();
+      return aKey < bKey ? -1 : aKey > bKey ? 1 : 0;
+    });
+    return xdr.ScVal.scvMap(sorted);
+  }
+
   private bytesToHex(value: unknown): string {
     if (typeof value === 'string') return value;
     if (value instanceof Uint8Array) return Buffer.from(value).toString('hex');
@@ -2908,19 +2927,10 @@ export class OnboardingBridgeSDK {
   }
 
   private feeTierToScVal(tier: FeeTier): xdr.ScVal {
-    return xdr.ScVal.scvMap([
-      new xdr.ScMapEntry({
-        key: xdr.ScVal.scvSymbol('fee_bps'),
-        val: nativeToScVal(tier.fee_bps, { type: 'u32' }),
-      }),
-      new xdr.ScMapEntry({
-        key: xdr.ScVal.scvSymbol('max_volume'),
-        val: nativeToScVal(BigInt(tier.max_volume), { type: 'i128' }),
-      }),
-      new xdr.ScMapEntry({
-        key: xdr.ScVal.scvSymbol('min_volume'),
-        val: nativeToScVal(BigInt(tier.min_volume), { type: 'i128' }),
-      }),
+    return this.sortedScMap([
+      this.scMapEntry('fee_bps', nativeToScVal(tier.fee_bps, { type: 'u32' })),
+      this.scMapEntry('max_volume', nativeToScVal(BigInt(tier.max_volume), { type: 'i128' })),
+      this.scMapEntry('min_volume', nativeToScVal(BigInt(tier.min_volume), { type: 'i128' })),
     ]);
   }
 }
