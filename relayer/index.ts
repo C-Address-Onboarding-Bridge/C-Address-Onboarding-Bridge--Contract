@@ -15,8 +15,7 @@
 import * as crypto from 'crypto';
 import * as http from 'http';
 import { Keypair } from '@stellar/stellar-sdk';
-import { OnboardingBridgeSDK } from '../sdk/src/bridge';
-import { CrossChainFundOptions, RelayerSig } from '../sdk/src/types';
+import { OnboardingBridgeSDK, CrossChainFundOptions, RelayerSig } from '@stellar/c-address-onboarding-bridge-sdk';
 
 // ---------------------------------------------------------------------------
 // Types
