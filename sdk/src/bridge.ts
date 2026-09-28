@@ -2711,6 +2711,13 @@ export class OnboardingBridgeSDK {
     const dummySource = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
     const dummyAccount = new Account(dummySource, '0');
 
+    const nonceScVal = options.nonce === undefined
+      ? xdr.ScVal.scvVoid()
+      : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+    const deadlineScVal = options.deadline === undefined
+      ? xdr.ScVal.scvVoid()
+      : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
+
     const tx = new TransactionBuilder(dummyAccount, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
@@ -2724,6 +2731,8 @@ export class OnboardingBridgeSDK {
             options.asset,
             options.amount,
           ]),
+          nonceScVal,
+          deadlineScVal,
         ),
       )
       .setTimeout(this.config.timeout ?? 30)

@@ -1583,6 +1583,59 @@ describe("OnboardingBridgeSDK", () => {
     });
   });
 
+  describe("estimateCost contract call", () => {
+    beforeEach(() => {
+      mockProvider.simulateTransaction.mockResolvedValue({
+        minResourceFee: "5000",
+      });
+      mockProvider.getLedgerEntries.mockResolvedValue(ledgerEntriesFor(0));
+    });
+
+    it("simulates fund_c_address with 6 arguments (base 4 + nonce + deadline)", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      await sdk.estimateCost({
+        source: MOCK_ADDRESS,
+        target: MOCK_ASSET,
+        asset: MOCK_ASSET,
+        amount: "100",
+        nonce: 42,
+        deadline: 1234567890,
+      });
+
+      expect(contract.call).toHaveBeenCalledWith(
+        "fund_c_address",
+        expect.anything(), // source
+        expect.anything(), // target
+        expect.anything(), // asset
+        expect.anything(), // amount
+        expect.anything(), // nonce
+        expect.anything(), // deadline
+      );
+    });
+
+    it("simulates fund_c_address with scvVoid nonce/deadline when not provided", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      await sdk.estimateCost({
+        source: MOCK_ADDRESS,
+        target: MOCK_ASSET,
+        asset: MOCK_ASSET,
+        amount: "100",
+      });
+
+      expect(contract.call).toHaveBeenCalledWith(
+        "fund_c_address",
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
   describe("estimateCost minimum balance", () => {
     const ESTIMATE_ARGS = {
       source: MOCK_ADDRESS,
