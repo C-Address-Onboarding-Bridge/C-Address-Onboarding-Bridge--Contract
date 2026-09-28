@@ -1110,6 +1110,39 @@ describe("OnboardingBridgeSDK", () => {
     });
   });
 
+  describe("getWhitelistedAssets", () => {
+    it("passes offset/limit to query_whitelisted_assets and paginates on-chain", async () => {
+      (scValToNative as jest.Mock).mockReturnValue([
+        { toString: () => MOCK_ASSET },
+      ]);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const page = await sdk.getWhitelistedAssets(undefined, 1);
+
+      expect(nativeToScVal).toHaveBeenCalledWith(0, { type: "u32" });
+      expect(nativeToScVal).toHaveBeenCalledWith(1, { type: "u32" });
+      expect(page.items).toEqual([MOCK_ASSET]);
+      // A full page (length === limit) means there may be more on-chain.
+      expect(page.hasMore).toBe(true);
+      expect(page.cursor).toBeDefined();
+    });
+
+    it("reports hasMore=false when the contract returns fewer than `limit` entries", async () => {
+      (scValToNative as jest.Mock).mockReturnValue([]);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const page = await sdk.getWhitelistedAssets(undefined, 20);
+
+      expect(page.items).toEqual([]);
+      expect(page.hasMore).toBe(false);
+      expect(page.cursor).toBeUndefined();
+    });
+  });
+
   describe("getAllBalances", () => {
     it("returns a record of asset → balance strings", async () => {
       const mockMap = new Map([[MOCK_ASSET, BigInt(1000)]]);

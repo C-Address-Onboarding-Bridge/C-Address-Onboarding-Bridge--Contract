@@ -2508,7 +2508,8 @@ export class OnboardingBridgeSDK {
    * Return a paginated list of whitelisted asset contract addresses.
    *
    * Only whitelisted assets can be used in `fundCAddress` and batch calls.
-   * The full list is fetched from the contract and paginated client-side.
+   * Pagination happens on-chain: the cursor encodes the offset, and the
+   * contract only returns up to `limit` entries starting at that offset.
    *
    * @param cursor - Opaque cursor from a previous call.  Omit to start from page 1.
    * @param limit  - Maximum items per page.  Defaults to 20.
@@ -2529,22 +2530,31 @@ export class OnboardingBridgeSDK {
     cursor?: string,
     limit = 20,
   ): Promise<PaginatedResult<string>> {
+    const offset = this.decodeCursor(cursor);
     const result = await withRpcHook(
       this.hooks,
       'simulateTransaction',
       { contractMethod: 'query_whitelisted_assets' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_whitelisted_assets', []),
+        this.buildSimulationTx('query_whitelisted_assets', [
+          nativeToScVal(offset, { type: 'u32' }),
+          nativeToScVal(limit, { type: 'u32' }),
+        ]),
       ),
     );
     if ('error' in result && result.error) {
       throw new Error(`Failed to query whitelisted assets: ${result.error}`);
     }
     const scVal = (result as any).results?.[0]?.retval;
-    const all: string[] = scVal
+    const page: string[] = scVal
       ? (scValToNative(scVal) as Address[]).map((a) => a.toString())
       : [];
-    return this.paginate(all, this.decodeCursor(cursor), limit);
+    const nextOffset = offset + page.length;
+    return {
+      items: page,
+      cursor: page.length === limit ? this.encodeCursor(nextOffset) : undefined,
+      hasMore: page.length === limit,
+    };
   }
 
   /**
