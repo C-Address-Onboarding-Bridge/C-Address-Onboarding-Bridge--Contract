@@ -643,6 +643,57 @@ export interface SolanaListenerConfig {
    * Maximum reconnect back-off delay in ms.  Defaults to 30 000 ms.
    */
   maxReconnectDelayMs?: number;
+  /**
+   * Solana JSON-RPC HTTP endpoint (https://...), used to backfill events
+   * that were emitted while the WebSocket was disconnected via
+   * `getSignaturesForAddress` / `getTransaction`. Required for reconnect
+   * backfill to run — without it a reconnect only resumes live delivery.
+   */
+  httpUrl?: string;
+  /**
+   * Path to a JSON file used to persist the last-processed transaction
+   * signature across restarts and reconnects. Defaults to
+   * `.solana-signature-<chainId>.json` in the current working directory.
+   */
+  signatureStorePath?: string;
+}
+
+/**
+ * Build the `logsSubscribe` request payload. Extracted as a pure function so
+ * the commitment level is unit-testable without opening a real WebSocket —
+ * see issue #668 (must use `finalized`, not `confirmed`, since a
+ * `confirmed` log can still be rolled back before funds are released).
+ */
+function buildSolanaSubscribePayload(programId: string): string {
+  return JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'logsSubscribe',
+    params: [{ mentions: [programId] }, { commitment: 'finalized' }],
+  });
+}
+
+/**
+ * Persists the last-processed Solana transaction signature to a local JSON
+ * file, mirroring `BlockStore`'s atomic write pattern, so a restart or
+ * reconnect can backfill exactly what was missed instead of losing it.
+ */
+export class SolanaSignatureStore {
+  private readonly filePath: string;
+
+  constructor(filePath: string) {
+    this.filePath = filePath;
+  }
+
+  load(): string | null {
+    const parsed = readJsonFile<{ signature?: unknown }>(this.filePath);
+    if (parsed && typeof parsed.signature === 'string') return parsed.signature;
+    return null;
+  }
+
+  save(signature: string): void {
+    writeJsonFileAtomic(this.filePath, { signature });
+  }
 }
 
 /**
@@ -663,10 +714,17 @@ export class SolanaChainListener implements ChainListener {
   private stopped = false;
   private reconnectDelay: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private signatureStore: SolanaSignatureStore;
+  /** Last transaction signature we know we've processed (persisted). */
+  private lastSignature: string | null;
 
   constructor(config: SolanaListenerConfig) {
     this.config = config;
     this.reconnectDelay = config.initialReconnectDelayMs ?? 1_000;
+    this.signatureStore = new SolanaSignatureStore(
+      config.signatureStorePath ?? `.solana-signature-${config.chainId}.json`,
+    );
+    this.lastSignature = this.signatureStore.load();
   }
 
   start(onEvent: (event: BridgeEvent) => void): void {
@@ -692,25 +750,29 @@ export class SolanaChainListener implements ChainListener {
       // Reset back-off on a successful connection
       this.reconnectDelay = this.config.initialReconnectDelayMs ?? 1_000;
 
-      const sub = JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'logsSubscribe',
-        params: [{ mentions: [this.config.programId] }, { commitment: 'confirmed' }],
-      });
-      this.ws.send(sub);
-      console.log('[solana-listener] subscribed to program logs');
+      this.ws.send(buildSolanaSubscribePayload(this.config.programId));
+      console.log('[solana-listener] subscribed to program logs (commitment=finalized)');
+
+      // Replay whatever happened while we were disconnected (or since the
+      // last restart) before resuming live delivery — see issue #668.
+      // logsSubscribe only delivers *new* notifications, so without this a
+      // reconnect silently drops everything emitted during the downtime.
+      this.backfill().catch((err: any) =>
+        console.error(`[solana-listener] backfill failed: ${err.message ?? err}`),
+      );
     };
 
     this.ws.onmessage = (msg: any) => {
       try {
         const data = JSON.parse(typeof msg === 'string' ? msg : msg.data);
+        const signature: string | undefined = data?.params?.result?.value?.signature;
         const logs: string[] = data?.params?.result?.value?.logs ?? [];
         for (const line of logs) {
           if (!line.startsWith('Program log: bridge_fund:')) continue;
           const event = this.decodeLine(line);
           if (event && this.onEvent) this.onEvent(event);
         }
+        if (signature) this.recordSignature(signature);
       } catch { /* ignore malformed messages */ }
     };
 
@@ -732,6 +794,67 @@ export class SolanaChainListener implements ChainListener {
         this.connect();
       }, delay);
     };
+  }
+
+  /**
+   * Fetch and replay any `bridge_fund` logs emitted since `lastSignature`
+   * (the last one we know we processed), using `getSignaturesForAddress` +
+   * `getTransaction` over plain JSON-RPC HTTP. `logsSubscribe` only pushes
+   * new notifications, so this is what actually closes the reconnect gap
+   * from issue #668. No-op when `httpUrl` isn't configured or there is no
+   * persisted signature yet (nothing to backfill from on a first run).
+   */
+  private async backfill(): Promise<void> {
+    if (!this.config.httpUrl || !this.lastSignature) return;
+
+    const sigInfos = await this.rpcCall('getSignaturesForAddress', [
+      this.config.programId,
+      { until: this.lastSignature, commitment: 'finalized' },
+    ]);
+    if (!Array.isArray(sigInfos) || sigInfos.length === 0) return;
+
+    // getSignaturesForAddress returns newest-first; replay oldest-first so
+    // event ordering (and the persisted signature) advances monotonically.
+    const ordered = [...sigInfos].reverse();
+    console.log(`[solana-listener] backfilling ${ordered.length} signature(s) since ${this.lastSignature}`);
+
+    for (const info of ordered) {
+      if (info?.err) {
+        this.recordSignature(info.signature);
+        continue;
+      }
+      try {
+        const tx = await this.rpcCall('getTransaction', [
+          info.signature,
+          { commitment: 'finalized', maxSupportedTransactionVersion: 0 },
+        ]);
+        const logs: string[] = tx?.meta?.logMessages ?? [];
+        for (const line of logs) {
+          if (!line.startsWith('Program log: bridge_fund:')) continue;
+          const event = this.decodeLine(line);
+          if (event && this.onEvent) this.onEvent(event);
+        }
+      } catch (err: any) {
+        console.error(`[solana-listener] backfill: failed to fetch tx ${info.signature}: ${err.message ?? err}`);
+      }
+      this.recordSignature(info.signature);
+    }
+  }
+
+  private recordSignature(signature: string): void {
+    this.lastSignature = signature;
+    this.signatureStore.save(signature);
+  }
+
+  private async rpcCall(method: string, params: unknown[]): Promise<any> {
+    const res = await fetch(this.config.httpUrl!, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    });
+    const json: any = await res.json();
+    if (json.error) throw new Error(json.error.message ?? `RPC error calling ${method}`);
+    return json.result;
   }
 
   /**
@@ -1291,6 +1414,84 @@ export function test_valid_env_parses_correctly(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #668: regression tests — finalized commitment + reconnect backfill
+// ---------------------------------------------------------------------------
+
+export function test_solana_listener_subscribes_with_finalized_commitment(): void {
+  const payload = JSON.parse(buildSolanaSubscribePayload('program'));
+  assertEqual(payload.method, 'logsSubscribe', 'should subscribe to logs');
+  assertEqual(
+    payload.params[1].commitment,
+    'finalized',
+    'solana subscription must use finalized commitment, not confirmed (can still be rolled back)',
+  );
+}
+
+export async function test_solana_listener_backfills_missed_events_after_reconnect(): Promise<void> {
+  const filePath = tempStorePath('solana-sig');
+  try {
+    const listener = new SolanaChainListener({
+      wsUrl: 'ws://localhost',
+      programId: 'program',
+      chainId: 101,
+      httpUrl: 'http://localhost',
+      signatureStorePath: filePath,
+    });
+    (listener as any).lastSignature = 'sig-before-restart';
+
+    const rpcCalls: string[] = [];
+    (listener as any).rpcCall = async (method: string, _params: unknown[]) => {
+      rpcCalls.push(method);
+      if (method === 'getSignaturesForAddress') {
+        return [{ signature: 'sig-new', err: null }];
+      }
+      if (method === 'getTransaction') {
+        return { meta: { logMessages: ['Program log: bridge_fund:' + 'ab'.repeat(32) + ':GDEST:CASSET:100'] } };
+      }
+      return null;
+    };
+
+    const events: BridgeEvent[] = [];
+    (listener as any).onEvent = (e: BridgeEvent) => events.push(e);
+
+    await (listener as any).backfill();
+
+    assertEqual(rpcCalls, ['getSignaturesForAddress', 'getTransaction'], 'backfill should query signatures then fetch the transaction');
+    assertEqual(events.length, 1, 'backfill should replay the missed bridge_fund event');
+    assertEqual((listener as any).lastSignature, 'sig-new', 'lastSignature should advance to the newest replayed signature');
+
+    // Simulate a restart: a fresh instance pointed at the same file should
+    // resume backfilling from the persisted signature, not from scratch.
+    const restarted = new SolanaChainListener({
+      wsUrl: 'ws://localhost',
+      programId: 'program',
+      chainId: 101,
+      httpUrl: 'http://localhost',
+      signatureStorePath: filePath,
+    });
+    assertEqual((restarted as any).lastSignature, 'sig-new', 'signature persisted before restart must be loaded on construction');
+  } finally {
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+  }
+}
+
+export async function test_solana_listener_skips_backfill_without_persisted_signature(): Promise<void> {
+  const listener = new SolanaChainListener({
+    wsUrl: 'ws://localhost',
+    programId: 'program',
+    chainId: 101,
+    httpUrl: 'http://localhost',
+    signatureStorePath: tempStorePath('solana-sig-fresh'),
+  });
+  let called = false;
+  (listener as any).rpcCall = async () => { called = true; return []; };
+
+  await (listener as any).backfill();
+
+  assert(!called, 'a fresh listener with no persisted signature has nothing to backfill from and should not call the RPC');
+}
+
+// ---------------------------------------------------------------------------
 // Issue #670: regression tests — submission state survives a process restart
 // ---------------------------------------------------------------------------
 
@@ -1339,6 +1540,9 @@ async function runRelayerSelfTests(): Promise<void> {
   test_eth_listener_decodes_realistic_abi_log_fixture();
   test_eth_listener_rejects_malformed_truncated_log_payload();
   test_solana_listener_rejects_bad_log_lines();
+  test_solana_listener_subscribes_with_finalized_commitment();
+  await test_solana_listener_backfills_missed_events_after_reconnect();
+  await test_solana_listener_skips_backfill_without_persisted_signature();
   test_payload_hash_matches_onchain_algorithm();
   test_amount_encoding_handles_large_decimals();
   test_signature_passes_ed25519_verify();
@@ -1386,6 +1590,7 @@ if (require.main === module) {
           wsUrl: process.env.SOLANA_WS_URL,
           programId: process.env.SOLANA_PROGRAM_ID!,
           chainId: 101,
+          httpUrl: process.env.SOLANA_HTTP_URL,
         })] : []),
       ],
     });
