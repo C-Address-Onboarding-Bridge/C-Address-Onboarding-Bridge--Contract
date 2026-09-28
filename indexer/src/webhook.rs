@@ -607,6 +607,11 @@ mod tests {
             pending_count, 0,
             "pending_deliveries counter must be 0 after marking dead"
         );
+        let dead_count = stats["dead_deliveries"].as_i64().unwrap_or(-1);
+        assert_eq!(
+            dead_count, 1,
+            "dead_deliveries counter must be 1 after marking dead"
+        );
 
         let _ = sub; // suppress unused warning
     }
@@ -655,5 +660,100 @@ mod tests {
             pending_count, 1,
             "delivery must stay pending after only one failure"
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_dead_deliveries_and_retry() {
+        let db = setup_db().await;
+
+        let _sub = db
+            .create_subscription(CreateSubscription {
+                url: "http://example.com/dead-hook".to_string(),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .expect("create subscription");
+
+        let event = IndexedEvent {
+            id: "evt-dead-001".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 1,
+            contract_id: "C_TEST".to_string(),
+            tx_hash: "deadbeef001".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({}),
+        };
+        db.insert_event(&event).await.expect("insert event");
+        db.queue_webhook_deliveries(&event)
+            .await
+            .expect("queue deliveries");
+
+        let pending = db.get_pending_deliveries().await.expect("get pending");
+        assert_eq!(pending.len(), 1);
+        let delivery_id = pending[0].id.clone();
+
+        // Mark delivery dead
+        db.mark_delivery_dead(&delivery_id, "terminal connection error")
+            .await
+            .expect("mark dead");
+
+        // Inspect via list_deliveries with status=dead
+        let dead_list = db
+            .list_deliveries(Some("dead"), 50, 0)
+            .await
+            .expect("list dead");
+        assert_eq!(dead_list.len(), 1);
+        assert_eq!(dead_list[0].id, delivery_id);
+        assert_eq!(dead_list[0].status, "dead");
+        assert_eq!(
+            dead_list[0].last_error.as_deref(),
+            Some("terminal connection error")
+        );
+
+        // Verify stats reflects dead delivery
+        let stats = db.get_stats().await.expect("get stats");
+        assert_eq!(stats["dead_deliveries"].as_i64(), Some(1));
+        assert_eq!(stats["pending_deliveries"].as_i64(), Some(0));
+
+        // Retry non-existent delivery returns false
+        let retry_missing = db
+            .retry_delivery("non-existent-id")
+            .await
+            .expect("retry missing");
+        assert!(
+            !retry_missing,
+            "retrying missing delivery must return false"
+        );
+
+        // Retry existing dead delivery
+        let retry_ok = db.retry_delivery(&delivery_id).await.expect("retry dead");
+        assert!(retry_ok, "retrying existing dead delivery must return true");
+
+        // Dead list is now empty
+        let dead_after = db
+            .list_deliveries(Some("dead"), 50, 0)
+            .await
+            .expect("list dead after");
+        assert!(
+            dead_after.is_empty(),
+            "dead deliveries list must be empty after retry"
+        );
+
+        // Delivery is back in pending queue
+        let pending_after = db
+            .get_pending_deliveries()
+            .await
+            .expect("get pending after");
+        assert_eq!(pending_after.len(), 1);
+        assert_eq!(pending_after[0].id, delivery_id);
+        assert_eq!(pending_after[0].status, "pending");
+
+        // Stats reflect back in pending
+        let stats_after = db.get_stats().await.expect("get stats after");
+        assert_eq!(stats_after["dead_deliveries"].as_i64(), Some(0));
+        assert_eq!(stats_after["pending_deliveries"].as_i64(), Some(1));
     }
 }
