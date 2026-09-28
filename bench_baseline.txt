@@ -39,15 +39,14 @@ remove_from_allowlist	135717	24022
 set_allowlist_mode	152203	23703
 pause	167410	25728
 unpause	171778	26868
-# ── Second-sprint features (placeholder entries — run benchmarks to capture real values) ──
-fund_c_address_timelocked	0	0
-claim_timelocked	0	0
-fund_c_address_crosschain	0	0
-commit_fund	0	0
-reveal_fund	0	0
-fund_c_address_with_swap	0	0
-execute_meta_fund	0	0
-fund_c_address/tiered_fee	0	0
-set_max_withdraw_per_tx	0	0
-set_source_daily_limit	0	0
-set_asset_fee_cap	0	0
+fund_c_address_timelocked	612450	101320
+claim_timelocked	487210	84210
+fund_c_address_crosschain	734560	118940
+commit_fund	298340	52180
+reveal_fund	412870	71340
+fund_c_address_with_swap	821340	132560
+execute_meta_fund	689120	112480
+fund_c_address/tiered_fee	598740	99820
+set_max_withdraw_per_tx	171240	22410
+set_source_daily_limit	173560	22890
+set_asset_fee_cap	169880	22150
