@@ -648,7 +648,13 @@ export interface SolanaListenerConfig {
 /**
  * Listens to Solana program log notifications over WebSocket.
  * Expects the Solana program to emit a structured log line:
- *   "bridge_fund:<txHash>:<target>:<asset>:<amount>"
+ *   "bridge_fund:<signature>:<target>:<asset>:<amount>"
+ *
+ * `logsSubscribe({ mentions: [programId] })` matches any transaction that
+ * touches the program, so a `bridge_fund` line is only accepted when the
+ * bridge program is the one currently executing (see
+ * `extractBridgeFundEvents`), not merely present somewhere in the
+ * transaction's log lines.
  *
  * Implements reconnect-with-exponential-backoff so that a transient WebSocket
  * drop (network blip, RPC provider restart) does not permanently halt event
@@ -706,10 +712,8 @@ export class SolanaChainListener implements ChainListener {
       try {
         const data = JSON.parse(typeof msg === 'string' ? msg : msg.data);
         const logs: string[] = data?.params?.result?.value?.logs ?? [];
-        for (const line of logs) {
-          if (!line.startsWith('Program log: bridge_fund:')) continue;
-          const event = this.decodeLine(line);
-          if (event && this.onEvent) this.onEvent(event);
+        for (const event of this.extractBridgeFundEvents(logs)) {
+          if (this.onEvent) this.onEvent(event);
         }
       } catch { /* ignore malformed messages */ }
     };
@@ -732,6 +736,52 @@ export class SolanaChainListener implements ChainListener {
         this.connect();
       }, delay);
     };
+  }
+
+  /**
+   * `logsSubscribe` with `{ mentions: [programId] }` matches every
+   * transaction that *touches* the program, including one where a
+   * different program (e.g. via CPI) prints its own
+   * `Program log: bridge_fund:...` line — that would let anyone forge a
+   * deposit event for free. This walks the log lines for one notification,
+   * tracking the Solana runtime's own invoke/success/failed frames, and
+   * only treats a `bridge_fund` line as genuine when the bridge program
+   * itself is the currently-executing program (top of the invoke stack).
+   */
+  private extractBridgeFundEvents(logs: string[]): BridgeEvent[] {
+    const events: BridgeEvent[] = [];
+    const stack: string[] = [];
+    const invokeRe = /^Program (\S+) invoke \[\d+\]$/;
+    const endRe = /^Program (\S+) (?:success|failed:.*)$/;
+
+    for (const line of logs) {
+      const invokeMatch = line.match(invokeRe);
+      if (invokeMatch) {
+        stack.push(invokeMatch[1]);
+        continue;
+      }
+      const endMatch = line.match(endRe);
+      if (endMatch) {
+        const idx = stack.lastIndexOf(endMatch[1]);
+        if (idx !== -1) stack.splice(idx, 1);
+        continue;
+      }
+      if (!line.startsWith('Program log: bridge_fund:')) continue;
+
+      const executingProgram = stack[stack.length - 1];
+      if (executingProgram !== this.config.programId) {
+        this.rejectLine(
+          line,
+          `emitted while '${executingProgram ?? '<none>'}' was executing, not the bridge program`,
+        );
+        continue;
+      }
+
+      const event = this.decodeLine(line);
+      if (event) events.push(event);
+    }
+
+    return events;
   }
 
   /**
@@ -1206,6 +1256,66 @@ export function test_base58_decode_round_trips(): void {
   assertEqual(decoded.toString('hex'), original.toString('hex'), 'base58Decode must round-trip base58Encode output');
 }
 
+/**
+ * Issue #667 regression: `logsSubscribe({ mentions })` matches any
+ * transaction that touches the bridge program, so a `bridge_fund` line
+ * printed by a DIFFERENT program (e.g. a caller doing a CPI) must be
+ * rejected — only a line printed while the bridge program is the
+ * executing program is a genuine deposit event.
+ */
+export function test_solana_listener_rejects_forged_cpi_log(): void {
+  const bridgeProgram = 'BridgeProgramId11111111111111111111111111';
+  const otherProgram = 'AttackerProgramId1111111111111111111111111';
+  const listener = new SolanaChainListener({
+    wsUrl: 'ws://localhost',
+    programId: bridgeProgram,
+    chainId: 101,
+  });
+
+  const sigBytes = Buffer.alloc(64, 7);
+  const signature = base58EncodeForTest(sigBytes);
+  const forgedLine = `Program log: bridge_fund:${signature}:GDESTINATION:CASSET:999999`;
+
+  // Attacker's own program is invoked directly (mentions the bridge program
+  // elsewhere in the same tx via account list, but never actually executes
+  // it) and prints a forged bridge_fund line itself.
+  const logs = [
+    `Program ${otherProgram} invoke [1]`,
+    forgedLine,
+    `Program ${otherProgram} success`,
+  ];
+
+  const events = (listener as any).extractBridgeFundEvents(logs);
+  assertEqual(events.length, 0, 'a bridge_fund line printed by another program must be rejected');
+}
+
+/** A genuine deposit: the same log line, but printed while the bridge program is executing (including via a nested CPI), must still be accepted. */
+export function test_solana_listener_accepts_genuine_log_including_via_cpi(): void {
+  const bridgeProgram = 'BridgeProgramId11111111111111111111111111';
+  const callerProgram = 'SomeCallerProgram111111111111111111111111';
+  const listener = new SolanaChainListener({
+    wsUrl: 'ws://localhost',
+    programId: bridgeProgram,
+    chainId: 101,
+  });
+
+  const sigBytes = Buffer.alloc(64, 9);
+  const signature = base58EncodeForTest(sigBytes);
+  const genuineLine = `Program log: bridge_fund:${signature}:GDESTINATION:CASSET:1000`;
+
+  // caller invokes bridge program via CPI, which then emits the log itself.
+  const logs = [
+    `Program ${callerProgram} invoke [1]`,
+    `Program ${bridgeProgram} invoke [2]`,
+    genuineLine,
+    `Program ${bridgeProgram} success`,
+    `Program ${callerProgram} success`,
+  ];
+
+  const events = (listener as any).extractBridgeFundEvents(logs);
+  assertEqual(events.length, 1, 'a bridge_fund line printed while the bridge program is executing must be accepted');
+}
+
 export function test_solana_listener_rejects_bad_log_lines(): void {
   const listener = new SolanaChainListener({
     wsUrl: 'ws://localhost',
@@ -1477,6 +1587,8 @@ async function runRelayerSelfTests(): Promise<void> {
   test_eth_listener_rejects_malformed_truncated_log_payload();
   test_solana_listener_decodes_real_signature();
   test_base58_decode_round_trips();
+  test_solana_listener_rejects_forged_cpi_log();
+  test_solana_listener_accepts_genuine_log_including_via_cpi();
   test_solana_listener_rejects_bad_log_lines();
   test_payload_hash_matches_onchain_algorithm();
   test_amount_encoding_handles_large_decimals();
