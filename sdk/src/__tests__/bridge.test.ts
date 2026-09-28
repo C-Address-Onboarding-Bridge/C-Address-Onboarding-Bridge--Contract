@@ -227,6 +227,68 @@ describe("OnboardingBridgeSDK", () => {
     });
   });
 
+  describe("fundCAddressTimelocked", () => {
+    it("passes nonce and deadline to contract.call when provided", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      const result = await sdk.fundCAddressTimelocked(
+        {
+          source: MOCK_ADDRESS,
+          target: MOCK_ASSET,
+          asset: MOCK_ASSET,
+          amount: "1000",
+          releaseTime: 2000000000,
+          cliffTime: 1900000000,
+          nonce: 42,
+          deadline: 1234567890,
+        },
+        mockKeypair,
+      );
+
+      expect(result.status).toBe("pending");
+      // 1 method name + 6 base args + 2 optional args = 9 total
+      expect(contract.call).toHaveBeenCalledWith(
+        "fund_c_address_timelocked",
+        expect.anything(), // source
+        expect.anything(), // target
+        expect.anything(), // asset
+        expect.anything(), // amount
+        expect.anything(), // releaseTime
+        expect.anything(), // cliffTime
+        expect.anything(), // nonce
+        expect.anything(), // deadline
+      );
+    });
+
+    it("omits nonce and deadline (scvVoid) when not provided", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      const result = await sdk.fundCAddressTimelocked(
+        {
+          source: MOCK_ADDRESS,
+          target: MOCK_ASSET,
+          asset: MOCK_ASSET,
+          amount: "1000",
+          releaseTime: 2000000000,
+        },
+        mockKeypair,
+      );
+
+      expect(result.status).toBe("pending");
+      expect(contract.call).toHaveBeenCalledWith(
+        "fund_c_address_timelocked",
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
   describe("fundCAddressWithSwap", () => {
     it("passes nonce and deadline to contract.call when provided", async () => {
       const contract = (Contract as jest.Mock).mock.results[0].value;
