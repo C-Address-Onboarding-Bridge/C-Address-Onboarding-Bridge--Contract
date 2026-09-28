@@ -25,3 +25,5 @@ uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.21"
 hex = "0.4"
 url = "2"
+hmac = "0.12"
+sha2 = "0.10"

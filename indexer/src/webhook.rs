@@ -3,8 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
 const MAX_RETRIES: i32 = 5;
 const DELIVERY_INTERVAL_MS: u64 = 2000;
+
+type HmacSha256 = Hmac<Sha256>;
 
 // ---------------------------------------------------------------------------
 // SSRF protection — URL validation
@@ -78,6 +83,17 @@ fn unwrap_ipv4_mapped_or_compatible(ip: IpAddr) -> IpAddr {
         }
     }
     ip
+}
+
+/// Generate the signature for a webhook payload.
+/// Signature is: sha256=<hex(hmac_sha256(secret, timestamp + "." + body))>
+fn generate_signature(secret: &str, timestamp: &str, body: &str) -> String {
+    let message = format!("{}.{}", timestamp, body);
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect("HMAC can take key of any size");
+    mac.update(message.as_bytes());
+    let result = mac.finalize();
+    format!("sha256={}", hex::encode(result.into_bytes()))
 }
 
 /// Validate a webhook URL at subscription-registration time.
@@ -159,6 +175,8 @@ pub struct Subscription {
     pub source_filter: Option<String>,
     pub target_filter: Option<String>,
     pub active: bool,
+    /// Secret used to sign webhook payloads. Returned only at creation.
+    pub secret: String,
     pub created_at: String,
 }
 
@@ -252,6 +270,21 @@ async fn deliver_pending(state: &AppState) -> Result<(), Box<dyn std::error::Err
             }
         };
 
+        let secret = match state
+            .db
+            .get_subscription_secret(&delivery.subscription_id)
+            .await?
+        {
+            Some(s) => s,
+            None => {
+                state
+                    .db
+                    .mark_delivery_dead(&delivery.id, "subscription secret not found")
+                    .await?;
+                continue;
+            }
+        };
+
         let payload = WebhookPayload {
             delivery_id: delivery.id.clone(),
             attempt: delivery.attempts + 1,
@@ -260,13 +293,18 @@ async fn deliver_pending(state: &AppState) -> Result<(), Box<dyn std::error::Err
             ledger_sequence: event.ledger_sequence,
             contract_id: event.contract_id,
             tx_hash: event.tx_hash,
-            timestamp: event.timestamp,
+            timestamp: event.timestamp.clone(),
             data: event.data,
         };
+
+        let body = serde_json::to_string(&payload).unwrap_or_default();
+        let signature = generate_signature(&secret, &payload.timestamp, &body);
 
         match state
             .webhook_client
             .post(&url)
+            .header("X-Signature", signature)
+            .header("X-Timestamp", payload.timestamp.clone())
             .json(&payload)
             .timeout(std::time::Duration::from_secs(10))
             .send()
@@ -746,6 +784,82 @@ mod tests {
         assert_eq!(
             pending_count, 1,
             "delivery must stay pending after only one failure"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue 4 — Webhook signature verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_generate_signature_is_consistent() {
+        let secret = "my-secret";
+        let timestamp = "2024-01-01T00:00:00Z";
+        let body = r#"{"delivery_id":"d1","attempt":1}"#;
+
+        let sig1 = generate_signature(secret, timestamp, body);
+        let sig2 = generate_signature(secret, timestamp, body);
+        assert_eq!(sig1, sig2, "signature must be deterministic");
+        assert!(sig1.starts_with("sha256="), "signature must have sha256= prefix");
+    }
+
+    #[test]
+    fn test_generate_signature_differs_for_different_secrets() {
+        let timestamp = "2024-01-01T00:00:00Z";
+        let body = r#"{"delivery_id":"d1","attempt":1}"#;
+
+        let sig1 = generate_signature("secret-1", timestamp, body);
+        let sig2 = generate_signature("secret-2", timestamp, body);
+        assert_ne!(sig1, sig2, "different secrets must produce different signatures");
+    }
+
+    #[test]
+    fn test_generate_signature_differs_for_different_timestamps() {
+        let secret = "my-secret";
+        let body = r#"{"delivery_id":"d1","attempt":1}"#;
+
+        let sig1 = generate_signature(secret, "2024-01-01T00:00:00Z", body);
+        let sig2 = generate_signature(secret, "2024-01-01T00:00:01Z", body);
+        assert_ne!(sig1, sig2, "different timestamps must produce different signatures");
+    }
+
+    #[test]
+    fn test_generate_signature_differs_for_different_bodies() {
+        let secret = "my-secret";
+        let timestamp = "2024-01-01T00:00:00Z";
+
+        let sig1 = generate_signature(secret, timestamp, r#"{"attempt":1}"#);
+        let sig2 = generate_signature(secret, timestamp, r#"{"attempt":2}"#);
+        assert_ne!(sig1, sig2, "different bodies must produce different signatures");
+    }
+
+    #[tokio::test]
+    async fn test_subscription_includes_secret() {
+        let db = setup_db().await;
+
+        let sub = db
+            .create_subscription(CreateSubscription {
+                url: "http://example.com/hook".to_string(),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .expect("create subscription");
+
+        assert!(!sub.secret.is_empty(), "subscription must include a secret");
+
+        // Verify the secret is retrievable
+        let stored_secret = db
+            .get_subscription_secret(&sub.id)
+            .await
+            .expect("get secret")
+            .expect("secret must exist");
+
+        assert_eq!(
+            sub.secret, stored_secret,
+            "stored secret must match the returned secret"
         );
     }
 }
