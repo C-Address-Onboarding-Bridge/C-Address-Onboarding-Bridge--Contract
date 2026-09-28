@@ -250,6 +250,64 @@ Transfers the contract admin role (admin only).
   - `adminKeypair`: `Keypair`
 - **Returns**: `Promise<TransactionResult>`
 
+##### `proposeNewAdmin`
+```ts
+async proposeNewAdmin(
+  newAdmin: string,
+  adminKeypair: Keypair
+): Promise<TransactionResult>
+```
+Proposes an admin handover (admin only). Prefer this over `setAdmin` — it proves the new admin controls the key (via `acceptAdmin`) before the role moves.
+- **Parameters**:
+  - `newAdmin`: `string` — Proposed admin's G-address.
+  - `adminKeypair`: `Keypair`
+- **Returns**: `Promise<TransactionResult>`
+
+##### `acceptAdmin`
+```ts
+async acceptAdmin(pendingAdminKeypair: Keypair): Promise<TransactionResult>
+```
+Accepts a pending admin handover. Must be signed by the proposed admin.
+- **Parameters**:
+  - `pendingAdminKeypair`: `Keypair` — Keypair of the proposed admin.
+- **Returns**: `Promise<TransactionResult>`
+
+##### `getPendingAdmin`
+```ts
+async getPendingAdmin(): Promise<string | null>
+```
+Returns the pending admin's G-address, or `null` if there is no pending handover.
+- **Returns**: `Promise<string | null>`
+
+##### `proposeNewFeeCollector`
+```ts
+async proposeNewFeeCollector(
+  newCollector: string,
+  adminKeypair: Keypair
+): Promise<TransactionResult>
+```
+Proposes a fee-collector handover (admin only). Prefer this over `setFeeCollector` — it proves the new collector controls the key (via `acceptFeeCollector`) before the role moves.
+- **Parameters**:
+  - `newCollector`: `string` — Proposed collector's G-address.
+  - `adminKeypair`: `Keypair`
+- **Returns**: `Promise<TransactionResult>`
+
+##### `acceptFeeCollector`
+```ts
+async acceptFeeCollector(pendingCollectorKeypair: Keypair): Promise<TransactionResult>
+```
+Accepts a pending fee-collector handover. Must be signed by the proposed collector.
+- **Parameters**:
+  - `pendingCollectorKeypair`: `Keypair` — Keypair of the proposed fee collector.
+- **Returns**: `Promise<TransactionResult>`
+
+##### `getPendingFeeCollector`
+```ts
+async getPendingFeeCollector(): Promise<string | null>
+```
+Returns the pending fee collector's G-address, or `null` if there is no pending handover.
+- **Returns**: `Promise<string | null>`
+
 ##### `upgrade`
 ```ts
 async upgrade(

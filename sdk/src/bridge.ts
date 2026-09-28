@@ -1916,6 +1916,376 @@ export class OnboardingBridgeSDK {
   }
 
   /**
+   * Propose an admin handover to a new G-address (admin only).
+   *
+   * This two-step path is preferred over `setAdmin` for normal operations
+   * because it proves the proposed admin controls the key (via
+   * {@link acceptAdmin}) before the role is moved — `setAdmin` transfers
+   * control immediately and unrecoverably if the new key is unusable.
+   *
+   * @param newAdmin     - G-address of the proposed admin.
+   * @param adminKeypair - Keypair of the current admin account.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * await sdk.proposeNewAdmin('G...newAdmin', adminKeypair);
+   * // newAdmin then calls:
+   * await sdk.acceptAdmin(newAdminKeypair);
+   * ```
+   */
+  async proposeNewAdmin(
+    newAdmin: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'proposeNewAdmin',
+      { newAdmin, nonce },
+      async () => {
+        try {
+          assertAccountAddress(newAdmin, 'newAdmin');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const nonceScVal = nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(nonce), { type: 'u64' });
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'propose_new_admin',
+                new Address(newAdmin).toScVal(),
+                nonceScVal,
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'propose_new_admin' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'propose_new_admin' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Accept a pending admin handover (must be signed by the proposed admin).
+   *
+   * Completes the handover started by {@link proposeNewAdmin}. Fails if there
+   * is no pending admin, or if `pendingAdminKeypair` does not match the
+   * address that was proposed.
+   *
+   * @param pendingAdminKeypair - Keypair of the proposed (pending) admin.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * await sdk.acceptAdmin(newAdminKeypair);
+   * ```
+   */
+  async acceptAdmin(pendingAdminKeypair: Keypair): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'acceptAdmin',
+      {},
+      async () => {
+        try {
+          const pendingAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: pendingAdminKeypair.publicKey() },
+            () => this.provider.getAccount(pendingAdminKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(pendingAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(this.contract.call('accept_admin'))
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'accept_admin' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(pendingAdminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'accept_admin' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Get the pending admin G-address, if an admin handover is in progress.
+   *
+   * @returns The pending admin's G-address, or `null` if there is no pending
+   *          handover.
+   *
+   * @throws {Error} On RPC failure.
+   */
+  async getPendingAdmin(): Promise<string | null> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_pending_admin' },
+      () => this.provider.simulateTransaction(this.buildSimulationTx('query_pending_admin', [])),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get pending admin: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    if (!scVal) return null;
+    const native = scValToNative(scVal);
+    return native ? native.toString() : null;
+  }
+
+  /**
+   * Propose a fee-collector handover to a new G-address (admin only).
+   *
+   * This two-step path is preferred over `setFeeCollector` for normal
+   * operations because it proves the proposed collector controls the key
+   * (via {@link acceptFeeCollector}) before the role is moved.
+   *
+   * @param newCollector - G-address of the proposed fee collector.
+   * @param adminKeypair - Keypair of the admin account.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * await sdk.proposeNewFeeCollector('G...newCollector', adminKeypair);
+   * // newCollector then calls:
+   * await sdk.acceptFeeCollector(newCollectorKeypair);
+   * ```
+   */
+  async proposeNewFeeCollector(
+    newCollector: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'proposeNewFeeCollector',
+      { newCollector, nonce },
+      async () => {
+        try {
+          assertAccountAddress(newCollector, 'newCollector');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const nonceScVal = nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(nonce), { type: 'u64' });
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'propose_new_fee_collector',
+                new Address(newCollector).toScVal(),
+                nonceScVal,
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'propose_new_fee_collector' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'propose_new_fee_collector' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Accept a pending fee-collector handover (must be signed by the proposed
+   * fee collector).
+   *
+   * Completes the handover started by {@link proposeNewFeeCollector}. Fails
+   * if there is no pending fee collector, or if `pendingCollectorKeypair`
+   * does not match the address that was proposed.
+   *
+   * @param pendingCollectorKeypair - Keypair of the proposed (pending) fee collector.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * await sdk.acceptFeeCollector(newCollectorKeypair);
+   * ```
+   */
+  async acceptFeeCollector(pendingCollectorKeypair: Keypair): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'acceptFeeCollector',
+      {},
+      async () => {
+        try {
+          const pendingAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: pendingCollectorKeypair.publicKey() },
+            () => this.provider.getAccount(pendingCollectorKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(pendingAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(this.contract.call('accept_fee_collector'))
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'accept_fee_collector' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(pendingCollectorKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'accept_fee_collector' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Get the pending fee-collector G-address, if a handover is in progress.
+   *
+   * @returns The pending fee collector's G-address, or `null` if there is no
+   *          pending handover.
+   *
+   * @throws {Error} On RPC failure.
+   */
+  async getPendingFeeCollector(): Promise<string | null> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_pending_fee_collector' },
+      () => this.provider.simulateTransaction(this.buildSimulationTx('query_pending_fee_collector', [])),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get pending fee collector: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    if (!scVal) return null;
+    const native = scValToNative(scVal);
+    return native ? native.toString() : null;
+  }
+
+  /**
    * Upgrade the contract to a new wasm implementation (admin only).
    * The new_wasm_hash must reference wasm already uploaded to the network.
    * Preserves all instance storage (admin, fee settings, etc.).
