@@ -11,6 +11,7 @@
  *
  * Options:
  *   --network <mainnet|testnet|dev>   Select deployment environment (default: testnet)
+ *   --salt <hex>                      Override the 32-byte contract salt (64 hex chars)
  *
  * Config files (checked in order, first found wins):
  *   deploy-config.<network>.json     e.g. deploy-config.testnet.json
@@ -101,6 +102,26 @@ function parseNetworkArg(): NetworkName {
 }
 
 /**
+ * Parse the optional --salt flag from argv.
+ *
+ * Returns a 32-byte Buffer.  When --salt is provided it must be a 64-character
+ * hex string (32 bytes); otherwise a cryptographically random salt is generated
+ * so that repeated deployments from the same admin account do not collide.
+ */
+export function parseSaltArg(): Buffer {
+  const idx = process.argv.indexOf('--salt');
+  if (idx !== -1 && process.argv[idx + 1]) {
+    const hex = process.argv[idx + 1];
+    if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+      console.error('Invalid --salt: expected 64 hex characters (32 bytes).');
+      process.exit(1);
+    }
+    return Buffer.from(hex, 'hex');
+  }
+  return randomBytes(32);
+}
+
+/**
  * Load and return the DeployConfig for the given network.
  *
  * Lookup order:
@@ -160,13 +181,25 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function poll(
+/**
+ * Poll the RPC node until the transaction is no longer NOT_FOUND.
+ *
+ * Throws when the transaction has FAILED (including the result XDR) so callers
+ * never mistake a failed transaction for a confirmed one.
+ */
+export async function poll(
   provider: SorobanRpc.Server,
   hash: string,
   retries = 20,
 ): Promise<SorobanRpc.Api.GetTransactionResponse> {
   for (let i = 0; i < retries; i++) {
     const r = await provider.getTransaction(hash);
+    if (r.status === 'FAILED') {
+      const resultXdr = (r as SorobanRpc.Api.GetFailedTransactionResponse).resultXdr;
+      throw new Error(
+        `Transaction ${hash} failed: ${resultXdr ? resultXdr.toXDR('base64') : 'no result XDR'}`,
+      );
+    }
     if (r.status !== 'NOT_FOUND') return r;
     await sleep(2000);
   }
@@ -221,7 +254,7 @@ async function deployContract(
   console.log('  WASM installed ✓');
 
   console.log('Creating contract instance…');
-  const salt = randomBytes(32);
+  const salt = parseSaltArg();
   const constructorArgs = [
     Address.fromString(admin.publicKey()).toScVal(),
     Address.fromString(cfg.feeCollectorPublicKey).toScVal(),
@@ -232,57 +265,6 @@ async function deployContract(
   const createResult = await submitAndConfirm(provider, cfg, admin, (account) =>
     new TransactionBuilder(account, {
       fee: BASE_FEE,
-      networkPassphrase: cfg.networkPassphrase,
-    })
-      .addOperation(
-        Operation.createCustomContract({
-          address: Address.fromString(admin.publicKey()),
-          wasmHash,
-          salt,
-          constructorArgs,
-        }),
-      )
-      .setTimeout(30)
-      .build(),
-  );
+      netw
 
-  const contractId = extractContractId(createResult);
-  if (!contractId) {
-    throw new Error('Contract deployment succeeded but returned no contractId');
-  }
-  console.log(`  Contract ID: ${contractId} ✓`);
-  return contractId;
-}
-
-/**
- * Extract the created contract ID from a createCustomContract result.
- * The contract address is returned as the operation's return value.
- */
-function extractContractId(result: SorobanRpc.Api.GetTransactionResponse): string | undefined {
-  if (result.status !== 'SUCCESS') return undefined;
-  const meta = result.resultMetaXdr;
-  if (!meta) return undefined;
-  const txMeta = xdr.TransactionMeta.fromXDR(meta, 'base64');
-  const sorobanMeta = txMeta.v3().sorobanMeta();
-  if (!sorobanMeta) return undefined;
-  const returnValue = sorobanMeta.returnValue();
-  if (!returnValue) return undefined;
-  return Address.fromScVal(returnValue).toString();
-}
-
-async function initialize(
-  provider: SorobanRpc.Server,
-  cfg: DeployConfig,
-  admin: Keypair,
-  contractId: string,
-  wasmHash: Buffer,
-): Promise<void> {
-  console.log(`Initializing contract ${contractId}…`);
-  const contract = new Contract(contractId);
-  const account = await provider.getAccount(admin.publicKey());
-
-  const tx = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    net
-
-/* … truncated 2866 chars — edit only what you need near the top … */
+/* … truncated 1649 chars — edit only what you need near the top … */
