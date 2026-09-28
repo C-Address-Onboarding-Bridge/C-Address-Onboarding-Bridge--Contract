@@ -13,7 +13,9 @@
  */
 
 import * as crypto from 'crypto';
+import * as fs from 'fs';
 import * as http from 'http';
+import * as path from 'path';
 import { Keypair } from '@stellar/stellar-sdk';
 import { OnboardingBridgeSDK } from '../sdk/src/bridge';
 import { CrossChainFundOptions, RelayerSig } from '../sdk/src/types';
@@ -1169,6 +1171,29 @@ export function test_valid_env_parses_correctly(): void {
   assertEqual(result.relayerPrivateKeys.length, 2, 'relayer key count');
 }
 
+export function test_block_store_save_and_load(): void {
+  const tmpDir = path.join(process.cwd(), '.tmp-block-store-test-' + Date.now());
+  const filePath = path.join(tmpDir, 'sub', 'block.json');
+  try {
+    const store = new BlockStore(filePath);
+    assertEqual(store.load(), null, 'load non-existent file returns null');
+
+    store.save('0x123456');
+    assertEqual(store.load(), '0x123456', 'loaded block matches saved block');
+
+    store.save('0xabcdef');
+    assertEqual(store.load(), '0xabcdef', 'updated block matches saved block');
+  } finally {
+    try {
+      if (fs.existsSync(tmpDir)) {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    } catch {
+      // ignore cleanup errors
+    }
+  }
+}
+
 async function runRelayerSelfTests(): Promise<void> {
   await test_duplicate_event_ignored_via_nonce_store();
   await test_nonce_marked_only_after_successful_submission();
@@ -1182,6 +1207,8 @@ async function runRelayerSelfTests(): Promise<void> {
   test_amount_encoding_handles_large_decimals();
   test_signature_passes_ed25519_verify();
   test_signature_from_known_seed_is_deterministic();
+  // Issue #657: BlockStore persistence
+  test_block_store_save_and_load();
   // Issue 3 & 4: env var and threshold validation
   test_missing_contract_id_throws();
   test_missing_rpc_url_throws();
