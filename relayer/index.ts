@@ -1044,18 +1044,33 @@ export function test_signature_from_known_seed_is_deterministic(): void {
  *
  * Exported so it can be unit-tested independently of process.exit.
  */
-export function validateEnv(env: NodeJS.ProcessEnv = process.env): {
+export interface ValidatedEthEnv {
+  rpcUrl: string;
+  bridgeContractAddress: string;
+  eventTopic: string;
+}
+
+export interface ValidatedSolanaEnv {
+  wsUrl: string;
+  programId: string;
+}
+
+export interface ValidatedEnv {
   contractId: string;
   rpcUrl: string;
   networkPassphrase: string;
   submitterSecretKey: string;
   threshold: number;
   relayerPrivateKeys: string[];
-} {
-  function requireString(name: string): string {
+  eth?: ValidatedEthEnv;
+  solana?: ValidatedSolanaEnv;
+}
+
+export function validateEnv(env: NodeJS.ProcessEnv = process.env): ValidatedEnv {
+  function requireString(name: string, customMessage?: string): string {
     const value = env[name];
     if (value === undefined || value.trim() === '') {
-      throw new Error(`${name} is required but was not set`);
+      throw new Error(customMessage ?? `${name} is required but was not set`);
     }
     return value.trim();
   }
@@ -1083,7 +1098,40 @@ export function validateEnv(env: NodeJS.ProcessEnv = process.env): {
     throw new Error('RELAYER_PRIVATE_KEYS is required and must contain at least one key');
   }
 
-  return { contractId, rpcUrl, networkPassphrase, submitterSecretKey, threshold, relayerPrivateKeys };
+  let eth: ValidatedEthEnv | undefined;
+  if (env['ETH_RPC_URL'] && env['ETH_RPC_URL'].trim() !== '') {
+    const ethRpcUrl = env['ETH_RPC_URL'].trim();
+    const bridgeContractAddress = requireString(
+      'ETH_BRIDGE_CONTRACT',
+      'ETH_BRIDGE_CONTRACT is required when ETH_RPC_URL is set',
+    );
+    const eventTopic = requireString(
+      'ETH_EVENT_TOPIC',
+      'ETH_EVENT_TOPIC is required when ETH_RPC_URL is set',
+    );
+    eth = { rpcUrl: ethRpcUrl, bridgeContractAddress, eventTopic };
+  }
+
+  let solana: ValidatedSolanaEnv | undefined;
+  if (env['SOLANA_WS_URL'] && env['SOLANA_WS_URL'].trim() !== '') {
+    const wsUrl = env['SOLANA_WS_URL'].trim();
+    const programId = requireString(
+      'SOLANA_PROGRAM_ID',
+      'SOLANA_PROGRAM_ID is required when SOLANA_WS_URL is set',
+    );
+    solana = { wsUrl, programId };
+  }
+
+  return {
+    contractId,
+    rpcUrl,
+    networkPassphrase,
+    submitterSecretKey,
+    threshold,
+    relayerPrivateKeys,
+    eth,
+    solana,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1169,6 +1217,79 @@ export function test_valid_env_parses_correctly(): void {
   assertEqual(result.relayerPrivateKeys.length, 2, 'relayer key count');
 }
 
+export function test_missing_eth_bridge_contract_throws(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test',
+    RELAYER_SECRET_KEY: 'secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32),
+    ETH_RPC_URL: 'http://eth-rpc',
+  };
+  try {
+    validateEnv(env);
+    throw new Error('Expected validateEnv to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('ETH_BRIDGE_CONTRACT'), `expected ETH_BRIDGE_CONTRACT error, got: ${e.message}`);
+  }
+}
+
+export function test_missing_eth_event_topic_throws(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test',
+    RELAYER_SECRET_KEY: 'secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32),
+    ETH_RPC_URL: 'http://eth-rpc',
+    ETH_BRIDGE_CONTRACT: '0xbridge',
+  };
+  try {
+    validateEnv(env);
+    throw new Error('Expected validateEnv to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('ETH_EVENT_TOPIC'), `expected ETH_EVENT_TOPIC error, got: ${e.message}`);
+  }
+}
+
+export function test_missing_solana_program_id_throws(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test',
+    RELAYER_SECRET_KEY: 'secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32),
+    SOLANA_WS_URL: 'ws://localhost',
+  };
+  try {
+    validateEnv(env);
+    throw new Error('Expected validateEnv to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('SOLANA_PROGRAM_ID'), `expected SOLANA_PROGRAM_ID error, got: ${e.message}`);
+  }
+}
+
+export function test_valid_eth_and_solana_env_parses(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test',
+    RELAYER_SECRET_KEY: 'secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32),
+    ETH_RPC_URL: 'http://eth-rpc',
+    ETH_BRIDGE_CONTRACT: '0xbridge',
+    ETH_EVENT_TOPIC: '0xtopic',
+    SOLANA_WS_URL: 'ws://localhost',
+    SOLANA_PROGRAM_ID: 'solana-program',
+  };
+  const result = validateEnv(env);
+  assertEqual(result.eth?.rpcUrl, 'http://eth-rpc', 'eth rpc');
+  assertEqual(result.eth?.bridgeContractAddress, '0xbridge', 'eth bridge contract');
+  assertEqual(result.eth?.eventTopic, '0xtopic', 'eth event topic');
+  assertEqual(result.solana?.wsUrl, 'ws://localhost', 'solana ws');
+  assertEqual(result.solana?.programId, 'solana-program', 'solana program id');
+}
+
 async function runRelayerSelfTests(): Promise<void> {
   await test_duplicate_event_ignored_via_nonce_store();
   await test_nonce_marked_only_after_successful_submission();
@@ -1188,6 +1309,11 @@ async function runRelayerSelfTests(): Promise<void> {
   test_nan_threshold_is_rejected();
   test_zero_threshold_is_rejected();
   test_valid_env_parses_correctly();
+  // Issue #659: listener env validation
+  test_missing_eth_bridge_contract_throws();
+  test_missing_eth_event_topic_throws();
+  test_missing_solana_program_id_throws();
+  test_valid_eth_and_solana_env_parses();
   console.log('[relayer] self-tests passed');
 }
 
@@ -1202,26 +1328,43 @@ if (require.main === module) {
       process.exit(1);
     });
   } else {
-    const service = new RelayerService({
-      contractId: process.env.CONTRACT_ID!,
-      rpcUrl: process.env.STELLAR_RPC_URL!,
-      networkPassphrase: process.env.NETWORK_PASSPHRASE!,
-      submitterSecretKey: process.env.RELAYER_SECRET_KEY!,
-      threshold: parseInt(process.env.THRESHOLD ?? '1', 10),
-      nodes: (process.env.RELAYER_PRIVATE_KEYS ?? '').split(',').map((pk) => ({ privateKey: pk.trim() })),
-      listeners: [
-        ...(process.env.ETH_RPC_URL ? [new EthChainListener({
-          rpcUrl: process.env.ETH_RPC_URL,
-          bridgeContractAddress: process.env.ETH_BRIDGE_CONTRACT!,
-          eventTopic: process.env.ETH_EVENT_TOPIC!,
+    let env: ValidatedEnv;
+    try {
+      env = validateEnv();
+    } catch (err: any) {
+      console.error(err.message ?? String(err));
+      process.exit(1);
+    }
+
+    const listeners: ChainListener[] = [];
+    if (env.eth) {
+      listeners.push(
+        new EthChainListener({
+          rpcUrl: env.eth.rpcUrl,
+          bridgeContractAddress: env.eth.bridgeContractAddress,
+          eventTopic: env.eth.eventTopic,
           chainId: 1,
-        })] : []),
-        ...(process.env.SOLANA_WS_URL ? [new SolanaChainListener({
-          wsUrl: process.env.SOLANA_WS_URL,
-          programId: process.env.SOLANA_PROGRAM_ID!,
+        }),
+      );
+    }
+    if (env.solana) {
+      listeners.push(
+        new SolanaChainListener({
+          wsUrl: env.solana.wsUrl,
+          programId: env.solana.programId,
           chainId: 101,
-        })] : []),
-      ],
+        }),
+      );
+    }
+
+    const service = new RelayerService({
+      contractId: env.contractId,
+      rpcUrl: env.rpcUrl,
+      networkPassphrase: env.networkPassphrase,
+      submitterSecretKey: env.submitterSecretKey,
+      threshold: env.threshold,
+      nodes: env.relayerPrivateKeys.map((pk) => ({ privateKey: pk })),
+      listeners,
     });
 
     const healthPort = parseInt(process.env.HEALTH_PORT ?? '3000', 10);
