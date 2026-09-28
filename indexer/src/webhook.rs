@@ -45,6 +45,9 @@ fn is_private_or_reserved(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_documentation()
                 || v4.is_unspecified()
+                || v4.is_multicast()   // 224.0.0.0/4
+                // 0.0.0.0/8 — This network
+                || (v4.octets()[0] == 0)
                 // 100.64.0.0/10 — CGNAT / shared address space
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
                 // 192.0.0.0/24 — IETF protocol assignments
@@ -57,12 +60,24 @@ fn is_private_or_reserved(ip: IpAddr) -> bool {
         IpAddr::V6(v6) => {
             v6.is_loopback()
                 || v6.is_unspecified()
+                || v6.is_multicast()   // ff00::/8
                 // fc00::/7 — unique local
                 || ((v6.segments()[0] & 0xFE00) == 0xFC00)
                 // fe80::/10 — link-local
                 || ((v6.segments()[0] & 0xFFC0) == 0xFE80)
         }
     }
+}
+
+/// Check if an IPv6 address is IPv4-mapped or compatible, and if so, return the
+/// embedded IPv4 address. Otherwise return the original IPv6 address.
+fn unwrap_ipv4_mapped_or_compatible(ip: IpAddr) -> IpAddr {
+    if let IpAddr::V6(v6) = ip {
+        if let Some(v4) = v6.to_ipv4_mapped() {
+            return IpAddr::V4(v4);
+        }
+    }
+    ip
 }
 
 /// Validate a webhook URL at subscription-registration time.
@@ -95,8 +110,9 @@ pub fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
         .trim_matches(|c| c == '[' || c == ']')
         .parse::<IpAddr>()
     {
-        if is_private_or_reserved(ip) {
-            return Err(UrlValidationError::PrivateOrReservedHost(ip.to_string()));
+        let unwrapped_ip = unwrap_ipv4_mapped_or_compatible(ip);
+        if is_private_or_reserved(unwrapped_ip) {
+            return Err(UrlValidationError::PrivateOrReservedHost(unwrapped_ip.to_string()));
         }
         return Ok(());
     }
@@ -114,9 +130,10 @@ pub fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
         .map_err(|_| UrlValidationError::UnresolvableHost(host.to_string()))?;
 
     for addr in addrs {
-        if is_private_or_reserved(addr.ip()) {
+        let ip = unwrap_ipv4_mapped_or_compatible(addr.ip());
+        if is_private_or_reserved(ip) {
             return Err(UrlValidationError::PrivateOrReservedHost(
-                addr.ip().to_string(),
+                ip.to_string(),
             ));
         }
     }
@@ -423,6 +440,61 @@ mod tests {
         let err = validate_webhook_url("not-a-url").unwrap_err();
         assert!(
             matches!(err, UrlValidationError::InvalidUrl(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_ipv4_mapped_ipv6_loopback_is_rejected() {
+        // ::ffff:127.0.0.1 is IPv4-mapped loopback
+        let err = validate_webhook_url("http://[::ffff:127.0.0.1]/hook").unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_ipv4_mapped_ipv6_metadata_is_rejected() {
+        // ::ffff:169.254.169.254 is IPv4-mapped EC2 metadata endpoint
+        let err = validate_webhook_url("http://[::ffff:169.254.169.254]/hook").unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_ipv6_multicast_is_rejected() {
+        // ff02::1 is IPv6 multicast
+        let err = validate_webhook_url("http://[ff02::1]/hook").unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_ipv4_multicast_is_rejected() {
+        // 224.0.0.1 is multicast
+        let err = validate_webhook_url("http://224.0.0.1/hook").unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_ipv4_zero_range_is_rejected() {
+        // 0.0.0.1 is in 0.0.0.0/8
+        let err = validate_webhook_url("http://0.0.0.1/hook").unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
             err
         );
