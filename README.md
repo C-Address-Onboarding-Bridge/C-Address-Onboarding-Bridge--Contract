@@ -863,3 +863,8 @@ for (const event of events) {
 ## License
 
 MIT
+
+## Handsoff notes
+
+<!-- handsoff-issue-690 -->
+- #690: sdk: InMemoryCache grows without bound — expired entries are only removed when read
