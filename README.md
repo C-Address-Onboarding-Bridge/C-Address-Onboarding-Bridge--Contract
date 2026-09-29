@@ -863,3 +863,8 @@ for (const event of events) {
 ## License
 
 MIT
+
+## Handsoff notes
+
+<!-- handsoff-issue-680 -->
+- #680: sdk: add wrappers for pause/unpause and blocklist/allowlist administration
