@@ -868,3 +868,6 @@ MIT
 
 <!-- handsoff-issue-680 -->
 - #680: sdk: add wrappers for pause/unpause and blocklist/allowlist administration
+
+<!-- handsoff-issue-681 -->
+- #681: sdk: add wrappers for asset whitelist and limit configuration
