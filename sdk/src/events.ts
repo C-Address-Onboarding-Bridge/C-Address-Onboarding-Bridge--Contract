@@ -274,56 +274,38 @@ export class EventSubscriber {
   }
 
   /**
-   * Total number of registered callbacks across all event names.
-   */
-  listenerCount(): number {
-    let total = 0;
-    for (const set of this.listeners.values()) {
-      total += set.size;
-    }
-    return total;
-  }
-
-  /**
-   * Tear down the subscriber: stop the polling loop and remove all listeners.
-   * After calling `destroy()` this instance cannot be reused.
+   * Stop polling and remove all listeners. The subscriber cannot be reused
+   * after this call.
    */
   destroy(): void {
+    this.destroyed = true;
     this.stopPolling();
     this.listeners.clear();
-    this.destroyed = true;
   }
 
-  /**
-   * Manually trigger a single poll. Useful in tests or for on-demand refresh.
-   *
-   * If the underlying RPC call rejects, the error is dispatched to registered
-   * 'error' listeners before the exception propagates to the caller.
-   */
-  async poll(): Promise<void> {
-    try {
-      await this.fetchAndDispatch();
-    } catch (err) {
-      this.dispatchError(err instanceof Error ? err : new Error(String(err)));
-      throw err;
+  // -------------------------------------------------------------------------
+  // Internal helpers
+  // -------------------------------------------------------------------------
+
+  /** Total number of registered listeners across all event names. */
+  private listenerCount(): number {
+    let count = 0;
+    for (const set of this.listeners.values()) {
+      count += set.size;
     }
+    return count;
   }
 
-  // -------------------------------------------------------------------------
-  // Polling internals
-  // -------------------------------------------------------------------------
-
+  /** Start the polling loop. */
   private startPolling(): void {
-    if (this.intervalHandle !== null) return;
+    // Kick off an immediate poll, then schedule subsequent polls.
+    void this.poll();
     this.intervalHandle = setInterval(() => {
-      this.fetchAndDispatch().catch((err) => {
-        // Emit to error listeners so consumers can detect persistently-down
-        // RPC endpoints and react (e.g. circuit break, alert, reconnect).
-        this.dispatchError(err instanceof Error ? err : new Error(String(err)));
-      });
+      void this.poll();
     }, this.pollingIntervalMs);
   }
 
+  /** Stop the polling loop. */
   private stopPolling(): void {
     if (this.intervalHandle !== null) {
       clearInterval(this.intervalHandle);
@@ -331,164 +313,145 @@ export class EventSubscriber {
     }
   }
 
-  private async fetchAndDispatch(): Promise<void> {
-    const params: SorobanRpc.Server.GetEventsRequest = {
-      filters: [
-        {
-          type: 'contract',
-          contractIds: [this.contractId],
-          topics: [['*']],
-        },
-      ],
-      limit: this.limit,
+  /**
+   * Build the RPC event filter for this contract.
+   *
+   * NOTE: In Soroban RPC each segment of a `topics` filter matches exactly one
+   * topic, so a filter like `topics: [['*']]` only matches events with exactly
+   * one topic (e.g. `ContractPaused`). Multi-topic events such as
+   * `CAddressFunded` (4 topics), `AdminTransferred` (3 topics) and
+   * `FeesWithdrawn` (2 topics) would never match.
+   *
+   * To receive every event emitted by the contract we therefore omit the
+   * `topics` field entirely, which matches all events of the contract
+   * regardless of how many topics they carry.
+   */
+  private buildFilter(): SorobanRpc.Api.EventFilter {
+    return {
+      type: 'contract',
+      contractIds: [this.contractId],
     };
-
-    // Attach cursor: either startLedger (number) or pagingToken (string).
-    if (typeof this.cursor === 'number') {
-      params.startLedger = this.cursor;
-    } else if (typeof this.cursor === 'string' && this.cursor !== 'now') {
-      params.cursor = this.cursor;
-    }
-    // When cursor === 'now', omit both — the RPC defaults to current ledger
-
-    const response = await this.server.getEvents(params);
-
-    for (const raw of response.events) {
-      const payload = this.parseEvent(raw);
-      if (payload) {
-        this.dispatch(payload);
-      }
-      // Advance cursor to the last received paging token
-      if (raw.pagingToken) {
-        this.cursor = raw.pagingToken as string;
-      }
-    }
   }
 
-  // -------------------------------------------------------------------------
-  // Event parsing
-  // -------------------------------------------------------------------------
+  /** Perform a single poll of the RPC for new events. */
+  private async poll(): Promise<void> {
+    if (this.destroyed) {
+      return;
+    }
 
-  private parseEvent(raw: SorobanRpc.Api.EventResponse): BridgeEventPayload | null {
     try {
-      const topics = raw.topic.map((t) => scValToNative(t));
-      const value = scValToNative(raw.value);
-      const ledger = raw.ledger;
-      const pagingToken = raw.pagingToken;
+      const response = await this.server.getEvents({
+        filters: [this.buildFilter()],
+        cursor: this.cursor as any,
+        limit: this.limit,
+      });
 
-      const name = typeof topics[0] === 'string' ? topics[0] : String(topics[0]);
-
-      switch (name) {
-        case 'CAddressFunded': {
-          // topics: [name, asset, source, target]  value: [amount, fee]
-          const [amount, fee] = Array.isArray(value)
-            ? value.map(String)
-            : [String(value), '0'];
-          return {
-            name: 'CAddressFunded',
-            asset: String(topics[1] ?? ''),
-            source: String(topics[2] ?? ''),
-            target: String(topics[3] ?? ''),
-            amount,
-            fee,
-            ledger,
-            pagingToken,
-          } satisfies CAddressFundedEvent;
-        }
-
-        case 'FeesWithdrawn': {
-          // topics: [name, feeCollector]  value: [amount, asset]
-          const [amount, asset] = Array.isArray(value)
-            ? value.map(String)
-            : [String(value), ''];
-          return {
-            name: 'FeesWithdrawn',
-            feeCollector: String(topics[1] ?? ''),
-            amount,
-            asset,
-            ledger,
-            pagingToken,
-          } satisfies FeesWithdrawnEvent;
-        }
-
-        case 'AdminChanged': {
-          // topics: [name, oldAdmin, newAdmin]  value: ()
-          return {
-            name: 'AdminChanged',
-            oldAdmin: String(topics[1] ?? ''),
-            newAdmin: String(topics[2] ?? ''),
-            ledger,
-            pagingToken,
-          } satisfies AdminChangedEvent;
-        }
-
-        case 'MetaFundExecuted': {
-          // topics: [name, asset, source, target]  value: [amount, fee, nonce]
-          const [amount, fee, nonce] = Array.isArray(value)
-            ? value.map(String)
-            : [String(value), '0', '0'];
-          return {
-            name: 'MetaFundExecuted',
-            asset: String(topics[1] ?? ''),
-            source: String(topics[2] ?? ''),
-            target: String(topics[3] ?? ''),
-            amount,
-            fee,
-            nonce,
-            ledger,
-            pagingToken,
-          } satisfies MetaFundExecutedEvent;
-        }
-
-        default: {
-          return {
-            name,
-            topics,
-            value,
-            ledger,
-            pagingToken,
-          } satisfies GenericBridgeEvent;
-        }
+      for (const raw of response.events) {
+        this.dispatch(raw);
       }
-    } catch {
-      return null;
+
+      // Advance the cursor to the latest paging token so the next poll only
+      // returns newer events.
+      if (response.events.length > 0) {
+        this.cursor = response.events[response.events.length - 1].pagingToken;
+      }
+    } catch (err) {
+      this.emitError(err instanceof Error ? err : new Error(String(err)));
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Dispatch
-  // -------------------------------------------------------------------------
+  /** Decode a raw RPC event and dispatch it to matching listeners. */
+  private dispatch(raw: SorobanRpc.Api.EventResponse): void {
+    const topics = raw.topic.map((t) => scValToNative(t));
+    const name = typeof topics[0] === 'string' ? (topics[0] as string) : '';
+    const value = scValToNative(raw.value);
 
-  private dispatch(payload: BridgeEventPayload): void {
-    // Fire specific listeners
-    const specific = this.listeners.get(payload.name);
+    const payload = this.buildPayload(name, topics, value, raw);
+
+    // Notify specific listeners
+    const specific = this.listeners.get(name);
     if (specific) {
       for (const cb of specific) {
-        try { cb(payload); } catch { /* isolate handler errors */ }
+        cb(payload);
       }
     }
 
-    // Fire wildcard listeners
+    // Notify wildcard listeners
     const wildcard = this.listeners.get('*');
     if (wildcard) {
       for (const cb of wildcard) {
-        try { cb(payload); } catch { /* isolate handler errors */ }
+        cb(payload);
       }
     }
   }
 
-  /**
-   * Dispatch an error to any registered 'error' listeners.
-   *
-   * This is called on poll failures so consumers can detect persistently-down
-   * RPC endpoints.  Handler errors are isolated so one bad listener doesn't
-   * break others.
-   */
-  private dispatchError(err: Error): void {
-    const errorListeners = this.listeners.get('error');
-    if (errorListeners) {
-      for (const cb of errorListeners) {
-        try { cb(err); } catch { /* isolate handler errors */ }
+  /** Build a typed payload from decoded topics/value. */
+  private buildPayload(
+    name: string,
+    topics: unknown[],
+    value: unknown,
+    raw: SorobanRpc.Api.EventResponse,
+  ): BridgeEventPayload {
+    const base = {
+      ledger: raw.ledger,
+      pagingToken: raw.pagingToken,
+    };
+
+    const v = (value ?? {}) as Record<string, unknown>;
+
+    switch (name) {
+      case 'CAddressFunded':
+        return {
+          name: 'CAddressFunded',
+          asset: String(v.asset ?? topics[1] ?? ''),
+          source: String(v.source ?? topics[2] ?? ''),
+          target: String(v.target ?? topics[3] ?? ''),
+          amount: String(v.amount ?? ''),
+          fee: String(v.fee ?? ''),
+          ...base,
+        };
+      case 'FeesWithdrawn':
+        return {
+          name: 'FeesWithdrawn',
+          feeCollector: String(v.feeCollector ?? topics[1] ?? ''),
+          amount: String(v.amount ?? ''),
+          asset: String(v.asset ?? ''),
+          ...base,
+        };
+      case 'AdminChanged':
+        return {
+          name: 'AdminChanged',
+          oldAdmin: String(v.oldAdmin ?? topics[1] ?? ''),
+          newAdmin: String(v.newAdmin ?? topics[2] ?? ''),
+          ...base,
+        };
+      case 'MetaFundExecuted':
+        return {
+          name: 'MetaFundExecuted',
+          asset: String(v.asset ?? ''),
+          source: String(v.source ?? ''),
+          target: String(v.target ?? ''),
+          amount: String(v.amount ?? ''),
+          fee: String(v.fee ?? ''),
+          nonce: String(v.nonce ?? ''),
+          ...base,
+        };
+      default:
+        return {
+          name,
+          topics,
+          value,
+          ...base,
+        };
+    }
+  }
+
+  /** Emit an error to any registered 'error' listeners. */
+  private emitError(err: Error): void {
+    const set = this.listeners.get('error');
+    if (set) {
+      for (const cb of set) {
+        cb(err);
       }
     }
   }

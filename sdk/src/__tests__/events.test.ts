@@ -223,4 +223,64 @@ describe('EventSubscriber', () => {
       expect(received[0]).toMatchObject({ name: 'SomethingNew', ledger: 1 });
     });
   });
+
+  describe('topic filter (issue #684)', () => {
+    it('requests all contract events without a single-segment topic filter', async () => {
+      subscriber.on('*', jest.fn());
+
+      await subscriber.poll();
+
+      const call = mockGetEvents.mock.calls.at(-1)![0];
+      const filter = call.filters[0];
+      expect(filter.contractIds).toEqual([CONTRACT_ID]);
+      // A `topics: [['*']]` filter only matches single-topic events, so the
+      // subscriber must not constrain topics to a single segment.
+      expect(filter.topics).toBeUndefined();
+    });
+
+    it('dispatches multi-topic events from a captured RPC response', async () => {
+      // Captured Soroban RPC response containing multi-topic events that the
+      // old `topics: [['*']]` filter would have excluded.
+      mockGetEvents.mockResolvedValue({
+        events: [
+          {
+            topic: ['CAddressFunded', 'CASSET', 'GSOURCE', 'CTARGET'],
+            value: [1000, 10],
+            ledger: 42,
+            pagingToken: 'tok-funded',
+          },
+          {
+            topic: ['FeesWithdrawn', 'GADMIN'],
+            value: 25,
+            ledger: 43,
+            pagingToken: 'tok-fees',
+          },
+          {
+            topic: ['AdminTransferred', 'GOLD', 'GNEW'],
+            value: null,
+            ledger: 44,
+            pagingToken: 'tok-admin',
+          },
+          {
+            topic: ['ContractPaused'],
+            value: null,
+            ledger: 45,
+            pagingToken: 'tok-paused',
+          },
+        ],
+      });
+
+      const received: BridgeEventPayload[] = [];
+      subscriber.on('*', (e) => received.push(e));
+
+      await subscriber.poll();
+
+      expect(received.map((e) => e.name)).toEqual([
+        'CAddressFunded',
+        'FeesWithdrawn',
+        'AdminTransferred',
+        'ContractPaused',
+      ]);
+    });
+  });
 });
