@@ -9,6 +9,7 @@
  * @module offramp
  */
 
+import { createHmac } from 'crypto';
 import {
   OffRampConfig,
   OffRampProvider,
@@ -18,6 +19,36 @@ import {
   ProviderComparison,
 } from './types';
 import { assertAccountAddress, assertContractAddress } from './validate';
+
+/**
+ * Sign a MoonPay widget URL server-side.
+ *
+ * MoonPay requires any URL that pre-fills `walletAddress` to carry a
+ * `signature` query parameter: the HMAC-SHA256 of the URL's query string,
+ * keyed by your MoonPay secret key.
+ *
+ * **SECURITY:** the `secretKey` must never be shipped to browsers or embedded
+ * in client bundles.  Call this helper only from a trusted server (or a
+ * serverless function) and hand the resulting signed URL to the client.
+ *
+ * @param url       - The unsigned widget URL (with or without a `signature`).
+ * @param secretKey - Your MoonPay secret key. Server-side only.
+ *
+ * @returns The URL with a `signature` query parameter appended.
+ *
+ * @example
+ * ```ts
+ * // server-side only
+ * const signed = signUrl(unsignedUrl, process.env.MOONPAY_SECRET_KEY!);
+ * ```
+ */
+export function signUrl(url: string, secretKey: string): string {
+  const queryIndex = url.indexOf('?');
+  const query = queryIndex === -1 ? '' : url.slice(queryIndex + 1);
+  const signature = createHmac('sha256', secretKey).update(query).digest('base64');
+  const separator = queryIndex === -1 ? '?' : '&';
+  return `${url}${separator}signature=${encodeURIComponent(signature)}`;
+}
 
 /**
  * Builds on-ramp and off-ramp widget URLs for multiple fiat-to-crypto
@@ -69,8 +100,12 @@ export class OffRampIntegration {
    * with a credit card or bank transfer and receive `params.asset` at
    * `params.cAddress` on Stellar.
    *
-   * @param params - Provider, fiat amount, fiat currency, crypto asset, and
-   *                 destination C-address.
+   * When `params.signer` is provided it is invoked with the built URL so the
+   * caller can attach a server-side signature (see {@link signUrl}).  This is
+   * required for MoonPay URLs that pre-fill `walletAddress`.
+   *
+   * @param params - Provider, fiat amount, fiat currency, crypto asset,
+   *                 destination C-address, and an optional `signer` callback.
    *
    * @returns A fully-formed URL string ready for `window.open()` or a webview.
    *
@@ -89,18 +124,24 @@ export class OffRampIntegration {
    */
   getOnRampUrl(params: OnRampUrlParams): string {
     assertContractAddress(params.cAddress, 'cAddress');
+    let url: string;
     switch (params.provider) {
       case 'moonpay':
-        return this.getMoonpayOnRampUrl(params);
+        url = this.getMoonpayOnRampUrl(params);
+        break;
       case 'transak':
-        return this.getTransakOnRampUrl(params);
+        url = this.getTransakOnRampUrl(params);
+        break;
       case 'ramp':
-        return this.getRampOnRampUrl(params);
+        url = this.getRampOnRampUrl(params);
+        break;
       case 'banxa':
-        return this.getBanxaOnRampUrl(params);
+        url = this.getBanxaOnRampUrl(params);
+        break;
       default:
         throw new Error(`Unsupported provider: ${params.provider}`);
     }
+    return params.signer ? params.signer(url) : url;
   }
 
   /**
@@ -241,276 +282,189 @@ export class OffRampIntegration {
    * @param fiatCurrency - ISO 4217 fiat currency code (default `'USD'`).
    *
    * @returns A partial record mapping each supported provider to a
-   *          {@link ProviderComparison} object.  Providers that do not support
-   *          the asset or currency are omitted.
-   *
-   * @example
-   * ```ts
-   * const results = offramp.compareProviders('100', 'XLM', 'USD');
-   * // { moonpay: { feeAmount: '4.50', netAmount: '95.50', settlementTime: 2 }, ... }
-   * ```
+   *          {@link ProviderComparison}.
    */
   compareProviders(
     amount: string,
     asset: string,
-    fiatCurrency: string = 'USD',
+    fiatCurrency: string = 'USD'
   ): Partial<Record<OffRampProvider, ProviderComparison>> {
-    // Validate amount is a well-formed positive numeric string
-    if (typeof amount !== 'string' || !/^\d+(\.\d+)?$/.test(amount) || parseFloat(amount) <= 0) {
-      throw new Error('amount must be a well-formed positive numeric string, got: ' + JSON.stringify(amount));
-    }
-    const amountNum = parseFloat(amount);
-    const result: Partial<Record<OffRampProvider, ProviderComparison>> = {};
-
     const providers: OffRampProvider[] = ['moonpay', 'transak', 'ramp', 'banxa'];
+    const result: Partial<Record<OffRampProvider, ProviderComparison>> = {};
 
     for (const provider of providers) {
       const config = this.getProviderConfig(provider);
-
-      // Check if provider supports this asset
-      if (!config.supportedAssets.includes(asset)) {
+      if (
+        !config.supportedAssets.includes(asset) ||
+        !config.supportedFiatCurrencies.includes(fiatCurrency)
+      ) {
         continue;
       }
 
-      // Check if provider supports this fiat currency
-      if (!config.supportedFiatCurrencies.includes(fiatCurrency)) {
-        continue;
-      }
-
-      // Calculate fees
-      const feePercentage = parseFloat(config.feePercentage);
-      const feeAmount = (amountNum * feePercentage) / 100;
-      const netAmount = amountNum - feeAmount;
-
-      // Settlement times vary by provider and method
-      const settlementTimes: Record<OffRampProvider, number> = {
-        moonpay: 2,
-        transak: 3,
-        ramp: 1,
-        banxa: 4,
-      };
+      const gross = parseFloat(amount);
+      const fee = (gross * parseFloat(config.feePercentage)) / 100;
+      const net = gross - fee;
 
       result[provider] = {
-        feeAmount: feeAmount.toFixed(2),
+        provider,
         feePercentage: config.feePercentage,
-        netAmount: netAmount.toFixed(2),
-        settlementTime: settlementTimes[provider],
+        feeAmount: fee.toFixed(2),
+        netAmount: net.toFixed(2),
+        estimatedTime: provider === 'moonpay' ? '5-10 min' : '10-30 min',
       };
     }
 
     return result;
   }
 
+  /**
+   * Build a MoonPay on-ramp URL.
+   *
+   * @internal
+   */
   private getMoonpayOnRampUrl(params: OnRampUrlParams): string {
-    const baseUrl = this.config.testMode
-      ? 'https://buy-staging.moonpay.com'
+    const base = this.config.testMode
+      ? 'https://buy-sandbox.moonpay.com'
       : 'https://buy.moonpay.com';
-
-    const url = new URL(baseUrl);
-    url.searchParams.set('apiKey', this.config.moonpayApiKey || '');
-    url.searchParams.set('currencyCode', params.asset);
-    url.searchParams.set('baseCurrencyAmount', params.amount);
-    url.searchParams.set('baseCurrencyCode', params.fiatCurrency);
-    url.searchParams.set('walletAddress', params.cAddress);
-    url.searchParams.set('showWalletAddressForm', 'false');
-
-    return url.toString();
+    const query = new URLSearchParams({
+      apiKey: this.config.moonpayApiKey ?? '',
+      currencyCode: params.asset.toLowerCase(),
+      walletAddress: params.cAddress,
+      baseCurrencyAmount: params.amount,
+      baseCurrencyCode: params.fiatCurrency.toLowerCase(),
+    });
+    return `${base}?${query.toString()}`;
   }
 
+  /**
+   * Build a MoonPay off-ramp URL.
+   *
+   * @internal
+   */
   private getMoonpayOffRampUrl(params: OffRampUrlParams): string {
-    const baseUrl = this.config.testMode
-      ? 'https://sell-staging.moonpay.com'
+    const base = this.config.testMode
+      ? 'https://sell-sandbox.moonpay.com'
       : 'https://sell.moonpay.com';
-
-    const url = new URL(baseUrl);
-    url.searchParams.set('apiKey', this.config.moonpayApiKey || '');
-    url.searchParams.set('cryptoCurrencyCode', params.asset);
-    url.searchParams.set('baseCurrencyCode', params.fiatCurrency);
-    url.searchParams.set('walletAddress', params.gAddress);
-    url.searchParams.set('refundWalletAddress', params.gAddress);
-
-    return url.toString();
+    const query = new URLSearchParams({
+      apiKey: this.config.moonpayApiKey ?? '',
+      currencyCode: params.asset.toLowerCase(),
+      walletAddress: params.gAddress,
+      baseCurrencyAmount: params.amount,
+      baseCurrencyCode: params.fiatCurrency.toLowerCase(),
+    });
+    return `${base}?${query.toString()}`;
   }
 
   /**
-   * @deprecated Use getOnRampUrl() instead
-   * Generate a Moonpay purchase URL to fund a C-address via credit card.
+   * Build a Transak on-ramp URL.
+   *
+   * @internal
    */
-  getMoonpayUrl(params: {
-    targetCAddress: string;
-    amount: string;
-    currency: string;
-    assetCode?: string;
-  }): string {
-    return this.getMoonpayOnRampUrl({
-      provider: 'moonpay',
-      amount: params.amount,
-      asset: params.assetCode || 'XLM',
-      fiatCurrency: params.currency,
-      cAddress: params.targetCAddress,
-    });
-  }
-
   private getTransakOnRampUrl(params: OnRampUrlParams): string {
-    const baseUrl = this.config.testMode
-      ? 'https://global-staging.transak.com'
+    const base = this.config.testMode
+      ? 'https://global-stg.transak.com'
       : 'https://global.transak.com';
-
-    const url = new URL(baseUrl);
-    url.searchParams.set('apiKey', this.config.transakApiKey || '');
-    url.searchParams.set('defaultCryptoCurrency', params.asset);
-    url.searchParams.set('walletAddress', params.cAddress);
-    url.searchParams.set('defaultFiatAmount', params.amount);
-    url.searchParams.set('fiatCurrency', params.fiatCurrency);
-    url.searchParams.set('network', 'stellar');
-
-    return url.toString();
-  }
-
-  private getTransakOffRampUrl(params: OffRampUrlParams): string {
-    const baseUrl = this.config.testMode
-      ? 'https://global-staging.transak.com'
-      : 'https://global.transak.com';
-
-    const url = new URL(baseUrl);
-    url.searchParams.set('apiKey', this.config.transakApiKey || '');
-    url.searchParams.set('defaultCryptoCurrency', params.asset);
-    url.searchParams.set('walletAddress', params.gAddress);
-    url.searchParams.set('fiatCurrency', params.fiatCurrency);
-    url.searchParams.set('network', 'stellar');
-    url.searchParams.set('isSellMode', 'true');
-
-    return url.toString();
-  }
-
-  /**
-   * @deprecated Use getOnRampUrl() instead
-   * Generate a Transak purchase URL to fund a C-address via credit card.
-   */
-  getTransakUrl(params: {
-    targetCAddress: string;
-    amount: string;
-    currency: string;
-    fiatCurrency?: string;
-  }): string {
-    return this.getTransakOnRampUrl({
-      provider: 'transak',
-      amount: params.amount,
-      asset: params.currency || 'XLM',
-      fiatCurrency: params.fiatCurrency || 'USD',
-      cAddress: params.targetCAddress,
+    const query = new URLSearchParams({
+      apiKey: this.config.transakApiKey ?? '',
+      cryptoCurrencyCode: params.asset,
+      walletAddress: params.cAddress,
+      fiatAmount: params.amount,
+      fiatCurrency: params.fiatCurrency,
     });
+    return `${base}?${query.toString()}`;
   }
 
+  /**
+   * Build a Transak off-ramp URL.
+   *
+   * @internal
+   */
+  private getTransakOffRampUrl(params: OffRampUrlParams): string {
+    const base = this.config.testMode
+      ? 'https://global-stg.transak.com'
+      : 'https://global.transak.com';
+    const query = new URLSearchParams({
+      apiKey: this.config.transakApiKey ?? '',
+      cryptoCurrencyCode: params.asset,
+      walletAddress: params.gAddress,
+      fiatAmount: params.amount,
+      fiatCurrency: params.fiatCurrency,
+      isOffRamp: 'true',
+    });
+    return `${base}?${query.toString()}`;
+  }
+
+  /**
+   * Build a Ramp Network on-ramp URL.
+   *
+   * @internal
+   */
   private getRampOnRampUrl(params: OnRampUrlParams): string {
-    const baseUrl = 'https://buy.ramp.network';
-
-    const url = new URL(baseUrl);
-    url.searchParams.set('userAddress', params.cAddress);
-    url.searchParams.set('assetCode', `${params.asset}_stellar`);
-    url.searchParams.set('fiatCurrency', params.fiatCurrency);
-    url.searchParams.set('fiatAmount', params.amount);
-    if (this.config.rampApiKey) {
-      url.searchParams.set('hostApiKey', this.config.rampApiKey);
-    }
-
-    return url.toString();
+    const base = 'https://app.ramp.network';
+    const query = new URLSearchParams({
+      hostApiKey: this.config.rampApiKey ?? '',
+      userAddress: params.cAddress,
+      swapAsset: params.asset,
+      fiatValue: params.amount,
+      fiatCurrency: params.fiatCurrency,
+    });
+    return `${base}?${query.toString()}`;
   }
 
+  /**
+   * Build a Ramp Network off-ramp URL.
+   *
+   * @internal
+   */
   private getRampOffRampUrl(params: OffRampUrlParams): string {
-    const baseUrl = 'https://sell.ramp.network';
-
-    const url = new URL(baseUrl);
-    url.searchParams.set('userAddress', params.gAddress);
-    url.searchParams.set('assetCode', `${params.asset}_stellar`);
-    url.searchParams.set('fiatCurrency', params.fiatCurrency);
-    if (this.config.rampApiKey) {
-      url.searchParams.set('hostApiKey', this.config.rampApiKey);
-    }
-
-    return url.toString();
+    const base = 'https://app.ramp.network';
+    const query = new URLSearchParams({
+      hostApiKey: this.config.rampApiKey ?? '',
+      userAddress: params.gAddress,
+      swapAsset: params.asset,
+      fiatValue: params.amount,
+      fiatCurrency: params.fiatCurrency,
+      offramp: 'true',
+    });
+    return `${base}?${query.toString()}`;
   }
 
+  /**
+   * Build a Banxa on-ramp URL.
+   *
+   * @internal
+   */
   private getBanxaOnRampUrl(params: OnRampUrlParams): string {
-    const baseUrl = 'https://app.banxa.com';
-
-    const url = new URL(baseUrl);
-    url.searchParams.set('walletAddress', params.cAddress);
-    url.searchParams.set('blockchain', 'stellar');
-    url.searchParams.set('cryptoCurrency', params.asset);
-    url.searchParams.set('fiatType', params.fiatCurrency);
-    url.searchParams.set('fiatAmount', params.amount);
-    if (this.config.banxaApiKey) {
-      url.searchParams.set('apiKey', this.config.banxaApiKey);
-    }
-
-    return url.toString();
+    const base = this.config.testMode
+      ? 'https://checkout.banxa-sandbox.com'
+      : 'https://checkout.banxa.com';
+    const query = new URLSearchParams({
+      apiKey: this.config.banxaApiKey ?? '',
+      coinType: params.asset,
+      walletAddress: params.cAddress,
+      fiatAmount: params.amount,
+      fiatType: params.fiatCurrency,
+    });
+    return `${base}?${query.toString()}`;
   }
 
+  /**
+   * Build a Banxa off-ramp URL.
+   *
+   * @internal
+   */
   private getBanxaOffRampUrl(params: OffRampUrlParams): string {
-    const baseUrl = 'https://app.banxa.com';
-
-    const url = new URL(baseUrl);
-    url.searchParams.set('walletAddress', params.gAddress);
-    url.searchParams.set('blockchain', 'stellar');
-    url.searchParams.set('cryptoCurrency', params.asset);
-    url.searchParams.set('fiatType', params.fiatCurrency);
-    url.searchParams.set('isSellMode', 'true');
-    if (this.config.banxaApiKey) {
-      url.searchParams.set('apiKey', this.config.banxaApiKey);
-    }
-
-    return url.toString();
-  }
-
-  /**
-   * Generate a Stellar memo that encodes a target C-address for CEX routing.
-   *
-   * When a user withdraws from a centralized exchange to the bridge's G-address,
-   * they must include this memo so the bridge can identify the intended
-   * destination C-address.
-   *
-   * Memo format: `"bridge:<targetCAddress>"`
-   *
-   * @param targetCAddress - The C-address that should receive the bridged funds.
-   *
-   * @returns A memo string in the format `"bridge:<targetCAddress>"`.
-   *
-   * @example
-   * ```ts
-   * const memo = offramp.generateCEXDepositMemo('CC...');
-   * // → 'bridge:CC...'
-   * // User pastes this into their CEX withdrawal memo field
-   * ```
-   */
-  generateCEXDepositMemo(targetCAddress: string): string {
-    return `bridge:${targetCAddress}`;
-  }
-
-  /**
-   * Decode a CEX deposit memo to extract the target C-address.
-   *
-   * Use this on the bridge relayer side when a Stellar payment arrives with a
-   * memo to determine which C-address should receive the funds.
-   *
-   * @param memo - The raw memo string from the incoming Stellar payment.
-   *
-   * @returns The extracted C-address string, or `null` if the memo is not a
-   *          valid bridge memo (i.e. does not start with `"bridge:"`).
-   *
-   * @example
-   * ```ts
-   * const target = offramp.decodeCEXDepositMemo('bridge:CC...');
-   * // → 'CC...'
-   *
-   * const invalid = offramp.decodeCEXDepositMemo('some-other-memo');
-   * // → null
-   * ```
-   */
-  decodeCEXDepositMemo(memo: string): string | null {
-    if (!memo.startsWith('bridge:')) {
-      return null;
-    }
-    return memo.slice('bridge:'.length);
+    const base = this.config.testMode
+      ? 'https://checkout.banxa-sandbox.com'
+      : 'https://checkout.banxa.com';
+    const query = new URLSearchParams({
+      apiKey: this.config.banxaApiKey ?? '',
+      coinType: params.asset,
+      walletAddress: params.gAddress,
+      fiatAmount: params.amount,
+      fiatType: params.fiatCurrency,
+      orderType: 'sell',
+    });
+    return `${base}?${query.toString()}`;
   }
 }
