@@ -89,6 +89,11 @@ export type {
   Unsubscribe,
   CAddressFundedEvent,
   FeesWithdrawnEvent,
+  AdminProposedEvent,
+  AdminTransferredEvent,
+  FeeCollectorProposedEvent,
+  FeeCollectorTransferredEvent,
+  /** @deprecated Use {@link AdminProposedEvent} / {@link AdminTransferredEvent} instead. */
   AdminChangedEvent,
   MetaFundExecutedEvent,
   GenericBridgeEvent,

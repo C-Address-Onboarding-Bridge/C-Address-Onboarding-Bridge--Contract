@@ -60,13 +60,73 @@ export interface FeesWithdrawnEvent {
   pagingToken: string;
 }
 
-/** Emitted when the admin address is changed. */
+/**
+ * Emitted when a new admin is proposed (contract `AdminProposed`).
+ * The transfer only takes effect once the proposed admin accepts it.
+ */
+export interface AdminProposedEvent {
+  name: 'AdminProposed';
+  /** Current admin address proposing the change */
+  admin: string;
+  /** Proposed new admin address */
+  proposedAdmin: string;
+  ledger: number;
+  pagingToken: string;
+}
+
+/**
+ * Emitted when a proposed admin accepts and the admin address changes
+ * (contract `AdminTransferred`).
+ */
+export interface AdminTransferredEvent {
+  name: 'AdminTransferred';
+  /** Previous admin address */
+  oldAdmin: string;
+  /** New admin address */
+  newAdmin: string;
+  ledger: number;
+  pagingToken: string;
+}
+
+/**
+ * @deprecated The contract never emits `AdminChanged`. Admin changes are
+ * emitted as `AdminProposed` / `AdminTransferred`. Kept as an alias for
+ * backward compatibility.
+ */
 export interface AdminChangedEvent {
   name: 'AdminChanged';
   /** Previous admin address */
   oldAdmin: string;
   /** New admin address */
   newAdmin: string;
+  ledger: number;
+  pagingToken: string;
+}
+
+/**
+ * Emitted when a new fee collector is proposed (contract
+ * `FeeCollectorProposed`).
+ */
+export interface FeeCollectorProposedEvent {
+  name: 'FeeCollectorProposed';
+  /** Current fee collector proposing the change */
+  feeCollector: string;
+  /** Proposed new fee collector address */
+  proposedFeeCollector: string;
+  ledger: number;
+  pagingToken: string;
+}
+
+/**
+ * Emitted when a proposed fee collector accepts and the fee collector address
+ * changes (contract `FeeCollectorTransferred`).
+ */
+export interface FeeCollectorTransferredEvent {
+  name: 'FeeCollectorTransferred';
+  /** Previous fee collector address */
+  oldFeeCollector: string;
+  /** New fee collector address */
+  newFeeCollector: string;
   ledger: number;
   pagingToken: string;
 }
@@ -99,7 +159,11 @@ export interface GenericBridgeEvent {
 export type BridgeEventPayload =
   | CAddressFundedEvent
   | FeesWithdrawnEvent
+  | AdminProposedEvent
+  | AdminTransferredEvent
   | AdminChangedEvent
+  | FeeCollectorProposedEvent
+  | FeeCollectorTransferredEvent
   | MetaFundExecutedEvent
   | GenericBridgeEvent;
 
@@ -111,7 +175,15 @@ export type BridgeEventPayload =
 export interface BridgeEventMap {
   CAddressFunded: CAddressFundedEvent;
   FeesWithdrawn: FeesWithdrawnEvent;
+  AdminProposed: AdminProposedEvent;
+  AdminTransferred: AdminTransferredEvent;
+  /**
+   * @deprecated The contract never emits `AdminChanged`; use
+   * `AdminProposed` / `AdminTransferred` instead.
+   */
   AdminChanged: AdminChangedEvent;
+  FeeCollectorProposed: FeeCollectorProposedEvent;
+  FeeCollectorTransferred: FeeCollectorTransferredEvent;
   MetaFundExecuted: MetaFundExecutedEvent;
   /**
    * Emitted when the polling loop encounters an RPC error.
@@ -260,210 +332,6 @@ export class EventSubscriber {
           this.listeners.delete(eventName);
         }
       }
-      // Stop polling when no listeners remain (preserve 'error' listeners for
-      // the polling loop — only stop when ALL listeners are gone, including
-      // error listeners).
-      if (this.listenerCount() === 0) {
-        this.stopPolling();
-      }
-    };
-  }
+      // Stop polling when no listeners remain (preserve 'error' lis
 
-  /**
-   * Remove all listeners for a specific event name.
-   */
-  off(eventName: BridgeEventName): void {
-    this.listeners.delete(eventName);
-    if (this.listenerCount() === 0) {
-      this.stopPolling();
-    }
-  }
-
-  /**
-   * Stop polling and remove all listeners. The subscriber cannot be reused
-   * after this call.
-   */
-  destroy(): void {
-    this.destroyed = true;
-    this.stopPolling();
-    this.listeners.clear();
-  }
-
-  // -------------------------------------------------------------------------
-  // Polling internals
-  // -------------------------------------------------------------------------
-
-  /**
-   * Start the self-scheduling poll loop. The first fetch runs immediately;
-   * subsequent fetches are scheduled only after the previous one settles.
-   */
-  private startPolling(): void {
-    if (this.intervalHandle !== null || this.polling || this.destroyed) {
-      return;
-    }
-    void this.pollOnce();
-  }
-
-  /**
-   * Run a single fetch/dispatch cycle, then schedule the next one. Because the
-   * next tick is scheduled from the `finally` block, a slow `getEvents` call
-   * can never overlap with the next poll.
-   */
-  private async pollOnce(): Promise<void> {
-    if (this.destroyed) {
-      return;
-    }
-    this.polling = true;
-    try {
-      await this.fetchAndDispatch();
-    } finally {
-      this.polling = false;
-      if (!this.destroyed && this.listenerCount() > 0) {
-        this.intervalHandle = setTimeout(() => {
-          this.intervalHandle = null;
-          void this.pollOnce();
-        }, this.pollingIntervalMs);
-      } else {
-        this.intervalHandle = null;
-      }
-    }
-  }
-
-  /**
-   * Stop the poll loop and clear any pending timer. Safe to call multiple
-   * times.
-   */
-  private stopPolling(): void {
-    if (this.intervalHandle !== null) {
-      clearTimeout(this.intervalHandle);
-      this.intervalHandle = null;
-    }
-  }
-
-  /**
-   * Fetch events from the RPC and dispatch them to registered listeners.
-   * Updates `this.cursor` to the latest paging token seen.
-   */
-  private async fetchAndDispatch(): Promise<void> {
-    try {
-      const response = await this.server.getEvents({
-        filters: [{ type: 'contract', contractIds: [this.contractId] }],
-        cursor: typeof this.cursor === 'string' ? this.cursor : undefined,
-        startLedger:
-          typeof this.cursor === 'number' ? this.cursor : undefined,
-        limit: this.limit,
-      });
-
-      for (const raw of response.events) {
-        const payload = this.decodeEvent(raw);
-        if (payload) {
-          this.dispatch(payload);
-        }
-        if (raw.pagingToken) {
-          this.cursor = raw.pagingToken;
-        }
-      }
-    } catch (err) {
-      this.dispatchError(err instanceof Error ? err : new Error(String(err)));
-    }
-  }
-
-  /**
-   * Decode a raw Soroban RPC event into a typed payload. Returns `null` for
-   * events that cannot be decoded.
-   */
-  private decodeEvent(raw: SorobanRpc.Api.EventResponse): BridgeEventPayload | null {
-    try {
-      const topics = raw.topic.map((t) => scValToNative(t));
-      const name = typeof topics[0] === 'string' ? topics[0] : 'unknown';
-      const value = raw.value ? scValToNative(raw.value) : undefined;
-      const base = {
-        ledger: raw.ledger,
-        pagingToken: raw.pagingToken ?? '',
-      };
-
-      switch (name) {
-        case 'CAddressFunded':
-          return {
-            name,
-            asset: String(topics[1] ?? ''),
-            source: String(topics[2] ?? ''),
-            target: String(topics[3] ?? ''),
-            amount: String((value as any)?.amount ?? ''),
-            fee: String((value as any)?.fee ?? ''),
-            ...base,
-          };
-        case 'FeesWithdrawn':
-          return {
-            name,
-            feeCollector: String(topics[1] ?? ''),
-            amount: String((value as any)?.amount ?? ''),
-            asset: String((value as any)?.asset ?? ''),
-            ...base,
-          };
-        case 'AdminChanged':
-          return {
-            name,
-            oldAdmin: String(topics[1] ?? ''),
-            newAdmin: String(topics[2] ?? ''),
-            ...base,
-          };
-        case 'MetaFundExecuted':
-          return {
-            name,
-            asset: String(topics[1] ?? ''),
-            source: String(topics[2] ?? ''),
-            target: String(topics[3] ?? ''),
-            amount: String((value as any)?.amount ?? ''),
-            fee: String((value as any)?.fee ?? ''),
-            nonce: String((value as any)?.nonce ?? ''),
-            ...base,
-          };
-        default:
-          return {
-            name,
-            topics,
-            value,
-            ...base,
-          };
-      }
-    } catch {
-      return null;
-    }
-  }
-
-  /** Dispatch a decoded payload to matching listeners and the wildcard. */
-  private dispatch(payload: BridgeEventPayload): void {
-    const named = this.listeners.get(payload.name);
-    if (named) {
-      for (const cb of named) {
-        cb(payload);
-      }
-    }
-    const wildcard = this.listeners.get('*');
-    if (wildcard) {
-      for (const cb of wildcard) {
-        cb(payload);
-      }
-    }
-  }
-
-  /** Dispatch an error to 'error' listeners. */
-  private dispatchError(err: Error): void {
-    const set = this.listeners.get('error');
-    if (set) {
-      for (const cb of set) {
-        cb(err);
-      }
-    }
-  }
-
-  /** Total number of registered listeners across all event names. */
-  private listenerCount(): number {
-    let count = 0;
-    for (const set of this.listeners.values()) {
-      count += set.size;
-    }
-    return count;
-  }
-}
+/* … truncated 5789 chars — edit only what you need near the top … */
