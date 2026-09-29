@@ -221,7 +221,7 @@ pub enum DataKey {
     CrossChainNonce(BytesN<32>),
     DailyUsage(Address, Address, u64),
     FeeTiers,
-    SourceBridgedVolume(Address),
+    SourceBridgedVolume(Address, Address),
     LoyaltyToken,
     LoyaltyAmountPerFund,
     TimelockId,
@@ -1195,29 +1195,30 @@ fn read_fee_tiers(env: &Env) -> Option<Vec<FeeTier>> {
     env.storage().instance().get(&DataKey::FeeTiers)
 }
 
-fn read_source_bridged_volume(env: &Env, source: &Address) -> i128 {
+fn read_source_bridged_volume(env: &Env, source: &Address, asset: &Address) -> i128 {
     env.storage()
         .persistent()
-        .get(&DataKey::SourceBridgedVolume(source.clone()))
+        .get(&DataKey::SourceBridgedVolume(source.clone(), asset.clone()))
         .unwrap_or(0)
 }
 
 fn increment_source_bridged_volume(
     env: &Env,
     source: &Address,
+    asset: &Address,
     amount: i128,
 ) -> Result<(), BridgeError> {
-    let current = read_source_bridged_volume(env, source);
+    let current = read_source_bridged_volume(env, source, asset);
     let updated = safe_math::safe_add(current, amount)?;
     env.storage()
         .persistent()
-        .set(&DataKey::SourceBridgedVolume(source.clone()), &updated);
+        .set(&DataKey::SourceBridgedVolume(source.clone(), asset.clone()), &updated);
     Ok(())
 }
 
-fn get_tiered_fee_bps(env: &Env, source: &Address, fallback_bps: u32) -> u32 {
+fn get_tiered_fee_bps(env: &Env, source: &Address, asset: &Address, fallback_bps: u32) -> u32 {
     if let Some(tiers) = read_fee_tiers(env) {
-        let volume = read_source_bridged_volume(env, source);
+        let volume = read_source_bridged_volume(env, source, asset);
         for i in 0..tiers.len() {
             let tier = tiers.get(i).unwrap();
             if volume >= tier.min_volume && volume <= tier.max_volume {
@@ -1228,9 +1229,9 @@ fn get_tiered_fee_bps(env: &Env, source: &Address, fallback_bps: u32) -> u32 {
     fallback_bps
 }
 
-fn find_current_tier(env: &Env, source: &Address) -> Option<FeeTier> {
+fn find_current_tier(env: &Env, source: &Address, asset: &Address) -> Option<FeeTier> {
     if let Some(tiers) = read_fee_tiers(env) {
-        let volume = read_source_bridged_volume(env, source);
+        let volume = read_source_bridged_volume(env, source, asset);
         for i in 0..tiers.len() {
             let tier = tiers.get(i).unwrap();
             if volume >= tier.min_volume && volume <= tier.max_volume {
@@ -1609,7 +1610,7 @@ impl OnboardingBridge {
         consume_nonce(&env, &source, nonce)?;
 
         let global_fee_bps = read_fee_bps(&env);
-        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, &asset, global_fee_bps);
         let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
         let fee = calculate_fee(amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(amount, fee)?;
@@ -1622,7 +1623,7 @@ impl OnboardingBridge {
         }
 
         update_asset_counters(&env, &asset, fee, net_amount)?;
-        increment_source_bridged_volume(&env, &source, amount)?;
+        increment_source_bridged_volume(&env, &source, &asset, amount)?;
         extend_instance_ttl(&env);
         mint_loyalty_tokens(&env, &source);
 
@@ -1631,6 +1632,7 @@ impl OnboardingBridge {
 
         Ok(())
     }
+
 
     /// Funds multiple C-addresses in a single transaction from one source account.
     ///
@@ -1710,6 +1712,11 @@ impl OnboardingBridge {
         if targets.len() > MAX_BATCH_SIZE {
             return Err(BridgeError::BatchTooLarge);
         }
+        // #594: reject empty batches — a zero-length call transfers nothing but
+        // would still emit BatchCompleted and mint loyalty rewards.
+        if targets.is_empty() {
+            return Err(BridgeError::InvalidAmount);
+        }
         if let Some(dl) = deadline {
             if env.ledger().timestamp() > dl {
                 return Err(BridgeError::TransactionExpired);
@@ -1760,7 +1767,7 @@ impl OnboardingBridge {
         }
 
         let global_fee_bps = read_fee_bps(&env);
-        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, &asset, global_fee_bps);
         let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
 
         let mut num_success: u32 = 0;
@@ -1802,9 +1809,13 @@ impl OnboardingBridge {
             token_client.transfer(&contract_addr, &source, &refund_total);
         }
 
-        increment_source_bridged_volume(&env, &source, successful_total)?;
+        increment_source_bridged_volume(&env, &source, &asset, successful_total)?;
         extend_instance_ttl(&env);
-        mint_loyalty_tokens(&env, &source);
+        // #593: only reward loyalty when at least one transfer succeeded;
+        // minting when every entry was blocked/refunded hands out free rewards.
+        if num_success > 0 {
+            mint_loyalty_tokens(&env, &source);
+        }
 
         env.events()
             .publish(("BatchCompleted", source), (num_success, num_failures));
@@ -2510,7 +2521,7 @@ impl OnboardingBridge {
         token_client.transfer(&source, &contract_addr, &amount);
 
         let global_fee_bps = read_fee_bps(&env);
-        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, &asset, global_fee_bps);
         let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
         let fee = calculate_fee(amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(amount, fee)?;
@@ -2535,7 +2546,7 @@ impl OnboardingBridge {
 
         increment_user_deposit(&env, &source, &asset, amount)?;
         update_asset_counters(&env, &asset, protocol_fee, net_amount)?;
-        increment_source_bridged_volume(&env, &source, amount)?;
+        increment_source_bridged_volume(&env, &source, &asset, amount)?;
 
         extend_instance_ttl(&env);
 
@@ -2747,7 +2758,7 @@ impl OnboardingBridge {
     ) -> Result<(u32, i128, i128), BridgeError> {
         check_initialized(&env)?;
         let global_fee_bps = read_fee_bps(&env);
-        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, &asset, global_fee_bps);
         let cap = read_asset_fee_cap(&env, &asset);
         let effective_fee_bps = tiered_fee_bps.min(cap);
         let fee = calculate_fee(amount, effective_fee_bps)?;
@@ -3833,13 +3844,14 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `source` (`Address`) — The address to look up.
+    /// * `asset` (`Address`) — The token asset to scope the volume lookup to.
     ///
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_current_tier(env: Env, source: Address) -> Result<FeeTier, BridgeError> {
+    pub fn query_current_tier(env: Env, source: Address, asset: Address) -> Result<FeeTier, BridgeError> {
         check_initialized(&env)?;
-        Ok(find_current_tier(&env, &source).unwrap_or(FeeTier {
+        Ok(find_current_tier(&env, &source, &asset).unwrap_or(FeeTier {
             min_volume: 0,
             max_volume: i128::MAX,
             fee_bps: read_fee_bps(&env),
@@ -4596,7 +4608,7 @@ impl OnboardingBridge {
             DataKey::SourceDailyLimit(source.clone(), asset.clone()),
             DataKey::DailyUsage(source.clone(), asset.clone(), current_day(&env)),
             DataKey::UserDeposit(source.clone(), asset.clone()),
-            DataKey::SourceBridgedVolume(source.clone()),
+            DataKey::SourceBridgedVolume(source.clone(), asset.clone()),
             DataKey::Nonce(source.clone()),
             DataKey::AuthNonce(source.clone()),
         ] {
@@ -5016,7 +5028,7 @@ impl OnboardingBridge {
         token_client.transfer(&source, &contract_addr, &amount);
 
         let global_fee_bps = read_fee_bps(&env);
-        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, &asset, global_fee_bps);
         let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
         let fee = calculate_fee(amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(amount, fee)?;
@@ -5026,7 +5038,7 @@ impl OnboardingBridge {
         }
 
         update_asset_counters(&env, &asset, fee, net_amount)?;
-        increment_source_bridged_volume(&env, &source, amount)?;
+        increment_source_bridged_volume(&env, &source, &asset, amount)?;
         extend_instance_ttl(&env);
 
         mint_loyalty_tokens(&env, &source);
@@ -5232,7 +5244,7 @@ impl OnboardingBridge {
 
         // Step 4: deduct fee in target_asset and forward net to target.
         let global_fee_bps = read_fee_bps(&env);
-        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, global_fee_bps);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &source, &target_asset, global_fee_bps);
         let effective_fee_bps = get_effective_fee_bps(&env, &target_asset, tiered_fee_bps);
         let fee = calculate_fee(received_amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(received_amount, fee)?;
@@ -5242,7 +5254,7 @@ impl OnboardingBridge {
         }
 
         update_asset_counters(&env, &target_asset, fee, net_amount)?;
-        increment_source_bridged_volume(&env, &source, source_amount)?;
+        increment_source_bridged_volume(&env, &source, &target_asset, source_amount)?;
 
         mint_loyalty_tokens(&env, &source);
 
@@ -5532,7 +5544,7 @@ impl OnboardingBridge {
         );
 
         let global_fee_bps = read_fee_bps(&env);
-        let tiered_fee_bps = get_tiered_fee_bps(&env, &params.source, global_fee_bps);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &params.source, &params.asset, global_fee_bps);
         let effective_fee_bps = get_effective_fee_bps(&env, &params.asset, tiered_fee_bps);
         let fee = calculate_fee(params.amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(params.amount, fee)?;
@@ -5543,7 +5555,7 @@ impl OnboardingBridge {
 
         increment_user_deposit(&env, &params.source, &params.asset, params.amount)?;
         update_asset_counters(&env, &params.asset, fee, net_amount)?;
-        increment_source_bridged_volume(&env, &params.source, params.amount)?;
+        increment_source_bridged_volume(&env, &params.source, &params.asset, params.amount)?;
 
         extend_instance_ttl(&env);
 

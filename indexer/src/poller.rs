@@ -161,15 +161,14 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Build an [`IndexedEvent`] from a raw `getEvents` entry.
 ///
-/// `event_index` is the position of this event within its transaction.
-///
-/// TODO(next-bounty): it is accepted but not yet used. The intent was to fold it
-/// into the event id so two events in the same transaction cannot collide; that
-/// was never written, so the parameter is currently inert.
+/// `event_index` is the position of this event within its transaction and is
+/// folded into the deterministic ID so that multiple events of the same type
+/// emitted by a single transaction (e.g. one `CAddressFunded` per recipient in
+/// `batch_fund_c_address`) each receive a unique, stable ID.
 fn parse_contract_event(
     raw: &serde_json::Value,
     contract_id: &str,
-    _event_index: usize,
+    event_index: usize,
 ) -> Option<IndexedEvent> {
     let topics = raw.get("topic")?.as_array()?;
     if topics.is_empty() {
@@ -224,10 +223,12 @@ fn parse_contract_event(
         }
     }
 
-    // Deterministic ID: sha256(ledger || tx_hash || event_type) encoded as hex.
-    // Using a content-derived ID ensures that re-indexing the same on-chain event
-    // always produces the same id, which lets `INSERT OR IGNORE` be the sole
-    // deduplication mechanism rather than a UUID that varies per call.
+    // Deterministic ID: hash(ledger || tx_hash || event_type || first_topic || event_index).
+    // `event_index` (position within the transaction) disambiguates multiple
+    // events of the same type in one transaction, fixing the collision that
+    // caused all but the first `CAddressFunded` in a batch to be dropped.
+    // Re-indexing the same range always regenerates identical IDs, so
+    // `INSERT OR IGNORE` remains the sole deduplication mechanism.
     let id = {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -238,6 +239,9 @@ fn parse_contract_event(
         // Include the first topic so two distinct event types on the same tx are
         // differentiated even when ledger and tx_hash are identical.
         first_topic.hash(&mut hasher);
+        // Include the per-transaction position so two events of the same type
+        // in the same transaction receive different IDs (#633).
+        event_index.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
     };
 
@@ -526,5 +530,30 @@ mod tests {
         let id1 = parse_contract_event(&raw1, "C1", 0).unwrap().id;
         let id2 = parse_contract_event(&raw2, "C1", 0).unwrap().id;
         assert_ne!(id1, id2, "different tx_hash must produce different IDs");
+    }
+
+    /// Two events of the same type in the same transaction must produce distinct
+    /// IDs — this is the regression test for #633, where `batch_fund_c_address`
+    /// emits one `CAddressFunded` per recipient and all but the first were
+    /// silently dropped by `INSERT OR IGNORE`.
+    #[test]
+    fn test_parse_same_tx_different_event_index_gives_different_ids() {
+        let raw = raw_event(serde_json::json!(["CAddressFunded", "GSRC", "CTGT1"]));
+        let id0 = parse_contract_event(&raw, "C1", 0).unwrap().id;
+        let id1 = parse_contract_event(&raw, "C1", 1).unwrap().id;
+        assert_ne!(
+            id0, id1,
+            "events at different positions in the same tx must have different IDs"
+        );
+    }
+
+    /// Re-parsing the same event at the same index always returns the same ID
+    /// (stability guarantee for re-indexing after a restart).
+    #[test]
+    fn test_parse_same_event_index_is_stable() {
+        let raw = raw_event(serde_json::json!(["CAddressFunded", "GSRC", "CTGT"]));
+        let id_a = parse_contract_event(&raw, "C1", 3).unwrap().id;
+        let id_b = parse_contract_event(&raw, "C1", 3).unwrap().id;
+        assert_eq!(id_a, id_b, "same event_index must always produce the same ID");
     }
 }
