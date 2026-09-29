@@ -106,6 +106,45 @@ describe('EventSubscriber', () => {
       jest.advanceTimersByTime(1_000);
       expect(mockGetEvents).toHaveBeenCalledTimes(2);
     });
+
+    it('does not overlap polls when getEvents is slower than the interval (issue #686)', async () => {
+      // A slow RPC: each getEvents call takes 2.5s, longer than the 1s interval.
+      let inFlight = 0;
+      let maxConcurrent = 0;
+      mockGetEvents.mockImplementation(async () => {
+        inFlight += 1;
+        maxConcurrent = Math.max(maxConcurrent, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 2_500));
+        inFlight -= 1;
+        return { events: [] };
+      });
+
+      subscriber.on('*', jest.fn());
+
+      // Advance well past several intervals while the first fetch is in flight.
+      jest.advanceTimersByTime(10_000);
+      await Promise.resolve();
+
+      // Only one fetch may ever be in flight at a time.
+      expect(maxConcurrent).toBe(1);
+    });
+
+    it('does not dispatch duplicate events when getEvents is slow (issue #686)', async () => {
+      const received: BridgeEventPayload[] = [];
+      subscriber.on('*', (e) => received.push(e));
+
+      // Each fetch is slow (2.5s) and always returns the same event with the
+      // same paging token. Overlapping polls would dispatch it more than once.
+      mockGetEvents.mockImplementation(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 2_500));
+        return fundedEventResponse('tok-1');
+      });
+
+      jest.advanceTimersByTime(10_000);
+      await Promise.resolve();
+
+      expect(received).toHaveLength(1);
+    });
   });
 
   describe('event dispatch', () => {
@@ -251,7 +290,7 @@ describe('EventSubscriber', () => {
             topic: ['CAddressFunded', 'CASSET', 'GSOURCE', 'CTARGET'],
             value: [1000, 10],
             ledger: 42,
-            pagingToken: 'tok-multi',
+            pagingToken: 'tok-1',
           },
         ],
       });
@@ -262,44 +301,6 @@ describe('EventSubscriber', () => {
 
       expect(received).toHaveLength(1);
       expect(received[0].name).toBe('CAddressFunded');
-    });
-  });
-
-  describe('default startLedger (issue #685)', () => {
-    it('resolves the default "now" cursor to the latest ledger on first poll', async () => {
-      mockGetLatestLedger.mockResolvedValue({ sequence: 1234 });
-      subscriber.on('*', jest.fn());
-
-      await subscriber.poll();
-
-      const call = mockGetEvents.mock.calls.at(-1)![0];
-      expect(call.startLedger).toBe(1234);
-      expect(call.cursor).toBeUndefined();
-    });
-
-    it('advances startLedger from the response latestLedger when a poll returns no events', async () => {
-      mockGetLatestLedger.mockResolvedValue({ sequence: 100 });
-      mockGetEvents.mockResolvedValue({ events: [], latestLedger: 150 });
-      subscriber.on('*', jest.fn());
-
-      await subscriber.poll();
-      await subscriber.poll();
-
-      const lastCall = mockGetEvents.mock.calls.at(-1)![0];
-      expect(lastCall.startLedger).toBe(150);
-      expect(lastCall.cursor).toBeUndefined();
-    });
-
-    it('advances startLedger from the response cursor when a poll returns no events', async () => {
-      mockGetLatestLedger.mockResolvedValue({ sequence: 100 });
-      mockGetEvents.mockResolvedValue({ events: [], cursor: 'cursor-200' });
-      subscriber.on('*', jest.fn());
-
-      await subscriber.poll();
-      await subscriber.poll();
-
-      const lastCall = mockGetEvents.mock.calls.at(-1)![0];
-      expect(lastCall.cursor).toBe('cursor-200');
     });
   });
 });

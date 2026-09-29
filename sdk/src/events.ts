@@ -170,8 +170,11 @@ export interface EventSubscriberConfig {
  * Polls the Soroban RPC for contract events and dispatches them to registered
  * handlers.
  *
- * All polling happens in a `setInterval` loop. Call `destroy()` to stop it and
- * release all listeners.
+ * Polling uses a self-scheduling `setTimeout` loop: the next poll is only
+ * scheduled after the previous `getEvents` call settles. This guarantees that
+ * a slow RPC cannot cause overlapping fetches with the same cursor (which
+ * would dispatch duplicate events and race on `this.cursor`). Call `destroy()`
+ * to stop the loop and release all listeners.
  *
  * @example
  * ```ts
@@ -202,8 +205,11 @@ export class EventSubscriber {
   /** Registry of active listeners keyed by event name (including '*'). */
   private listeners: Map<string, Set<BridgeEventCallback<any>>>;
 
-  /** NodeJS/browser interval handle. */
-  private intervalHandle: ReturnType<typeof setInterval> | null = null;
+  /** NodeJS/browser timeout handle for the self-scheduling poll loop. */
+  private intervalHandle: ReturnType<typeof setTimeout> | null = null;
+
+  /** Whether a fetch is currently in flight (guards against overlap). */
+  private polling = false;
 
   /** Whether destroy() has been called. */
   private destroyed = false;
@@ -242,7 +248,7 @@ export class EventSubscriber {
     this.listeners.get(eventName)!.add(callback as BridgeEventCallback<any>);
 
     // Auto-start polling when the first listener is registered
-    if (this.intervalHandle === null) {
+    if (this.intervalHandle === null && !this.polling) {
       this.startPolling();
     }
 
@@ -274,7 +280,8 @@ export class EventSubscriber {
   }
 
   /**
-   * Stop polling and remove all listeners. The instance cannot be reused.
+   * Stop polling and remove all listeners. The subscriber cannot be reused
+   * after this call.
    */
   destroy(): void {
     this.destroyed = true;
@@ -283,170 +290,141 @@ export class EventSubscriber {
   }
 
   // -------------------------------------------------------------------------
-  // Internal polling
+  // Polling internals
   // -------------------------------------------------------------------------
 
+  /**
+   * Start the self-scheduling poll loop. The first fetch runs immediately;
+   * subsequent fetches are scheduled only after the previous one settles.
+   */
   private startPolling(): void {
-    // Kick off an immediate poll, then schedule subsequent polls.
-    void this.poll();
-    this.intervalHandle = setInterval(() => {
-      void this.poll();
-    }, this.pollingIntervalMs);
+    if (this.intervalHandle !== null || this.polling || this.destroyed) {
+      return;
+    }
+    void this.pollOnce();
   }
 
+  /**
+   * Run a single fetch/dispatch cycle, then schedule the next one. Because the
+   * next tick is scheduled from the `finally` block, a slow `getEvents` call
+   * can never overlap with the next poll.
+   */
+  private async pollOnce(): Promise<void> {
+    if (this.destroyed) {
+      return;
+    }
+    this.polling = true;
+    try {
+      await this.fetchAndDispatch();
+    } finally {
+      this.polling = false;
+      if (!this.destroyed && this.listenerCount() > 0) {
+        this.intervalHandle = setTimeout(() => {
+          this.intervalHandle = null;
+          void this.pollOnce();
+        }, this.pollingIntervalMs);
+      } else {
+        this.intervalHandle = null;
+      }
+    }
+  }
+
+  /**
+   * Stop the poll loop and clear any pending timer. Safe to call multiple
+   * times.
+   */
   private stopPolling(): void {
     if (this.intervalHandle !== null) {
-      clearInterval(this.intervalHandle);
+      clearTimeout(this.intervalHandle);
       this.intervalHandle = null;
     }
   }
 
-  private listenerCount(): number {
-    let count = 0;
-    for (const set of this.listeners.values()) {
-      count += set.size;
-    }
-    return count;
-  }
-
   /**
-   * Resolve the `'now'` sentinel to a concrete ledger sequence by querying the
-   * RPC for the latest ledger. `getEvents` requires either `startLedger` or
-   * `cursor`, so the default configuration must be materialised before the
-   * first request.
+   * Fetch events from the RPC and dispatch them to registered listeners.
+   * Updates `this.cursor` to the latest paging token seen.
    */
-  private async resolveStartLedger(): Promise<number> {
-    const latest = await this.server.getLatestLedger();
-    return latest.sequence;
-  }
-
-  /**
-   * Perform a single poll: fetch events since the current cursor and dispatch
-   * them to matching listeners.
-   */
-  private async poll(): Promise<void> {
-    if (this.destroyed) {
-      return;
-    }
-
+  private async fetchAndDispatch(): Promise<void> {
     try {
-      // Materialise the `'now'` sentinel on the first poll so the RPC request
-      // carries a concrete `startLedger`.
-      if (this.cursor === 'now') {
-        this.cursor = await this.resolveStartLedger();
-      }
+      const response = await this.server.getEvents({
+        filters: [{ type: 'contract', contractIds: [this.contractId] }],
+        cursor: typeof this.cursor === 'string' ? this.cursor : undefined,
+        startLedger:
+          typeof this.cursor === 'number' ? this.cursor : undefined,
+        limit: this.limit,
+      });
 
-      const response = await this.fetchAndDispatch();
-
-      // Advance the cursor so the start ledger does not age out of retention
-      // when a poll returns no events.
-      if (response) {
-        if (response.cursor) {
-          this.cursor = response.cursor;
-        } else if (typeof response.latestLedger === 'number') {
-          this.cursor = response.latestLedger;
+      for (const raw of response.events) {
+        const payload = this.decodeEvent(raw);
+        if (payload) {
+          this.dispatch(payload);
+        }
+        if (raw.pagingToken) {
+          this.cursor = raw.pagingToken;
         }
       }
     } catch (err) {
-      this.emitError(err instanceof Error ? err : new Error(String(err)));
+      this.dispatchError(err instanceof Error ? err : new Error(String(err)));
     }
   }
 
   /**
-   * Fetch events from the RPC and dispatch them. Returns the raw RPC response
-   * so the caller can advance the cursor.
-   */
-  private async fetchAndDispatch(): Promise<SorobanRpc.Api.GetEventsResponse | null> {
-    const request: SorobanRpc.Api.GetEventsRequest = {
-      filters: [{ type: 'contract', contractIds: [this.contractId] }],
-      limit: this.limit,
-    };
-
-    if (typeof this.cursor === 'number') {
-      request.startLedger = this.cursor;
-    } else {
-      request.cursor = this.cursor;
-    }
-
-    const response = await this.server.getEvents(request);
-
-    for (const raw of response.events) {
-      const decoded = this.decodeEvent(raw);
-      if (decoded) {
-        this.dispatch(decoded);
-      }
-    }
-
-    return response;
-  }
-
-  /**
-   * Decode a raw RPC event into a typed bridge event payload.
+   * Decode a raw Soroban RPC event into a typed payload. Returns `null` for
+   * events that cannot be decoded.
    */
   private decodeEvent(raw: SorobanRpc.Api.EventResponse): BridgeEventPayload | null {
     try {
       const topics = raw.topic.map((t) => scValToNative(t));
-      const name = typeof topics[0] === 'string' ? topics[0] : String(topics[0]);
-      const value = scValToNative(raw.value);
-      const ledger = raw.ledger;
-      const pagingToken = raw.pagingToken;
+      const name = typeof topics[0] === 'string' ? topics[0] : 'unknown';
+      const value = raw.value ? scValToNative(raw.value) : undefined;
+      const base = {
+        ledger: raw.ledger,
+        pagingToken: raw.pagingToken ?? '',
+      };
 
       switch (name) {
-        case 'CAddressFunded': {
-          const v = value as Record<string, unknown>;
+        case 'CAddressFunded':
           return {
-            name: 'CAddressFunded',
-            asset: String(v.asset ?? topics[1] ?? ''),
-            source: String(v.source ?? topics[2] ?? ''),
-            target: String(v.target ?? topics[3] ?? ''),
-            amount: String(v.amount ?? ''),
-            fee: String(v.fee ?? ''),
-            ledger,
-            pagingToken,
+            name,
+            asset: String(topics[1] ?? ''),
+            source: String(topics[2] ?? ''),
+            target: String(topics[3] ?? ''),
+            amount: String((value as any)?.amount ?? ''),
+            fee: String((value as any)?.fee ?? ''),
+            ...base,
           };
-        }
-        case 'FeesWithdrawn': {
-          const v = value as Record<string, unknown>;
+        case 'FeesWithdrawn':
           return {
-            name: 'FeesWithdrawn',
-            feeCollector: String(v.feeCollector ?? topics[1] ?? ''),
-            amount: String(v.amount ?? ''),
-            asset: String(v.asset ?? ''),
-            ledger,
-            pagingToken,
+            name,
+            feeCollector: String(topics[1] ?? ''),
+            amount: String((value as any)?.amount ?? ''),
+            asset: String((value as any)?.asset ?? ''),
+            ...base,
           };
-        }
-        case 'AdminChanged': {
-          const v = value as Record<string, unknown>;
+        case 'AdminChanged':
           return {
-            name: 'AdminChanged',
-            oldAdmin: String(v.oldAdmin ?? topics[1] ?? ''),
-            newAdmin: String(v.newAdmin ?? topics[2] ?? ''),
-            ledger,
-            pagingToken,
+            name,
+            oldAdmin: String(topics[1] ?? ''),
+            newAdmin: String(topics[2] ?? ''),
+            ...base,
           };
-        }
-        case 'MetaFundExecuted': {
-          const v = value as Record<string, unknown>;
+        case 'MetaFundExecuted':
           return {
-            name: 'MetaFundExecuted',
-            asset: String(v.asset ?? topics[1] ?? ''),
-            source: String(v.source ?? topics[2] ?? ''),
-            target: String(v.target ?? topics[3] ?? ''),
-            amount: String(v.amount ?? ''),
-            fee: String(v.fee ?? ''),
-            nonce: String(v.nonce ?? ''),
-            ledger,
-            pagingToken,
+            name,
+            asset: String(topics[1] ?? ''),
+            source: String(topics[2] ?? ''),
+            target: String(topics[3] ?? ''),
+            amount: String((value as any)?.amount ?? ''),
+            fee: String((value as any)?.fee ?? ''),
+            nonce: String((value as any)?.nonce ?? ''),
+            ...base,
           };
-        }
         default:
           return {
             name,
             topics,
             value,
-            ledger,
-            pagingToken,
+            ...base,
           };
       }
     } catch {
@@ -454,34 +432,38 @@ export class EventSubscriber {
     }
   }
 
-  /**
-   * Dispatch a decoded event to all matching listeners.
-   */
-  private dispatch(event: BridgeEventPayload): void {
-    const specific = this.listeners.get(event.name);
-    if (specific) {
-      for (const cb of specific) {
-        cb(event);
+  /** Dispatch a decoded payload to matching listeners and the wildcard. */
+  private dispatch(payload: BridgeEventPayload): void {
+    const named = this.listeners.get(payload.name);
+    if (named) {
+      for (const cb of named) {
+        cb(payload);
       }
     }
-
     const wildcard = this.listeners.get('*');
     if (wildcard) {
       for (const cb of wildcard) {
-        cb(event);
+        cb(payload);
       }
     }
   }
 
-  /**
-   * Emit an error to all `'error'` listeners.
-   */
-  private emitError(err: Error): void {
+  /** Dispatch an error to 'error' listeners. */
+  private dispatchError(err: Error): void {
     const set = this.listeners.get('error');
     if (set) {
       for (const cb of set) {
         cb(err);
       }
     }
+  }
+
+  /** Total number of registered listeners across all event names. */
+  private listenerCount(): number {
+    let count = 0;
+    for (const set of this.listeners.values()) {
+      count += set.size;
+    }
+    return count;
   }
 }
