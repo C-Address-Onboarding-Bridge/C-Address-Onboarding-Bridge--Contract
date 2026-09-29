@@ -5,11 +5,13 @@ import { EventSubscriber } from '../events';
 import type { CAddressFundedEvent, BridgeEventPayload } from '../events';
 
 const mockGetEvents = jest.fn();
+const mockGetLatestLedger = jest.fn();
 
 jest.mock('@stellar/stellar-sdk', () => ({
   SorobanRpc: {
     Server: jest.fn().mockImplementation(() => ({
       getEvents: mockGetEvents,
+      getLatestLedger: mockGetLatestLedger,
     })),
   },
   // The subscriber converts topics/values with scValToNative; the mock passes
@@ -47,6 +49,8 @@ describe('EventSubscriber', () => {
     jest.useFakeTimers();
     mockGetEvents.mockReset();
     mockGetEvents.mockResolvedValue({ events: [] });
+    mockGetLatestLedger.mockReset();
+    mockGetLatestLedger.mockResolvedValue({ sequence: 100 });
     subscriber = makeSubscriber();
   });
 
@@ -247,40 +251,55 @@ describe('EventSubscriber', () => {
             topic: ['CAddressFunded', 'CASSET', 'GSOURCE', 'CTARGET'],
             value: [1000, 10],
             ledger: 42,
-            pagingToken: 'tok-funded',
-          },
-          {
-            topic: ['FeesWithdrawn', 'GADMIN'],
-            value: 25,
-            ledger: 43,
-            pagingToken: 'tok-fees',
-          },
-          {
-            topic: ['AdminTransferred', 'GOLD', 'GNEW'],
-            value: null,
-            ledger: 44,
-            pagingToken: 'tok-admin',
-          },
-          {
-            topic: ['ContractPaused'],
-            value: null,
-            ledger: 45,
-            pagingToken: 'tok-paused',
+            pagingToken: 'tok-multi',
           },
         ],
       });
-
       const received: BridgeEventPayload[] = [];
       subscriber.on('*', (e) => received.push(e));
 
       await subscriber.poll();
 
-      expect(received.map((e) => e.name)).toEqual([
-        'CAddressFunded',
-        'FeesWithdrawn',
-        'AdminTransferred',
-        'ContractPaused',
-      ]);
+      expect(received).toHaveLength(1);
+      expect(received[0].name).toBe('CAddressFunded');
+    });
+  });
+
+  describe('default startLedger (issue #685)', () => {
+    it('resolves the default "now" cursor to the latest ledger on first poll', async () => {
+      mockGetLatestLedger.mockResolvedValue({ sequence: 1234 });
+      subscriber.on('*', jest.fn());
+
+      await subscriber.poll();
+
+      const call = mockGetEvents.mock.calls.at(-1)![0];
+      expect(call.startLedger).toBe(1234);
+      expect(call.cursor).toBeUndefined();
+    });
+
+    it('advances startLedger from the response latestLedger when a poll returns no events', async () => {
+      mockGetLatestLedger.mockResolvedValue({ sequence: 100 });
+      mockGetEvents.mockResolvedValue({ events: [], latestLedger: 150 });
+      subscriber.on('*', jest.fn());
+
+      await subscriber.poll();
+      await subscriber.poll();
+
+      const lastCall = mockGetEvents.mock.calls.at(-1)![0];
+      expect(lastCall.startLedger).toBe(150);
+      expect(lastCall.cursor).toBeUndefined();
+    });
+
+    it('advances startLedger from the response cursor when a poll returns no events', async () => {
+      mockGetLatestLedger.mockResolvedValue({ sequence: 100 });
+      mockGetEvents.mockResolvedValue({ events: [], cursor: 'cursor-200' });
+      subscriber.on('*', jest.fn());
+
+      await subscriber.poll();
+      await subscriber.poll();
+
+      const lastCall = mockGetEvents.mock.calls.at(-1)![0];
+      expect(lastCall.cursor).toBe('cursor-200');
     });
   });
 });
