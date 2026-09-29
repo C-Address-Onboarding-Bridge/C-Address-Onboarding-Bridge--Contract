@@ -868,3 +868,6 @@ MIT
 
 <!-- handsoff-issue-690 -->
 - #690: sdk: InMemoryCache grows without bound — expired entries are only removed when read
+
+<!-- handsoff-issue-691 -->
+- #691: sdk: estimateCost() reads a non-existent cost.feeCharged field
