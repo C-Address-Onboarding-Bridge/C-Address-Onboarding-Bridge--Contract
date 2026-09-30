@@ -25,36 +25,47 @@ const SIMULATION_SOURCE =
   'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 
 /**
+ * A contract argument paired with its explicit Soroban ABI type.
+ *
+ * Callers must declare the type of every argument instead of relying on the
+ * value's string contents, so that e.g. a `u32` parameter is never encoded as
+ * an `i128`, and a non-address string that happens to start with `G` is not
+ * forced into an `Address`.
+ */
+export interface TypedArg {
+  /** The JavaScript value to encode. */
+  value: any;
+  /**
+   * The Soroban ABI type to encode `value` as. When omitted, the value is
+   * encoded with `nativeToScVal`'s default inference (no string heuristics).
+   */
+  type?: string;
+}
+
+/**
  * Convert a single JavaScript value to its Soroban `ScVal` representation.
  *
- * **Encoding rules (in order):**
+ * Encoding is explicit: when a {@link TypedArg} is supplied the value is
+ * encoded with the declared ABI `type`; otherwise `nativeToScVal`'s default
+ * inference is used. No type is ever guessed from the string contents.
  *
- * | JS value                  | ScVal type         |
- * |---------------------------|--------------------|
- * | String starting with C/G  | `Address`          |
- * | Numeric string (digits)   | `i128`             |
- * | Other string              | `string` (Symbol)  |
- * | `number` or `bigint`      | `i128`             |
- * | `Address` instance        | `Address`          |
- * | `null` / `undefined`      | `Void`             |
- * | `Array`                   | `Vec` (recursive)  |
- * | Everything else           | `nativeToScVal`    |
- *
- * @param arg - A JavaScript value to encode.
+ * @param arg - A JavaScript value, or a `{ value, type }` pair.
  * @returns The encoded `xdr.ScVal`.
  */
 export function toSingleScVal(arg: any): xdr.ScVal {
-  if (typeof arg === 'string') {
-    if (arg.startsWith('C') || arg.startsWith('G')) {
-      return new Address(arg).toScVal();
+  if (arg !== null && typeof arg === 'object' && 'value' in arg) {
+    const { value, type } = arg as TypedArg;
+    if (value === null || value === undefined) {
+      return xdr.ScVal.scvVoid();
     }
-    if (/^\d+$/.test(arg)) {
-      return nativeToScVal(BigInt(arg), { type: 'i128' });
+    if (value instanceof Address) {
+      return value.toScVal();
     }
-    return nativeToScVal(arg, { type: 'string' });
+    return type ? nativeToScVal(value, { type }) : nativeToScVal(value);
   }
-  if (typeof arg === 'number' || typeof arg === 'bigint') {
-    return nativeToScVal(arg, { type: 'i128' });
+
+  if (arg === null || arg === undefined) {
+    return xdr.ScVal.scvVoid();
   }
   if (arg instanceof Address) {
     return arg.toScVal();
@@ -67,9 +78,10 @@ export function toSingleScVal(arg: any): xdr.ScVal {
  *
  * `null` / `undefined` values are encoded as `ScVal.scvVoid()`, and nested
  * arrays are recursively encoded as `ScVal.scvVec(...)` via
- * {@link toSingleScVal}.
+ * {@link toSingleScVal}. Each element may be a {@link TypedArg} to declare its
+ * ABI type explicitly.
  *
- * @param args - Array of values to encode.
+ * @param args - Array of values (or `{ value, type }` pairs) to encode.
  * @returns Array of encoded `xdr.ScVal`.
  */
 export function toScVals(args: any[]): xdr.ScVal[] {
@@ -94,7 +106,8 @@ export function toScVals(args: any[]): xdr.ScVal[] {
  *
  * @param contract         - The Soroban {@link Contract} instance.
  * @param method           - Contract method name to invoke.
- * @param args             - JavaScript values to encode and pass as arguments.
+ * @param args             - Values (or `{ value, type }` pairs) to encode and
+ *                           pass as arguments.
  * @param networkPassphrase - Stellar network passphrase.
  * @param timeout          - Transaction timeout in seconds.
  * @returns A built (but unsigned) transaction ready for simulation.
