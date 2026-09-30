@@ -97,6 +97,110 @@ impl Database {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Inserts `event` and, if it was newly indexed (not a re-poll of an
+    /// already-seen event), queues its webhook deliveries -- both inside one
+    /// SQLite transaction.
+    ///
+    /// `insert_event` and `queue_webhook_deliveries` used to run as two
+    /// separate statements. If the process died (or `queue_webhook_deliveries`
+    /// errored) between them, the event was committed but its deliveries were
+    /// not; the next poll would then see the event as a duplicate
+    /// (`insert_event` returns false) and never queue it, permanently losing
+    /// those webhooks. Doing both under one transaction means either both
+    /// happen or neither does. See #647.
+    pub async fn insert_event_and_queue_deliveries(
+        &self,
+        event: &IndexedEvent,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+
+        let data_str = serde_json::to_string(&event.data).unwrap_or_default();
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO events (id, event_type, ledger_sequence, contract_id, tx_hash, timestamp, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(&event.id)
+        .bind(&event.event_type)
+        .bind(event.ledger_sequence)
+        .bind(&event.contract_id)
+        .bind(&event.tx_hash)
+        .bind(&event.timestamp)
+        .bind(&data_str)
+        .execute(&mut tx)
+        .await?;
+        let inserted = result.rows_affected() > 0;
+
+        if inserted {
+            Self::queue_webhook_deliveries_tx(&mut tx, event).await?;
+        }
+
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    /// Same subscription-matching and insert logic as
+    /// [`Database::queue_webhook_deliveries`], but run against an open
+    /// transaction so callers can commit it atomically alongside another
+    /// write (see [`Database::insert_event_and_queue_deliveries`]).
+    async fn queue_webhook_deliveries_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        event: &IndexedEvent,
+    ) -> Result<(), sqlx::Error> {
+        let subs: Vec<SubscriptionRow> = sqlx::query_as(
+            "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, created_at
+             FROM subscriptions WHERE active = 1",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let data = &event.data;
+
+        for (sub_id, _url, event_type, asset_filter, source_filter, target_filter, _active, _created_at) in
+            subs
+        {
+            if let Some(ref et) = event_type {
+                if et != &event.event_type {
+                    continue;
+                }
+            }
+            if let Some(ref af) = asset_filter {
+                if let Some(asset) = data.get("asset").and_then(|v| v.as_str()) {
+                    if asset != af {
+                        continue;
+                    }
+                }
+            }
+            if let Some(ref sf) = source_filter {
+                if let Some(source) = data.get("source").and_then(|v| v.as_str()) {
+                    if source != sf {
+                        continue;
+                    }
+                }
+            }
+            if let Some(ref tf) = target_filter {
+                if let Some(target) = data.get("target").and_then(|v| v.as_str()) {
+                    if target != tf {
+                        continue;
+                    }
+                }
+            }
+
+            let delivery_id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
+                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)",
+            )
+            .bind(&delivery_id)
+            .bind(&sub_id)
+            .bind(&event.id)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        Ok(())
+    }
+
     pub async fn list_events(
         &self,
         limit: i64,

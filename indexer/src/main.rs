@@ -123,20 +123,16 @@ async fn main() {
     // cleanly before the axum server drains in-flight HTTP requests.
     let token = CancellationToken::new();
 
-    // TODO(next-bounty): run_poller and run_delivery_worker each take only
-    // `state` -- neither accepts a CancellationToken, so the tokens below cannot
-    // be passed yet and cooperative shutdown of the background workers is not
-    // wired up. Give both workers a token parameter, then restore these.
     let poller_state = Arc::clone(&state);
-    // let poller_token = token.clone();
-    let _poller_handle = tokio::spawn(async move {
-        poller::run_poller(poller_state).await;
+    let poller_token = token.clone();
+    let poller_handle = tokio::spawn(async move {
+        poller::run_poller(poller_state, poller_token).await;
     });
 
     let webhook_state = Arc::clone(&state);
-    // let webhook_token = token.clone();
-    let _webhook_handle = tokio::spawn(async move {
-        webhook::run_delivery_worker(webhook_state).await;
+    let webhook_token = token.clone();
+    let webhook_handle = tokio::spawn(async move {
+        webhook::run_delivery_worker(webhook_state, webhook_token).await;
     });
 
     // Public read-only routes — no auth required.
@@ -197,11 +193,11 @@ async fn main() {
         .await
         .unwrap();
 
-    // TODO(next-bounty): joining the worker handles here would block forever --
-    // both workers loop indefinitely and have no cancellation token to observe
-    // (see the spawn sites above). The tokio runtime drops them when main
-    // returns. Restore the join once the workers honour the token.
-    // let _ = tokio::join!(poller_handle, webhook_handle);
+    // `with_graceful_shutdown` above already cancelled `token` once SIGTERM/
+    // SIGINT arrived, so both workers are winding down (or already have).
+    // Join them so `main` does not return -- and the process does not exit --
+    // until they have actually stopped. See #646.
+    let _ = tokio::join!(poller_handle, webhook_handle);
     tracing::info!("Indexer shut down cleanly");
 }
 
@@ -259,7 +255,10 @@ async fn list_events(
 ) -> Result<Json<Vec<events::IndexedEvent>>, StatusCode> {
     state
         .db
-        .list_events(params.limit.unwrap_or(50), params.offset.unwrap_or(0))
+        .list_events(
+            events::clamp_limit(params.limit, 50),
+            events::clamp_offset(params.offset),
+        )
         .await
         .map(Json)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
@@ -274,8 +273,8 @@ async fn list_events_by_type(
         .db
         .list_events_by_type(
             &event_type,
-            params.limit.unwrap_or(50),
-            params.offset.unwrap_or(0),
+            events::clamp_limit(params.limit, 50),
+            events::clamp_offset(params.offset),
         )
         .await
         .map(Json)
@@ -334,7 +333,7 @@ async fn replay_events(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let events = state
         .db
-        .list_events_from_ledger(req.from_ledger, req.limit.unwrap_or(100))
+        .list_events_from_ledger(req.from_ledger, events::clamp_limit(req.limit, 100))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 

@@ -3,6 +3,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 pub const MAX_CONCURRENT_DELIVERIES: usize = 10;
 const MAX_RETRIES: i32 = 5;
@@ -181,14 +182,25 @@ struct WebhookPayload {
     data: serde_json::Value,
 }
 
-pub async fn run_delivery_worker(state: Arc<AppState>) {
+/// Runs the delivery loop until `token` is cancelled. Cancellation is
+/// observed between iterations (via `select!` on the inter-poll sleep) so an
+/// in-flight `deliver_pending` always finishes cleanly before the worker
+/// returns. See #646.
+pub async fn run_delivery_worker(state: Arc<AppState>, token: CancellationToken) {
     tracing::info!("Starting webhook delivery worker");
 
     loop {
         if let Err(e) = deliver_pending(&state).await {
             tracing::error!("Delivery worker error: {}", e);
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(DELIVERY_INTERVAL_MS)).await;
+
+        tokio::select! {
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(DELIVERY_INTERVAL_MS)) => {}
+            _ = token.cancelled() => {
+                tracing::info!("Webhook delivery worker received shutdown signal, exiting");
+                return;
+            }
+        }
     }
 }
 
