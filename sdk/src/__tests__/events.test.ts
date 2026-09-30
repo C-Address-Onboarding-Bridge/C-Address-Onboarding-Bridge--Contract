@@ -5,11 +5,13 @@ import { EventSubscriber } from '../events';
 import type { CAddressFundedEvent, BridgeEventPayload } from '../events';
 
 const mockGetEvents = jest.fn();
+const mockGetLatestLedger = jest.fn();
 
 jest.mock('@stellar/stellar-sdk', () => ({
   SorobanRpc: {
     Server: jest.fn().mockImplementation(() => ({
       getEvents: mockGetEvents,
+      getLatestLedger: mockGetLatestLedger,
     })),
   },
   // The subscriber converts topics/values with scValToNative; the mock passes
@@ -47,6 +49,8 @@ describe('EventSubscriber', () => {
     jest.useFakeTimers();
     mockGetEvents.mockReset();
     mockGetEvents.mockResolvedValue({ events: [] });
+    mockGetLatestLedger.mockReset();
+    mockGetLatestLedger.mockResolvedValue({ sequence: 100 });
     subscriber = makeSubscriber();
   });
 
@@ -101,6 +105,45 @@ describe('EventSubscriber', () => {
       await Promise.resolve();
       jest.advanceTimersByTime(1_000);
       expect(mockGetEvents).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not overlap polls when getEvents is slower than the interval (issue #686)', async () => {
+      // A slow RPC: each getEvents call takes 2.5s, longer than the 1s interval.
+      let inFlight = 0;
+      let maxConcurrent = 0;
+      mockGetEvents.mockImplementation(async () => {
+        inFlight += 1;
+        maxConcurrent = Math.max(maxConcurrent, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 2_500));
+        inFlight -= 1;
+        return { events: [] };
+      });
+
+      subscriber.on('*', jest.fn());
+
+      // Advance well past several intervals while the first fetch is in flight.
+      jest.advanceTimersByTime(10_000);
+      await Promise.resolve();
+
+      // Only one fetch may ever be in flight at a time.
+      expect(maxConcurrent).toBe(1);
+    });
+
+    it('does not dispatch duplicate events when getEvents is slow (issue #686)', async () => {
+      const received: BridgeEventPayload[] = [];
+      subscriber.on('*', (e) => received.push(e));
+
+      // Each fetch is slow (2.5s) and always returns the same event with the
+      // same paging token. Overlapping polls would dispatch it more than once.
+      mockGetEvents.mockImplementation(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 2_500));
+        return fundedEventResponse('tok-1');
+      });
+
+      jest.advanceTimersByTime(10_000);
+      await Promise.resolve();
+
+      expect(received).toHaveLength(1);
     });
   });
 
@@ -221,6 +264,43 @@ describe('EventSubscriber', () => {
 
       expect(received).toHaveLength(1);
       expect(received[0]).toMatchObject({ name: 'SomethingNew', ledger: 1 });
+    });
+  });
+
+  describe('topic filter (issue #684)', () => {
+    it('requests all contract events without a single-segment topic filter', async () => {
+      subscriber.on('*', jest.fn());
+
+      await subscriber.poll();
+
+      const call = mockGetEvents.mock.calls.at(-1)![0];
+      const filter = call.filters[0];
+      expect(filter.contractIds).toEqual([CONTRACT_ID]);
+      // A `topics: [['*']]` filter only matches single-topic events, so the
+      // subscriber must not constrain topics to a single segment.
+      expect(filter.topics).toBeUndefined();
+    });
+
+    it('dispatches multi-topic events from a captured RPC response', async () => {
+      // Captured Soroban RPC response containing multi-topic events that the
+      // old `topics: [['*']]` filter would have excluded.
+      mockGetEvents.mockResolvedValue({
+        events: [
+          {
+            topic: ['CAddressFunded', 'CASSET', 'GSOURCE', 'CTARGET'],
+            value: [1000, 10],
+            ledger: 42,
+            pagingToken: 'tok-1',
+          },
+        ],
+      });
+      const received: BridgeEventPayload[] = [];
+      subscriber.on('*', (e) => received.push(e));
+
+      await subscriber.poll();
+
+      expect(received).toHaveLength(1);
+      expect(received[0].name).toBe('CAddressFunded');
     });
   });
 });

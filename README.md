@@ -268,15 +268,20 @@ graph LR
 A Rust service (axum HTTP server + SQLite) that:
 
 - Polls the Soroban RPC (`poller.rs`) for `OnboardingBridge` contract events
-  (`events.rs`) — funding, batch completion, fee withdrawals, admin changes.
+  (`events.rs`) — funding, batch completion, fee withdrawals, admin changes,
+  initialization, upgrade lifecycle, emergency migrations, and referral-rate
+  changes.
 - Persists every event to its own database (`db.rs`) so historical event
   data survives independently of the chain's own retention/pruning.
 - Delivers webhooks (`webhook.rs`) to subscribers (dashboards, alerting,
   accounting systems) whenever a new event is indexed, so consumers don't
   need to poll the chain themselves.
 
-Configured via `SOROBAN_RPC_URL`, `CONTRACT_ID`, `DATABASE_URL`, and
-`LISTEN_ADDR` environment variables (see `indexer/src/main.rs`).
+Configured via `SOROBAN_RPC_URL`, `CONTRACT_ID`, `DATABASE_URL`, `LISTEN_ADDR`,
+and `API_KEY` environment variables (see `indexer/src/main.rs`). Read-only
+endpoints are public; subscription creation/deletion and event replay require
+`Authorization: Bearer <API_KEY>`. CORS accepts requests from any origin, but
+does not replace API-key authentication.
 
 #### Relayer (`relayer/`)
 
@@ -603,7 +608,7 @@ async function withdrawAccumulatedFees() {
 
 **Access control**
 - The admin keypair can change fee rate, fee collector, and admin address. Treat it with the same care as a root credential.
-- Rotate admin and fee collector keys periodically. Use `sdk.setAdmin()` and `sdk.setFeeCollector()` to perform the rotation atomically.
+- Rotate admin and fee collector keys periodically. Prefer the two-step handover — `sdk.proposeNewAdmin()` / `sdk.acceptAdmin()` and `sdk.proposeNewFeeCollector()` / `sdk.acceptFeeCollector()` — over `sdk.setAdmin()` / `sdk.setFeeCollector()`, since the two-step path proves the new key is usable before the role is moved.
 
 **Contract upgrades**
 - Keep the deployed WASM hash in version control alongside the source. Before upgrading, verify the new WASM hash corresponds to audited source.
@@ -750,11 +755,19 @@ const adminKeypair = Keypair.fromSecret(process.env.ADMIN_SECRET!);
 // Update fee rate (max 1000 bps)
 await sdk.setFee(75, adminKeypair);
 
-// Rotate fee collector
-await sdk.setFeeCollector('G...newCollector', adminKeypair);
+// Rotate fee collector or admin: prefer the two-step propose/accept handover
+// below over setFeeCollector()/setAdmin(), which transfer the role
+// immediately and unrecoverably if the new key turns out to be unusable.
 
-// Transfer admin role
-await sdk.setAdmin('G...newAdmin', adminKeypair);
+// Propose + accept a fee-collector handover
+await sdk.proposeNewFeeCollector('G...newCollector', adminKeypair);
+const pendingCollector = await sdk.getPendingFeeCollector(); // 'G...newCollector'
+await sdk.acceptFeeCollector(newCollectorKeypair); // signed by the new collector
+
+// Propose + accept an admin handover
+await sdk.proposeNewAdmin('G...newAdmin', adminKeypair);
+const pendingAdmin = await sdk.getPendingAdmin(); // 'G...newAdmin'
+await sdk.acceptAdmin(newAdminKeypair); // signed by the new admin
 
 // Recover accidentally sent tokens
 await sdk.reclaimTokens(
@@ -866,8 +879,11 @@ MIT
 
 ## Handsoff notes
 
-<!-- handsoff-issue-690 -->
-- #690: sdk: InMemoryCache grows without bound — expired entries are only removed when read
+<!-- handsoff-issue-680 -->
+- #680: sdk: add wrappers for pause/unpause and blocklist/allowlist administration
 
-<!-- handsoff-issue-691 -->
-- #691: sdk: estimateCost() reads a non-existent cost.feeCharged field
+<!-- handsoff-issue-681 -->
+- #681: sdk: add wrappers for asset whitelist and limit configuration
+
+<!-- handsoff-issue-682 -->
+- #682: sdk: add register_meta_signer and a helper that builds the exact meta-tx payload the contract verifies
