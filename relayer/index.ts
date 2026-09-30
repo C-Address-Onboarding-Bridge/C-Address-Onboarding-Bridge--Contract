@@ -535,7 +535,9 @@ export const DEFAULT_ETH_CONFIRMATIONS = 12;
 
 /**
  * Minimal Ethereum log-polling listener.  Decodes a `BridgeFund` log with
- * ABI: `BridgeFund(bytes32 txHash, string target, string asset, uint256 amount)`.
+ * ABI: `BridgeFund(string target, string asset, uint256 amount)`. The replay
+ * key is derived from the log's own `transactionHash`/`logIndex`, not from
+ * event data (see `decode()`).
  *
  * Persists the last-processed block number to a local file so that a restart
  * resumes from the correct position and never skips events emitted during a
@@ -659,22 +661,78 @@ export class EthChainListener implements ChainListener {
       body,
     });
     const json: any = await res.json();
-    return json.result ?? [];
+    if (json.error) {
+      const message = typeof json.error?.message === 'string' ? json.error.message : JSON.stringify(json.error);
+      throw new Error(`${method} RPC error: ${message}`);
+    }
+    return json.result;
+  }
+
+  /**
+   * Fetch logs in the range [fromBlock, latest], walking forward in chunks of
+   * at most `maxBlockRange` blocks so that a large gap since the last
+   * checkpoint (e.g. after downtime) never produces a single unbounded
+   * `eth_getLogs` request that most providers would reject outright.
+   *
+   * A JSON-RPC `error` is thrown (not swallowed as "no logs") so callers can
+   * see and retry it.
+   */
+  private async getLogs(): Promise<{ logs: any[]; queriedToBlock: number | null }> {
+    const maxRange = this.config.maxBlockRange ?? 2_000;
+
+    const latestHex: string = await this.rpcCall('eth_blockNumber', []);
+    const latestBlock = parseInt(latestHex, 16);
+
+    const startBlock =
+      this.fromBlock === 'latest' ? latestBlock : parseInt(this.fromBlock, 16);
+    if (!Number.isFinite(startBlock) || startBlock > latestBlock) {
+      return { logs: [], queriedToBlock: null };
+    }
+
+    const endBlock = Math.min(startBlock + maxRange - 1, latestBlock);
+
+    const result = await this.rpcCall('eth_getLogs', [{
+      fromBlock: '0x' + startBlock.toString(16),
+      toBlock: '0x' + endBlock.toString(16),
+      address: this.config.bridgeContractAddress,
+      topics: [this.config.eventTopic],
+    }]);
+
+    return { logs: Array.isArray(result) ? result : [], queriedToBlock: endBlock };
   }
 
   /**
    * Decode a raw eth log into a BridgeEvent.
    * Expected ABI-encoded topics/data:
    *   topic[0]: event signature hash
-   *   topic[1]: bytes32 txHash (indexed)
    *   data:     abi.encode(string target, string asset, uint256 amount)
+   *
+   * The replay key (`txHash`) is derived from the log's own
+   * `transactionHash` + `logIndex` — fields the RPC node/chain attests to —
+   * rather than from any value the emitting contract chose to include in the
+   * event data. Otherwise a buggy or malicious emitter controls the replay
+   * key, and two BridgeFund logs in the same transaction (same
+   * transactionHash) would collide on-chain, where the replay key is
+   * `(chain_id, tx_hash)`.
    */
   private decode(log: any): BridgeEvent | null {
     try {
-      if (!Array.isArray(log.topics) || typeof log.topics[1] !== 'string') return null;
-      const txHashTopic = log.topics[1] as string;
-      if (!txHashTopic.startsWith('0x') || txHashTopic.length !== 66) return null;
-      const txHash = txHashTopic.slice(2); // strip 0x
+      if (typeof log.transactionHash !== 'string' || !log.transactionHash.startsWith('0x') || log.transactionHash.length !== 66) {
+        return null;
+      }
+      const logIndexRaw = log.logIndex;
+      const logIndex =
+        typeof logIndexRaw === 'string' ? parseInt(logIndexRaw, 16) : Number(logIndexRaw);
+      if (!Number.isFinite(logIndex) || logIndex < 0) return null;
+
+      const txHashBytes = Buffer.from(log.transactionHash.slice(2), 'hex');
+      const logIndexBuf = Buffer.alloc(4);
+      logIndexBuf.writeUInt32BE(logIndex);
+      const txHash = crypto
+        .createHash('sha256')
+        .update(txHashBytes)
+        .update(logIndexBuf)
+        .digest('hex');
 
       // ABI-decode non-indexed data: (string target, string asset, uint256 amount)
       if (typeof log.data !== 'string' || !log.data.startsWith('0x')) return null;
@@ -713,6 +771,39 @@ export class EthChainListener implements ChainListener {
 // Solana listener (WebSocket log subscription — no @solana/web3.js required)
 // ---------------------------------------------------------------------------
 
+// Bitcoin/Solana base58 alphabet (no 0, O, I, l).
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const BASE58_MAP: Record<string, number> = Object.fromEntries(
+  BASE58_ALPHABET.split('').map((c, i) => [c, i]),
+);
+
+/**
+ * Decode a base58 string (e.g. a Solana signature or pubkey) into raw bytes.
+ * Throws on any character outside the base58 alphabet. Only stdlib
+ * primitives (BigInt) are used, matching this file's no-extra-deps policy.
+ */
+function base58Decode(input: string): Buffer {
+  if (input.length === 0) throw new Error('empty base58 string');
+
+  let leadingZeros = 0;
+  while (leadingZeros < input.length && input[leadingZeros] === '1') leadingZeros++;
+
+  let num = 0n;
+  for (const ch of input) {
+    const value = BASE58_MAP[ch];
+    if (value === undefined) throw new Error(`invalid base58 character: ${ch}`);
+    num = num * 58n + BigInt(value);
+  }
+
+  const bytes: number[] = [];
+  while (num > 0n) {
+    bytes.unshift(Number(num & 0xffn));
+    num >>= 8n;
+  }
+
+  return Buffer.concat([Buffer.alloc(leadingZeros, 0), Buffer.from(bytes)]);
+}
+
 export interface SolanaListenerConfig {
   /** Solana WebSocket endpoint (wss://...) */
   wsUrl: string;
@@ -734,7 +825,13 @@ export interface SolanaListenerConfig {
 /**
  * Listens to Solana program log notifications over WebSocket.
  * Expects the Solana program to emit a structured log line:
- *   "bridge_fund:<txHash>:<target>:<asset>:<amount>"
+ *   "bridge_fund:<signature>:<target>:<asset>:<amount>"
+ *
+ * `logsSubscribe({ mentions: [programId] })` matches any transaction that
+ * touches the program, so a `bridge_fund` line is only accepted when the
+ * bridge program is the one currently executing (see
+ * `extractBridgeFundEvents`), not merely present somewhere in the
+ * transaction's log lines.
  *
  * Implements reconnect-with-exponential-backoff so that a transient WebSocket
  * drop (network blip, RPC provider restart) does not permanently halt event
@@ -792,10 +889,8 @@ export class SolanaChainListener implements ChainListener {
       try {
         const data = JSON.parse(typeof msg === 'string' ? msg : msg.data);
         const logs: string[] = data?.params?.result?.value?.logs ?? [];
-        for (const line of logs) {
-          if (!line.startsWith('Program log: bridge_fund:')) continue;
-          const event = this.decodeLine(line);
-          if (event && this.onEvent) this.onEvent(event);
+        for (const event of this.extractBridgeFundEvents(logs)) {
+          if (this.onEvent) this.onEvent(event);
         }
       } catch { /* ignore malformed messages */ }
     };
@@ -821,16 +916,81 @@ export class SolanaChainListener implements ChainListener {
   }
 
   /**
-   * Parse: "Program log: bridge_fund:<txHash>:<target>:<asset>:<amount>"
+   * `logsSubscribe` with `{ mentions: [programId] }` matches every
+   * transaction that *touches* the program, including one where a
+   * different program (e.g. via CPI) prints its own
+   * `Program log: bridge_fund:...` line — that would let anyone forge a
+   * deposit event for free. This walks the log lines for one notification,
+   * tracking the Solana runtime's own invoke/success/failed frames, and
+   * only treats a `bridge_fund` line as genuine when the bridge program
+   * itself is the currently-executing program (top of the invoke stack).
+   */
+  private extractBridgeFundEvents(logs: string[]): BridgeEvent[] {
+    const events: BridgeEvent[] = [];
+    const stack: string[] = [];
+    const invokeRe = /^Program (\S+) invoke \[\d+\]$/;
+    const endRe = /^Program (\S+) (?:success|failed:.*)$/;
+
+    for (const line of logs) {
+      const invokeMatch = line.match(invokeRe);
+      if (invokeMatch) {
+        stack.push(invokeMatch[1]);
+        continue;
+      }
+      const endMatch = line.match(endRe);
+      if (endMatch) {
+        const idx = stack.lastIndexOf(endMatch[1]);
+        if (idx !== -1) stack.splice(idx, 1);
+        continue;
+      }
+      if (!line.startsWith('Program log: bridge_fund:')) continue;
+
+      const executingProgram = stack[stack.length - 1];
+      if (executingProgram !== this.config.programId) {
+        this.rejectLine(
+          line,
+          `emitted while '${executingProgram ?? '<none>'}' was executing, not the bridge program`,
+        );
+        continue;
+      }
+
+      const event = this.decodeLine(line);
+      if (event) events.push(event);
+    }
+
+    return events;
+  }
+
+  /**
+   * Parse: "Program log: bridge_fund:<signature>:<target>:<asset>:<amount>"
+   *
+   * `<signature>` is the base58-encoded 64-byte Solana transaction
+   * signature. The payload hash / contract nonce need a 32-byte `txHash`
+   * (see `computeNonce`), so the signature is base58-decoded, validated to
+   * be exactly 64 bytes, and mapped to 32 bytes via `sha256(signature)`
+   * rather than being used as-is (which would silently truncate/garble a
+   * real signature into an arbitrary buffer).
    */
   private decodeLine(line: string): BridgeEvent | null {
     try {
       const payload = line.replace('Program log: bridge_fund:', '');
       const parts = payload.split(':');
       if (parts.length !== 4) return this.rejectLine(line, 'expected 4 fields');
-      const [txHash, target, asset, amount] = parts;
-      if (!txHash || !target || !asset || !amount) return this.rejectLine(line, 'missing field');
+      const [signature, target, asset, amount] = parts;
+      if (!signature || !target || !asset || !amount) return this.rejectLine(line, 'missing field');
       if (!/^\d+$/.test(amount)) return this.rejectLine(line, 'amount is not numeric');
+
+      let sigBytes: Buffer;
+      try {
+        sigBytes = base58Decode(signature);
+      } catch {
+        return this.rejectLine(line, 'signature is not valid base58');
+      }
+      if (sigBytes.length !== 64) {
+        return this.rejectLine(line, `signature must decode to 64 bytes, got ${sigBytes.length}`);
+      }
+      const txHash = crypto.createHash('sha256').update(sigBytes).digest('hex');
+
       return { chainId: this.config.chainId, txHash, target, asset, amount };
     } catch {
       return this.rejectLine(line, 'malformed line');
@@ -1168,13 +1328,20 @@ function encodedString(value: string): string {
   return word((hex.length / 2).toString(16)) + hex.padEnd(paddedLength, '0');
 }
 
-function makeAbiLog(target: string, asset: string, amount: bigint): any {
+function makeAbiLog(
+  target: string,
+  asset: string,
+  amount: bigint,
+  overrides: { transactionHash?: string; logIndex?: string } = {},
+): any {
   const targetTail = encodedString(target);
   const assetTail = encodedString(asset);
   const targetOffset = 32 * 3;
   const assetOffset = targetOffset + targetTail.length / 2;
   return {
-    topics: ['0x' + '00'.repeat(32), '0x' + 'cd'.repeat(32)],
+    topics: ['0x' + '00'.repeat(32)],
+    transactionHash: overrides.transactionHash ?? '0x' + 'cd'.repeat(32),
+    logIndex: overrides.logIndex ?? '0x0',
     data: '0x' + word(targetOffset.toString(16)) + word(assetOffset.toString(16)) + word(amount.toString(16)) + targetTail + assetTail,
   };
 }
@@ -1187,12 +1354,109 @@ export function test_eth_listener_decodes_realistic_abi_log_fixture(): void {
     chainId: 1,
   });
 
-  const event = (listener as any).decode(makeAbiLog('GDESTINATION', 'CASSET', 123456789n));
+  const log = makeAbiLog('GDESTINATION', 'CASSET', 123456789n);
+  const event = (listener as any).decode(log);
 
   assert(event !== null, 'valid ABI log should decode');
   assertEqual(event.target, 'GDESTINATION', 'target should decode');
   assertEqual(event.asset, 'CASSET', 'asset should decode');
   assertEqual(event.amount, '123456789', 'amount should decode');
+
+  const expectedTxHash = crypto
+    .createHash('sha256')
+    .update(Buffer.from((log.transactionHash as string).slice(2), 'hex'))
+    .update(Buffer.alloc(4)) // logIndex 0
+    .digest('hex');
+  assertEqual(event.txHash, expectedTxHash, 'txHash must be derived from log.transactionHash + logIndex');
+}
+
+/**
+ * Issue #665 regression: two BridgeFund logs in the SAME transaction (same
+ * transactionHash, different logIndex) must produce different replay keys,
+ * and the emitted event's own data must have no influence on txHash.
+ */
+export function test_eth_listener_derives_txhash_from_log_not_event_data(): void {
+  const listener = new EthChainListener({
+    rpcUrl: 'http://localhost',
+    bridgeContractAddress: '0xbridge',
+    eventTopic: '0xtopic',
+    chainId: 1,
+  });
+
+  const sameTx = '0x' + 'ab'.repeat(32);
+  const log0 = makeAbiLog('GDESTINATION', 'CASSET', 1n, { transactionHash: sameTx, logIndex: '0x0' });
+  const log1 = makeAbiLog('GDESTINATION', 'CASSET', 1n, { transactionHash: sameTx, logIndex: '0x1' });
+
+  const event0 = (listener as any).decode(log0);
+  const event1 = (listener as any).decode(log1);
+
+  assert(event0 !== null && event1 !== null, 'both logs should decode');
+  assert(
+    event0.txHash !== event1.txHash,
+    'two logs in the same transaction must not collapse to the same replay key',
+  );
+}
+
+/**
+ * Issue #664 regression: a JSON-RPC `error` (e.g. "block range too large")
+ * must be thrown, not silently treated as "no logs".
+ */
+export async function test_eth_listener_throws_on_rpc_error(): Promise<void> {
+  const originalFetch = (globalThis as any).fetch;
+  (globalThis as any).fetch = async () => ({
+    json: async () => ({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'block range too large' } }),
+  });
+  try {
+    const listener = new EthChainListener({
+      rpcUrl: 'http://localhost',
+      bridgeContractAddress: '0xbridge',
+      eventTopic: '0xtopic',
+      chainId: 1,
+    });
+    let threw = false;
+    try {
+      await (listener as any).rpcCall('eth_getLogs', [{}]);
+    } catch {
+      threw = true;
+    }
+    assert(threw, 'a JSON-RPC error result must be thrown, not swallowed as an empty log list');
+  } finally {
+    (globalThis as any).fetch = originalFetch;
+  }
+}
+
+/**
+ * Issue #664 regression: a single `getLogs()` call must never request more
+ * than `maxBlockRange` blocks, even when the checkpoint is far behind head.
+ */
+export async function test_eth_listener_bounds_block_range(): Promise<void> {
+  const originalFetch = (globalThis as any).fetch;
+  const requestedRanges: Array<{ fromBlock: string; toBlock: string }> = [];
+  (globalThis as any).fetch = async (_url: string, init: any) => {
+    const body = JSON.parse(init.body);
+    if (body.method === 'eth_blockNumber') {
+      return { json: async () => ({ jsonrpc: '2.0', id: 1, result: '0x' + (100_000).toString(16) }) };
+    }
+    requestedRanges.push(body.params[0]);
+    return { json: async () => ({ jsonrpc: '2.0', id: 1, result: [] }) };
+  };
+  try {
+    const listener = new EthChainListener({
+      rpcUrl: 'http://localhost',
+      bridgeContractAddress: '0xbridge',
+      eventTopic: '0xtopic',
+      chainId: 1,
+      maxBlockRange: 500,
+    });
+    (listener as any).fromBlock = '0x0';
+    const { queriedToBlock } = await (listener as any).getLogs();
+    assertEqual(queriedToBlock, 499, 'queried range must be capped at maxBlockRange - 1');
+    assertEqual(requestedRanges.length, 1, 'exactly one eth_getLogs call should be made');
+    assertEqual(requestedRanges[0].fromBlock, '0x0', 'fromBlock should be the checkpoint');
+    assertEqual(requestedRanges[0].toBlock, '0x' + (499).toString(16), 'toBlock must not exceed maxBlockRange');
+  } finally {
+    (globalThis as any).fetch = originalFetch;
+  }
 }
 
 export function test_eth_listener_rejects_malformed_truncated_log_payload(): void {
@@ -1203,7 +1467,12 @@ export function test_eth_listener_rejects_malformed_truncated_log_payload(): voi
     chainId: 1,
   });
 
-  const event = (listener as any).decode({ topics: ['0x' + '00'.repeat(32), '0x' + 'cd'.repeat(32)], data: '0x1234' });
+  const event = (listener as any).decode({
+    topics: ['0x' + '00'.repeat(32)],
+    transactionHash: '0x' + 'cd'.repeat(32),
+    logIndex: '0x0',
+    data: '0x1234',
+  });
 
   assertEqual(event, null, 'truncated ABI log should be rejected');
 }
@@ -1349,6 +1618,16 @@ export function test_solana_listener_rejects_bad_log_lines(): void {
   assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset'), null, 'missing amount should be rejected');
   assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset:100:extra'), null, 'extra colon should be rejected');
   assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset:not-a-number'), null, 'non-numeric amount should be rejected');
+  assertEqual(
+    decodeLine('Program log: bridge_fund:tx:target:asset:100'),
+    null,
+    'a signature that does not base58-decode to 64 bytes should be rejected',
+  );
+  assertEqual(
+    decodeLine('Program log: bridge_fund:not*base58!:target:asset:100'),
+    null,
+    'a signature with characters outside the base58 alphabet should be rejected',
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1597,6 +1876,10 @@ async function runRelayerSelfTests(): Promise<void> {
   await test_signer_url_node_signs_via_remote_call_not_local_key();
   await test_mixed_signer_url_and_private_key_nodes_meet_threshold();
   test_eth_listener_decodes_realistic_abi_log_fixture();
+  test_eth_listener_derives_txhash_from_log_not_event_data();
+  test_eth_listener_rejects_log_missing_transaction_hash();
+  await test_eth_listener_throws_on_rpc_error();
+  await test_eth_listener_bounds_block_range();
   test_eth_listener_rejects_malformed_truncated_log_payload();
   await test_eth_listener_resolves_latest_to_concrete_block_on_first_poll();
   await test_eth_listener_advances_from_block_even_with_no_logs();
