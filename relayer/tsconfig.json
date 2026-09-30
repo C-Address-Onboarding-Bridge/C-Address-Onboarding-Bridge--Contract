@@ -2,7 +2,9 @@
   "compilerOptions": {
     "target": "ES2022",
     "module": "commonjs",
-    "lib": ["ES2022"],
+    "lib": [
+      "ES2022"
+    ],
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
@@ -12,11 +14,13 @@
     "rootDir": ".",
     "declaration": true,
     "sourceMap": true,
-    "paths": {
-      "../sdk/src/*": ["../sdk/src/*"]
-    },
     "baseUrl": "."
   },
-  "include": ["index.ts"],
-  "exclude": ["node_modules", "dist"]
+  "include": [
+    "index.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
+  ]
 }
