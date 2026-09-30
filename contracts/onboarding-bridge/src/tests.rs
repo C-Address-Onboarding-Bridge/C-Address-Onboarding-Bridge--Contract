@@ -302,7 +302,6 @@ fn test_query_balance() {
     assert_eq!(bal, 1000i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_batch_empty() {
     let env = Env::default();
@@ -316,7 +315,11 @@ fn test_batch_empty() {
     let targets: Vec<Address> = Vec::new(&env);
     let amounts: Vec<i128> = Vec::new(&env);
 
-    bridge.batch_fund_c_address(&admin, &targets, &amounts, &token_id, &None, &None);
+    // #594: empty batch must be rejected rather than succeeding silently.
+    assert_eq!(
+        bridge.try_batch_fund_c_address(&admin, &targets, &amounts, &token_id, &None, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
 }
 
 #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
@@ -2721,20 +2724,22 @@ fn count_events_with_topic(env: &Env, bridge_id: &Address, topic: &str) -> u32 {
     count
 }
 
-/// Empty targets array — returns Ok immediately, no BatchCompleted event.
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
+/// Empty targets array — rejected with InvalidAmount (#594).
+/// Before the fix, an empty batch transferred nothing but still emitted
+/// BatchCompleted and minted loyalty rewards — a free loyalty farm.
 #[test]
-fn test_batch_empty_array_no_events() {
+fn test_batch_empty_array_rejected() {
     let env = Env::default();
     let (bridge, user, token_id, _) = setup_batch(&env);
-    let event_count_before = env.events().all().len();
 
     let targets: Vec<Address> = Vec::new(&env);
     let amounts: Vec<i128> = Vec::new(&env);
-    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None);
 
-    // No new events emitted — the contract returns early before even emitting BatchCompleted.
-    assert_eq!(env.events().all().len(), event_count_before);
+    // Must be rejected — no tokens should move, no events emitted.
+    assert_eq!(
+        bridge.try_batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
     // Source balance unchanged.
     assert_eq!(check_balance(&env, &token_id, &user), 1_000_000i128);
 }
@@ -3037,12 +3042,130 @@ fn test_batch_100_targets() {
     assert_eq!(check_balance(&env, &token_id, &user), 1_000_000i128); // original unchanged
 }
 
+/// #593: batch_fund_c_address must NOT mint loyalty tokens when every target
+/// is blocked (num_success == 0). Before the fix, loyalty was minted
+/// unconditionally, letting an attacker farm the reserve at zero cost.
+#[test]
+fn test_batch_all_blocked_no_loyalty_minted() {
+    let env = Env::default();
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let (admin, user, fee_collector) = create_test_users(&env);
+    init_token(&env, &token_id, &admin);
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1_000i128);
+
+    // Set up a separate loyalty token and fund the bridge reserve.
+    let loyalty_token_id = env.register(TestToken, ());
+    init_token(&env, &loyalty_token_id, &admin);
+    bridge.set_loyalty_token(&loyalty_token_id, &10i128);
+    mint_tokens(&env, &loyalty_token_id, &bridge_id, 1_000i128);
+
+    let t1 = Address::generate(&env);
+    let t2 = Address::generate(&env);
+    bridge.add_to_blocklist(&t1, &None);
+    bridge.add_to_blocklist(&t2, &None);
+
+    let targets = Vec::from_array(&env, [t1, t2]);
+    let amounts = Vec::from_array(&env, [400i128, 600i128]);
+    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None);
+
+    // No loyalty reward must be minted — user's loyalty balance stays at 0.
+    assert_eq!(check_balance(&env, &loyalty_token_id, &user), 0i128);
+    // Bridge loyalty reserve is untouched.
+    assert_eq!(check_balance(&env, &loyalty_token_id, &bridge_id), 1_000i128);
+    // Full refund of the funding token.
+    assert_eq!(check_balance(&env, &token_id, &user), 1_000i128);
+}
+
+/// #593: when at least one target succeeds, loyalty IS still minted.
+#[test]
+fn test_batch_partial_success_loyalty_minted() {
+    let env = Env::default();
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let (admin, user, fee_collector) = create_test_users(&env);
+    init_token(&env, &token_id, &admin);
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1_000i128);
+
+    let loyalty_token_id = env.register(TestToken, ());
+    init_token(&env, &loyalty_token_id, &admin);
+    bridge.set_loyalty_token(&loyalty_token_id, &10i128);
+    mint_tokens(&env, &loyalty_token_id, &bridge_id, 1_000i128);
+
+    let good = Address::generate(&env);
+    let blocked = Address::generate(&env);
+    bridge.add_to_blocklist(&blocked, &None);
+
+    let targets = Vec::from_array(&env, [good, blocked]);
+    let amounts = Vec::from_array(&env, [500i128, 500i128]);
+    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None);
+
+    // One success → loyalty must be minted.
+    assert_eq!(check_balance(&env, &loyalty_token_id, &user), 10i128);
+}
+
+/// #595: SourceBridgedVolume is now keyed per (source, asset) so that volume
+/// from different assets does not pollute each other's fee-tier lookup.
+#[test]
+fn test_fee_tiers_keyed_per_asset() {
+    let env = Env::default();
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let (admin, user, fee_collector) = create_test_users(&env);
+    init_token(&env, &token_id, &admin);
+
+    // Register a second token asset.
+    let token2_id = env.register(TestToken, ());
+    init_token(&env, &token2_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None); // default 1% fee
+    bridge.add_asset(&token_id, &None);
+    bridge.add_asset(&token2_id, &None);
+
+    // Set a tier: volume >= 1000 → 0 bps fee.
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier {
+            min_volume: 1_000i128,
+            max_volume: i128::MAX,
+            fee_bps: 0u32,
+        }],
+    );
+    bridge.set_fee_tiers(&tiers);
+
+    // Fund 1000 units of token_id — this should push token_id volume to tier.
+    mint_tokens(&env, &token_id, &user, 1_000i128);
+    let target1 = Address::generate(&env);
+    bridge.fund_c_address(&user, &target1, &token_id, &1_000i128, &None, &None);
+
+    // Query current tier for token_id — should be in the 0 bps tier.
+    let tier_token1 = bridge.query_current_tier(&user, &token_id);
+    assert_eq!(tier_token1.fee_bps, 0u32, "token_id volume should reach zero-fee tier");
+
+    // Query current tier for token2_id — volume is still 0, must NOT inherit token_id's volume.
+    let tier_token2 = bridge.query_current_tier(&user, &token2_id);
+    assert_eq!(
+        tier_token2.fee_bps, 100u32,
+        "token2_id volume is 0 — must not inherit token_id volume (#595)"
+    );
+
+    // Now fund 1000 of token2_id and confirm its tier updates independently.
+    mint_tokens(&env, &token2_id, &user, 1_000i128);
+    let target2 = Address::generate(&env);
+    bridge.fund_c_address(&user, &target2, &token2_id, &1_000i128, &None, &None);
+    let tier_token2_after = bridge.query_current_tier(&user, &token2_id);
+    assert_eq!(tier_token2_after.fee_bps, 0u32, "token2_id should now be in zero-fee tier");
+}
+
 /// Batches larger than MAX_BATCH_SIZE (100) must be rejected.
 #[test]
 fn test_batch_exceeds_max_size() {
     let env = Env::default();
     let (bridge, user, token_id, _) = setup_batch(&env);
-
     let mut targets: Vec<Address> = Vec::new(&env);
     let mut amounts: Vec<i128> = Vec::new(&env);
     for _ in 0..101 {
@@ -5812,7 +5935,7 @@ fn test_extend_source_persistent_ttl_extends_source_keys() {
         DataKey::SourceDailyLimit(user.clone(), token_id.clone()),
         DataKey::DailyUsage(user.clone(), token_id.clone(), day),
         DataKey::UserDeposit(user.clone(), token_id.clone()),
-        DataKey::SourceBridgedVolume(user.clone()),
+        DataKey::SourceBridgedVolume(user.clone(), token_id.clone()),
         DataKey::Nonce(user.clone()),
         DataKey::AuthNonce(user.clone()),
     ];
