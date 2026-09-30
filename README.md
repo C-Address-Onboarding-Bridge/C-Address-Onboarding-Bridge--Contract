@@ -608,7 +608,7 @@ async function withdrawAccumulatedFees() {
 
 **Access control**
 - The admin keypair can change fee rate, fee collector, and admin address. Treat it with the same care as a root credential.
-- Rotate admin and fee collector keys periodically. Use `sdk.setAdmin()` and `sdk.setFeeCollector()` to perform the rotation atomically.
+- Rotate admin and fee collector keys periodically. Prefer the two-step handover — `sdk.proposeNewAdmin()` / `sdk.acceptAdmin()` and `sdk.proposeNewFeeCollector()` / `sdk.acceptFeeCollector()` — over `sdk.setAdmin()` / `sdk.setFeeCollector()`, since the two-step path proves the new key is usable before the role is moved.
 
 **Contract upgrades**
 - Keep the deployed WASM hash in version control alongside the source. Before upgrading, verify the new WASM hash corresponds to audited source.
@@ -755,11 +755,19 @@ const adminKeypair = Keypair.fromSecret(process.env.ADMIN_SECRET!);
 // Update fee rate (max 1000 bps)
 await sdk.setFee(75, adminKeypair);
 
-// Rotate fee collector
-await sdk.setFeeCollector('G...newCollector', adminKeypair);
+// Rotate fee collector or admin: prefer the two-step propose/accept handover
+// below over setFeeCollector()/setAdmin(), which transfer the role
+// immediately and unrecoverably if the new key turns out to be unusable.
 
-// Transfer admin role
-await sdk.setAdmin('G...newAdmin', adminKeypair);
+// Propose + accept a fee-collector handover
+await sdk.proposeNewFeeCollector('G...newCollector', adminKeypair);
+const pendingCollector = await sdk.getPendingFeeCollector(); // 'G...newCollector'
+await sdk.acceptFeeCollector(newCollectorKeypair); // signed by the new collector
+
+// Propose + accept an admin handover
+await sdk.proposeNewAdmin('G...newAdmin', adminKeypair);
+const pendingAdmin = await sdk.getPendingAdmin(); // 'G...newAdmin'
+await sdk.acceptAdmin(newAdminKeypair); // signed by the new admin
 
 // Recover accidentally sent tokens
 await sdk.reclaimTokens(
