@@ -1,9 +1,10 @@
 use crate::events::IndexedEvent;
 use crate::webhook::{CreateSubscription, Subscription, WebhookDelivery};
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use std::str::FromStr;
 
 /// Raw column tuple for a `subscriptions` row, in SELECT order:
-/// id, url, event_type, asset_filter, source_filter, target_filter, active, created_at.
+/// id, url, event_type, asset_filter, source_filter, target_filter, active, secret, created_at.
 type SubscriptionRow = (
     String,
     String,
@@ -12,6 +13,7 @@ type SubscriptionRow = (
     Option<String>,
     Option<String>,
     bool,
+    String,
     String,
 );
 
@@ -28,96 +30,31 @@ type WebhookDeliveryRow = (
     String,
 );
 
+#[derive(Clone)]
 pub struct Database {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 impl Database {
     pub async fn new(url: &str) -> Self {
+        let options = SqliteConnectOptions::from_str(url)
+            .expect("Failed to parse database connection URL")
+            .foreign_keys(true)
+            .create_if_missing(true);
+
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(url)
+            .connect_with(options)
             .await
             .expect("Failed to connect to database");
         Self { pool }
     }
 
     pub async fn migrate(&self) {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS events (
-                id TEXT PRIMARY KEY,
-                event_type TEXT NOT NULL,
-                ledger_sequence INTEGER NOT NULL,
-                contract_id TEXT NOT NULL,
-                tx_hash TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                data TEXT NOT NULL
-            )",
-        )
-        .execute(&self.pool)
-        .await
-        .expect("Failed to create events table");
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS subscriptions (
-                id TEXT PRIMARY KEY,
-                url TEXT NOT NULL,
-                event_type TEXT,
-                asset_filter TEXT,
-                source_filter TEXT,
-                target_filter TEXT,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
-            )",
-        )
-        .execute(&self.pool)
-        .await
-        .expect("Failed to create subscriptions table");
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS webhook_deliveries (
-                id TEXT PRIMARY KEY,
-                subscription_id TEXT NOT NULL,
-                event_id TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                attempts INTEGER NOT NULL DEFAULT 0,
-                next_retry_at TEXT,
-                last_error TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (subscription_id) REFERENCES subscriptions(id),
-                FOREIGN KEY (event_id) REFERENCES events(id)
-            )",
-        )
-        .execute(&self.pool)
-        .await
-        .expect("Failed to create webhook_deliveries table");
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS indexer_state (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )",
-        )
-        .execute(&self.pool)
-        .await
-        .expect("Failed to create indexer_state table");
-
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)")
-            .execute(&self.pool)
+        sqlx::migrate!("./migrations")
+            .run(&self.pool)
             .await
-            .ok();
-
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_events_ledger ON events(ledger_sequence)")
-            .execute(&self.pool)
-            .await
-            .ok();
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_deliveries_status ON webhook_deliveries(status, next_retry_at)",
-        )
-        .execute(&self.pool)
-        .await
-        .ok();
+            .expect("Failed to run migrations");
     }
 
     pub async fn get_last_ledger(&self) -> Result<Option<i64>, sqlx::Error> {
@@ -160,6 +97,110 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Inserts `event` and, if it was newly indexed (not a re-poll of an
+    /// already-seen event), queues its webhook deliveries -- both inside one
+    /// SQLite transaction.
+    ///
+    /// `insert_event` and `queue_webhook_deliveries` used to run as two
+    /// separate statements. If the process died (or `queue_webhook_deliveries`
+    /// errored) between them, the event was committed but its deliveries were
+    /// not; the next poll would then see the event as a duplicate
+    /// (`insert_event` returns false) and never queue it, permanently losing
+    /// those webhooks. Doing both under one transaction means either both
+    /// happen or neither does. See #647.
+    pub async fn insert_event_and_queue_deliveries(
+        &self,
+        event: &IndexedEvent,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+
+        let data_str = serde_json::to_string(&event.data).unwrap_or_default();
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO events (id, event_type, ledger_sequence, contract_id, tx_hash, timestamp, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(&event.id)
+        .bind(&event.event_type)
+        .bind(event.ledger_sequence)
+        .bind(&event.contract_id)
+        .bind(&event.tx_hash)
+        .bind(&event.timestamp)
+        .bind(&data_str)
+        .execute(&mut tx)
+        .await?;
+        let inserted = result.rows_affected() > 0;
+
+        if inserted {
+            Self::queue_webhook_deliveries_tx(&mut tx, event).await?;
+        }
+
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    /// Same subscription-matching and insert logic as
+    /// [`Database::queue_webhook_deliveries`], but run against an open
+    /// transaction so callers can commit it atomically alongside another
+    /// write (see [`Database::insert_event_and_queue_deliveries`]).
+    async fn queue_webhook_deliveries_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        event: &IndexedEvent,
+    ) -> Result<(), sqlx::Error> {
+        let subs: Vec<SubscriptionRow> = sqlx::query_as(
+            "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, created_at
+             FROM subscriptions WHERE active = 1",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let data = &event.data;
+
+        for (sub_id, _url, event_type, asset_filter, source_filter, target_filter, _active, _created_at) in
+            subs
+        {
+            if let Some(ref et) = event_type {
+                if et != &event.event_type {
+                    continue;
+                }
+            }
+            if let Some(ref af) = asset_filter {
+                if let Some(asset) = data.get("asset").and_then(|v| v.as_str()) {
+                    if asset != af {
+                        continue;
+                    }
+                }
+            }
+            if let Some(ref sf) = source_filter {
+                if let Some(source) = data.get("source").and_then(|v| v.as_str()) {
+                    if source != sf {
+                        continue;
+                    }
+                }
+            }
+            if let Some(ref tf) = target_filter {
+                if let Some(target) = data.get("target").and_then(|v| v.as_str()) {
+                    if target != tf {
+                        continue;
+                    }
+                }
+            }
+
+            let delivery_id = uuid::Uuid::new_v4().to_string();
+            sqlx::query(
+                "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
+                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)",
+            )
+            .bind(&delivery_id)
+            .bind(&sub_id)
+            .bind(&event.id)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn list_events(
@@ -220,10 +261,11 @@ impl Database {
         req: CreateSubscription,
     ) -> Result<Subscription, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
+        let secret = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO subscriptions (id, url, event_type, asset_filter, source_filter, target_filter, active, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+            "INSERT INTO subscriptions (id, url, event_type, asset_filter, source_filter, target_filter, active, secret, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)",
         )
         .bind(&id)
         .bind(&req.url)
@@ -231,6 +273,7 @@ impl Database {
         .bind(&req.asset_filter)
         .bind(&req.source_filter)
         .bind(&req.target_filter)
+        .bind(&secret)
         .bind(&now)
         .execute(&self.pool)
         .await?;
@@ -243,6 +286,7 @@ impl Database {
             source_filter: req.source_filter,
             target_filter: req.target_filter,
             active: true,
+            secret,
             created_at: now,
         })
     }
@@ -250,7 +294,7 @@ impl Database {
     pub async fn list_subscriptions(&self) -> Result<Vec<Subscription>, sqlx::Error> {
         let rows: Vec<SubscriptionRow> =
             sqlx::query_as(
-                "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, created_at
+                "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, secret, created_at
                  FROM subscriptions WHERE active = 1",
             )
             .fetch_all(&self.pool)
@@ -267,6 +311,7 @@ impl Database {
                     source_filter,
                     target_filter,
                     active,
+                    secret,
                     created_at,
                 )| {
                     Subscription {
@@ -277,6 +322,7 @@ impl Database {
                         source_filter,
                         target_filter,
                         active,
+                        secret,
                         created_at,
                     }
                 },
@@ -304,25 +350,25 @@ impl Database {
             }
 
             let data = &event.data;
+
+            // #640: filters must fail CLOSED — if the event does not carry the
+            // filtered field at all, it does NOT match the subscription.
             if let Some(ref af) = sub.asset_filter {
-                if let Some(asset) = data.get("asset").and_then(|v| v.as_str()) {
-                    if asset != af {
-                        continue;
-                    }
+                match data.get("asset").and_then(|v| v.as_str()) {
+                    Some(asset) if asset == af => {} // field present and matches → keep going
+                    _ => continue,                   // missing or non-matching → skip
                 }
             }
             if let Some(ref sf) = sub.source_filter {
-                if let Some(source) = data.get("source").and_then(|v| v.as_str()) {
-                    if source != sf {
-                        continue;
-                    }
+                match data.get("source").and_then(|v| v.as_str()) {
+                    Some(source) if source == sf => {}
+                    _ => continue,
                 }
             }
             if let Some(ref tf) = sub.target_filter {
-                if let Some(target) = data.get("target").and_then(|v| v.as_str()) {
-                    if target != tf {
-                        continue;
-                    }
+                match data.get("target").and_then(|v| v.as_str()) {
+                    Some(target) if target == tf => {}
+                    _ => continue,
                 }
             }
 
@@ -431,6 +477,15 @@ impl Database {
         Ok(row.map(|(url,)| url))
     }
 
+    pub async fn get_subscription_secret(&self, id: &str) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT secret FROM subscriptions WHERE id = ?1 AND active = 1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(secret,)| secret))
+    }
+
     pub async fn get_event_by_id(&self, id: &str) -> Result<Option<IndexedEvent>, sqlx::Error> {
         let row: Option<(String, String, i64, String, String, String, String)> = sqlx::query_as(
             "SELECT id, event_type, ledger_sequence, contract_id, tx_hash, timestamp, data
@@ -441,6 +496,82 @@ impl Database {
         .await?;
 
         Ok(row.map(row_to_event))
+    }
+
+    pub async fn list_deliveries(
+        &self,
+        status: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<WebhookDelivery>, sqlx::Error> {
+        let rows: Vec<WebhookDeliveryRow> = match status {
+            Some(s) => {
+                sqlx::query_as(
+                    "SELECT id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at
+                     FROM webhook_deliveries
+                     WHERE status = ?1
+                     ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+                )
+                .bind(s)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at
+                     FROM webhook_deliveries
+                     ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
+                )
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    subscription_id,
+                    event_id,
+                    status,
+                    attempts,
+                    next_retry_at,
+                    last_error,
+                    created_at,
+                )| {
+                    WebhookDelivery {
+                        id,
+                        subscription_id,
+                        event_id,
+                        status,
+                        attempts,
+                        next_retry_at,
+                        last_error,
+                        created_at,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    pub async fn retry_delivery(&self, id: &str) -> Result<bool, sqlx::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE webhook_deliveries
+             SET status = 'pending', next_retry_at = ?2, attempts = 0
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn get_stats(&self) -> Result<serde_json::Value, sqlx::Error> {
@@ -455,6 +586,11 @@ impl Database {
 
         let pending_deliveries: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'pending'")
+                .fetch_one(&self.pool)
+                .await?;
+
+        let dead_deliveries: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'dead'")
                 .fetch_one(&self.pool)
                 .await?;
 
@@ -475,6 +611,7 @@ impl Database {
             "total_events": total_events.0,
             "active_subscriptions": total_subs.0,
             "pending_deliveries": pending_deliveries.0,
+            "dead_deliveries": dead_deliveries.0,
             "last_indexed_ledger": last_ledger,
             "event_counts": counts,
         }))
@@ -577,7 +714,7 @@ mod tests {
         use crate::poller::parse_contract_event_for_test;
 
         let raw = serde_json::json!({
-            "topic": ["CAddressFunded", "GSOURCE", "CTARGET"],
+            "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
             "ledger": 42,
             "txHash": "abcdef1234567890",
             "createdAt": "2024-01-01T00:00:00Z",
@@ -594,6 +731,53 @@ mod tests {
         assert_eq!(
             id1, id2,
             "parse_contract_event must produce the same id for the same input"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #656 - Versioned migrations and foreign keys
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_migrate_empty_in_memory_database() {
+        let db = Database::new("sqlite::memory:").await;
+        db.migrate().await;
+
+        let tables: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                .fetch_all(&db.pool)
+                .await
+                .expect("Failed to query sqlite_master");
+
+        let names: Vec<String> = tables.into_iter().map(|(n,)| n).collect();
+        assert!(names.contains(&"events".to_string()));
+        assert!(names.contains(&"subscriptions".to_string()));
+        assert!(names.contains(&"webhook_deliveries".to_string()));
+        assert!(names.contains(&"indexer_state".to_string()));
+        assert!(names.contains(&"_sqlx_migrations".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_foreign_keys_are_enforced() {
+        let db = Database::new("sqlite::memory:").await;
+        db.migrate().await;
+
+        let fk_enabled: (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+            .fetch_one(&db.pool)
+            .await
+            .expect("Failed to query PRAGMA foreign_keys");
+        assert_eq!(fk_enabled.0, 1, "PRAGMA foreign_keys must be enabled");
+
+        let result = sqlx::query(
+            "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, created_at)
+             VALUES ('del-fk-test', 'sub-nonexistent', 'evt-nonexistent', 'pending', 0, '2024-01-01T00:00:00Z')",
+        )
+        .execute(&db.pool)
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Foreign key constraint violation must return error"
         );
     }
 }

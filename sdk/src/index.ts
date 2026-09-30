@@ -89,7 +89,10 @@ export type {
   Unsubscribe,
   CAddressFundedEvent,
   FeesWithdrawnEvent,
-  AdminChangedEvent,
+  AdminProposedEvent,
+  AdminTransferredEvent,
+  FeeCollectorTransferProposedEvent,
+  FeeCollectorTransferredEvent,
   MetaFundExecutedEvent,
   GenericBridgeEvent,
 } from './events';

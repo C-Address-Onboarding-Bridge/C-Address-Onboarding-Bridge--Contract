@@ -891,6 +891,20 @@ export interface FundCAddressWithSwapOptions {
    * Each pool must implement `swap(min_amount_out: i128, to: Address) → i128`.
    */
   swapRoute: string[];
+
+  /**
+   * Optional sequential nonce for replay protection.
+   * Pass `undefined` to skip nonce enforcement (standard Stellar tx
+   * replay protection via sequence number applies).
+   */
+  nonce?: string | number | bigint;
+
+  /**
+   * Optional Unix timestamp (seconds) deadline.
+   * If provided and the ledger timestamp exceeds this value, the
+   * contract will reject the transaction.
+   */
+  deadline?: string | number | bigint;
 }
 
 // ---------------------------------------------------------------------------
@@ -899,11 +913,10 @@ export interface FundCAddressWithSwapOptions {
 
 /**
  * A single page of results returned by list-querying SDK methods such as
- * {@link OnboardingBridgeSDK.getWhitelistedAssets},
- * {@link OnboardingBridgeSDK.getBlocklistedAddresses}, etc.
+ * {@link OnboardingBridgeSDK.getWhitelistedAssets}.
  *
- * Because Soroban contracts return full vectors, pagination is performed
- * client-side. The `cursor` is an opaque base64-encoded offset token.
+ * Pagination is performed on-chain: the `cursor` is an opaque base64-encoded
+ * offset token that the contract call resumes from.
  *
  * @typeParam T — the element type for items in this page.
  *
