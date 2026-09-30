@@ -1,6 +1,7 @@
 use crate::events::IndexedEvent;
 use crate::webhook::{CreateSubscription, Subscription, WebhookDelivery};
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use std::str::FromStr;
 
 /// Raw column tuple for a `subscriptions` row, in SELECT order:
 /// id, url, event_type, asset_filter, source_filter, target_filter, active, created_at.
@@ -29,95 +30,29 @@ type WebhookDeliveryRow = (
 );
 
 pub struct Database {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 impl Database {
     pub async fn new(url: &str) -> Self {
+        let options = SqliteConnectOptions::from_str(url)
+            .expect("Failed to parse database connection URL")
+            .foreign_keys(true)
+            .create_if_missing(true);
+
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(url)
+            .connect_with(options)
             .await
             .expect("Failed to connect to database");
         Self { pool }
     }
 
     pub async fn migrate(&self) {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS events (
-                id TEXT PRIMARY KEY,
-                event_type TEXT NOT NULL,
-                ledger_sequence INTEGER NOT NULL,
-                contract_id TEXT NOT NULL,
-                tx_hash TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                data TEXT NOT NULL
-            )",
-        )
-        .execute(&self.pool)
-        .await
-        .expect("Failed to create events table");
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS subscriptions (
-                id TEXT PRIMARY KEY,
-                url TEXT NOT NULL,
-                event_type TEXT,
-                asset_filter TEXT,
-                source_filter TEXT,
-                target_filter TEXT,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
-            )",
-        )
-        .execute(&self.pool)
-        .await
-        .expect("Failed to create subscriptions table");
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS webhook_deliveries (
-                id TEXT PRIMARY KEY,
-                subscription_id TEXT NOT NULL,
-                event_id TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                attempts INTEGER NOT NULL DEFAULT 0,
-                next_retry_at TEXT,
-                last_error TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (subscription_id) REFERENCES subscriptions(id),
-                FOREIGN KEY (event_id) REFERENCES events(id)
-            )",
-        )
-        .execute(&self.pool)
-        .await
-        .expect("Failed to create webhook_deliveries table");
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS indexer_state (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )",
-        )
-        .execute(&self.pool)
-        .await
-        .expect("Failed to create indexer_state table");
-
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)")
-            .execute(&self.pool)
+        sqlx::migrate!("./migrations")
+            .run(&self.pool)
             .await
-            .ok();
-
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_events_ledger ON events(ledger_sequence)")
-            .execute(&self.pool)
-            .await
-            .ok();
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_deliveries_status ON webhook_deliveries(status, next_retry_at)",
-        )
-        .execute(&self.pool)
-        .await
-        .ok();
+            .expect("Failed to run migrations");
     }
 
     pub async fn get_last_ledger(&self) -> Result<Option<i64>, sqlx::Error> {
@@ -594,6 +529,53 @@ mod tests {
         assert_eq!(
             id1, id2,
             "parse_contract_event must produce the same id for the same input"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #656 - Versioned migrations and foreign keys
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_migrate_empty_in_memory_database() {
+        let db = Database::new("sqlite::memory:").await;
+        db.migrate().await;
+
+        let tables: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                .fetch_all(&db.pool)
+                .await
+                .expect("Failed to query sqlite_master");
+
+        let names: Vec<String> = tables.into_iter().map(|(n,)| n).collect();
+        assert!(names.contains(&"events".to_string()));
+        assert!(names.contains(&"subscriptions".to_string()));
+        assert!(names.contains(&"webhook_deliveries".to_string()));
+        assert!(names.contains(&"indexer_state".to_string()));
+        assert!(names.contains(&"_sqlx_migrations".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_foreign_keys_are_enforced() {
+        let db = Database::new("sqlite::memory:").await;
+        db.migrate().await;
+
+        let fk_enabled: (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+            .fetch_one(&db.pool)
+            .await
+            .expect("Failed to query PRAGMA foreign_keys");
+        assert_eq!(fk_enabled.0, 1, "PRAGMA foreign_keys must be enabled");
+
+        let result = sqlx::query(
+            "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, created_at)
+             VALUES ('del-fk-test', 'sub-nonexistent', 'evt-nonexistent', 'pending', 0, '2024-01-01T00:00:00Z')",
+        )
+        .execute(&db.pool)
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Foreign key constraint violation must return error"
         );
     }
 }

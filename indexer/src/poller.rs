@@ -176,10 +176,7 @@ fn parse_contract_event(
         return None;
     }
 
-    let decoded_topics: Vec<serde_json::Value> = topics
-        .iter()
-        .map(decode_rpc_scval)
-        .collect();
+    let decoded_topics: Vec<serde_json::Value> = topics.iter().map(decode_rpc_scval).collect();
     let first_topic = decoded_topics
         .first()
         .and_then(serde_json::Value::as_str)
@@ -286,7 +283,7 @@ fn decode_scval(bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
         6 => Ok(serde_json::Value::Number(
             (read_u64(bytes, &mut cursor)? as i64).into(),
         )),
-        13 | 14 | 15 => {
+        13..=15 => {
             let raw = read_opaque(bytes, &mut cursor)?;
             if kind == 15 || kind == 14 {
                 Ok(serde_json::Value::String(
@@ -311,14 +308,26 @@ fn decode_scval(bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
 
 fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, &'static str> {
     let end = cursor.checked_add(4).ok_or("cursor overflow")?;
-    let value = u32::from_be_bytes(bytes.get(*cursor..end).ok_or("truncated u32")?.try_into().map_err(|_| "invalid u32")?);
+    let value = u32::from_be_bytes(
+        bytes
+            .get(*cursor..end)
+            .ok_or("truncated u32")?
+            .try_into()
+            .map_err(|_| "invalid u32")?,
+    );
     *cursor = end;
     Ok(value)
 }
 
 fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, &'static str> {
     let end = cursor.checked_add(8).ok_or("cursor overflow")?;
-    let value = u64::from_be_bytes(bytes.get(*cursor..end).ok_or("truncated u64")?.try_into().map_err(|_| "invalid u64")?);
+    let value = u64::from_be_bytes(
+        bytes
+            .get(*cursor..end)
+            .ok_or("truncated u64")?
+            .try_into()
+            .map_err(|_| "invalid u64")?,
+    );
     *cursor = end;
     Ok(value)
 }
@@ -465,9 +474,9 @@ mod tests {
     #[test]
     fn test_parse_decodes_rpc_scval_topics_and_value() {
         let raw = raw_event(serde_json::json!([
-            "AAAADwAAAA5DQWRkcmVzc0Z1bmQ=",
-            "AAAADwAAAAtHU09VUkNFQQ==",
-            "AAAADwAAAAtDVEFSR0VUQQ=="
+            "AAAADwAAAA5DQWRkcmVzc0Z1bmRlZAAA",
+            "AAAADwAAAAtHU09VUkNFQUREUgA=",
+            "AAAADwAAAAtDVEFSR0VUQUREUgA="
         ]));
         let raw = serde_json::json!({
             "topic": raw["topic"],

@@ -47,6 +47,41 @@ pub struct AppState {
     pub lookback_ledgers: i64,
 }
 
+pub fn public_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/api/events", get(list_events))
+        .route("/api/events/:event_type", get(list_events_by_type))
+        .route("/api/stats", get(get_stats))
+        .route("/health", get(health))
+}
+
+pub fn protected_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route(
+            "/api/subscriptions",
+            get(list_subscriptions).post(create_subscription),
+        )
+        .route("/api/subscriptions/:id", delete(delete_subscription))
+        .route("/api/replay", post(replay_events))
+}
+
+pub fn build_app(state: Arc<AppState>) -> Router {
+    // SECURITY TODO(next-bounty): protected routes were meant to
+    // sit behind a `require_api_key` middleware that was never written.
+    let protected = protected_routes();
+    // .route_layer(middleware::from_fn_with_state(
+    //     Arc::clone(&state),
+    //     require_api_key,
+    // ));
+
+    // TODO(next-bounty): `build_cors_layer()` was never written either; tower-http
+    // is still a dependency, so add the helper and restore this layer.
+    public_routes()
+        .merge(protected)
+        // .layer(build_cors_layer())
+        .with_state(state)
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -354,12 +389,13 @@ mod auth_tests {
             lookback_ledgers: poller::DEFAULT_LOOKBACK_LEDGERS,
         });
 
-        let public_routes = Router::new()
-            .route("/api/subscriptions", get(list_subscriptions))
-            .route("/health", get(health));
+        let public_routes = Router::new().route("/health", get(health));
 
         let protected_routes = Router::new()
-            .route("/api/subscriptions", post(create_subscription))
+            .route(
+                "/api/subscriptions",
+                get(list_subscriptions).post(create_subscription),
+            )
             .route("/api/subscriptions/:id", delete(delete_subscription))
             .route("/api/replay", post(replay_events))
             .route_layer(middleware::from_fn_with_state(
@@ -395,6 +431,28 @@ mod auth_tests {
             response.status(),
             StatusCode::UNAUTHORIZED,
             "POST /api/subscriptions without token must return 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_get_subscriptions_is_rejected() {
+        let app = test_app("secret-key").await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/subscriptions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "GET /api/subscriptions without token must return 401"
         );
     }
 
@@ -549,5 +607,72 @@ mod auth_tests {
         assert_ne!(sha256_hex("hello"), sha256_hex("world"));
         // Output is 64 hex chars (32 bytes).
         assert_eq!(sha256_hex("test").len(), 64);
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn mock_app_state() -> Arc<AppState> {
+        let database = db::Database::new("sqlite::memory:").await;
+        database.migrate().await;
+
+        Arc::new(AppState {
+            db: database,
+            rpc_url: "http://localhost".to_string(),
+            contract_id: "C_TEST".to_string(),
+            webhook_client: reqwest::Client::new(),
+            lookback_ledgers: 0,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_get_subscriptions_not_in_public_routes() {
+        let state = mock_app_state().await;
+        let app = public_routes().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/subscriptions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "GET /api/subscriptions must not be exposed on public_routes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_subscriptions_is_in_protected_routes() {
+        let state = mock_app_state().await;
+        let app = protected_routes().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/subscriptions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "GET /api/subscriptions must be routed under protected_routes"
+        );
     }
 }
