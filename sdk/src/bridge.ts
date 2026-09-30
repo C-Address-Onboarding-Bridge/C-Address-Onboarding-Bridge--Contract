@@ -502,6 +502,8 @@ export class OnboardingBridgeSDK {
         amount: options.amount,
         releaseTime: options.releaseTime,
         cliffTime: options.cliffTime ?? 0,
+        nonce: options.nonce,
+        deadline: options.deadline,
       },
       async () => {
         try {
@@ -516,6 +518,13 @@ export class OnboardingBridgeSDK {
             () => this.provider.getAccount(options.source),
           );
 
+          const nonceScVal = options.nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+          const deadlineScVal = options.deadline === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
+
           const tx = new TransactionBuilder(sourceAccount, {
             fee: BASE_FEE,
             networkPassphrase: this.networkPassphrase,
@@ -529,6 +538,8 @@ export class OnboardingBridgeSDK {
                 nativeToScVal(BigInt(options.amount), { type: 'i128' }),
                 nativeToScVal(BigInt(options.releaseTime), { type: 'u64' }),
                 nativeToScVal(BigInt(options.cliffTime ?? 0), { type: 'u64' }),
+                nonceScVal,
+                deadlineScVal,
               ),
             )
             .setTimeout(this.config.timeout ?? 30)
@@ -706,6 +717,8 @@ export class OnboardingBridgeSDK {
         targetAsset: options.targetAsset,
         sourceAmount: options.sourceAmount,
         minTargetAmount: options.minTargetAmount,
+        nonce: options.nonce,
+        deadline: options.deadline,
       },
       async () => {
         try {
@@ -721,6 +734,13 @@ export class OnboardingBridgeSDK {
             { address: options.source },
             () => this.provider.getAccount(options.source),
           );
+
+          const nonceScVal = options.nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+          const deadlineScVal = options.deadline === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
 
           const tx = new TransactionBuilder(sourceAccount, {
             fee: BASE_FEE,
@@ -738,6 +758,8 @@ export class OnboardingBridgeSDK {
                   options.minTargetAmount,
                   options.swapRoute,
                 ]),
+                nonceScVal,
+                deadlineScVal,
               ),
             )
             .setTimeout(this.config.timeout ?? 30)
@@ -3015,6 +3037,13 @@ export class OnboardingBridgeSDK {
     const dummySource = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
     const dummyAccount = new Account(dummySource, '0');
 
+    const nonceScVal = options.nonce === undefined
+      ? xdr.ScVal.scvVoid()
+      : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+    const deadlineScVal = options.deadline === undefined
+      ? xdr.ScVal.scvVoid()
+      : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
+
     const tx = new TransactionBuilder(dummyAccount, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
@@ -3028,6 +3057,8 @@ export class OnboardingBridgeSDK {
             options.asset,
             options.amount,
           ]),
+          nonceScVal,
+          deadlineScVal,
         ),
       )
       .setTimeout(this.config.timeout ?? 30)

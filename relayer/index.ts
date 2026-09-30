@@ -1739,6 +1739,24 @@ export function test_signature_from_known_seed_is_deterministic(): void {
  *
  * Exported so it can be unit-tested independently of process.exit.
  */
+/**
+ * Parse a required chain-id environment variable as a positive integer.
+ * Used for `ETH_CHAIN_ID` / `SOLANA_CHAIN_ID`, which are only required when
+ * the corresponding listener is enabled (Issue: chain ids were previously
+ * hard-coded to 1 / 101, which silently signs testnet events as mainnet).
+ */
+export function requireChainId(env: NodeJS.ProcessEnv, name: string): number {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === '') {
+    throw new Error(`${name} is required but was not set`);
+  }
+  const chainId = parseInt(raw.trim(), 10);
+  if (!Number.isInteger(chainId) || chainId < 0) {
+    throw new Error(`${name} must be a non-negative integer, got: "${raw}"`);
+  }
+  return chainId;
+}
+
 export function validateEnv(env: NodeJS.ProcessEnv = process.env): {
   contractId: string;
   rpcUrl: string;
@@ -1849,6 +1867,28 @@ export function test_zero_threshold_is_rejected(): void {
   }
 }
 
+export function test_missing_chain_id_throws(): void {
+  try {
+    requireChainId({}, 'ETH_CHAIN_ID');
+    throw new Error('Expected requireChainId to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('ETH_CHAIN_ID'), `expected ETH_CHAIN_ID error, got: ${e.message}`);
+  }
+}
+
+export function test_non_numeric_chain_id_throws(): void {
+  try {
+    requireChainId({ SOLANA_CHAIN_ID: 'not-a-number' }, 'SOLANA_CHAIN_ID');
+    throw new Error('Expected requireChainId to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('SOLANA_CHAIN_ID'), `expected SOLANA_CHAIN_ID error, got: ${e.message}`);
+  }
+}
+
+export function test_valid_chain_id_parses_correctly(): void {
+  assertEqual(requireChainId({ ETH_CHAIN_ID: '11155111' }, 'ETH_CHAIN_ID'), 11155111, 'ETH_CHAIN_ID');
+}
+
 export function test_valid_env_parses_correctly(): void {
   const env: NodeJS.ProcessEnv = {
     CONTRACT_ID: 'C_TEST',
@@ -1896,6 +1936,10 @@ async function runRelayerSelfTests(): Promise<void> {
   test_nan_threshold_is_rejected();
   test_zero_threshold_is_rejected();
   test_valid_env_parses_correctly();
+  // Issue #672: chain ids must come from env, not be hard-coded to 1/101.
+  test_missing_chain_id_throws();
+  test_non_numeric_chain_id_throws();
+  test_valid_chain_id_parses_correctly();
   console.log('[relayer] self-tests passed');
 }
 
@@ -1933,7 +1977,7 @@ if (require.main === module) {
         ...(process.env.SOLANA_WS_URL ? [new SolanaChainListener({
           wsUrl: process.env.SOLANA_WS_URL,
           programId: process.env.SOLANA_PROGRAM_ID!,
-          chainId: 101,
+          chainId: requireChainId(process.env, 'SOLANA_CHAIN_ID'),
         })] : []),
       ],
     });
