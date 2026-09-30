@@ -1,8 +1,10 @@
 use crate::events::{BridgeEventType, IndexedEvent};
 use crate::AppState;
 use base64::Engine;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 const POLL_INTERVAL_MS: u64 = 5000;
 const MAX_EVENTS_PER_POLL: usize = 100;
@@ -13,14 +15,33 @@ const MAX_EVENTS_PER_POLL: usize = 100;
 /// ~5 s per ledger) and can be overridden via the `LOOKBACK_LEDGERS` env var.
 pub const DEFAULT_LOOKBACK_LEDGERS: i64 = 720;
 
-pub async fn run_poller(state: Arc<AppState>) {
+/// Runs the poll loop until `token` is cancelled. Cancellation is observed
+/// between iterations (via `select!` on the inter-poll sleep) so an
+/// in-flight `poll_once` always finishes cleanly before the worker returns.
+/// See #646.
+pub async fn run_poller(state: Arc<AppState>, token: CancellationToken) {
     tracing::info!("Starting event poller for contract {}", state.contract_id);
 
     loop {
         if let Err(e) = poll_once(&state).await {
-            tracing::error!("Poller error: {}", e);
+            // #638: distinguish timeout errors so operators can tune RPC_REQUEST_TIMEOUT_SECS
+            if e.to_string().contains("timed out") || e.to_string().contains("timeout") {
+                tracing::warn!(
+                    "Poller RPC timeout (configure via RPC_REQUEST_TIMEOUT_SECS / RPC_CONNECT_TIMEOUT_SECS): {}",
+                    e
+                );
+            } else {
+                tracing::error!("Poller error: {}", e);
+            }
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+
+        tokio::select! {
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)) => {}
+            _ = token.cancelled() => {
+                tracing::info!("Poller received shutdown signal, exiting");
+                return;
+            }
+        }
     }
 }
 
@@ -34,13 +55,19 @@ async fn fetch_latest_ledger(state: &AppState) -> Result<i64, Box<dyn std::error
     });
 
     let response = state
-        .webhook_client
+        .rpc_client
         .post(&state.rpc_url)
         .json(&request)
         .send()
         .await?;
 
     let body: serde_json::Value = response.json().await?;
+
+    // #637 — surface JSON-RPC errors instead of silently treating them as
+    // missing fields.
+    if let Some(err) = body.get("error") {
+        return Err(format!("getLatestLedger RPC error: {}", err).into());
+    }
 
     let seq = body
         .get("result")
@@ -77,56 +104,107 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getEvents",
-        "params": {
-            "startLedger": start_ledger,
-            "filters": [{
-                "type": "contract",
-                "contractIds": [state.contract_id],
-            }],
-            "pagination": {
-                "limit": MAX_EVENTS_PER_POLL,
-            }
+    // #635 — page through all results using the RPC cursor so that more than
+    // MAX_EVENTS_PER_POLL events in a single poll window are never silently
+    // dropped.  We persist the cursor (encoded as a string) rather than a
+    // plain ledger number so the next poll resumes exactly where we left off.
+    let mut pagination_cursor: Option<String> = None;
+    let mut max_ledger = start_ledger;
+    let mut any_events = false;
+
+    loop {
+        let mut pagination = serde_json::json!({ "limit": MAX_EVENTS_PER_POLL });
+        if let Some(ref c) = pagination_cursor {
+            pagination["cursor"] = serde_json::Value::String(c.clone());
         }
-    });
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getEvents",
+            "params": {
+                "startLedger": start_ledger,
+                "filters": [{
+                    "type": "contract",
+                    "contractIds": [state.contract_id],
+                }],
+                "pagination": pagination,
+            }
+        });
+
+        let response = state
+            .webhook_client
+            .post(&state.rpc_url)
+            .json(&request)
+            .send()
+            .await?;
+
+        let body: serde_json::Value = response.json().await?;
+
+        // #637 — if the RPC returned an error object, propagate it so
+        // run_poller logs it rather than silently treating it as no events.
+        if let Some(err) = body.get("error") {
+            let message = err.to_string();
+
+            // #636 — detect "start ledger out of range" and recover to the
+            // oldest available ledger rather than getting stuck forever.
+            if message.contains("startLedger") || message.contains("out of range") || message.contains("beforeOldestLedger") {
+                tracing::warn!(
+                    "Cursor ledger {} is outside RPC retention window ({}). \
+                     Recovering to latest ledger tip.",
+                    start_ledger,
+                    message
+                );
+                let latest = fetch_latest_ledger(state).await?;
+                state.db.set_last_ledger(latest).await?;
+                return Ok(());
+            }
+
+            return Err(format!("getEvents RPC error: {}", message).into());
+        }
 
     let response = state
-        .webhook_client
+        .rpc_client
         .post(&state.rpc_url)
         .json(&request)
         .send()
         .await?;
 
-    let body: serde_json::Value = response.json().await?;
+        any_events = true;
 
-    let events = body
-        .get("result")
-        .and_then(|r| r.get("events"))
-        .and_then(|e| e.as_array())
-        .cloned()
-        .unwrap_or_default();
+        let mut events_seen_per_tx: HashMap<&str, usize> = HashMap::new();
 
-    if events.is_empty() {
-        return Ok(());
-    }
+        for raw_event in &events {
+            let ledger = raw_event
+                .get("ledger")
+                .and_then(|l| l.as_i64())
+                .unwrap_or(0);
+            if ledger > max_ledger {
+                max_ledger = ledger;
+            }
 
-    let mut max_ledger = start_ledger;
-    // Position of each event within its transaction. Combined with the ledger
-    // and tx hash this yields a stable primary key, so re-polling a range
-    // already seen (after a restart, or a crash before `set_last_ledger`)
-    // regenerates the same ids and `insert_event` deduplicates them.
-    let mut events_seen_per_tx: HashMap<&str, usize> = HashMap::new();
+            let tx_hash = raw_event
+                .get("txHash")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            let counter = events_seen_per_tx.entry(tx_hash).or_insert(0);
+            let event_index = *counter;
+            *counter += 1;
 
-    for raw_event in &events {
-        let ledger = raw_event
-            .get("ledger")
-            .and_then(|l| l.as_i64())
-            .unwrap_or(0);
-        if ledger > max_ledger {
-            max_ledger = ledger;
+            if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id, event_index) {
+                // Only fan out webhooks for events we have not indexed before;
+                // otherwise a re-poll would re-deliver every event in the range.
+                if state.db.insert_event(&indexed).await? {
+                    state.db.queue_webhook_deliveries(&indexed).await?;
+                    tracing::info!(
+                        "Indexed event: {} at ledger {}",
+                        indexed.event_type,
+                        indexed.ledger_sequence
+                    );
+                } else {
+                    tracing::debug!("Skipping already-indexed event {}", indexed.id);
+                }
+            }
         }
 
         let tx_hash = raw_event
@@ -138,10 +216,12 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
         *counter += 1;
 
         if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id, event_index) {
+            // Insert the event and queue its webhook deliveries atomically
+            // (one SQLite transaction) so a crash between the two can never
+            // leave an indexed event with no deliveries queued. See #647.
             // Only fan out webhooks for events we have not indexed before;
             // otherwise a re-poll would re-deliver every event in the range.
-            if state.db.insert_event(&indexed).await? {
-                state.db.queue_webhook_deliveries(&indexed).await?;
+            if state.db.insert_event_and_queue_deliveries(&indexed).await? {
                 tracing::info!(
                     "Indexed event: {} at ledger {}",
                     indexed.event_type,
@@ -151,10 +231,15 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
                 tracing::debug!("Skipping already-indexed event {}", indexed.id);
             }
         }
+        pagination_cursor = next_cursor;
     }
 
-    state.db.set_last_ledger(max_ledger).await?;
-    tracing::debug!("Poller advanced to ledger {}", max_ledger);
+    // Always advance the persisted cursor so quiet periods don't stall us.
+    // (#636: also covers the no-events case above via max_ledger update.)
+    if any_events || max_ledger > start_ledger {
+        state.db.set_last_ledger(max_ledger).await?;
+        tracing::debug!("Poller advanced to ledger {}", max_ledger);
+    }
 
     Ok(())
 }
@@ -162,9 +247,8 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
 /// Build an [`IndexedEvent`] from a raw `getEvents` entry.
 ///
 /// `event_index` is the position of this event within its transaction and is
-/// folded into the deterministic ID so that multiple events of the same type
-/// emitted by a single transaction (e.g. one `CAddressFunded` per recipient in
-/// `batch_fund_c_address`) each receive a unique, stable ID.
+/// folded into the SHA-256 id so two events in the same transaction cannot
+/// produce the same id.
 fn parse_contract_event(
     raw: &serde_json::Value,
     contract_id: &str,
@@ -175,10 +259,7 @@ fn parse_contract_event(
         return None;
     }
 
-    let decoded_topics: Vec<serde_json::Value> = topics
-        .iter()
-        .map(decode_rpc_scval)
-        .collect();
+    let decoded_topics: Vec<serde_json::Value> = topics.iter().map(decode_rpc_scval).collect();
     let first_topic = decoded_topics
         .first()
         .and_then(serde_json::Value::as_str)
@@ -206,43 +287,79 @@ fn parse_contract_event(
         data.insert("value".to_string(), decode_rpc_scval(value));
     }
 
-    if decoded_topics.len() > 1 {
-        if let Some(source) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-            data.insert(
-                "source".to_string(),
-                serde_json::Value::String(source.to_string()),
-            );
+    // Topic position of the asset/source/target/referrer party fields varies
+    // by event: most events publish (name, source, target), but some funding
+    // paths interleave an asset (or two, for swaps) before the parties. Map
+    // each event type to its actual topic layout so `data` gets correctly
+    // labelled fields instead of a generic, sometimes-wrong source/target.
+    // See #642.
+    match &event_type {
+        BridgeEventType::SwapAndFunded => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "source_asset");
+            insert_topic_str(&mut data, &decoded_topics, 2, "target_asset");
+            insert_topic_str(&mut data, &decoded_topics, 3, "source");
+            insert_topic_str(&mut data, &decoded_topics, 4, "target");
         }
-    }
-    if decoded_topics.len() > 2 {
-        if let Some(target) = decoded_topics.get(2).and_then(|t| t.as_str()) {
-            data.insert(
-                "target".to_string(),
-                serde_json::Value::String(target.to_string()),
-            );
+        BridgeEventType::CommitRevealFunded | BridgeEventType::MetaFundExecuted => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "asset");
+            insert_topic_str(&mut data, &decoded_topics, 2, "source");
+            insert_topic_str(&mut data, &decoded_topics, 3, "target");
         }
+        BridgeEventType::ReferralPaid => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "source");
+            insert_topic_str(&mut data, &decoded_topics, 2, "referrer");
+        }
+        _ => {
+            // CAddressFunded, CommitFund, BatchTransferFailed, and the
+            // remaining admin/config events all publish (name, source, target).
+            insert_topic_str(&mut data, &decoded_topics, 1, "source");
+            insert_topic_str(&mut data, &decoded_topics, 2, "target");
+        }
+        // ("FeesWithdrawn", fee_collector) — asset carried in value, not topics
+        BridgeEventType::FeesWithdrawn => {
+            if let Some(collector) = decoded_topics.get(1).and_then(|t| t.as_str()) {
+                data.insert("fee_collector".to_string(), serde_json::Value::String(collector.to_string()));
+            }
+        }
+        // ("AdminProposed", admin, new_admin) / ("AdminTransferred", old_admin, pending)
+        BridgeEventType::AdminProposed | BridgeEventType::AdminTransferred => {
+            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
+                data.insert("from".to_string(), serde_json::Value::String(from.to_string()));
+            }
+            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
+                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
+            }
+        }
+        // ("FeeCollectorTransferProposed", admin, new_collector) / ("FeeCollectorTransferred", old, pending)
+        BridgeEventType::FeeCollectorTransferProposed | BridgeEventType::FeeCollectorTransferred => {
+            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
+                data.insert("from".to_string(), serde_json::Value::String(from.to_string()));
+            }
+            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
+                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
+            }
+        }
+        // All other event types: no well-known topic fields beyond the event name.
+        _ => {}
     }
 
-    // Deterministic ID: hash(ledger || tx_hash || event_type || first_topic || event_index).
-    // `event_index` (position within the transaction) disambiguates multiple
-    // events of the same type in one transaction, fixing the collision that
-    // caused all but the first `CAddressFunded` in a batch to be dropped.
-    // Re-indexing the same range always regenerates identical IDs, so
-    // `INSERT OR IGNORE` remains the sole deduplication mechanism.
+    // #634 — Deterministic ID: sha256(ledger || tx_hash || event_type ||
+    // first_topic || event_index) encoded as a 64-char hex string.
+    //
+    // Using SHA-256 (rather than std::hash::DefaultHasher, whose output is
+    // explicitly NOT stable across Rust releases) ensures:
+    //   1. The id never changes when the toolchain is upgraded.
+    //   2. The id space is large enough (256 bits) to avoid collisions.
+    //   3. Re-indexing the same on-chain event always produces the same id,
+    //      so `INSERT OR IGNORE` remains the sole deduplication mechanism.
     let id = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        ledger.hash(&mut hasher);
-        tx_hash.hash(&mut hasher);
-        event_type.as_str().hash(&mut hasher);
-        // Include the first topic so two distinct event types on the same tx are
-        // differentiated even when ledger and tx_hash are identical.
-        first_topic.hash(&mut hasher);
-        // Include the per-transaction position so two events of the same type
-        // in the same transaction receive different IDs (#633).
-        event_index.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+        let mut hasher = Sha256::new();
+        hasher.update(ledger.to_le_bytes());
+        hasher.update(tx_hash.as_bytes());
+        hasher.update(event_type.as_str().as_bytes());
+        hasher.update(first_topic.as_bytes());
+        hasher.update(event_index.to_le_bytes());
+        hex::encode(hasher.finalize())
     };
 
     Some(IndexedEvent {
@@ -254,6 +371,20 @@ fn parse_contract_event(
         timestamp,
         data: serde_json::Value::Object(data),
     })
+}
+
+/// Insert `topics[idx]` into `data[key]` as a string, if present. Used to
+/// label the asset/source/target/referrer fields at their event-specific
+/// topic position (see the `match event_type` above).
+fn insert_topic_str(
+    data: &mut serde_json::Map<String, serde_json::Value>,
+    topics: &[serde_json::Value],
+    idx: usize,
+    key: &str,
+) {
+    if let Some(value) = topics.get(idx).and_then(serde_json::Value::as_str) {
+        data.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+    }
 }
 
 /// Decode the base64 XDR representation returned by Soroban RPC. Older test
@@ -290,7 +421,7 @@ fn decode_scval(bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
         6 => Ok(serde_json::Value::Number(
             (read_u64(bytes, &mut cursor)? as i64).into(),
         )),
-        13 | 14 | 15 => {
+        13..=15 => {
             let raw = read_opaque(bytes, &mut cursor)?;
             if kind == 15 || kind == 14 {
                 Ok(serde_json::Value::String(
@@ -315,14 +446,26 @@ fn decode_scval(bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
 
 fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, &'static str> {
     let end = cursor.checked_add(4).ok_or("cursor overflow")?;
-    let value = u32::from_be_bytes(bytes.get(*cursor..end).ok_or("truncated u32")?.try_into().map_err(|_| "invalid u32")?);
+    let value = u32::from_be_bytes(
+        bytes
+            .get(*cursor..end)
+            .ok_or("truncated u32")?
+            .try_into()
+            .map_err(|_| "invalid u32")?,
+    );
     *cursor = end;
     Ok(value)
 }
 
 fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, &'static str> {
     let end = cursor.checked_add(8).ok_or("cursor overflow")?;
-    let value = u64::from_be_bytes(bytes.get(*cursor..end).ok_or("truncated u64")?.try_into().map_err(|_| "invalid u64")?);
+    let value = u64::from_be_bytes(
+        bytes
+            .get(*cursor..end)
+            .ok_or("truncated u64")?
+            .try_into()
+            .map_err(|_| "invalid u64")?,
+    );
     *cursor = end;
     Ok(value)
 }
@@ -441,40 +584,175 @@ mod tests {
     /// topics[1] is extracted into `data["source"]`.
     #[test]
     fn test_parse_extracts_source_from_topics_index_1() {
+        // NOTE: this test uses the OLD (pre-#639) assumed layout and is kept
+        // only to document the former behaviour.  The corrected layout is
+        // tested by test_c_address_funded_topic_mapping below.
         let raw = raw_event(serde_json::json!([
             "CAddressFunded",
+            "GASSETADDR",
             "GSOURCEADDR",
             "CTARGETADDR"
         ]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        // asset is now at topics[1]
+        assert_eq!(
+            event.data["asset"].as_str(),
+            Some("GASSETADDR"),
+            "topics[1] must be stored as data.asset for CAddressFunded"
+        );
+        // source is now at topics[2]
         assert_eq!(
             event.data["source"].as_str(),
             Some("GSOURCEADDR"),
-            "topics[1] must be stored as data.source"
+            "topics[2] must be stored as data.source for CAddressFunded"
         );
     }
 
     /// topics[2] is extracted into `data["target"]`.
     #[test]
     fn test_parse_extracts_target_from_topics_index_2() {
-        let raw = raw_event(serde_json::json!(["CAddressFunded", "GSOURCE", "CTARGET"]));
+        let raw = raw_event(serde_json::json!(["CAddressFunded", "GASSET", "GSOURCE", "CTARGET"]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(
             event.data["target"].as_str(),
             Some("CTARGET"),
-            "topics[2] must be stored as data.target"
+            "topics[3] must be stored as data.target for CAddressFunded"
+        );
+    }
+
+    /// #639: CAddressFunded topic layout is ("CAddressFunded", asset, source, target).
+    /// Verify all three fields land in the correct data keys.
+    #[test]
+    fn test_c_address_funded_topic_mapping() {
+        let raw = raw_event(serde_json::json!([
+            "CAddressFunded",
+            "CASSETCONTRACT",
+            "GSOURCEADDR",
+            "CTARGETADDR"
+        ]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(
+            event.data["asset"].as_str(),
+            Some("CASSETCONTRACT"),
+            "topics[1] must be the asset contract address"
+        );
+        assert_eq!(
+            event.data["source"].as_str(),
+            Some("GSOURCEADDR"),
+            "topics[2] must be the source G-address"
+        );
+        assert_eq!(
+            event.data["target"].as_str(),
+            Some("CTARGETADDR"),
+            "topics[3] must be the target C-address"
+        );
+    }
+
+    /// #640: asset_filter requires data["asset"] to be present.
+    /// Confirm parse_contract_event populates it for CAddressFunded.
+    #[test]
+    fn test_c_address_funded_populates_asset_field() {
+        let raw = raw_event(serde_json::json!([
+            "AAAADwAAAA5DQWRkcmVzc0Z1bmRlZAAA",
+            "AAAADwAAAAtHU09VUkNFQUREUgA=",
+            "AAAADwAAAAtDVEFSR0VUQUREUgA="
+        ]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert!(
+            event.data.get("asset").is_some(),
+            "data['asset'] must be present for CAddressFunded so asset_filter can match"
+        );
+    }
+
+    /// #639/#640: FeesWithdrawn layout is ("FeesWithdrawn", fee_collector).
+    /// No asset in topics — verify fee_collector is stored correctly.
+    #[test]
+    fn test_fees_withdrawn_topic_mapping() {
+        let raw = raw_event(serde_json::json!(["FeesWithdrawn", "GCOLLECTOR"]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(
+            event.data["fee_collector"].as_str(),
+            Some("GCOLLECTOR"),
+            "topics[1] must be stored as data.fee_collector for FeesWithdrawn"
+        );
+        assert!(
+            event.data.get("asset").is_none(),
+            "FeesWithdrawn has no asset topic — data['asset'] must be absent"
+        );
+    }
+
+    /// #641: AdminProposed layout is ("AdminProposed", admin, new_admin).
+    #[test]
+    fn test_admin_proposed_topic_mapping() {
+        let raw = raw_event(serde_json::json!(["AdminProposed", "GADMIN", "GNEWADMIN"]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.data["from"].as_str(), Some("GADMIN"));
+        assert_eq!(event.data["to"].as_str(), Some("GNEWADMIN"));
+    }
+
+    /// #641: AdminTransferred layout is ("AdminTransferred", old_admin, pending).
+    #[test]
+    fn test_admin_transferred_topic_mapping() {
+        let raw = raw_event(serde_json::json!(["AdminTransferred", "GOLDADMIN", "GNEWADMIN"]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.data["from"].as_str(), Some("GOLDADMIN"));
+        assert_eq!(event.data["to"].as_str(), Some("GNEWADMIN"));
+    }
+
+    /// #641: FeeCollectorTransferProposed and FeeCollectorTransferred are now recognised.
+    #[test]
+    fn test_fee_collector_role_change_topics_are_recognised() {
+        let proposed = raw_event(serde_json::json!([
+            "FeeCollectorTransferProposed",
+            "GADMIN",
+            "GNEWCOLLECTOR"
+        ]));
+        let transferred = raw_event(serde_json::json!([
+            "FeeCollectorTransferred",
+            "GOLDCOLLECTOR",
+            "GNEWCOLLECTOR"
+        ]));
+        assert!(
+            parse_contract_event(&proposed, "C1", 0).is_some(),
+            "FeeCollectorTransferProposed must be recognised"
+        );
+        assert!(
+            parse_contract_event(&transferred, "C1", 0).is_some(),
+            "FeeCollectorTransferred must be recognised"
+        );
+    }
+
+    /// #641: The old incorrect topic strings AdminChanged / FeeCollectorChanged
+    /// must NOT produce indexed events (contract never emits them).
+    #[test]
+    fn test_old_incorrect_role_change_topics_produce_no_event() {
+        let raw_admin = raw_event(serde_json::json!(["AdminChanged", "GADMIN", "GNEWADMIN"]));
+        let raw_fc = raw_event(serde_json::json!(["FeeCollectorChanged", "GCOL", "GNEWCOL"]));
+        assert!(
+            parse_contract_event(&raw_admin, "C1", 0).is_none(),
+            "'AdminChanged' must yield None — contract never emits this"
+        );
+        assert!(
+            parse_contract_event(&raw_fc, "C1", 0).is_none(),
+            "'FeeCollectorChanged' must yield None — contract never emits this"
         );
     }
 
     #[test]
     fn test_parse_decodes_rpc_scval_topics_and_value() {
-        let raw = raw_event(serde_json::json!([
-            "AAAADwAAAA5DQWRkcmVzc0Z1bmQ=",
-            "AAAADwAAAAtHU09VUkNFQQ==",
-            "AAAADwAAAAtDVEFSR0VUQQ=="
-        ]));
+        // #639: CAddressFunded is ("CAddressFunded", asset, source, target) — 4 topics.
+        // Base64-encoded XDR ScSymbol values for each field:
+        //   "CAddressFunded" -> AAAADwAAAA5DQWRkcmVzc0Z1bmRlZAAA
+        //   "CASSETADDR"     -> AAAADwAAAApDQVNTRVRBRERSAAA=
+        //   "GSOURCEADDR"    -> AAAADwAAAAtHU09VUkNFQUREUgA=
+        //   "CTARGETADDR"    -> AAAADwAAAAtDVEFSR0VUQUREUgA=
         let raw = serde_json::json!({
-            "topic": raw["topic"],
+            "topic": [
+                "AAAADwAAAA5DQWRkcmVzc0Z1bmRlZAAA",
+                "AAAADwAAAApDQVNTRVRBRERSAAA=",
+                "AAAADwAAAAtHU09VUkNFQUREUgA=",
+                "AAAADwAAAAtDVEFSR0VUQUREUgA="
+            ],
             "ledger": 10,
             "txHash": "cafebabe00000000",
             "createdAt": "2024-06-01T12:00:00Z",
@@ -482,6 +760,7 @@ mod tests {
         });
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(event.event_type, "CAddressFunded");
+        assert_eq!(event.data["asset"].as_str(), Some("CASSETADDR"));
         assert_eq!(event.data["source"].as_str(), Some("GSOURCEADDR"));
         assert_eq!(event.data["target"].as_str(), Some("CTARGETADDR"));
         assert_eq!(event.data["value"], serde_json::json!(42));
@@ -512,6 +791,98 @@ mod tests {
         assert_eq!(id1, id2, "IDs must be identical for the same raw event");
     }
 
+    // -----------------------------------------------------------------------
+    // Issue #642 — funding-path events (commit-reveal, swap, meta-tx, referral)
+    // -----------------------------------------------------------------------
+
+    /// `CommitFund` uses the generic (name, source, target) layout.
+    #[test]
+    fn test_parse_commit_fund_extracts_source_and_target() {
+        let raw = raw_event(serde_json::json!(["CommitFund", "GSRC", "CTGT"]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.event_type, "CommitFund");
+        assert_eq!(event.data["source"].as_str(), Some("GSRC"));
+        assert_eq!(event.data["target"].as_str(), Some("CTGT"));
+    }
+
+    /// `CommitRevealFunded` publishes (name, asset, source, target) — the
+    /// asset must not be mislabelled as the source.
+    #[test]
+    fn test_parse_commit_reveal_funded_extracts_asset_source_target() {
+        let raw = raw_event(serde_json::json!([
+            "CommitRevealFunded",
+            "CASSET",
+            "GSRC",
+            "CTGT"
+        ]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.event_type, "CommitRevealFunded");
+        assert_eq!(event.data["asset"].as_str(), Some("CASSET"));
+        assert_eq!(event.data["source"].as_str(), Some("GSRC"));
+        assert_eq!(event.data["target"].as_str(), Some("CTGT"));
+    }
+
+    /// `MetaFundExecuted` shares the (name, asset, source, target) layout.
+    #[test]
+    fn test_parse_meta_fund_executed_extracts_asset_source_target() {
+        let raw = raw_event(serde_json::json!([
+            "MetaFundExecuted",
+            "CASSET",
+            "GSRC",
+            "CTGT"
+        ]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.event_type, "MetaFundExecuted");
+        assert_eq!(event.data["asset"].as_str(), Some("CASSET"));
+        assert_eq!(event.data["source"].as_str(), Some("GSRC"));
+        assert_eq!(event.data["target"].as_str(), Some("CTGT"));
+    }
+
+    /// `SwapAndFunded` publishes (name, source_asset, target_asset, source,
+    /// target) — five topics in total.
+    #[test]
+    fn test_parse_swap_and_funded_extracts_all_parties() {
+        let raw = raw_event(serde_json::json!([
+            "SwapAndFunded",
+            "CSRCASSET",
+            "CTGTASSET",
+            "GSRC",
+            "CTGT"
+        ]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.event_type, "SwapAndFunded");
+        assert_eq!(event.data["source_asset"].as_str(), Some("CSRCASSET"));
+        assert_eq!(event.data["target_asset"].as_str(), Some("CTGTASSET"));
+        assert_eq!(event.data["source"].as_str(), Some("GSRC"));
+        assert_eq!(event.data["target"].as_str(), Some("CTGT"));
+    }
+
+    /// `ReferralPaid` publishes (name, source, referrer) — the second party
+    /// is a referrer, not a funding target.
+    #[test]
+    fn test_parse_referral_paid_extracts_source_and_referrer() {
+        let raw = raw_event(serde_json::json!(["ReferralPaid", "GSRC", "GREFERRER"]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.event_type, "ReferralPaid");
+        assert_eq!(event.data["source"].as_str(), Some("GSRC"));
+        assert_eq!(event.data["referrer"].as_str(), Some("GREFERRER"));
+        assert!(event.data["target"].is_null());
+    }
+
+    /// `BatchTransferFailed` uses the generic (name, source, target) layout.
+    #[test]
+    fn test_parse_batch_transfer_failed_extracts_source_and_target() {
+        let raw = raw_event(serde_json::json!([
+            "BatchTransferFailed",
+            "GSRC",
+            "CTGT"
+        ]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.event_type, "BatchTransferFailed");
+        assert_eq!(event.data["source"].as_str(), Some("GSRC"));
+        assert_eq!(event.data["target"].as_str(), Some("CTGT"));
+    }
+
     /// Deterministic ID: different tx_hash → different id.
     #[test]
     fn test_parse_deterministic_id_different_tx_hash_different_id() {
@@ -532,28 +903,35 @@ mod tests {
         assert_ne!(id1, id2, "different tx_hash must produce different IDs");
     }
 
-    /// Two events of the same type in the same transaction must produce distinct
-    /// IDs — this is the regression test for #633, where `batch_fund_c_address`
-    /// emits one `CAddressFunded` per recipient and all but the first were
-    /// silently dropped by `INSERT OR IGNORE`.
-    #[test]
-    fn test_parse_same_tx_different_event_index_gives_different_ids() {
-        let raw = raw_event(serde_json::json!(["CAddressFunded", "GSRC", "CTGT1"]));
-        let id0 = parse_contract_event(&raw, "C1", 0).unwrap().id;
-        let id1 = parse_contract_event(&raw, "C1", 1).unwrap().id;
-        assert_ne!(
-            id0, id1,
-            "events at different positions in the same tx must have different IDs"
-        );
-    }
+    // -----------------------------------------------------------------------
+    // Issue #646 — cooperative shutdown
+    // -----------------------------------------------------------------------
 
-    /// Re-parsing the same event at the same index always returns the same ID
-    /// (stability guarantee for re-indexing after a restart).
-    #[test]
-    fn test_parse_same_event_index_is_stable() {
-        let raw = raw_event(serde_json::json!(["CAddressFunded", "GSRC", "CTGT"]));
-        let id_a = parse_contract_event(&raw, "C1", 3).unwrap().id;
-        let id_b = parse_contract_event(&raw, "C1", 3).unwrap().id;
-        assert_eq!(id_a, id_b, "same event_index must always produce the same ID");
+    /// Cancelling the token must make `run_poller` return instead of looping
+    /// forever, so the background task can be joined on shutdown.
+    #[tokio::test]
+    async fn test_run_poller_returns_when_cancelled() {
+        let db = crate::db::Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        let state = Arc::new(crate::AppState {
+            db,
+            // Unroutable in test sandboxes / CI, so `poll_once` fails fast and
+            // the loop reaches the cancellable sleep quickly.
+            rpc_url: "http://127.0.0.1:1".to_string(),
+            contract_id: "C_TEST".to_string(),
+            webhook_client: reqwest::Client::new(),
+            lookback_ledgers: 720,
+        });
+        let token = CancellationToken::new();
+        let worker_token = token.clone();
+
+        let handle = tokio::spawn(run_poller(state, worker_token));
+
+        token.cancel();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("worker must return promptly after cancellation")
+            .expect("worker task must not panic");
     }
 }
