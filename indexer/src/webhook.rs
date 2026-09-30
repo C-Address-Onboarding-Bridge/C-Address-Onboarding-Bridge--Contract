@@ -1,10 +1,15 @@
 use crate::AppState;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
+pub const MAX_CONCURRENT_DELIVERIES: usize = 10;
 const MAX_RETRIES: i32 = 5;
 const DELIVERY_INTERVAL_MS: u64 = 2000;
+
+type HmacSha256 = Hmac<Sha256>;
 
 // ---------------------------------------------------------------------------
 // SSRF protection — URL validation
@@ -45,6 +50,9 @@ fn is_private_or_reserved(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_documentation()
                 || v4.is_unspecified()
+                || v4.is_multicast()   // 224.0.0.0/4
+                // 0.0.0.0/8 — This network
+                || (v4.octets()[0] == 0)
                 // 100.64.0.0/10 — CGNAT / shared address space
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
                 // 192.0.0.0/24 — IETF protocol assignments
@@ -57,12 +65,35 @@ fn is_private_or_reserved(ip: IpAddr) -> bool {
         IpAddr::V6(v6) => {
             v6.is_loopback()
                 || v6.is_unspecified()
+                || v6.is_multicast()   // ff00::/8
                 // fc00::/7 — unique local
                 || ((v6.segments()[0] & 0xFE00) == 0xFC00)
                 // fe80::/10 — link-local
                 || ((v6.segments()[0] & 0xFFC0) == 0xFE80)
         }
     }
+}
+
+/// Check if an IPv6 address is IPv4-mapped or compatible, and if so, return the
+/// embedded IPv4 address. Otherwise return the original IPv6 address.
+fn unwrap_ipv4_mapped_or_compatible(ip: IpAddr) -> IpAddr {
+    if let IpAddr::V6(v6) = ip {
+        if let Some(v4) = v6.to_ipv4_mapped() {
+            return IpAddr::V4(v4);
+        }
+    }
+    ip
+}
+
+/// Generate the signature for a webhook payload.
+/// Signature is: sha256=<hex(hmac_sha256(secret, timestamp + "." + body))>
+fn generate_signature(secret: &str, timestamp: &str, body: &str) -> String {
+    let message = format!("{}.{}", timestamp, body);
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .expect("HMAC can take key of any size");
+    mac.update(message.as_bytes());
+    let result = mac.finalize();
+    format!("sha256={}", hex::encode(result.into_bytes()))
 }
 
 /// Validate a webhook URL at subscription-registration time.
@@ -72,10 +103,9 @@ fn is_private_or_reserved(ip: IpAddr) -> bool {
 ///   2. Scheme must be `http` or `https`.
 ///   3. Host must not resolve to a private/link-local/reserved IP address.
 ///
-/// DNS resolution is intentionally synchronous (via `std::net::ToSocketAddrs`)
-/// so this can be called from a synchronous context without an async executor.
-/// For a production service you would use `tokio::net::lookup_host` instead.
-pub fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
+/// DNS resolution is performed asynchronously using `tokio::net::lookup_host`
+/// to avoid blocking async handlers.
+pub async fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
     // --- 1. Parse the URL ---------------------------------------------------
     let parsed = url::Url::parse(url).map_err(|e| UrlValidationError::InvalidUrl(e.to_string()))?;
 
@@ -95,8 +125,9 @@ pub fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
         .trim_matches(|c| c == '[' || c == ']')
         .parse::<IpAddr>()
     {
-        if is_private_or_reserved(ip) {
-            return Err(UrlValidationError::PrivateOrReservedHost(ip.to_string()));
+        let unwrapped_ip = unwrap_ipv4_mapped_or_compatible(ip);
+        if is_private_or_reserved(unwrapped_ip) {
+            return Err(UrlValidationError::PrivateOrReservedHost(unwrapped_ip.to_string()));
         }
         return Ok(());
     }
@@ -110,13 +141,15 @@ pub fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
     }
 
     let port = parsed.port_or_known_default().unwrap_or(80);
-    let addrs = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
         .map_err(|_| UrlValidationError::UnresolvableHost(host.to_string()))?;
 
     for addr in addrs {
-        if is_private_or_reserved(addr.ip()) {
+        let ip = unwrap_ipv4_mapped_or_compatible(addr.ip());
+        if is_private_or_reserved(ip) {
             return Err(UrlValidationError::PrivateOrReservedHost(
-                addr.ip().to_string(),
+                ip.to_string(),
             ));
         }
     }
@@ -142,6 +175,8 @@ pub struct Subscription {
     pub source_filter: Option<String>,
     pub target_filter: Option<String>,
     pub active: bool,
+    /// Secret used to sign webhook payloads. Returned only at creation.
+    pub secret: String,
     pub created_at: String,
 }
 
@@ -179,78 +214,150 @@ struct WebhookPayload {
     data: serde_json::Value,
 }
 
-pub async fn run_delivery_worker(state: Arc<AppState>) {
+/// Runs the delivery loop until `token` is cancelled. Cancellation is
+/// observed between iterations (via `select!` on the inter-poll sleep) so an
+/// in-flight `deliver_pending` always finishes cleanly before the worker
+/// returns. See #646.
+pub async fn run_delivery_worker(state: Arc<AppState>, token: CancellationToken) {
     tracing::info!("Starting webhook delivery worker");
 
     loop {
         if let Err(e) = deliver_pending(&state).await {
             tracing::error!("Delivery worker error: {}", e);
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(DELIVERY_INTERVAL_MS)).await;
+
+        tokio::select! {
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(DELIVERY_INTERVAL_MS)) => {}
+            _ = token.cancelled() => {
+                tracing::info!("Webhook delivery worker received shutdown signal, exiting");
+                return;
+            }
+        }
     }
 }
 
-async fn deliver_pending(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
+/// Deliver pending webhook notifications concurrently with a bounded limit.
+///
+/// Per-subscription ordering guarantee:
+/// Deliveries are partitioned by `subscription_id` so that deliveries destined
+/// for the same subscription endpoint are executed sequentially in FIFO order
+/// (by `created_at`). Different subscriptions are delivered concurrently up to
+/// `MAX_CONCURRENT_DELIVERIES`, ensuring that a slow or hanging endpoint does
+/// not block or delay deliveries to other subscribers.
+pub async fn deliver_pending(
+    state: &AppState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let deliveries = state.db.get_pending_deliveries().await?;
+    if deliveries.is_empty() {
+        return Ok(());
+    }
+
+    // Partition deliveries by subscription_id to maintain FIFO ordering per subscriber.
+    // Preserve the order of first encounter (already ordered by created_at ASC).
+    let mut sub_order: Vec<String> = Vec::new();
+    let mut sub_queues: std::collections::HashMap<String, Vec<WebhookDelivery>> =
+        std::collections::HashMap::new();
 
     for delivery in deliveries {
-        let url = match state
-            .db
-            .get_subscription_url(&delivery.subscription_id)
-            .await?
-        {
-            Some(url) => url,
-            None => {
-                state
-                    .db
-                    .mark_delivery_dead(&delivery.id, "subscription not found or inactive")
-                    .await?;
-                continue;
-            }
-        };
+        if !sub_queues.contains_key(&delivery.subscription_id) {
+            sub_order.push(delivery.subscription_id.clone());
+        }
+        sub_queues
+            .entry(delivery.subscription_id.clone())
+            .or_default()
+            .push(delivery);
+    }
 
-        let event = match state.db.get_event_by_id(&delivery.event_id).await? {
-            Some(e) => e,
-            None => {
-                state
-                    .db
-                    .mark_delivery_dead(&delivery.id, "event not found")
-                    .await?;
-                continue;
-            }
-        };
+    let queues: Vec<Vec<WebhookDelivery>> = sub_order
+        .into_iter()
+        .filter_map(|sub_id| sub_queues.remove(&sub_id))
+        .collect();
 
-        let payload = WebhookPayload {
-            delivery_id: delivery.id.clone(),
-            attempt: delivery.attempts + 1,
-            event_id: event.id,
-            event_type: event.event_type,
-            ledger_sequence: event.ledger_sequence,
-            contract_id: event.contract_id,
-            tx_hash: event.tx_hash,
-            timestamp: event.timestamp,
-            data: event.data,
-        };
+    futures::stream::iter(queues)
+        .map(|queue| deliver_subscription_queue(state, queue))
+        .buffer_unordered(MAX_CONCURRENT_DELIVERIES)
+        .collect::<Vec<()>>()
+        .await;
 
-        match state
-            .webhook_client
-            .post(&url)
-            .json(&payload)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                state.db.mark_delivery_success(&delivery.id).await?;
-                tracing::debug!("Delivered webhook {} to {}", delivery.id, url);
-            }
-            Ok(resp) => {
-                let error = format!("HTTP {}", resp.status());
-                handle_retry(state, &delivery, &error).await?;
-            }
-            Err(e) => {
-                handle_retry(state, &delivery, &e.to_string()).await?;
-            }
+    Ok(())
+}
+
+async fn deliver_subscription_queue(state: &AppState, deliveries: Vec<WebhookDelivery>) {
+    for delivery in deliveries {
+        if let Err(e) = deliver_single(state, &delivery).await {
+            tracing::error!(
+                "Failed to process delivery {} for subscription {}: {}",
+                delivery.id,
+                delivery.subscription_id,
+                e
+            );
+            // On error delivering to this subscription, abort remaining queued deliveries
+            // for this subscription in this poll cycle to preserve FIFO ordering.
+            break;
+        }
+    }
+}
+
+async fn deliver_single(
+    state: &AppState,
+    delivery: &WebhookDelivery,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let url = match state
+        .db
+        .get_subscription_url(&delivery.subscription_id)
+        .await?
+    {
+        Some(url) => url,
+        None => {
+            state
+                .db
+                .mark_delivery_dead(&delivery.id, "subscription not found or inactive")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let event = match state.db.get_event_by_id(&delivery.event_id).await? {
+        Some(e) => e,
+        None => {
+            state
+                .db
+                .mark_delivery_dead(&delivery.id, "event not found")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let payload = WebhookPayload {
+        delivery_id: delivery.id.clone(),
+        attempt: delivery.attempts + 1,
+        event_id: event.id,
+        event_type: event.event_type,
+        ledger_sequence: event.ledger_sequence,
+        contract_id: event.contract_id,
+        tx_hash: event.tx_hash,
+        timestamp: event.timestamp,
+        data: event.data,
+    };
+
+    match state
+        .webhook_client
+        .post(&url)
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            state.db.mark_delivery_success(&delivery.id).await?;
+            tracing::debug!("Delivered webhook {} to {}", delivery.id, url);
+        }
+        Ok(resp) => {
+            let error = format!("HTTP {}", resp.status());
+            handle_retry(state, delivery, &error).await?;
+        }
+        Err(e) => {
+            handle_retry(state, delivery, &e.to_string()).await?;
         }
     }
 
@@ -261,7 +368,7 @@ async fn handle_retry(
     state: &AppState,
     delivery: &WebhookDelivery,
     error: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let attempt = delivery.attempts + 1;
     if attempt >= MAX_RETRIES {
         state.db.mark_delivery_dead(&delivery.id, error).await?;
@@ -307,19 +414,19 @@ mod tests {
     // Issue 1 — SSRF URL validation
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_valid_https_url_is_accepted() {
-        assert!(validate_webhook_url("https://example.com/hook").is_ok());
+    #[tokio::test]
+    async fn test_valid_https_url_is_accepted() {
+        assert!(validate_webhook_url("https://example.com/hook").await.is_ok());
     }
 
-    #[test]
-    fn test_valid_http_url_is_accepted() {
-        assert!(validate_webhook_url("http://example.com/hook").is_ok());
+    #[tokio::test]
+    async fn test_valid_http_url_is_accepted() {
+        assert!(validate_webhook_url("http://example.com/hook").await.is_ok());
     }
 
-    #[test]
-    fn test_non_http_scheme_is_rejected() {
-        let err = validate_webhook_url("ftp://example.com/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_non_http_scheme_is_rejected() {
+        let err = validate_webhook_url("ftp://example.com/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::ForbiddenScheme(_)),
             "got: {:?}",
@@ -327,9 +434,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_file_scheme_is_rejected() {
-        let err = validate_webhook_url("file:///etc/passwd").unwrap_err();
+    #[tokio::test]
+    async fn test_file_scheme_is_rejected() {
+        let err = validate_webhook_url("file:///etc/passwd").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::ForbiddenScheme(_)),
             "got: {:?}",
@@ -337,9 +444,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_localhost_host_is_rejected() {
-        let err = validate_webhook_url("http://localhost/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_localhost_host_is_rejected() {
+        let err = validate_webhook_url("http://localhost/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -347,9 +454,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_loopback_ipv4_is_rejected() {
-        let err = validate_webhook_url("http://127.0.0.1/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_loopback_ipv4_is_rejected() {
+        let err = validate_webhook_url("http://127.0.0.1/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -357,9 +464,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_private_10_block_is_rejected() {
-        let err = validate_webhook_url("http://10.0.0.1/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_private_10_block_is_rejected() {
+        let err = validate_webhook_url("http://10.0.0.1/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -367,9 +474,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_private_172_block_is_rejected() {
-        let err = validate_webhook_url("http://172.16.0.1/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_private_172_block_is_rejected() {
+        let err = validate_webhook_url("http://172.16.0.1/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -377,9 +484,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_private_192_168_block_is_rejected() {
-        let err = validate_webhook_url("http://192.168.1.1/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_private_192_168_block_is_rejected() {
+        let err = validate_webhook_url("http://192.168.1.1/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -387,10 +494,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_link_local_metadata_ip_is_rejected() {
+    #[tokio::test]
+    async fn test_link_local_metadata_ip_is_rejected() {
         // 169.254.169.254 is the EC2 / GCP instance metadata endpoint
-        let err = validate_webhook_url("http://169.254.169.254/latest/meta-data/").unwrap_err();
+        let err = validate_webhook_url("http://169.254.169.254/latest/meta-data/").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -398,9 +505,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_link_local_range_is_rejected() {
-        let err = validate_webhook_url("http://169.254.0.1/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_link_local_range_is_rejected() {
+        let err = validate_webhook_url("http://169.254.0.1/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -408,9 +515,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_ipv6_loopback_is_rejected() {
-        let err = validate_webhook_url("http://[::1]/hook").unwrap_err();
+    #[tokio::test]
+    async fn test_ipv6_loopback_is_rejected() {
+        let err = validate_webhook_url("http://[::1]/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -418,11 +525,66 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_malformed_url_is_rejected() {
-        let err = validate_webhook_url("not-a-url").unwrap_err();
+    #[tokio::test]
+    async fn test_malformed_url_is_rejected() {
+        let err = validate_webhook_url("not-a-url").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::InvalidUrl(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ipv4_mapped_ipv6_loopback_is_rejected() {
+        // ::ffff:127.0.0.1 is IPv4-mapped loopback
+        let err = validate_webhook_url("http://[::ffff:127.0.0.1]/hook").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ipv4_mapped_ipv6_metadata_is_rejected() {
+        // ::ffff:169.254.169.254 is IPv4-mapped EC2 metadata endpoint
+        let err = validate_webhook_url("http://[::ffff:169.254.169.254]/hook").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ipv6_multicast_is_rejected() {
+        // ff02::1 is IPv6 multicast
+        let err = validate_webhook_url("http://[ff02::1]/hook").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ipv4_multicast_is_rejected() {
+        // 224.0.0.1 is multicast
+        let err = validate_webhook_url("http://224.0.0.1/hook").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ipv4_zero_range_is_rejected() {
+        // 0.0.0.1 is in 0.0.0.0/8
+        let err = validate_webhook_url("http://0.0.0.1/hook").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
             err
         );
@@ -607,6 +769,11 @@ mod tests {
             pending_count, 0,
             "pending_deliveries counter must be 0 after marking dead"
         );
+        let dead_count = stats["dead_deliveries"].as_i64().unwrap_or(-1);
+        assert_eq!(
+            dead_count, 1,
+            "dead_deliveries counter must be 1 after marking dead"
+        );
 
         let _ = sub; // suppress unused warning
     }
@@ -654,6 +821,135 @@ mod tests {
         assert_eq!(
             pending_count, 1,
             "delivery must stay pending after only one failure"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #653 - Concurrent deliveries with bounded limit
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_slow_endpoint_does_not_delay_fast_endpoint() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        let slow_finished = Arc::new(AtomicBool::new(false));
+        let fast_finished_before_slow = Arc::new(AtomicBool::new(false));
+
+        let slow_finished_clone = Arc::clone(&slow_finished);
+        let fast_flag_clone = Arc::clone(&fast_finished_before_slow);
+
+        let test_router = axum::Router::new()
+            .route(
+                "/slow",
+                post(move || {
+                    let slow_finished = Arc::clone(&slow_finished_clone);
+                    async move {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                        slow_finished.store(true, Ordering::SeqCst);
+                        axum::http::StatusCode::OK
+                    }
+                }),
+            )
+            .route(
+                "/fast",
+                post(move || {
+                    let slow_finished = Arc::clone(&slow_finished);
+                    let fast_flag = Arc::clone(&fast_flag_clone);
+                    async move {
+                        if !slow_finished.load(Ordering::SeqCst) {
+                            fast_flag.store(true, Ordering::SeqCst);
+                        }
+                        axum::http::StatusCode::OK
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, test_router).await.unwrap();
+        });
+
+        let db = setup_db().await;
+
+        let sub_slow = db
+            .create_subscription(CreateSubscription {
+                url: format!("http://127.0.0.1:{}/slow", port),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .unwrap();
+
+        let sub_fast = db
+            .create_subscription(CreateSubscription {
+                url: format!("http://127.0.0.1:{}/fast", port),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .unwrap();
+
+        let event = IndexedEvent {
+            id: "evt-concurrent-test".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 10,
+            contract_id: "C_TEST".to_string(),
+            tx_hash: "abcd".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({}),
+        };
+        db.insert_event(&event).await.unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
+             VALUES ('del-slow', ?1, ?2, 'pending', 0, ?3, '2024-01-01T00:00:00Z')",
+        )
+        .bind(&sub_slow.id)
+        .bind(&event.id)
+        .bind(&now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
+             VALUES ('del-fast', ?1, ?2, 'pending', 0, ?3, '2024-01-01T00:00:01Z')",
+        )
+        .bind(&sub_fast.id)
+        .bind(&event.id)
+        .bind(&now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let state = AppState {
+            db,
+            rpc_url: "http://localhost".to_string(),
+            contract_id: "C_TEST".to_string(),
+            webhook_client: reqwest::Client::new(),
+            lookback_ledgers: 0,
+        };
+
+        let start = Instant::now();
+        deliver_pending(&state).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            fast_finished_before_slow.load(Ordering::SeqCst),
+            "Fast endpoint must complete before slow endpoint"
+        );
+        assert!(
+            elapsed.as_millis() < 800,
+            "Deliveries must run concurrently: took {:?}",
+            elapsed
         );
     }
 }

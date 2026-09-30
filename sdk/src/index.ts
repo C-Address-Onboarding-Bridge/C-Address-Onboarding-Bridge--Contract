@@ -91,10 +91,8 @@ export type {
   FeesWithdrawnEvent,
   AdminProposedEvent,
   AdminTransferredEvent,
-  FeeCollectorProposedEvent,
+  FeeCollectorTransferProposedEvent,
   FeeCollectorTransferredEvent,
-  /** @deprecated Use {@link AdminProposedEvent} / {@link AdminTransferredEvent} instead. */
-  AdminChangedEvent,
   MetaFundExecutedEvent,
   GenericBridgeEvent,
 } from './events';

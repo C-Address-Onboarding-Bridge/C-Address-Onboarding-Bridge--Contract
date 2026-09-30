@@ -250,6 +250,64 @@ Transfers the contract admin role (admin only).
   - `adminKeypair`: `Keypair`
 - **Returns**: `Promise<TransactionResult>`
 
+##### `proposeNewAdmin`
+```ts
+async proposeNewAdmin(
+  newAdmin: string,
+  adminKeypair: Keypair
+): Promise<TransactionResult>
+```
+Proposes an admin handover (admin only). Prefer this over `setAdmin` — it proves the new admin controls the key (via `acceptAdmin`) before the role moves.
+- **Parameters**:
+  - `newAdmin`: `string` — Proposed admin's G-address.
+  - `adminKeypair`: `Keypair`
+- **Returns**: `Promise<TransactionResult>`
+
+##### `acceptAdmin`
+```ts
+async acceptAdmin(pendingAdminKeypair: Keypair): Promise<TransactionResult>
+```
+Accepts a pending admin handover. Must be signed by the proposed admin.
+- **Parameters**:
+  - `pendingAdminKeypair`: `Keypair` — Keypair of the proposed admin.
+- **Returns**: `Promise<TransactionResult>`
+
+##### `getPendingAdmin`
+```ts
+async getPendingAdmin(): Promise<string | null>
+```
+Returns the pending admin's G-address, or `null` if there is no pending handover.
+- **Returns**: `Promise<string | null>`
+
+##### `proposeNewFeeCollector`
+```ts
+async proposeNewFeeCollector(
+  newCollector: string,
+  adminKeypair: Keypair
+): Promise<TransactionResult>
+```
+Proposes a fee-collector handover (admin only). Prefer this over `setFeeCollector` — it proves the new collector controls the key (via `acceptFeeCollector`) before the role moves.
+- **Parameters**:
+  - `newCollector`: `string` — Proposed collector's G-address.
+  - `adminKeypair`: `Keypair`
+- **Returns**: `Promise<TransactionResult>`
+
+##### `acceptFeeCollector`
+```ts
+async acceptFeeCollector(pendingCollectorKeypair: Keypair): Promise<TransactionResult>
+```
+Accepts a pending fee-collector handover. Must be signed by the proposed collector.
+- **Parameters**:
+  - `pendingCollectorKeypair`: `Keypair` — Keypair of the proposed fee collector.
+- **Returns**: `Promise<TransactionResult>`
+
+##### `getPendingFeeCollector`
+```ts
+async getPendingFeeCollector(): Promise<string | null>
+```
+Returns the pending fee collector's G-address, or `null` if there is no pending handover.
+- **Returns**: `Promise<string | null>`
+
 ##### `upgrade`
 ```ts
 async upgrade(
@@ -351,50 +409,33 @@ async getWhitelistedAssets(
   limit?: number
 ): Promise<PaginatedResult<string>>
 ```
-Queries the list of whitelisted tokens with client-side pagination.
+Queries the list of whitelisted tokens with on-chain pagination (the cursor encodes the offset).
 - **Parameters**:
   - `cursor`: `string` (optional base64 cursor)
   - `limit`: `number` (optional, default 20)
 - **Returns**: `Promise<PaginatedResult<string>>`
 
-##### `getFeeExemptAddresses`
+##### `isBlocked`
 ```ts
-async getFeeExemptAddresses(
-  cursor?: string,
-  limit?: number
-): Promise<PaginatedResult<string>>
+async isBlocked(address: string): Promise<boolean>
 ```
-Queries fee-exempt addresses with client-side pagination.
+Checks whether `address` is on the blocklist. The contract only exposes a
+per-address membership check (`query_is_blocked`) — there is no call that
+lists the full blocklist.
 - **Parameters**:
-  - `cursor`: `string` (optional)
-  - `limit`: `number` (optional)
-- **Returns**: `Promise<PaginatedResult<string>>`
+  - `address`: `string`
+- **Returns**: `Promise<boolean>`
 
-##### `getBlocklistedAddresses`
+##### `isAllowlisted`
 ```ts
-async getBlocklistedAddresses(
-  cursor?: string,
-  limit?: number
-): Promise<PaginatedResult<string>>
+async isAllowlisted(address: string): Promise<boolean>
 ```
-Queries the blocklist with client-side pagination.
+Checks whether `address` is on the allowlist. The contract only exposes a
+per-address membership check (`query_is_allowlisted`) — there is no call that
+lists the full allowlist.
 - **Parameters**:
-  - `cursor`: `string` (optional)
-  - `limit`: `number` (optional)
-- **Returns**: `Promise<PaginatedResult<string>>`
-
-##### `getAllowlistedAddresses`
-```ts
-async getAllowlistedAddresses(
-  cursor?: string,
-  limit?: number
-): Promise<PaginatedResult<string>>
-```
-Queries the allowlist with client-side pagination.
-- **Parameters**:
-  - `cursor`: `string` (optional)
-  - `limit`: `number` (optional)
-- **Returns**: `Promise<PaginatedResult<string>>`
+  - `address`: `string`
+- **Returns**: `Promise<boolean>`
 
 ##### `estimateCost`
 ```ts

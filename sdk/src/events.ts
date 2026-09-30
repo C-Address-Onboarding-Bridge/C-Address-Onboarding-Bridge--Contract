@@ -60,45 +60,46 @@ export interface FeesWithdrawnEvent {
   pagingToken: string;
 }
 
-/**
- * Emitted when a new admin is proposed (contract `AdminProposed`).
- * The transfer only takes effect once the proposed admin accepts it.
- */
+/** Emitted when a new admin is proposed (two-step transfer). */
 export interface AdminProposedEvent {
   name: 'AdminProposed';
-  /** Current admin address proposing the change */
-  admin: string;
-  /** Proposed new admin address */
-  proposedAdmin: string;
+  /** Current admin that initiated the proposal */
+  from: string;
+  /** Proposed new admin */
+  to: string;
   ledger: number;
   pagingToken: string;
 }
 
-/**
- * Emitted when a proposed admin accepts and the admin address changes
- * (contract `AdminTransferred`).
- */
+/** Emitted when the pending admin accepts the role (two-step transfer). */
 export interface AdminTransferredEvent {
   name: 'AdminTransferred';
-  /** Previous admin address */
-  oldAdmin: string;
-  /** New admin address */
-  newAdmin: string;
+  /** Previous admin */
+  from: string;
+  /** New admin that accepted the role */
+  to: string;
   ledger: number;
   pagingToken: string;
 }
 
-/**
- * @deprecated The contract never emits `AdminChanged`. Admin changes are
- * emitted as `AdminProposed` / `AdminTransferred`. Kept as an alias for
- * backward compatibility.
- */
-export interface AdminChangedEvent {
-  name: 'AdminChanged';
-  /** Previous admin address */
-  oldAdmin: string;
-  /** New admin address */
-  newAdmin: string;
+/** Emitted when a new fee collector is proposed (two-step transfer). */
+export interface FeeCollectorTransferProposedEvent {
+  name: 'FeeCollectorTransferProposed';
+  /** Current admin that initiated the proposal */
+  admin: string;
+  /** Proposed new fee collector */
+  newCollector: string;
+  ledger: number;
+  pagingToken: string;
+}
+
+/** Emitted when the pending fee collector accepts the role (two-step transfer). */
+export interface FeeCollectorTransferredEvent {
+  name: 'FeeCollectorTransferred';
+  /** Previous fee collector */
+  from: string;
+  /** New fee collector that accepted the role */
+  to: string;
   ledger: number;
   pagingToken: string;
 }
@@ -161,8 +162,7 @@ export type BridgeEventPayload =
   | FeesWithdrawnEvent
   | AdminProposedEvent
   | AdminTransferredEvent
-  | AdminChangedEvent
-  | FeeCollectorProposedEvent
+  | FeeCollectorTransferProposedEvent
   | FeeCollectorTransferredEvent
   | MetaFundExecutedEvent
   | GenericBridgeEvent;
@@ -177,12 +177,7 @@ export interface BridgeEventMap {
   FeesWithdrawn: FeesWithdrawnEvent;
   AdminProposed: AdminProposedEvent;
   AdminTransferred: AdminTransferredEvent;
-  /**
-   * @deprecated The contract never emits `AdminChanged`; use
-   * `AdminProposed` / `AdminTransferred` instead.
-   */
-  AdminChanged: AdminChangedEvent;
-  FeeCollectorProposed: FeeCollectorProposedEvent;
+  FeeCollectorTransferProposed: FeeCollectorTransferProposedEvent;
   FeeCollectorTransferred: FeeCollectorTransferredEvent;
   MetaFundExecuted: MetaFundExecutedEvent;
   /**
@@ -334,4 +329,256 @@ export class EventSubscriber {
       }
       // Stop polling when no listeners remain (preserve 'error' lis
 
-/* … truncated 5789 chars — edit only what you need near the top … */
+  /**
+   * Total number of registered callbacks across all event names.
+   */
+  listenerCount(): number {
+    let total = 0;
+    for (const set of this.listeners.values()) {
+      total += set.size;
+    }
+    return total;
+  }
+
+  /**
+   * Tear down the subscriber: stop the polling loop and remove all listeners.
+   * After calling `destroy()` this instance cannot be reused.
+   */
+  destroy(): void {
+    this.stopPolling();
+    this.listeners.clear();
+    this.destroyed = true;
+  }
+
+  /**
+   * Manually trigger a single poll. Useful in tests or for on-demand refresh.
+   *
+   * If the underlying RPC call rejects, the error is dispatched to registered
+   * 'error' listeners before the exception propagates to the caller.
+   */
+  async poll(): Promise<void> {
+    try {
+      await this.fetchAndDispatch();
+    } catch (err) {
+      this.dispatchError(err instanceof Error ? err : new Error(String(err)));
+      throw err;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Polling internals
+  // -------------------------------------------------------------------------
+
+  private startPolling(): void {
+    if (this.intervalHandle !== null) return;
+    this.intervalHandle = setInterval(() => {
+      this.fetchAndDispatch().catch((err) => {
+        // Emit to error listeners so consumers can detect persistently-down
+        // RPC endpoints and react (e.g. circuit break, alert, reconnect).
+        this.dispatchError(err instanceof Error ? err : new Error(String(err)));
+      });
+    }, this.pollingIntervalMs);
+  }
+
+  private stopPolling(): void {
+    if (this.intervalHandle !== null) {
+      clearInterval(this.intervalHandle);
+      this.intervalHandle = null;
+    }
+  }
+
+  private async fetchAndDispatch(): Promise<void> {
+    const params: SorobanRpc.Server.GetEventsRequest = {
+      filters: [
+        {
+          type: 'contract',
+          contractIds: [this.contractId],
+          topics: [['*']],
+        },
+      ],
+      limit: this.limit,
+    };
+
+    // Attach cursor: either startLedger (number) or pagingToken (string).
+    if (typeof this.cursor === 'number') {
+      params.startLedger = this.cursor;
+    } else if (typeof this.cursor === 'string' && this.cursor !== 'now') {
+      params.cursor = this.cursor;
+    }
+    // When cursor === 'now', omit both — the RPC defaults to current ledger
+
+    const response = await this.server.getEvents(params);
+
+    for (const raw of response.events) {
+      const payload = this.parseEvent(raw);
+      if (payload) {
+        this.dispatch(payload);
+      }
+      // Advance cursor to the last received paging token
+      if (raw.pagingToken) {
+        this.cursor = raw.pagingToken as string;
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Event parsing
+  // -------------------------------------------------------------------------
+
+  private parseEvent(raw: SorobanRpc.Api.EventResponse): BridgeEventPayload | null {
+    try {
+      const topics = raw.topic.map((t) => scValToNative(t));
+      const value = scValToNative(raw.value);
+      const ledger = raw.ledger;
+      const pagingToken = raw.pagingToken;
+
+      const name = typeof topics[0] === 'string' ? topics[0] : String(topics[0]);
+
+      switch (name) {
+        case 'CAddressFunded': {
+          // topics: [name, asset, source, target]  value: [amount, fee]
+          const [amount, fee] = Array.isArray(value)
+            ? value.map(String)
+            : [String(value), '0'];
+          return {
+            name: 'CAddressFunded',
+            asset: String(topics[1] ?? ''),
+            source: String(topics[2] ?? ''),
+            target: String(topics[3] ?? ''),
+            amount,
+            fee,
+            ledger,
+            pagingToken,
+          } satisfies CAddressFundedEvent;
+        }
+
+        case 'FeesWithdrawn': {
+          // topics: [name, feeCollector]  value: [amount, asset]
+          const [amount, asset] = Array.isArray(value)
+            ? value.map(String)
+            : [String(value), ''];
+          return {
+            name: 'FeesWithdrawn',
+            feeCollector: String(topics[1] ?? ''),
+            amount,
+            asset,
+            ledger,
+            pagingToken,
+          } satisfies FeesWithdrawnEvent;
+        }
+
+        case 'AdminProposed': {
+          // topics: [name, admin, new_admin]  value: ()
+          return {
+            name: 'AdminProposed',
+            from: String(topics[1] ?? ''),
+            to: String(topics[2] ?? ''),
+            ledger,
+            pagingToken,
+          } satisfies AdminProposedEvent;
+        }
+
+        case 'AdminTransferred': {
+          // topics: [name, old_admin, pending]  value: ()
+          return {
+            name: 'AdminTransferred',
+            from: String(topics[1] ?? ''),
+            to: String(topics[2] ?? ''),
+            ledger,
+            pagingToken,
+          } satisfies AdminTransferredEvent;
+        }
+
+        case 'FeeCollectorTransferProposed': {
+          // topics: [name, admin, new_collector]  value: ()
+          return {
+            name: 'FeeCollectorTransferProposed',
+            admin: String(topics[1] ?? ''),
+            newCollector: String(topics[2] ?? ''),
+            ledger,
+            pagingToken,
+          } satisfies FeeCollectorTransferProposedEvent;
+        }
+
+        case 'FeeCollectorTransferred': {
+          // topics: [name, old_collector, pending]  value: ()
+          return {
+            name: 'FeeCollectorTransferred',
+            from: String(topics[1] ?? ''),
+            to: String(topics[2] ?? ''),
+            ledger,
+            pagingToken,
+          } satisfies FeeCollectorTransferredEvent;
+        }
+
+        case 'MetaFundExecuted': {
+          // topics: [name, asset, source, target]  value: [amount, fee, nonce]
+          const [amount, fee, nonce] = Array.isArray(value)
+            ? value.map(String)
+            : [String(value), '0', '0'];
+          return {
+            name: 'MetaFundExecuted',
+            asset: String(topics[1] ?? ''),
+            source: String(topics[2] ?? ''),
+            target: String(topics[3] ?? ''),
+            amount,
+            fee,
+            nonce,
+            ledger,
+            pagingToken,
+          } satisfies MetaFundExecutedEvent;
+        }
+
+        default: {
+          return {
+            name,
+            topics,
+            value,
+            ledger,
+            pagingToken,
+          } satisfies GenericBridgeEvent;
+        }
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Dispatch
+  // -------------------------------------------------------------------------
+
+  private dispatch(payload: BridgeEventPayload): void {
+    // Fire specific listeners
+    const specific = this.listeners.get(payload.name);
+    if (specific) {
+      for (const cb of specific) {
+        try { cb(payload); } catch { /* isolate handler errors */ }
+      }
+    }
+
+    // Fire wildcard listeners
+    const wildcard = this.listeners.get('*');
+    if (wildcard) {
+      for (const cb of wildcard) {
+        try { cb(payload); } catch { /* isolate handler errors */ }
+      }
+    }
+  }
+
+  /**
+   * Dispatch an error to any registered 'error' listeners.
+   *
+   * This is called on poll failures so consumers can detect persistently-down
+   * RPC endpoints.  Handler errors are isolated so one bad listener doesn't
+   * break others.
+   */
+  private dispatchError(err: Error): void {
+    const errorListeners = this.listeners.get('error');
+    if (errorListeners) {
+      for (const cb of errorListeners) {
+        try { cb(err); } catch { /* isolate handler errors */ }
+      }
+    }
+  }
+}
