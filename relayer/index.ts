@@ -1903,11 +1903,15 @@ export function validateEnv(env: NodeJS.ProcessEnv = process.env): {
   submitterSecretKey: string;
   threshold: number;
   relayerPrivateKeys: string[];
-} {
-  function requireString(name: string): string {
+  eth?: ValidatedEthEnv;
+  solana?: ValidatedSolanaEnv;
+}
+
+export function validateEnv(env: NodeJS.ProcessEnv = process.env): ValidatedEnv {
+  function requireString(name: string, customMessage?: string): string {
     const value = env[name];
     if (value === undefined || value.trim() === '') {
-      throw new Error(`${name} is required but was not set`);
+      throw new Error(customMessage ?? `${name} is required but was not set`);
     }
     return value.trim();
   }
@@ -1935,7 +1939,40 @@ export function validateEnv(env: NodeJS.ProcessEnv = process.env): {
     throw new Error('RELAYER_PRIVATE_KEYS is required and must contain at least one key');
   }
 
-  return { contractId, rpcUrl, networkPassphrase, submitterSecretKey, threshold, relayerPrivateKeys };
+  let eth: ValidatedEthEnv | undefined;
+  if (env['ETH_RPC_URL'] && env['ETH_RPC_URL'].trim() !== '') {
+    const ethRpcUrl = env['ETH_RPC_URL'].trim();
+    const bridgeContractAddress = requireString(
+      'ETH_BRIDGE_CONTRACT',
+      'ETH_BRIDGE_CONTRACT is required when ETH_RPC_URL is set',
+    );
+    const eventTopic = requireString(
+      'ETH_EVENT_TOPIC',
+      'ETH_EVENT_TOPIC is required when ETH_RPC_URL is set',
+    );
+    eth = { rpcUrl: ethRpcUrl, bridgeContractAddress, eventTopic };
+  }
+
+  let solana: ValidatedSolanaEnv | undefined;
+  if (env['SOLANA_WS_URL'] && env['SOLANA_WS_URL'].trim() !== '') {
+    const wsUrl = env['SOLANA_WS_URL'].trim();
+    const programId = requireString(
+      'SOLANA_PROGRAM_ID',
+      'SOLANA_PROGRAM_ID is required when SOLANA_WS_URL is set',
+    );
+    solana = { wsUrl, programId };
+  }
+
+  return {
+    contractId,
+    rpcUrl,
+    networkPassphrase,
+    submitterSecretKey,
+    threshold,
+    relayerPrivateKeys,
+    eth,
+    solana,
+  };
 }
 
 // ---------------------------------------------------------------------------
