@@ -186,35 +186,6 @@
                             },
                             {
                               "key": {
-                                "symbol": "fee_bps"
-                              },
-                              "val": {
-                                "u32": 200
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "fee_collector"
-                              },
-                              "val": {
-                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                              }
-                            }
-                          ]
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "Config"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "map": [
-                            {
-                              "key": {
                                 "symbol": "allowlist_mode"
                               },
                               "val": {
@@ -227,6 +198,14 @@
                               },
                               "val": {
                                 "u32": 200
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "fee_collector"
+                              },
+                              "val": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                               }
                             },
                             {
@@ -244,12 +223,24 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "CurrentWasmHash"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "FeeBps"
                             }
                           ]
                         },
                         "val": {
-                          "u32": 200
+                          "u32": 50
                         }
                       },
                       {
