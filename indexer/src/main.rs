@@ -302,7 +302,7 @@ async fn create_subscription(
     Json(req): Json<webhook::CreateSubscription>,
 ) -> Result<(StatusCode, Json<webhook::Subscription>), (StatusCode, Json<serde_json::Value>)> {
     // Validate the URL before persisting to prevent SSRF via webhook delivery.
-    if let Err(e) = webhook::validate_webhook_url(&req.url) {
+    if let Err(e) = webhook::validate_webhook_url(&req.url).await {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({ "error": e.to_string() })),

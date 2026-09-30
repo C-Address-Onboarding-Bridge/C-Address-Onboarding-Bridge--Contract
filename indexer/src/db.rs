@@ -4,7 +4,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
 
 /// Raw column tuple for a `subscriptions` row, in SELECT order:
-/// id, url, event_type, asset_filter, source_filter, target_filter, active, created_at.
+/// id, url, event_type, asset_filter, source_filter, target_filter, active, secret, created_at.
 type SubscriptionRow = (
     String,
     String,
@@ -13,6 +13,7 @@ type SubscriptionRow = (
     Option<String>,
     Option<String>,
     bool,
+    String,
     String,
 );
 
@@ -260,10 +261,11 @@ impl Database {
         req: CreateSubscription,
     ) -> Result<Subscription, sqlx::Error> {
         let id = uuid::Uuid::new_v4().to_string();
+        let secret = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO subscriptions (id, url, event_type, asset_filter, source_filter, target_filter, active, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+            "INSERT INTO subscriptions (id, url, event_type, asset_filter, source_filter, target_filter, active, secret, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)",
         )
         .bind(&id)
         .bind(&req.url)
@@ -271,6 +273,7 @@ impl Database {
         .bind(&req.asset_filter)
         .bind(&req.source_filter)
         .bind(&req.target_filter)
+        .bind(&secret)
         .bind(&now)
         .execute(&self.pool)
         .await?;
@@ -283,6 +286,7 @@ impl Database {
             source_filter: req.source_filter,
             target_filter: req.target_filter,
             active: true,
+            secret,
             created_at: now,
         })
     }
@@ -290,7 +294,7 @@ impl Database {
     pub async fn list_subscriptions(&self) -> Result<Vec<Subscription>, sqlx::Error> {
         let rows: Vec<SubscriptionRow> =
             sqlx::query_as(
-                "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, created_at
+                "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, secret, created_at
                  FROM subscriptions WHERE active = 1",
             )
             .fetch_all(&self.pool)
@@ -307,6 +311,7 @@ impl Database {
                     source_filter,
                     target_filter,
                     active,
+                    secret,
                     created_at,
                 )| {
                     Subscription {
@@ -317,6 +322,7 @@ impl Database {
                         source_filter,
                         target_filter,
                         active,
+                        secret,
                         created_at,
                     }
                 },
@@ -469,6 +475,15 @@ impl Database {
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(row.map(|(url,)| url))
+    }
+
+    pub async fn get_subscription_secret(&self, id: &str) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT secret FROM subscriptions WHERE id = ?1 AND active = 1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(secret,)| secret))
     }
 
     pub async fn get_event_by_id(&self, id: &str) -> Result<Option<IndexedEvent>, sqlx::Error> {
