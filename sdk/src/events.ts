@@ -60,13 +60,46 @@ export interface FeesWithdrawnEvent {
   pagingToken: string;
 }
 
-/** Emitted when the admin address is changed. */
-export interface AdminChangedEvent {
-  name: 'AdminChanged';
-  /** Previous admin address */
-  oldAdmin: string;
-  /** New admin address */
-  newAdmin: string;
+/** Emitted when a new admin is proposed (two-step transfer). */
+export interface AdminProposedEvent {
+  name: 'AdminProposed';
+  /** Current admin that initiated the proposal */
+  from: string;
+  /** Proposed new admin */
+  to: string;
+  ledger: number;
+  pagingToken: string;
+}
+
+/** Emitted when the pending admin accepts the role (two-step transfer). */
+export interface AdminTransferredEvent {
+  name: 'AdminTransferred';
+  /** Previous admin */
+  from: string;
+  /** New admin that accepted the role */
+  to: string;
+  ledger: number;
+  pagingToken: string;
+}
+
+/** Emitted when a new fee collector is proposed (two-step transfer). */
+export interface FeeCollectorTransferProposedEvent {
+  name: 'FeeCollectorTransferProposed';
+  /** Current admin that initiated the proposal */
+  admin: string;
+  /** Proposed new fee collector */
+  newCollector: string;
+  ledger: number;
+  pagingToken: string;
+}
+
+/** Emitted when the pending fee collector accepts the role (two-step transfer). */
+export interface FeeCollectorTransferredEvent {
+  name: 'FeeCollectorTransferred';
+  /** Previous fee collector */
+  from: string;
+  /** New fee collector that accepted the role */
+  to: string;
   ledger: number;
   pagingToken: string;
 }
@@ -99,7 +132,10 @@ export interface GenericBridgeEvent {
 export type BridgeEventPayload =
   | CAddressFundedEvent
   | FeesWithdrawnEvent
-  | AdminChangedEvent
+  | AdminProposedEvent
+  | AdminTransferredEvent
+  | FeeCollectorTransferProposedEvent
+  | FeeCollectorTransferredEvent
   | MetaFundExecutedEvent
   | GenericBridgeEvent;
 
@@ -111,7 +147,10 @@ export type BridgeEventPayload =
 export interface BridgeEventMap {
   CAddressFunded: CAddressFundedEvent;
   FeesWithdrawn: FeesWithdrawnEvent;
-  AdminChanged: AdminChangedEvent;
+  AdminProposed: AdminProposedEvent;
+  AdminTransferred: AdminTransferredEvent;
+  FeeCollectorTransferProposed: FeeCollectorTransferProposedEvent;
+  FeeCollectorTransferred: FeeCollectorTransferredEvent;
   MetaFundExecuted: MetaFundExecutedEvent;
   /**
    * Emitted when the polling loop encounters an RPC error.
@@ -411,15 +450,48 @@ export class EventSubscriber {
           } satisfies FeesWithdrawnEvent;
         }
 
-        case 'AdminChanged': {
-          // topics: [name, oldAdmin, newAdmin]  value: ()
+        case 'AdminProposed': {
+          // topics: [name, admin, new_admin]  value: ()
           return {
-            name: 'AdminChanged',
-            oldAdmin: String(topics[1] ?? ''),
-            newAdmin: String(topics[2] ?? ''),
+            name: 'AdminProposed',
+            from: String(topics[1] ?? ''),
+            to: String(topics[2] ?? ''),
             ledger,
             pagingToken,
-          } satisfies AdminChangedEvent;
+          } satisfies AdminProposedEvent;
+        }
+
+        case 'AdminTransferred': {
+          // topics: [name, old_admin, pending]  value: ()
+          return {
+            name: 'AdminTransferred',
+            from: String(topics[1] ?? ''),
+            to: String(topics[2] ?? ''),
+            ledger,
+            pagingToken,
+          } satisfies AdminTransferredEvent;
+        }
+
+        case 'FeeCollectorTransferProposed': {
+          // topics: [name, admin, new_collector]  value: ()
+          return {
+            name: 'FeeCollectorTransferProposed',
+            admin: String(topics[1] ?? ''),
+            newCollector: String(topics[2] ?? ''),
+            ledger,
+            pagingToken,
+          } satisfies FeeCollectorTransferProposedEvent;
+        }
+
+        case 'FeeCollectorTransferred': {
+          // topics: [name, old_collector, pending]  value: ()
+          return {
+            name: 'FeeCollectorTransferred',
+            from: String(topics[1] ?? ''),
+            to: String(topics[2] ?? ''),
+            ledger,
+            pagingToken,
+          } satisfies FeeCollectorTransferredEvent;
         }
 
         case 'MetaFundExecuted': {

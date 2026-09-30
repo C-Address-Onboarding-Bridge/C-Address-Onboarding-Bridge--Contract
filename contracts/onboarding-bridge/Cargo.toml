@@ -14,7 +14,7 @@ crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
-ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+ed25519-dalek = { version = "2.2.0", default-features = false }
 soroban-sdk = "22.0.1"
 
 [dev-dependencies]
