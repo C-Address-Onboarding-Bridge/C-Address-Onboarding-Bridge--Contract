@@ -150,6 +150,19 @@ export interface DeadLetterEntry {
  */
 export class DeadLetterQueue {
   private entries: DeadLetterEntry[] = [];
+  private readonly filePath: string | null;
+
+  constructor(filePath?: string) {
+    this.filePath = filePath ?? null;
+    if (this.filePath) {
+      const loaded = readJsonFile<DeadLetterEntry[]>(this.filePath);
+      if (Array.isArray(loaded)) this.entries = loaded;
+    }
+  }
+
+  private persist(): void {
+    if (this.filePath) writeJsonFileAtomic(this.filePath, this.entries);
+  }
 
   enqueue(event: BridgeEvent, available: number, required: number, reason: string): void {
     // Replace any stale entry for the same event so retries don't pile up
@@ -162,6 +175,7 @@ export class DeadLetterQueue {
       requiredSigners: required,
       reason,
     });
+    this.persist();
     console.warn(
       `[relayer] dead-letter: chain=${event.chainId} tx=${event.txHash} ` +
         `signers=${available}/${required} reason="${reason}" — stored for retry`,
@@ -178,6 +192,7 @@ export class DeadLetterQueue {
     this.entries = this.entries.filter(
       (e) => !(e.event.chainId === chainId && e.event.txHash === txHash),
     );
+    this.persist();
   }
 
   size(): number {
@@ -268,11 +283,28 @@ function signPayload(privateKeyHex: string, payloadHash: Buffer): RelayerSig {
 }
 
 // ---------------------------------------------------------------------------
-// In-memory nonce deduplication (replace with Redis / DB in production)
+// Nonce deduplication — persisted to a local JSON file (see issue #670) so a
+// restart does not forget which (chainId, txHash) pairs were already
+// submitted and re-process everything since the last persisted block.
 // ---------------------------------------------------------------------------
 
 class NonceStore {
   private seen = new Set<string>();
+  private readonly filePath: string | null;
+
+  constructor(filePath?: string) {
+    this.filePath = filePath ?? null;
+    if (this.filePath) {
+      const loaded = readJsonFile<string[]>(this.filePath);
+      if (Array.isArray(loaded)) {
+        for (const key of loaded) this.seen.add(key);
+      }
+    }
+  }
+
+  private persist(): void {
+    if (this.filePath) writeJsonFileAtomic(this.filePath, [...this.seen]);
+  }
 
   has(chainId: number, txHash: string): boolean {
     return this.seen.has(`${chainId}:${txHash}`);
@@ -280,6 +312,7 @@ class NonceStore {
 
   mark(chainId: number, txHash: string): void {
     this.seen.add(`${chainId}:${txHash}`);
+    this.persist();
   }
 }
 
@@ -291,7 +324,7 @@ export class RelayerService {
   private sdk: OnboardingBridgeSDK;
   private submitterKeypair: ReturnType<typeof Keypair.fromSecret>;
   private config: RelayerServiceConfig;
-  private nonces = new NonceStore();
+  private nonces: NonceStore;
   private startedAt = Date.now();
   private lastEventPerChain: Map<number, string> = new Map();
   private dlqRetryTimer: ReturnType<typeof setInterval> | null = null;
@@ -376,6 +409,8 @@ export class RelayerService {
   }
 
   private async handleEvent(event: BridgeEvent): Promise<void> {
+    const key = `${event.chainId}:${event.txHash}`;
+
     if (this.nonces.has(event.chainId, event.txHash)) {
       console.log(`[relayer] duplicate event ignored: chain=${event.chainId} tx=${event.txHash}`);
       return;
@@ -409,18 +444,31 @@ export class RelayerService {
       this.dlq.enqueue(event, sigs.length, this.config.threshold, 'insufficient signers after dedup');
       return;
     }
-
-    const options: CrossChainFundOptions = {
-      chainId: event.chainId,
-      txHash: event.txHash,
-      target: event.target,
-      asset: event.asset,
-      amount: event.amount,
-      sigs: sigs.slice(0, this.config.threshold), // submit exactly threshold sigs
-    };
+    this.inFlight.add(key);
 
     try {
-      const result = await this.sdk.fundCrosschain(options, this.submitterKeypair);
+      console.log(`[relayer] event received: chain=${event.chainId} tx=${event.txHash} target=${event.target} amount=${event.amount}`);
+
+      const payloadHash = computePayloadHash(event);
+
+      // Collect signatures from all configured nodes, then deduplicate by pubkey.
+      // The contract does NOT verify that sigs contains distinct pubkeys — the doc
+      // comment on fund_c_address_crosschain explicitly delegates deduplication to
+      // relayer infrastructure.  A config mistake (two nodes sharing a key) or a
+      // malicious injection must not inflate the effective signature count past
+      // what distinct keys actually authorize.
+      const rawSigs: RelayerSig[] = this.config.nodes.map((node) =>
+        signPayload(node.privateKey, payloadHash),
+      );
+      const seenPubkeys = new Set<string>();
+      const sigs: RelayerSig[] = rawSigs.filter((sig) => {
+        if (seenPubkeys.has(sig.pubkey)) {
+          console.warn(`[relayer] duplicate pubkey detected and removed: ${sig.pubkey}`);
+          return false;
+        }
+        seenPubkeys.add(sig.pubkey);
+        return true;
+      });
 
       if (result.status === 'failed') {
         console.error(`[relayer] fundCrosschain failed: ${result.error}`);
@@ -820,6 +868,57 @@ export interface SolanaListenerConfig {
    * Maximum reconnect back-off delay in ms.  Defaults to 30 000 ms.
    */
   maxReconnectDelayMs?: number;
+  /**
+   * Solana JSON-RPC HTTP endpoint (https://...), used to backfill events
+   * that were emitted while the WebSocket was disconnected via
+   * `getSignaturesForAddress` / `getTransaction`. Required for reconnect
+   * backfill to run — without it a reconnect only resumes live delivery.
+   */
+  httpUrl?: string;
+  /**
+   * Path to a JSON file used to persist the last-processed transaction
+   * signature across restarts and reconnects. Defaults to
+   * `.solana-signature-<chainId>.json` in the current working directory.
+   */
+  signatureStorePath?: string;
+}
+
+/**
+ * Build the `logsSubscribe` request payload. Extracted as a pure function so
+ * the commitment level is unit-testable without opening a real WebSocket —
+ * see issue #668 (must use `finalized`, not `confirmed`, since a
+ * `confirmed` log can still be rolled back before funds are released).
+ */
+function buildSolanaSubscribePayload(programId: string): string {
+  return JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'logsSubscribe',
+    params: [{ mentions: [programId] }, { commitment: 'finalized' }],
+  });
+}
+
+/**
+ * Persists the last-processed Solana transaction signature to a local JSON
+ * file, mirroring `BlockStore`'s atomic write pattern, so a restart or
+ * reconnect can backfill exactly what was missed instead of losing it.
+ */
+export class SolanaSignatureStore {
+  private readonly filePath: string;
+
+  constructor(filePath: string) {
+    this.filePath = filePath;
+  }
+
+  load(): string | null {
+    const parsed = readJsonFile<{ signature?: unknown }>(this.filePath);
+    if (parsed && typeof parsed.signature === 'string') return parsed.signature;
+    return null;
+  }
+
+  save(signature: string): void {
+    writeJsonFileAtomic(this.filePath, { signature });
+  }
 }
 
 /**
@@ -846,10 +945,17 @@ export class SolanaChainListener implements ChainListener {
   private stopped = false;
   private reconnectDelay: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private signatureStore: SolanaSignatureStore;
+  /** Last transaction signature we know we've processed (persisted). */
+  private lastSignature: string | null;
 
   constructor(config: SolanaListenerConfig) {
     this.config = config;
     this.reconnectDelay = config.initialReconnectDelayMs ?? 1_000;
+    this.signatureStore = new SolanaSignatureStore(
+      config.signatureStorePath ?? `.solana-signature-${config.chainId}.json`,
+    );
+    this.lastSignature = this.signatureStore.load();
   }
 
   start(onEvent: (event: BridgeEvent) => void): void {
@@ -875,23 +981,27 @@ export class SolanaChainListener implements ChainListener {
       // Reset back-off on a successful connection
       this.reconnectDelay = this.config.initialReconnectDelayMs ?? 1_000;
 
-      const sub = JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'logsSubscribe',
-        params: [{ mentions: [this.config.programId] }, { commitment: 'confirmed' }],
-      });
-      this.ws.send(sub);
-      console.log('[solana-listener] subscribed to program logs');
+      this.ws.send(buildSolanaSubscribePayload(this.config.programId));
+      console.log('[solana-listener] subscribed to program logs (commitment=finalized)');
+
+      // Replay whatever happened while we were disconnected (or since the
+      // last restart) before resuming live delivery — see issue #668.
+      // logsSubscribe only delivers *new* notifications, so without this a
+      // reconnect silently drops everything emitted during the downtime.
+      this.backfill().catch((err: any) =>
+        console.error(`[solana-listener] backfill failed: ${err.message ?? err}`),
+      );
     };
 
     this.ws.onmessage = (msg: any) => {
       try {
         const data = JSON.parse(typeof msg === 'string' ? msg : msg.data);
+        const signature: string | undefined = data?.params?.result?.value?.signature;
         const logs: string[] = data?.params?.result?.value?.logs ?? [];
         for (const event of this.extractBridgeFundEvents(logs)) {
           if (this.onEvent) this.onEvent(event);
         }
+        if (signature) this.recordSignature(signature);
       } catch { /* ignore malformed messages */ }
     };
 
@@ -1091,10 +1201,11 @@ function makeTestService(params: {
     fundCrosschain: params.fundCrosschain ?? (async () => ({ status: 'pending', hash: 'hash' })),
   };
   (service as any).submitterKeypair = {};
-  (service as any).nonces = new NonceStore();
+  (service as any).nonces = new NonceStore(); // no filePath: in-memory only for tests
   (service as any).startedAt = Date.now();
   (service as any).lastEventPerChain = new Map();
-  (service as any).dlq = new DeadLetterQueue();
+  (service as any).inFlight = new Set<string>();
+  (service as any).dlq = new DeadLetterQueue(); // no filePath: in-memory only for tests
   return service;
 }
 
@@ -1112,6 +1223,34 @@ export async function test_duplicate_event_ignored_via_nonce_store(): Promise<vo
   await (service as any).handleEvent(event);
 
   assertEqual(calls, 1, 'duplicate event should not call SDK twice');
+}
+
+/**
+ * Issue #669 regression: two concurrent deliveries of the same event (e.g. a
+ * reconnect replay racing a live notification) must only submit once, even
+ * though neither delivery has awaited far enough to mark the nonce yet.
+ */
+export async function test_concurrent_duplicate_events_submit_only_once(): Promise<void> {
+  let calls = 0;
+  let resolveFirst!: () => void;
+  const gate = new Promise<void>((resolve) => { resolveFirst = resolve; });
+  const service = makeTestService({
+    fundCrosschain: async () => {
+      calls += 1;
+      await gate; // hold the first call open so the second one races it
+      return { status: 'pending', hash: 'hash' };
+    },
+  });
+  const event = makeTestEvent();
+
+  // Fire both deliveries "concurrently" (no await between them), then let
+  // the first submission complete.
+  const p1 = (service as any).handleEvent(event);
+  const p2 = (service as any).handleEvent(event);
+  resolveFirst();
+  await Promise.all([p1, p2]);
+
+  assertEqual(calls, 1, 'concurrent duplicate events must only call the SDK once');
 }
 
 export async function test_nonce_marked_only_after_successful_submission(): Promise<void> {
@@ -1904,8 +2043,126 @@ export function test_valid_env_parses_correctly(): void {
   assertEqual(result.relayerPrivateKeys.length, 2, 'relayer key count');
 }
 
+// ---------------------------------------------------------------------------
+// Issue #668: regression tests — finalized commitment + reconnect backfill
+// ---------------------------------------------------------------------------
+
+export function test_solana_listener_subscribes_with_finalized_commitment(): void {
+  const payload = JSON.parse(buildSolanaSubscribePayload('program'));
+  assertEqual(payload.method, 'logsSubscribe', 'should subscribe to logs');
+  assertEqual(
+    payload.params[1].commitment,
+    'finalized',
+    'solana subscription must use finalized commitment, not confirmed (can still be rolled back)',
+  );
+}
+
+export async function test_solana_listener_backfills_missed_events_after_reconnect(): Promise<void> {
+  const filePath = tempStorePath('solana-sig');
+  try {
+    const listener = new SolanaChainListener({
+      wsUrl: 'ws://localhost',
+      programId: 'program',
+      chainId: 101,
+      httpUrl: 'http://localhost',
+      signatureStorePath: filePath,
+    });
+    (listener as any).lastSignature = 'sig-before-restart';
+
+    const rpcCalls: string[] = [];
+    (listener as any).rpcCall = async (method: string, _params: unknown[]) => {
+      rpcCalls.push(method);
+      if (method === 'getSignaturesForAddress') {
+        return [{ signature: 'sig-new', err: null }];
+      }
+      if (method === 'getTransaction') {
+        return { meta: { logMessages: ['Program log: bridge_fund:' + 'ab'.repeat(32) + ':GDEST:CASSET:100'] } };
+      }
+      return null;
+    };
+
+    const events: BridgeEvent[] = [];
+    (listener as any).onEvent = (e: BridgeEvent) => events.push(e);
+
+    await (listener as any).backfill();
+
+    assertEqual(rpcCalls, ['getSignaturesForAddress', 'getTransaction'], 'backfill should query signatures then fetch the transaction');
+    assertEqual(events.length, 1, 'backfill should replay the missed bridge_fund event');
+    assertEqual((listener as any).lastSignature, 'sig-new', 'lastSignature should advance to the newest replayed signature');
+
+    // Simulate a restart: a fresh instance pointed at the same file should
+    // resume backfilling from the persisted signature, not from scratch.
+    const restarted = new SolanaChainListener({
+      wsUrl: 'ws://localhost',
+      programId: 'program',
+      chainId: 101,
+      httpUrl: 'http://localhost',
+      signatureStorePath: filePath,
+    });
+    assertEqual((restarted as any).lastSignature, 'sig-new', 'signature persisted before restart must be loaded on construction');
+  } finally {
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+  }
+}
+
+export async function test_solana_listener_skips_backfill_without_persisted_signature(): Promise<void> {
+  const listener = new SolanaChainListener({
+    wsUrl: 'ws://localhost',
+    programId: 'program',
+    chainId: 101,
+    httpUrl: 'http://localhost',
+    signatureStorePath: tempStorePath('solana-sig-fresh'),
+  });
+  let called = false;
+  (listener as any).rpcCall = async () => { called = true; return []; };
+
+  await (listener as any).backfill();
+
+  assert(!called, 'a fresh listener with no persisted signature has nothing to backfill from and should not call the RPC');
+}
+
+// ---------------------------------------------------------------------------
+// Issue #670: regression tests — submission state survives a process restart
+// ---------------------------------------------------------------------------
+
+function tempStorePath(name: string): string {
+  return path.join(require('os').tmpdir(), `relayer-self-test-${name}-${process.pid}-${Date.now()}.json`);
+}
+
+export function test_nonce_store_persists_across_restart(): void {
+  const filePath = tempStorePath('nonces');
+  try {
+    const before = new NonceStore(filePath);
+    assertEqual(before.has(1, 'abcd'), false, 'fresh store should not have the nonce yet');
+    before.mark(1, 'abcd');
+
+    // Simulate a restart: construct a brand-new instance pointed at the same file.
+    const after = new NonceStore(filePath);
+    assert(after.has(1, 'abcd'), 'nonce marked before restart must still be present after restart');
+  } finally {
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+  }
+}
+
+export function test_dead_letter_queue_persists_across_restart(): void {
+  const filePath = tempStorePath('dlq');
+  try {
+    const before = new DeadLetterQueue(filePath);
+    before.enqueue(makeTestEvent(), 1, 2);
+    assertEqual(before.size(), 1, 'entry should be enqueued');
+
+    // Simulate a restart: construct a brand-new instance pointed at the same file.
+    const after = new DeadLetterQueue(filePath);
+    assertEqual(after.size(), 1, 'dead-letter entry must survive a restart');
+    assertEqual(after.all()[0].event.txHash, makeTestEvent().txHash, 'restored entry must match the original event');
+  } finally {
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+  }
+}
+
 async function runRelayerSelfTests(): Promise<void> {
   await test_duplicate_event_ignored_via_nonce_store();
+  await test_concurrent_duplicate_events_submit_only_once();
   await test_nonce_marked_only_after_successful_submission();
   await test_below_threshold_short_circuits_before_sdk_call();
   await test_duplicate_pubkey_nodes_do_not_inflate_sig_count();
@@ -1926,6 +2183,9 @@ async function runRelayerSelfTests(): Promise<void> {
   await test_eth_listener_withholds_logs_within_confirmation_depth();
   await test_eth_listener_skips_removed_reorged_logs();
   test_solana_listener_rejects_bad_log_lines();
+  test_solana_listener_subscribes_with_finalized_commitment();
+  await test_solana_listener_backfills_missed_events_after_reconnect();
+  await test_solana_listener_skips_backfill_without_persisted_signature();
   test_payload_hash_matches_onchain_algorithm();
   test_amount_encoding_handles_large_decimals();
   test_signature_passes_ed25519_verify();
