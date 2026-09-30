@@ -913,11 +913,10 @@ export interface FundCAddressWithSwapOptions {
 
 /**
  * A single page of results returned by list-querying SDK methods such as
- * {@link OnboardingBridgeSDK.getWhitelistedAssets},
- * {@link OnboardingBridgeSDK.getBlocklistedAddresses}, etc.
+ * {@link OnboardingBridgeSDK.getWhitelistedAssets}.
  *
- * Because Soroban contracts return full vectors, pagination is performed
- * client-side. The `cursor` is an opaque base64-encoded offset token.
+ * Pagination is performed on-chain: the `cursor` is an opaque base64-encoded
+ * offset token that the contract call resumes from.
  *
  * @typeParam T — the element type for items in this page.
  *

@@ -13,10 +13,15 @@
  */
 
 import * as crypto from 'crypto';
+import * as fs from 'fs';
 import * as http from 'http';
+import * as path from 'path';
 import { Keypair } from '@stellar/stellar-sdk';
-import { OnboardingBridgeSDK } from '../sdk/src/bridge';
-import { CrossChainFundOptions, RelayerSig } from '../sdk/src/types';
+import {
+  OnboardingBridgeSDK,
+  CrossChainFundOptions,
+  RelayerSig,
+} from '@stellar/c-address-onboarding-bridge-sdk';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -43,10 +48,62 @@ export interface ChainListener {
   stop(): void;
 }
 
-/** Config for one relayer node (holds its own signing key). */
-export interface RelayerNodeConfig {
-  /** Ed25519 private key as 32-byte hex string (seed). */
-  privateKey: string;
+/**
+ * Config for one relayer node/signer.
+ *
+ * Two shapes are supported:
+ *
+ * - `{ signerUrl }` (recommended): the key never enters this process. The
+ *   relayer POSTs the payload hash to an independent signer service — run by
+ *   the operator that owns that key, on its own host/process — and receives
+ *   back a signature. See `relayer/signer-service.ts` and
+ *   `adr/ADR-007-signer-key-isolation.md`.
+ * - `{ privateKey }` (legacy/dev only): the key is loaded directly into this
+ *   process. Kept for local development and backwards compatibility, but
+ *   using it for more than one node defeats the multi-sig threshold, since
+ *   compromising this one process then yields every key. A deprecation
+ *   warning is logged whenever it's used with more than one configured node.
+ */
+export type RelayerNodeConfig =
+  | { privateKey: string; signerUrl?: undefined }
+  | { signerUrl: string; privateKey?: undefined };
+
+/** Timeout for a remote signer HTTP call, in ms. */
+const SIGNER_REQUEST_TIMEOUT_MS = 5_000;
+
+/**
+ * Request a signature from an independent per-operator signer service that
+ * holds exactly one key. The relayer process never sees that key's material.
+ */
+async function requestRemoteSignature(signerUrl: string, payloadHash: Buffer): Promise<RelayerSig> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SIGNER_REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${signerUrl.replace(/\/$/, '')}/sign`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payloadHash: payloadHash.toString('hex') }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`signer at ${signerUrl} responded ${res.status}`);
+    }
+    const json: any = await res.json();
+    if (typeof json.pubkey !== 'string' || typeof json.signature !== 'string') {
+      throw new Error(`signer at ${signerUrl} returned a malformed response`);
+    }
+    return { pubkey: json.pubkey, signature: json.signature };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/** Sign the payload hash with a single node, using whichever custody mode it's configured for. */
+async function signWithNode(node: RelayerNodeConfig, payloadHash: Buffer): Promise<RelayerSig> {
+  if (node.signerUrl) {
+    return requestRemoteSignature(node.signerUrl, payloadHash);
+  }
+  return signPayload(node.privateKey!, payloadHash);
 }
 
 export interface RelayerServiceConfig {
@@ -62,6 +119,12 @@ export interface RelayerServiceConfig {
   threshold: number;
   /** Chain listeners to watch. */
   listeners: ChainListener[];
+  /**
+   * How often to retry dead-lettered events, in ms. Set to 0 to disable the
+   * automatic retry timer (the DLQ can still be drained manually via
+   * `retryDeadLetters()`). Defaults to 60_000 (1 minute).
+   */
+  dlqRetryIntervalMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -76,25 +139,32 @@ export interface DeadLetterEntry {
   /** How many signers were available vs how many were required. */
   availableSigners: number;
   requiredSigners: number;
+  /** Human-readable reason the event could not be submitted. */
+  reason: string;
 }
 
 /**
- * In-memory dead-letter store for under-threshold events.
- * Replace with a persistent store (e.g. Redis, SQLite) in production.
+ * In-memory dead-letter store for under-threshold events and failed
+ * submissions. Replace with a persistent store (e.g. Redis, SQLite) in
+ * production.
  */
 export class DeadLetterQueue {
   private entries: DeadLetterEntry[] = [];
 
-  enqueue(event: BridgeEvent, available: number, required: number): void {
+  enqueue(event: BridgeEvent, available: number, required: number, reason: string): void {
+    // Replace any stale entry for the same event so retries don't pile up
+    // duplicate rows for the same tx.
+    this.remove(event.chainId, event.txHash);
     this.entries.push({
       event,
       enqueuedAt: new Date().toISOString(),
       availableSigners: available,
       requiredSigners: required,
+      reason,
     });
     console.warn(
       `[relayer] dead-letter: chain=${event.chainId} tx=${event.txHash} ` +
-        `signers=${available}/${required} — stored for retry`,
+        `signers=${available}/${required} reason="${reason}" — stored for retry`,
     );
   }
 
@@ -224,6 +294,7 @@ export class RelayerService {
   private nonces = new NonceStore();
   private startedAt = Date.now();
   private lastEventPerChain: Map<number, string> = new Map();
+  private dlqRetryTimer: ReturnType<typeof setInterval> | null = null;
   readonly dlq = new DeadLetterQueue();
 
   constructor(config: RelayerServiceConfig) {
@@ -234,12 +305,33 @@ export class RelayerService {
       networkPassphrase: config.networkPassphrase,
     });
     this.submitterKeypair = Keypair.fromSecret(config.submitterSecretKey);
+
+    const inProcessKeyCount = config.nodes.filter((n) => n.privateKey !== undefined).length;
+    if (inProcessKeyCount > 1) {
+      console.warn(
+        `[relayer] WARNING: ${inProcessKeyCount} relayer private keys are loaded directly into ` +
+          'this process. This defeats the multi-sig threshold — compromising this one process ' +
+          'yields every key. Configure each node with a `signerUrl` pointing at an independent ' +
+          'signer service instead (see relayer/signer-service.ts and ' +
+          'adr/ADR-007-signer-key-isolation.md). `privateKey` remains only for local dev.',
+      );
+    }
   }
 
   start(): void {
     for (const listener of this.config.listeners) {
       listener.start((event) => this.handleEvent(event));
     }
+
+    const retryIntervalMs = this.config.dlqRetryIntervalMs ?? 60_000;
+    if (retryIntervalMs > 0) {
+      this.dlqRetryTimer = setInterval(() => {
+        this.retryDeadLetters().catch((err) =>
+          console.error(`[relayer] dead-letter retry sweep failed: ${err.message}`),
+        );
+      }, retryIntervalMs);
+    }
+
     console.log(`[relayer] started with ${this.config.nodes.length} node(s), threshold=${this.config.threshold}`);
   }
 
@@ -247,7 +339,25 @@ export class RelayerService {
     for (const listener of this.config.listeners) {
       listener.stop();
     }
+    if (this.dlqRetryTimer) {
+      clearInterval(this.dlqRetryTimer);
+      this.dlqRetryTimer = null;
+    }
     console.log('[relayer] stopped');
+  }
+
+  /**
+   * Re-attempt delivery for every event currently in the dead-letter queue.
+   * `handleEvent` re-enqueues (replacing the stale entry) on repeat failure
+   * and removes the entry on success, so this simply drains what it can.
+   */
+  async retryDeadLetters(): Promise<void> {
+    const pending = this.dlq.all();
+    if (pending.length === 0) return;
+    console.log(`[relayer] retrying ${pending.length} dead-lettered event(s)`);
+    for (const entry of pending) {
+      await this.handleEvent(entry.event);
+    }
   }
 
   healthStatus(): HealthStatus {
@@ -281,8 +391,8 @@ export class RelayerService {
     // relayer infrastructure.  A config mistake (two nodes sharing a key) or a
     // malicious injection must not inflate the effective signature count past
     // what distinct keys actually authorize.
-    const rawSigs: RelayerSig[] = this.config.nodes.map((node) =>
-      signPayload(node.privateKey, payloadHash),
+    const rawSigs: RelayerSig[] = await Promise.all(
+      this.config.nodes.map((node) => signWithNode(node, payloadHash)),
     );
     const seenPubkeys = new Set<string>();
     const sigs: RelayerSig[] = rawSigs.filter((sig) => {
@@ -296,6 +406,7 @@ export class RelayerService {
 
     if (sigs.length < this.config.threshold) {
       console.warn(`[relayer] not enough signers after dedup: have ${sigs.length}, need ${this.config.threshold}`);
+      this.dlq.enqueue(event, sigs.length, this.config.threshold, 'insufficient signers after dedup');
       return;
     }
 
@@ -313,15 +424,18 @@ export class RelayerService {
 
       if (result.status === 'failed') {
         console.error(`[relayer] fundCrosschain failed: ${result.error}`);
+        this.dlq.enqueue(event, sigs.length, this.config.threshold, `submission failed: ${result.error}`);
         return;
       }
 
       // Mark nonce only after successful submission
       this.nonces.mark(event.chainId, event.txHash);
       this.lastEventPerChain.set(event.chainId, new Date().toISOString());
+      this.dlq.remove(event.chainId, event.txHash);
       console.log(`[relayer] submitted tx=${result.hash} for chain=${event.chainId} src-tx=${event.txHash}`);
     } catch (err: any) {
       console.error(`[relayer] unexpected error: ${err.message}`);
+      this.dlq.enqueue(event, sigs.length, this.config.threshold, `unexpected error: ${err.message}`);
     }
   }
 }
@@ -405,11 +519,25 @@ export interface EthListenerConfig {
    * directory when not provided.
    */
   blockStorePath?: string;
+  /**
+   * Number of blocks to hold back from the chain head before a log is
+   * considered final and acted on. A deposit that is later reorged out on
+   * Ethereum cannot be reversed once it has been paid out on Stellar, so logs
+   * newer than `latest - confirmations` are left for a later poll instead of
+   * being queried at all. Defaults to `DEFAULT_ETH_CONFIRMATIONS` (12 blocks,
+   * ~ the depth generally considered final on Ethereum mainnet).
+   */
+  confirmations?: number;
 }
+
+/** Default confirmation depth applied when `EthListenerConfig.confirmations` is not set. */
+export const DEFAULT_ETH_CONFIRMATIONS = 12;
 
 /**
  * Minimal Ethereum log-polling listener.  Decodes a `BridgeFund` log with
- * ABI: `BridgeFund(bytes32 txHash, string target, string asset, uint256 amount)`.
+ * ABI: `BridgeFund(string target, string asset, uint256 amount)`. The replay
+ * key is derived from the log's own `transactionHash`/`logIndex`, not from
+ * event data (see `decode()`).
  *
  * Persists the last-processed block number to a local file so that a restart
  * resumes from the correct position and never skips events emitted during a
@@ -422,6 +550,7 @@ export class EthChainListener implements ChainListener {
   private fromBlock: string;
   private config: EthListenerConfig;
   private blockStore: BlockStore;
+  private onEvent: ((event: BridgeEvent) => void) | null = null;
 
   constructor(config: EthListenerConfig) {
     this.config = config;
@@ -435,33 +564,9 @@ export class EthChainListener implements ChainListener {
   }
 
   start(onEvent: (event: BridgeEvent) => void): void {
-    // Fire-and-forget: confirm the configured chainId actually matches the
-    // node we're polling before we start emitting events signed for it.
-    this.verifyChainId().catch((err: any) => {
-      console.error(`[eth-listener] chainId verification failed: ${err.message}`);
-    });
-
-    const poll = async () => {
-      try {
-        const logs = await this.getLogs();
-        for (const log of logs) {
-          const event = this.decode(log);
-          if (event) onEvent(event);
-        }
-        if (logs.length > 0) {
-          // advance fromBlock past the last processed block
-          const lastBlock = parseInt(logs[logs.length - 1].blockNumber, 16);
-          this.fromBlock = '0x' + (lastBlock + 1).toString(16);
-          // Persist so a restart resumes from here
-          this.blockStore.save(this.fromBlock);
-        }
-      } catch (err: any) {
-        console.error(`[eth-listener] poll error: ${err.message}`);
-      }
-    };
-
-    this.timer = setInterval(poll, this.config.pollIntervalMs ?? 12_000);
-    poll(); // immediate first poll
+    this.onEvent = onEvent;
+    this.timer = setInterval(() => this.pollOnce(), this.config.pollIntervalMs ?? 12_000);
+    this.pollOnce(); // immediate first poll
   }
 
   stop(): void {
@@ -469,42 +574,82 @@ export class EthChainListener implements ChainListener {
   }
 
   /**
-   * Cross-check `config.chainId` against the RPC node's own `eth_chainId`.
-   * Prevents signing/relaying testnet events (Sepolia, Base, …) with a
-   * chainId configured for a different network (e.g. mainnet's `1`).
+   * Run a single poll cycle. Exposed (not just used from the timer) so tests
+   * can drive it deterministically against a fake RPC.
    */
-  private async verifyChainId(): Promise<void> {
+  private async pollOnce(): Promise<void> {
+    try {
+      if (this.fromBlock === 'latest') {
+        // Fresh install: resolve 'latest' to a concrete block number *once*
+        // and persist it, instead of re-querying a single sliding block on
+        // every poll (which misses anything produced between two polls).
+        const current = await this.getBlockNumber();
+        this.fromBlock = current;
+        this.blockStore.save(this.fromBlock);
+        console.log(`[eth-listener] resolved initial block to ${this.fromBlock}`);
+        return;
+      }
+
+      const latest = await this.getBlockNumber();
+      const confirmations = this.config.confirmations ?? DEFAULT_ETH_CONFIRMATIONS;
+      const safeToBlockNum = Math.max(parseInt(latest, 16) - confirmations, 0);
+      const fromBlockNum = parseInt(this.fromBlock, 16);
+
+      if (safeToBlockNum < fromBlockNum) {
+        // Nothing has reached the required confirmation depth yet — wait for
+        // a later poll instead of acting on unconfirmed (reorg-able) blocks.
+        return;
+      }
+
+      const toBlock = '0x' + safeToBlockNum.toString(16);
+      const logs = await this.getLogs(toBlock);
+      for (const log of logs) {
+        if (log && log.removed === true) {
+          console.warn(`[eth-listener] skipping reorged log tx=${log.transactionHash ?? '?'}`);
+          continue;
+        }
+        const event = this.decode(log);
+        if (event && this.onEvent) this.onEvent(event);
+      }
+
+      // Always advance fromBlock past the queried range — even when zero
+      // logs were returned. Otherwise any block produced between two polls
+      // that never contains a matching log is never queried again.
+      const nextFromBlock = '0x' + (safeToBlockNum + 1).toString(16);
+      this.fromBlock = nextFromBlock;
+      this.blockStore.save(this.fromBlock);
+    } catch (err: any) {
+      console.error(`[eth-listener] poll error: ${err.message}`);
+    }
+  }
+
+  private async getBlockNumber(): Promise<string> {
     const body = JSON.stringify({
       jsonrpc: '2.0',
       id: 1,
-      method: 'eth_chainId',
+      method: 'eth_blockNumber',
       params: [],
     });
-
     const res = await fetch(this.config.rpcUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body,
     });
     const json: any = await res.json();
-    const remoteChainId = parseInt(json.result, 16);
-
-    if (Number.isFinite(remoteChainId) && remoteChainId !== this.config.chainId) {
-      console.error(
-        `[eth-listener] chainId mismatch: configured=${this.config.chainId} ` +
-          `rpc-reported=${remoteChainId}. Signed payloads will use the wrong chainId.`,
-      );
+    if (typeof json.result !== 'string') {
+      throw new Error('eth_blockNumber returned no result');
     }
+    return json.result;
   }
 
-  private async getLogs(): Promise<any[]> {
+  private async getLogs(toBlock: string): Promise<any[]> {
     const body = JSON.stringify({
       jsonrpc: '2.0',
       id: 1,
       method: 'eth_getLogs',
       params: [{
         fromBlock: this.fromBlock,
-        toBlock: 'latest',
+        toBlock,
         address: this.config.bridgeContractAddress,
         topics: [this.config.eventTopic],
       }],
@@ -516,22 +661,78 @@ export class EthChainListener implements ChainListener {
       body,
     });
     const json: any = await res.json();
-    return json.result ?? [];
+    if (json.error) {
+      const message = typeof json.error?.message === 'string' ? json.error.message : JSON.stringify(json.error);
+      throw new Error(`${method} RPC error: ${message}`);
+    }
+    return json.result;
+  }
+
+  /**
+   * Fetch logs in the range [fromBlock, latest], walking forward in chunks of
+   * at most `maxBlockRange` blocks so that a large gap since the last
+   * checkpoint (e.g. after downtime) never produces a single unbounded
+   * `eth_getLogs` request that most providers would reject outright.
+   *
+   * A JSON-RPC `error` is thrown (not swallowed as "no logs") so callers can
+   * see and retry it.
+   */
+  private async getLogs(): Promise<{ logs: any[]; queriedToBlock: number | null }> {
+    const maxRange = this.config.maxBlockRange ?? 2_000;
+
+    const latestHex: string = await this.rpcCall('eth_blockNumber', []);
+    const latestBlock = parseInt(latestHex, 16);
+
+    const startBlock =
+      this.fromBlock === 'latest' ? latestBlock : parseInt(this.fromBlock, 16);
+    if (!Number.isFinite(startBlock) || startBlock > latestBlock) {
+      return { logs: [], queriedToBlock: null };
+    }
+
+    const endBlock = Math.min(startBlock + maxRange - 1, latestBlock);
+
+    const result = await this.rpcCall('eth_getLogs', [{
+      fromBlock: '0x' + startBlock.toString(16),
+      toBlock: '0x' + endBlock.toString(16),
+      address: this.config.bridgeContractAddress,
+      topics: [this.config.eventTopic],
+    }]);
+
+    return { logs: Array.isArray(result) ? result : [], queriedToBlock: endBlock };
   }
 
   /**
    * Decode a raw eth log into a BridgeEvent.
    * Expected ABI-encoded topics/data:
    *   topic[0]: event signature hash
-   *   topic[1]: bytes32 txHash (indexed)
    *   data:     abi.encode(string target, string asset, uint256 amount)
+   *
+   * The replay key (`txHash`) is derived from the log's own
+   * `transactionHash` + `logIndex` — fields the RPC node/chain attests to —
+   * rather than from any value the emitting contract chose to include in the
+   * event data. Otherwise a buggy or malicious emitter controls the replay
+   * key, and two BridgeFund logs in the same transaction (same
+   * transactionHash) would collide on-chain, where the replay key is
+   * `(chain_id, tx_hash)`.
    */
   private decode(log: any): BridgeEvent | null {
     try {
-      if (!Array.isArray(log.topics) || typeof log.topics[1] !== 'string') return null;
-      const txHashTopic = log.topics[1] as string;
-      if (!txHashTopic.startsWith('0x') || txHashTopic.length !== 66) return null;
-      const txHash = txHashTopic.slice(2); // strip 0x
+      if (typeof log.transactionHash !== 'string' || !log.transactionHash.startsWith('0x') || log.transactionHash.length !== 66) {
+        return null;
+      }
+      const logIndexRaw = log.logIndex;
+      const logIndex =
+        typeof logIndexRaw === 'string' ? parseInt(logIndexRaw, 16) : Number(logIndexRaw);
+      if (!Number.isFinite(logIndex) || logIndex < 0) return null;
+
+      const txHashBytes = Buffer.from(log.transactionHash.slice(2), 'hex');
+      const logIndexBuf = Buffer.alloc(4);
+      logIndexBuf.writeUInt32BE(logIndex);
+      const txHash = crypto
+        .createHash('sha256')
+        .update(txHashBytes)
+        .update(logIndexBuf)
+        .digest('hex');
 
       // ABI-decode non-indexed data: (string target, string asset, uint256 amount)
       if (typeof log.data !== 'string' || !log.data.startsWith('0x')) return null;
@@ -570,6 +771,39 @@ export class EthChainListener implements ChainListener {
 // Solana listener (WebSocket log subscription — no @solana/web3.js required)
 // ---------------------------------------------------------------------------
 
+// Bitcoin/Solana base58 alphabet (no 0, O, I, l).
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const BASE58_MAP: Record<string, number> = Object.fromEntries(
+  BASE58_ALPHABET.split('').map((c, i) => [c, i]),
+);
+
+/**
+ * Decode a base58 string (e.g. a Solana signature or pubkey) into raw bytes.
+ * Throws on any character outside the base58 alphabet. Only stdlib
+ * primitives (BigInt) are used, matching this file's no-extra-deps policy.
+ */
+function base58Decode(input: string): Buffer {
+  if (input.length === 0) throw new Error('empty base58 string');
+
+  let leadingZeros = 0;
+  while (leadingZeros < input.length && input[leadingZeros] === '1') leadingZeros++;
+
+  let num = 0n;
+  for (const ch of input) {
+    const value = BASE58_MAP[ch];
+    if (value === undefined) throw new Error(`invalid base58 character: ${ch}`);
+    num = num * 58n + BigInt(value);
+  }
+
+  const bytes: number[] = [];
+  while (num > 0n) {
+    bytes.unshift(Number(num & 0xffn));
+    num >>= 8n;
+  }
+
+  return Buffer.concat([Buffer.alloc(leadingZeros, 0), Buffer.from(bytes)]);
+}
+
 export interface SolanaListenerConfig {
   /** Solana WebSocket endpoint (wss://...) */
   wsUrl: string;
@@ -591,7 +825,13 @@ export interface SolanaListenerConfig {
 /**
  * Listens to Solana program log notifications over WebSocket.
  * Expects the Solana program to emit a structured log line:
- *   "bridge_fund:<txHash>:<target>:<asset>:<amount>"
+ *   "bridge_fund:<signature>:<target>:<asset>:<amount>"
+ *
+ * `logsSubscribe({ mentions: [programId] })` matches any transaction that
+ * touches the program, so a `bridge_fund` line is only accepted when the
+ * bridge program is the one currently executing (see
+ * `extractBridgeFundEvents`), not merely present somewhere in the
+ * transaction's log lines.
  *
  * Implements reconnect-with-exponential-backoff so that a transient WebSocket
  * drop (network blip, RPC provider restart) does not permanently halt event
@@ -649,10 +889,8 @@ export class SolanaChainListener implements ChainListener {
       try {
         const data = JSON.parse(typeof msg === 'string' ? msg : msg.data);
         const logs: string[] = data?.params?.result?.value?.logs ?? [];
-        for (const line of logs) {
-          if (!line.startsWith('Program log: bridge_fund:')) continue;
-          const event = this.decodeLine(line);
-          if (event && this.onEvent) this.onEvent(event);
+        for (const event of this.extractBridgeFundEvents(logs)) {
+          if (this.onEvent) this.onEvent(event);
         }
       } catch { /* ignore malformed messages */ }
     };
@@ -678,16 +916,81 @@ export class SolanaChainListener implements ChainListener {
   }
 
   /**
-   * Parse: "Program log: bridge_fund:<txHash>:<target>:<asset>:<amount>"
+   * `logsSubscribe` with `{ mentions: [programId] }` matches every
+   * transaction that *touches* the program, including one where a
+   * different program (e.g. via CPI) prints its own
+   * `Program log: bridge_fund:...` line — that would let anyone forge a
+   * deposit event for free. This walks the log lines for one notification,
+   * tracking the Solana runtime's own invoke/success/failed frames, and
+   * only treats a `bridge_fund` line as genuine when the bridge program
+   * itself is the currently-executing program (top of the invoke stack).
+   */
+  private extractBridgeFundEvents(logs: string[]): BridgeEvent[] {
+    const events: BridgeEvent[] = [];
+    const stack: string[] = [];
+    const invokeRe = /^Program (\S+) invoke \[\d+\]$/;
+    const endRe = /^Program (\S+) (?:success|failed:.*)$/;
+
+    for (const line of logs) {
+      const invokeMatch = line.match(invokeRe);
+      if (invokeMatch) {
+        stack.push(invokeMatch[1]);
+        continue;
+      }
+      const endMatch = line.match(endRe);
+      if (endMatch) {
+        const idx = stack.lastIndexOf(endMatch[1]);
+        if (idx !== -1) stack.splice(idx, 1);
+        continue;
+      }
+      if (!line.startsWith('Program log: bridge_fund:')) continue;
+
+      const executingProgram = stack[stack.length - 1];
+      if (executingProgram !== this.config.programId) {
+        this.rejectLine(
+          line,
+          `emitted while '${executingProgram ?? '<none>'}' was executing, not the bridge program`,
+        );
+        continue;
+      }
+
+      const event = this.decodeLine(line);
+      if (event) events.push(event);
+    }
+
+    return events;
+  }
+
+  /**
+   * Parse: "Program log: bridge_fund:<signature>:<target>:<asset>:<amount>"
+   *
+   * `<signature>` is the base58-encoded 64-byte Solana transaction
+   * signature. The payload hash / contract nonce need a 32-byte `txHash`
+   * (see `computeNonce`), so the signature is base58-decoded, validated to
+   * be exactly 64 bytes, and mapped to 32 bytes via `sha256(signature)`
+   * rather than being used as-is (which would silently truncate/garble a
+   * real signature into an arbitrary buffer).
    */
   private decodeLine(line: string): BridgeEvent | null {
     try {
       const payload = line.replace('Program log: bridge_fund:', '');
       const parts = payload.split(':');
       if (parts.length !== 4) return this.rejectLine(line, 'expected 4 fields');
-      const [txHash, target, asset, amount] = parts;
-      if (!txHash || !target || !asset || !amount) return this.rejectLine(line, 'missing field');
+      const [signature, target, asset, amount] = parts;
+      if (!signature || !target || !asset || !amount) return this.rejectLine(line, 'missing field');
       if (!/^\d+$/.test(amount)) return this.rejectLine(line, 'amount is not numeric');
+
+      let sigBytes: Buffer;
+      try {
+        sigBytes = base58Decode(signature);
+      } catch {
+        return this.rejectLine(line, 'signature is not valid base58');
+      }
+      if (sigBytes.length !== 64) {
+        return this.rejectLine(line, `signature must decode to 64 bytes, got ${sigBytes.length}`);
+      }
+      const txHash = crypto.createHash('sha256').update(sigBytes).digest('hex');
+
       return { chainId: this.config.chainId, txHash, target, asset, amount };
     } catch {
       return this.rejectLine(line, 'malformed line');
@@ -907,6 +1210,114 @@ export async function test_mixed_duplicate_and_unique_pubkeys_meet_threshold(): 
   assert(capturedSigCount <= 2, 'SDK must receive at most threshold sigs after dedup');
 }
 
+// ---------------------------------------------------------------------------
+// Issue #660: regression tests — dead-letter queue is actually written to
+// ---------------------------------------------------------------------------
+
+export async function test_below_threshold_event_is_enqueued_to_dlq(): Promise<void> {
+  const service = makeTestService({ threshold: 2, nodes: [{ privateKey: '01'.repeat(32) }] });
+  const event = makeTestEvent();
+
+  await (service as any).handleEvent(event);
+
+  assertEqual(service.dlq.size(), 1, 'under-threshold event should be enqueued to the DLQ');
+  assertEqual(service.dlq.all()[0].reason, 'insufficient signers after dedup', 'DLQ entry should record the reason');
+}
+
+export async function test_failed_submission_is_enqueued_to_dlq(): Promise<void> {
+  const service = makeTestService({
+    fundCrosschain: async () => ({ status: 'failed', hash: '', error: 'boom' }),
+  });
+  const event = makeTestEvent();
+
+  await (service as any).handleEvent(event);
+
+  assertEqual(service.dlq.size(), 1, 'failed submission should be enqueued to the DLQ');
+}
+
+export async function test_successful_retry_removes_dlq_entry(): Promise<void> {
+  let attempt = 0;
+  const service = makeTestService({
+    fundCrosschain: async () => {
+      attempt += 1;
+      return attempt === 1
+        ? { status: 'failed', hash: '', error: 'boom' }
+        : { status: 'pending', hash: 'hash' };
+    },
+  });
+  const event = makeTestEvent();
+
+  await (service as any).handleEvent(event);
+  assertEqual(service.dlq.size(), 1, 'first failure should enqueue an entry');
+
+  await service.retryDeadLetters();
+  assertEqual(service.dlq.size(), 0, 'a successful retry should remove the DLQ entry');
+}
+
+// ---------------------------------------------------------------------------
+// Issue #661: regression tests — per-signer key isolation via signerUrl nodes
+// ---------------------------------------------------------------------------
+
+export async function test_signer_url_node_signs_via_remote_call_not_local_key(): Promise<void> {
+  const originalFetch = (globalThis as any).fetch;
+  let calledUrl = '';
+  let sentBody: any = null;
+  (globalThis as any).fetch = async (url: string, opts: any) => {
+    calledUrl = url;
+    sentBody = JSON.parse(opts.body);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ pubkey: 'aa'.repeat(32), signature: 'bb'.repeat(64) }),
+    };
+  };
+  try {
+    let capturedSigCount = 0;
+    const service = makeTestService({
+      threshold: 1,
+      nodes: [{ signerUrl: 'http://signer-a.internal:4000' }],
+      fundCrosschain: async (options: CrossChainFundOptions) => {
+        capturedSigCount = options.sigs.length;
+        return { status: 'pending', hash: 'hash' };
+      },
+    });
+
+    await (service as any).handleEvent(makeTestEvent());
+
+    assertEqual(calledUrl, 'http://signer-a.internal:4000/sign', 'should POST to the configured signer service');
+    assert(typeof sentBody.payloadHash === 'string', 'request body must carry the payload hash, never a private key');
+    assertEqual(capturedSigCount, 1, 'the remote signature should reach the SDK call');
+  } finally {
+    (globalThis as any).fetch = originalFetch;
+  }
+}
+
+export async function test_mixed_signer_url_and_private_key_nodes_meet_threshold(): Promise<void> {
+  const originalFetch = (globalThis as any).fetch;
+  (globalThis as any).fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ pubkey: 'cc'.repeat(32), signature: 'dd'.repeat(64) }),
+  });
+  try {
+    let calls = 0;
+    const service = makeTestService({
+      threshold: 2,
+      nodes: [{ signerUrl: 'http://signer-b.internal:4000' }, { privateKey: '05'.repeat(32) }],
+      fundCrosschain: async () => {
+        calls += 1;
+        return { status: 'pending', hash: 'hash' };
+      },
+    });
+
+    await (service as any).handleEvent(makeTestEvent());
+
+    assertEqual(calls, 1, 'a mix of remote and local signers should still meet the threshold');
+  } finally {
+    (globalThis as any).fetch = originalFetch;
+  }
+}
+
 function word(hex: string): string {
   return hex.padStart(64, '0');
 }
@@ -917,13 +1328,20 @@ function encodedString(value: string): string {
   return word((hex.length / 2).toString(16)) + hex.padEnd(paddedLength, '0');
 }
 
-function makeAbiLog(target: string, asset: string, amount: bigint): any {
+function makeAbiLog(
+  target: string,
+  asset: string,
+  amount: bigint,
+  overrides: { transactionHash?: string; logIndex?: string } = {},
+): any {
   const targetTail = encodedString(target);
   const assetTail = encodedString(asset);
   const targetOffset = 32 * 3;
   const assetOffset = targetOffset + targetTail.length / 2;
   return {
-    topics: ['0x' + '00'.repeat(32), '0x' + 'cd'.repeat(32)],
+    topics: ['0x' + '00'.repeat(32)],
+    transactionHash: overrides.transactionHash ?? '0x' + 'cd'.repeat(32),
+    logIndex: overrides.logIndex ?? '0x0',
     data: '0x' + word(targetOffset.toString(16)) + word(assetOffset.toString(16)) + word(amount.toString(16)) + targetTail + assetTail,
   };
 }
@@ -936,12 +1354,109 @@ export function test_eth_listener_decodes_realistic_abi_log_fixture(): void {
     chainId: 1,
   });
 
-  const event = (listener as any).decode(makeAbiLog('GDESTINATION', 'CASSET', 123456789n));
+  const log = makeAbiLog('GDESTINATION', 'CASSET', 123456789n);
+  const event = (listener as any).decode(log);
 
   assert(event !== null, 'valid ABI log should decode');
   assertEqual(event.target, 'GDESTINATION', 'target should decode');
   assertEqual(event.asset, 'CASSET', 'asset should decode');
   assertEqual(event.amount, '123456789', 'amount should decode');
+
+  const expectedTxHash = crypto
+    .createHash('sha256')
+    .update(Buffer.from((log.transactionHash as string).slice(2), 'hex'))
+    .update(Buffer.alloc(4)) // logIndex 0
+    .digest('hex');
+  assertEqual(event.txHash, expectedTxHash, 'txHash must be derived from log.transactionHash + logIndex');
+}
+
+/**
+ * Issue #665 regression: two BridgeFund logs in the SAME transaction (same
+ * transactionHash, different logIndex) must produce different replay keys,
+ * and the emitted event's own data must have no influence on txHash.
+ */
+export function test_eth_listener_derives_txhash_from_log_not_event_data(): void {
+  const listener = new EthChainListener({
+    rpcUrl: 'http://localhost',
+    bridgeContractAddress: '0xbridge',
+    eventTopic: '0xtopic',
+    chainId: 1,
+  });
+
+  const sameTx = '0x' + 'ab'.repeat(32);
+  const log0 = makeAbiLog('GDESTINATION', 'CASSET', 1n, { transactionHash: sameTx, logIndex: '0x0' });
+  const log1 = makeAbiLog('GDESTINATION', 'CASSET', 1n, { transactionHash: sameTx, logIndex: '0x1' });
+
+  const event0 = (listener as any).decode(log0);
+  const event1 = (listener as any).decode(log1);
+
+  assert(event0 !== null && event1 !== null, 'both logs should decode');
+  assert(
+    event0.txHash !== event1.txHash,
+    'two logs in the same transaction must not collapse to the same replay key',
+  );
+}
+
+/**
+ * Issue #664 regression: a JSON-RPC `error` (e.g. "block range too large")
+ * must be thrown, not silently treated as "no logs".
+ */
+export async function test_eth_listener_throws_on_rpc_error(): Promise<void> {
+  const originalFetch = (globalThis as any).fetch;
+  (globalThis as any).fetch = async () => ({
+    json: async () => ({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'block range too large' } }),
+  });
+  try {
+    const listener = new EthChainListener({
+      rpcUrl: 'http://localhost',
+      bridgeContractAddress: '0xbridge',
+      eventTopic: '0xtopic',
+      chainId: 1,
+    });
+    let threw = false;
+    try {
+      await (listener as any).rpcCall('eth_getLogs', [{}]);
+    } catch {
+      threw = true;
+    }
+    assert(threw, 'a JSON-RPC error result must be thrown, not swallowed as an empty log list');
+  } finally {
+    (globalThis as any).fetch = originalFetch;
+  }
+}
+
+/**
+ * Issue #664 regression: a single `getLogs()` call must never request more
+ * than `maxBlockRange` blocks, even when the checkpoint is far behind head.
+ */
+export async function test_eth_listener_bounds_block_range(): Promise<void> {
+  const originalFetch = (globalThis as any).fetch;
+  const requestedRanges: Array<{ fromBlock: string; toBlock: string }> = [];
+  (globalThis as any).fetch = async (_url: string, init: any) => {
+    const body = JSON.parse(init.body);
+    if (body.method === 'eth_blockNumber') {
+      return { json: async () => ({ jsonrpc: '2.0', id: 1, result: '0x' + (100_000).toString(16) }) };
+    }
+    requestedRanges.push(body.params[0]);
+    return { json: async () => ({ jsonrpc: '2.0', id: 1, result: [] }) };
+  };
+  try {
+    const listener = new EthChainListener({
+      rpcUrl: 'http://localhost',
+      bridgeContractAddress: '0xbridge',
+      eventTopic: '0xtopic',
+      chainId: 1,
+      maxBlockRange: 500,
+    });
+    (listener as any).fromBlock = '0x0';
+    const { queriedToBlock } = await (listener as any).getLogs();
+    assertEqual(queriedToBlock, 499, 'queried range must be capped at maxBlockRange - 1');
+    assertEqual(requestedRanges.length, 1, 'exactly one eth_getLogs call should be made');
+    assertEqual(requestedRanges[0].fromBlock, '0x0', 'fromBlock should be the checkpoint');
+    assertEqual(requestedRanges[0].toBlock, '0x' + (499).toString(16), 'toBlock must not exceed maxBlockRange');
+  } finally {
+    (globalThis as any).fetch = originalFetch;
+  }
 }
 
 export function test_eth_listener_rejects_malformed_truncated_log_payload(): void {
@@ -952,9 +1467,144 @@ export function test_eth_listener_rejects_malformed_truncated_log_payload(): voi
     chainId: 1,
   });
 
-  const event = (listener as any).decode({ topics: ['0x' + '00'.repeat(32), '0x' + 'cd'.repeat(32)], data: '0x1234' });
+  const event = (listener as any).decode({
+    topics: ['0x' + '00'.repeat(32)],
+    transactionHash: '0x' + 'cd'.repeat(32),
+    logIndex: '0x0',
+    data: '0x1234',
+  });
 
   assertEqual(event, null, 'truncated ABI log should be rejected');
+}
+
+// ---------------------------------------------------------------------------
+// Issue #663: regression tests — fromBlock resolution and advancement
+// ---------------------------------------------------------------------------
+
+function withFakeFetch<T>(handler: (method: string, params: any) => any, fn: () => Promise<T>): Promise<T> {
+  const original = (globalThis as any).fetch;
+  (globalThis as any).fetch = async (_url: string, opts: any) => {
+    const body = JSON.parse(opts.body);
+    const result = handler(body.method, body.params);
+    return { json: async () => ({ result }) };
+  };
+  return fn().finally(() => {
+    (globalThis as any).fetch = original;
+  });
+}
+
+function tmpBlockStorePath(name: string): string {
+  return path.join(require('os').tmpdir(), `eth-block-${name}-${Date.now()}-${Math.random()}.json`);
+}
+
+export async function test_eth_listener_resolves_latest_to_concrete_block_on_first_poll(): Promise<void> {
+  await withFakeFetch(
+    (method) => (method === 'eth_blockNumber' ? '0x64' : []),
+    async () => {
+      const listener = new EthChainListener({
+        rpcUrl: 'http://localhost',
+        bridgeContractAddress: '0xbridge',
+        eventTopic: '0xtopic',
+        chainId: 1,
+        blockStorePath: tmpBlockStorePath('resolve'),
+      });
+      await (listener as any).pollOnce();
+      assertEqual((listener as any).fromBlock, '0x64', 'fromBlock should resolve to a concrete block number on first poll');
+    },
+  );
+}
+
+export async function test_eth_listener_advances_from_block_even_with_no_logs(): Promise<void> {
+  let blockNumberCalls = 0;
+  await withFakeFetch(
+    (method) => {
+      if (method === 'eth_blockNumber') {
+        blockNumberCalls += 1;
+        return '0x' + (100 + blockNumberCalls).toString(16);
+      }
+      return []; // no matching logs, ever
+    },
+    async () => {
+      const listener = new EthChainListener({
+        rpcUrl: 'http://localhost',
+        bridgeContractAddress: '0xbridge',
+        eventTopic: '0xtopic',
+        chainId: 1,
+        blockStorePath: tmpBlockStorePath('advance'),
+      });
+      await (listener as any).pollOnce(); // resolves 'latest' -> 0x65
+      const afterFirst = (listener as any).fromBlock;
+      await (listener as any).pollOnce(); // queries logs (none), must still advance
+      const afterSecond = (listener as any).fromBlock;
+      assert(afterFirst !== afterSecond, 'fromBlock must advance past the queried range even when no logs are returned');
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #662: regression tests — confirmation-depth buffer / reorg protection
+// ---------------------------------------------------------------------------
+
+export async function test_eth_listener_withholds_logs_within_confirmation_depth(): Promise<void> {
+  await withFakeFetch(
+    (method) => (method === 'eth_blockNumber' ? '0x64' : []), // latest = 100
+    async () => {
+      const listener = new EthChainListener({
+        rpcUrl: 'http://localhost',
+        bridgeContractAddress: '0xbridge',
+        eventTopic: '0xtopic',
+        chainId: 1,
+        confirmations: 12,
+        blockStorePath: tmpBlockStorePath('confirm-init'),
+      });
+      await (listener as any).pollOnce(); // resolves fromBlock -> 0x64 (100)
+
+      let getLogsCalled = false;
+      const originalFetch = (globalThis as any).fetch;
+      (globalThis as any).fetch = async (_url: string, opts: any) => {
+        const body = JSON.parse(opts.body);
+        if (body.method === 'eth_blockNumber') return { json: async () => ({ result: '0x65' }) }; // latest = 101, only 1 new block
+        getLogsCalled = true;
+        return { json: async () => ({ result: [] }) };
+      };
+      try {
+        await (listener as any).pollOnce();
+      } finally {
+        (globalThis as any).fetch = originalFetch;
+      }
+
+      assert(!getLogsCalled, 'logs within the confirmation window must not be queried yet');
+      assertEqual((listener as any).fromBlock, '0x64', 'fromBlock must not advance until blocks are confirmed');
+    },
+  );
+}
+
+export async function test_eth_listener_skips_removed_reorged_logs(): Promise<void> {
+  await withFakeFetch(
+    (method) => {
+      if (method === 'eth_blockNumber') return '0x64';
+      return [{ topics: ['0x' + '00'.repeat(32), '0x' + 'cd'.repeat(32)], data: '0x1234', removed: true }];
+    },
+    async () => {
+      const listener = new EthChainListener({
+        rpcUrl: 'http://localhost',
+        bridgeContractAddress: '0xbridge',
+        eventTopic: '0xtopic',
+        chainId: 1,
+        confirmations: 0,
+        blockStorePath: tmpBlockStorePath('removed-init'),
+      });
+      await (listener as any).pollOnce(); // resolve fromBlock
+
+      let emitted = 0;
+      (listener as any).onEvent = () => {
+        emitted += 1;
+      };
+      await (listener as any).pollOnce(); // poll with a removed:true log present
+
+      assertEqual(emitted, 0, 'removed:true (reorged) logs must not be acted on');
+    },
+  );
 }
 
 export function test_solana_listener_rejects_bad_log_lines(): void {
@@ -968,6 +1618,16 @@ export function test_solana_listener_rejects_bad_log_lines(): void {
   assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset'), null, 'missing amount should be rejected');
   assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset:100:extra'), null, 'extra colon should be rejected');
   assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset:not-a-number'), null, 'non-numeric amount should be rejected');
+  assertEqual(
+    decodeLine('Program log: bridge_fund:tx:target:asset:100'),
+    null,
+    'a signature that does not base58-decode to 64 bytes should be rejected',
+  );
+  assertEqual(
+    decodeLine('Program log: bridge_fund:not*base58!:target:asset:100'),
+    null,
+    'a signature with characters outside the base58 alphabet should be rejected',
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1250,8 +1910,21 @@ async function runRelayerSelfTests(): Promise<void> {
   await test_below_threshold_short_circuits_before_sdk_call();
   await test_duplicate_pubkey_nodes_do_not_inflate_sig_count();
   await test_mixed_duplicate_and_unique_pubkeys_meet_threshold();
+  await test_below_threshold_event_is_enqueued_to_dlq();
+  await test_failed_submission_is_enqueued_to_dlq();
+  await test_successful_retry_removes_dlq_entry();
+  await test_signer_url_node_signs_via_remote_call_not_local_key();
+  await test_mixed_signer_url_and_private_key_nodes_meet_threshold();
   test_eth_listener_decodes_realistic_abi_log_fixture();
+  test_eth_listener_derives_txhash_from_log_not_event_data();
+  test_eth_listener_rejects_log_missing_transaction_hash();
+  await test_eth_listener_throws_on_rpc_error();
+  await test_eth_listener_bounds_block_range();
   test_eth_listener_rejects_malformed_truncated_log_payload();
+  await test_eth_listener_resolves_latest_to_concrete_block_on_first_poll();
+  await test_eth_listener_advances_from_block_even_with_no_logs();
+  await test_eth_listener_withholds_logs_within_confirmation_depth();
+  await test_eth_listener_skips_removed_reorged_logs();
   test_solana_listener_rejects_bad_log_lines();
   test_payload_hash_matches_onchain_algorithm();
   test_amount_encoding_handles_large_decimals();
@@ -1287,13 +1960,19 @@ if (require.main === module) {
       networkPassphrase: process.env.NETWORK_PASSPHRASE!,
       submitterSecretKey: process.env.RELAYER_SECRET_KEY!,
       threshold: parseInt(process.env.THRESHOLD ?? '1', 10),
-      nodes: (process.env.RELAYER_PRIVATE_KEYS ?? '').split(',').map((pk) => ({ privateKey: pk.trim() })),
+      // Prefer independent per-operator signer services (RELAYER_SIGNER_URLS)
+      // over in-process keys (RELAYER_PRIVATE_KEYS, legacy/dev only — see
+      // adr/ADR-007-signer-key-isolation.md).
+      nodes: process.env.RELAYER_SIGNER_URLS
+        ? process.env.RELAYER_SIGNER_URLS.split(',').map((url) => ({ signerUrl: url.trim() }))
+        : (process.env.RELAYER_PRIVATE_KEYS ?? '').split(',').map((pk) => ({ privateKey: pk.trim() })),
       listeners: [
         ...(process.env.ETH_RPC_URL ? [new EthChainListener({
           rpcUrl: process.env.ETH_RPC_URL,
           bridgeContractAddress: process.env.ETH_BRIDGE_CONTRACT!,
           eventTopic: process.env.ETH_EVENT_TOPIC!,
-          chainId: requireChainId(process.env, 'ETH_CHAIN_ID'),
+          chainId: 1,
+          confirmations: process.env.ETH_CONFIRMATIONS ? parseInt(process.env.ETH_CONFIRMATIONS, 10) : undefined,
         })] : []),
         ...(process.env.SOLANA_WS_URL ? [new SolanaChainListener({
           wsUrl: process.env.SOLANA_WS_URL,

@@ -874,6 +874,110 @@ describe("OnboardingBridgeSDK", () => {
     });
   });
 
+  describe("proposeNewAdmin", () => {
+    it("returns pending status on success", async () => {
+      const result = await sdk.proposeNewAdmin(MOCK_ADDRESS, mockKeypair);
+
+      expect(result.status).toBe("pending");
+    });
+
+    it("passes nonce to contract.call when provided", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      const result = await sdk.proposeNewAdmin(MOCK_ADDRESS, mockKeypair, 789);
+
+      expect(result.status).toBe("pending");
+      expect(contract.call).toHaveBeenCalledWith(
+        "propose_new_admin",
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
+  describe("acceptAdmin", () => {
+    it("returns pending status on success, signed by the pending admin", async () => {
+      const result = await sdk.acceptAdmin(mockKeypair);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith("accept_admin");
+      expect(result.status).toBe("pending");
+    });
+  });
+
+  describe("getPendingAdmin", () => {
+    it("returns the pending admin address when one is set", async () => {
+      (scValToNative as jest.Mock).mockReturnValue({ toString: () => MOCK_ADDRESS });
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const result = await sdk.getPendingAdmin();
+
+      expect(result).toBe(MOCK_ADDRESS);
+    });
+
+    it("returns null when there is no pending admin", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+
+      const result = await sdk.getPendingAdmin();
+
+      expect(result).toBeNull();
+    });
+  });
+
+  describe("proposeNewFeeCollector", () => {
+    it("returns pending status on success", async () => {
+      const result = await sdk.proposeNewFeeCollector(MOCK_ADDRESS, mockKeypair);
+
+      expect(result.status).toBe("pending");
+    });
+
+    it("passes nonce to contract.call when provided", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      const result = await sdk.proposeNewFeeCollector(MOCK_ADDRESS, mockKeypair, 321);
+
+      expect(result.status).toBe("pending");
+      expect(contract.call).toHaveBeenCalledWith(
+        "propose_new_fee_collector",
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
+  describe("acceptFeeCollector", () => {
+    it("returns pending status on success, signed by the pending collector", async () => {
+      const result = await sdk.acceptFeeCollector(mockKeypair);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith("accept_fee_collector");
+      expect(result.status).toBe("pending");
+    });
+  });
+
+  describe("getPendingFeeCollector", () => {
+    it("returns the pending fee collector address when one is set", async () => {
+      (scValToNative as jest.Mock).mockReturnValue({ toString: () => MOCK_ADDRESS });
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const result = await sdk.getPendingFeeCollector();
+
+      expect(result).toBe(MOCK_ADDRESS);
+    });
+
+    it("returns null when there is no pending fee collector", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+
+      const result = await sdk.getPendingFeeCollector();
+
+      expect(result).toBeNull();
+    });
+  });
+
   describe("timelocked upgrades", () => {
     const wasmHash = "a".repeat(64);
 
@@ -1239,6 +1343,39 @@ describe("OnboardingBridgeSDK", () => {
     });
   });
 
+  describe("getWhitelistedAssets", () => {
+    it("passes offset/limit to query_whitelisted_assets and paginates on-chain", async () => {
+      (scValToNative as jest.Mock).mockReturnValue([
+        { toString: () => MOCK_ASSET },
+      ]);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const page = await sdk.getWhitelistedAssets(undefined, 1);
+
+      expect(nativeToScVal).toHaveBeenCalledWith(0, { type: "u32" });
+      expect(nativeToScVal).toHaveBeenCalledWith(1, { type: "u32" });
+      expect(page.items).toEqual([MOCK_ASSET]);
+      // A full page (length === limit) means there may be more on-chain.
+      expect(page.hasMore).toBe(true);
+      expect(page.cursor).toBeDefined();
+    });
+
+    it("reports hasMore=false when the contract returns fewer than `limit` entries", async () => {
+      (scValToNative as jest.Mock).mockReturnValue([]);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const page = await sdk.getWhitelistedAssets(undefined, 20);
+
+      expect(page.items).toEqual([]);
+      expect(page.hasMore).toBe(false);
+      expect(page.cursor).toBeUndefined();
+    });
+  });
+
   describe("getAllBalances", () => {
     it("returns a record of asset → balance strings", async () => {
       const mockMap = new Map([[MOCK_ASSET, BigInt(1000)]]);
@@ -1583,55 +1720,64 @@ describe("OnboardingBridgeSDK", () => {
     });
   });
 
-  describe("estimateCost contract call", () => {
-    beforeEach(() => {
+  describe("isBlocked", () => {
+    it("calls query_is_blocked and returns its boolean result", async () => {
+      (scValToNative as jest.Mock).mockReturnValue(true);
       mockProvider.simulateTransaction.mockResolvedValue({
-        minResourceFee: "5000",
+        results: [{ retval: {} }],
       });
-      mockProvider.getLedgerEntries.mockResolvedValue(ledgerEntriesFor(0));
+
+      const result = await sdk.isBlocked(MOCK_ADDRESS);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith("query_is_blocked", expect.anything());
+      expect(result).toBe(true);
     });
 
-    it("simulates fund_c_address with 6 arguments (base 4 + nonce + deadline)", async () => {
-      const contract = (Contract as jest.Mock).mock.results[0].value;
+    it("returns false when no results", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
 
-      await sdk.estimateCost({
-        source: MOCK_ADDRESS,
-        target: MOCK_ASSET,
-        asset: MOCK_ASSET,
-        amount: "100",
-        nonce: 42,
-        deadline: 1234567890,
-      });
+      const result = await sdk.isBlocked(MOCK_ADDRESS);
 
-      expect(contract.call).toHaveBeenCalledWith(
-        "fund_c_address",
-        expect.anything(), // source
-        expect.anything(), // target
-        expect.anything(), // asset
-        expect.anything(), // amount
-        expect.anything(), // nonce
-        expect.anything(), // deadline
+      expect(result).toBe(false);
+    });
+
+    it("throws on simulation error", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({ error: "fail" });
+
+      await expect(sdk.isBlocked(MOCK_ADDRESS)).rejects.toThrow(
+        "Failed to query blocklist status",
       );
     });
+  });
 
-    it("simulates fund_c_address with scvVoid nonce/deadline when not provided", async () => {
-      const contract = (Contract as jest.Mock).mock.results[0].value;
-
-      await sdk.estimateCost({
-        source: MOCK_ADDRESS,
-        target: MOCK_ASSET,
-        asset: MOCK_ASSET,
-        amount: "100",
+  describe("isAllowlisted", () => {
+    it("calls query_is_allowlisted and returns its boolean result", async () => {
+      (scValToNative as jest.Mock).mockReturnValue(true);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
       });
 
-      expect(contract.call).toHaveBeenCalledWith(
-        "fund_c_address",
-        expect.anything(),
-        expect.anything(),
-        expect.anything(),
-        expect.anything(),
-        expect.anything(),
-        expect.anything(),
+      const result = await sdk.isAllowlisted(MOCK_ADDRESS);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith("query_is_allowlisted", expect.anything());
+      expect(result).toBe(true);
+    });
+
+    it("returns false when no results", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+
+      const result = await sdk.isAllowlisted(MOCK_ADDRESS);
+
+      expect(result).toBe(false);
+    });
+
+    it("throws on simulation error", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({ error: "fail" });
+
+      await expect(sdk.isAllowlisted(MOCK_ADDRESS)).rejects.toThrow(
+        "Failed to query allowlist status",
       );
     });
   });
@@ -2307,16 +2453,12 @@ describe("Observability hooks - onRpcCall coverage", () => {
       call: (s: OnboardingBridgeSDK) => s.getWhitelistedAssets(),
     },
     {
-      name: "getFeeExemptAddresses",
-      call: (s: OnboardingBridgeSDK) => s.getFeeExemptAddresses(),
+      name: "isBlocked",
+      call: (s: OnboardingBridgeSDK) => s.isBlocked(MOCK_ADDRESS),
     },
     {
-      name: "getBlocklistedAddresses",
-      call: (s: OnboardingBridgeSDK) => s.getBlocklistedAddresses(),
-    },
-    {
-      name: "getAllowlistedAddresses",
-      call: (s: OnboardingBridgeSDK) => s.getAllowlistedAddresses(),
+      name: "isAllowlisted",
+      call: (s: OnboardingBridgeSDK) => s.isAllowlisted(MOCK_ADDRESS),
     },
     {
       name: "estimateCost",
