@@ -2227,6 +2227,8 @@ async function runRelayerSelfTests(): Promise<void> {
   test_amount_encoding_handles_large_decimals();
   test_signature_passes_ed25519_verify();
   test_signature_from_known_seed_is_deterministic();
+  // Issue #657: BlockStore persistence
+  test_block_store_save_and_load();
   // Issue 3 & 4: env var and threshold validation
   test_missing_contract_id_throws();
   test_missing_rpc_url_throws();
