@@ -138,7 +138,7 @@ fn bench_initialize_warm() {
 fn bench_fund_amount(amount: i128) {
     let (env, bridge_id, token_id, _admin, _fee_collector) = initialized_setup();
     let bridge = crate::OnboardingBridgeClient::new(&env, &bridge_id);
-    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
+    let _network_id = BytesN::from_array(&env, &[0x11u8; 32]);
     let user = Address::generate(&env);
     let target = Address::generate(&env);
     mint(&env, &token_id, &user, amount * 2);
@@ -658,6 +658,7 @@ fn bench_execute_meta_fund() {
     let signing_key = SigningKey::from_bytes(&secret);
     let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
     bridge.register_meta_signer(&source, &pubkey);
+    let network_id = BytesN::from_array(&env, &[9u8; 32]);
     bridge.set_meta_tx_network_id(&network_id);
 
     // Build the canonical meta-fund payload and sign it.
@@ -697,12 +698,7 @@ fn bench_execute_meta_fund() {
         deadline,
     };
 
-    soroban_sdk::token::Client::new(&env, &token_id).approve(
-        &source,
-        &bridge_id,
-        &amount,
-        &100u32,
-    );
+    soroban_sdk::token::Client::new(&env, &token_id).approve(&source, &bridge_id, &amount, &100u32);
     measure(&env, "execute_meta_fund", || {
         bridge.execute_meta_fund(&params, &pubkey, &signature);
     });

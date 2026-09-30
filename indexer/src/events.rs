@@ -60,16 +60,12 @@ pub enum BridgeEventType {
     AddressAllowlisted,
     AddressUnallowlisted,
     AllowlistModeChanged,
-    // Funding paths that bypass the plain `fund_c_address` entry point.
-    // Previously dropped by `from_topic`, so dashboards built on the indexer
-    // under-reported volume moved through commit-reveal, swap, meta-tx and
-    // referral funding. See #642.
-    CommitFund,
-    CommitRevealFunded,
-    SwapAndFunded,
-    MetaFundExecuted,
-    ReferralPaid,
-    BatchTransferFailed,
+    Initialized,
+    UpgradeScheduled,
+    UpgradeCancelled,
+    ContractUpgraded,
+    EmergencyMigrated,
+    ReferralRateChanged,
 }
 
 impl BridgeEventType {
@@ -98,12 +94,12 @@ impl BridgeEventType {
             "AddressAllowlisted" => Some(Self::AddressAllowlisted),
             "AddressUnallowlisted" => Some(Self::AddressUnallowlisted),
             "AllowlistModeChanged" => Some(Self::AllowlistModeChanged),
-            "CommitFund" => Some(Self::CommitFund),
-            "CommitRevealFunded" => Some(Self::CommitRevealFunded),
-            "SwapAndFunded" => Some(Self::SwapAndFunded),
-            "MetaFundExecuted" => Some(Self::MetaFundExecuted),
-            "ReferralPaid" => Some(Self::ReferralPaid),
-            "BatchTransferFailed" => Some(Self::BatchTransferFailed),
+            "Initialized" => Some(Self::Initialized),
+            "UpgradeScheduled" => Some(Self::UpgradeScheduled),
+            "UpgradeCancelled" => Some(Self::UpgradeCancelled),
+            "ContractUpgraded" => Some(Self::ContractUpgraded),
+            "EmergencyMigrated" => Some(Self::EmergencyMigrated),
+            "ReferralRateChanged" => Some(Self::ReferralRateChanged),
             _ => None,
         }
     }
@@ -133,12 +129,12 @@ impl BridgeEventType {
             Self::AddressAllowlisted => "AddressAllowlisted",
             Self::AddressUnallowlisted => "AddressUnallowlisted",
             Self::AllowlistModeChanged => "AllowlistModeChanged",
-            Self::CommitFund => "CommitFund",
-            Self::CommitRevealFunded => "CommitRevealFunded",
-            Self::SwapAndFunded => "SwapAndFunded",
-            Self::MetaFundExecuted => "MetaFundExecuted",
-            Self::ReferralPaid => "ReferralPaid",
-            Self::BatchTransferFailed => "BatchTransferFailed",
+            Self::Initialized => "Initialized",
+            Self::UpgradeScheduled => "UpgradeScheduled",
+            Self::UpgradeCancelled => "UpgradeCancelled",
+            Self::ContractUpgraded => "ContractUpgraded",
+            Self::EmergencyMigrated => "EmergencyMigrated",
+            Self::ReferralRateChanged => "ReferralRateChanged",
         }
     }
 }
@@ -178,6 +174,12 @@ mod tests {
             ("AddressAllowlisted", "AddressAllowlisted"),
             ("AddressUnallowlisted", "AddressUnallowlisted"),
             ("AllowlistModeChanged", "AllowlistModeChanged"),
+            ("Initialized", "Initialized"),
+            ("UpgradeScheduled", "UpgradeScheduled"),
+            ("UpgradeCancelled", "UpgradeCancelled"),
+            ("ContractUpgraded", "ContractUpgraded"),
+            ("EmergencyMigrated", "EmergencyMigrated"),
+            ("ReferralRateChanged", "ReferralRateChanged"),
         ];
 
         for (topic, expected_str) in cases {
