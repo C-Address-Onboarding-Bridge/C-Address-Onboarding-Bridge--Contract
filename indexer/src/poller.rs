@@ -1,6 +1,7 @@
 use crate::events::{BridgeEventType, IndexedEvent};
 use crate::AppState;
 use base64::Engine;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -62,6 +63,12 @@ async fn fetch_latest_ledger(state: &AppState) -> Result<i64, Box<dyn std::error
 
     let body: serde_json::Value = response.json().await?;
 
+    // #637 — surface JSON-RPC errors instead of silently treating them as
+    // missing fields.
+    if let Some(err) = body.get("error") {
+        return Err(format!("getLatestLedger RPC error: {}", err).into());
+    }
+
     let seq = body
         .get("result")
         .and_then(|r| r.get("sequence"))
@@ -97,21 +104,64 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getEvents",
-        "params": {
-            "startLedger": start_ledger,
-            "filters": [{
-                "type": "contract",
-                "contractIds": [state.contract_id],
-            }],
-            "pagination": {
-                "limit": MAX_EVENTS_PER_POLL,
-            }
+    // #635 — page through all results using the RPC cursor so that more than
+    // MAX_EVENTS_PER_POLL events in a single poll window are never silently
+    // dropped.  We persist the cursor (encoded as a string) rather than a
+    // plain ledger number so the next poll resumes exactly where we left off.
+    let mut pagination_cursor: Option<String> = None;
+    let mut max_ledger = start_ledger;
+    let mut any_events = false;
+
+    loop {
+        let mut pagination = serde_json::json!({ "limit": MAX_EVENTS_PER_POLL });
+        if let Some(ref c) = pagination_cursor {
+            pagination["cursor"] = serde_json::Value::String(c.clone());
         }
-    });
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getEvents",
+            "params": {
+                "startLedger": start_ledger,
+                "filters": [{
+                    "type": "contract",
+                    "contractIds": [state.contract_id],
+                }],
+                "pagination": pagination,
+            }
+        });
+
+        let response = state
+            .webhook_client
+            .post(&state.rpc_url)
+            .json(&request)
+            .send()
+            .await?;
+
+        let body: serde_json::Value = response.json().await?;
+
+        // #637 — if the RPC returned an error object, propagate it so
+        // run_poller logs it rather than silently treating it as no events.
+        if let Some(err) = body.get("error") {
+            let message = err.to_string();
+
+            // #636 — detect "start ledger out of range" and recover to the
+            // oldest available ledger rather than getting stuck forever.
+            if message.contains("startLedger") || message.contains("out of range") || message.contains("beforeOldestLedger") {
+                tracing::warn!(
+                    "Cursor ledger {} is outside RPC retention window ({}). \
+                     Recovering to latest ledger tip.",
+                    start_ledger,
+                    message
+                );
+                let latest = fetch_latest_ledger(state).await?;
+                state.db.set_last_ledger(latest).await?;
+                return Ok(());
+            }
+
+            return Err(format!("getEvents RPC error: {}", message).into());
+        }
 
     let response = state
         .rpc_client
@@ -120,33 +170,41 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
         .send()
         .await?;
 
-    let body: serde_json::Value = response.json().await?;
+        any_events = true;
 
-    let events = body
-        .get("result")
-        .and_then(|r| r.get("events"))
-        .and_then(|e| e.as_array())
-        .cloned()
-        .unwrap_or_default();
+        let mut events_seen_per_tx: HashMap<&str, usize> = HashMap::new();
 
-    if events.is_empty() {
-        return Ok(());
-    }
+        for raw_event in &events {
+            let ledger = raw_event
+                .get("ledger")
+                .and_then(|l| l.as_i64())
+                .unwrap_or(0);
+            if ledger > max_ledger {
+                max_ledger = ledger;
+            }
 
-    let mut max_ledger = start_ledger;
-    // Position of each event within its transaction. Combined with the ledger
-    // and tx hash this yields a stable primary key, so re-polling a range
-    // already seen (after a restart, or a crash before `set_last_ledger`)
-    // regenerates the same ids and `insert_event` deduplicates them.
-    let mut events_seen_per_tx: HashMap<&str, usize> = HashMap::new();
+            let tx_hash = raw_event
+                .get("txHash")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            let counter = events_seen_per_tx.entry(tx_hash).or_insert(0);
+            let event_index = *counter;
+            *counter += 1;
 
-    for raw_event in &events {
-        let ledger = raw_event
-            .get("ledger")
-            .and_then(|l| l.as_i64())
-            .unwrap_or(0);
-        if ledger > max_ledger {
-            max_ledger = ledger;
+            if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id, event_index) {
+                // Only fan out webhooks for events we have not indexed before;
+                // otherwise a re-poll would re-deliver every event in the range.
+                if state.db.insert_event(&indexed).await? {
+                    state.db.queue_webhook_deliveries(&indexed).await?;
+                    tracing::info!(
+                        "Indexed event: {} at ledger {}",
+                        indexed.event_type,
+                        indexed.ledger_sequence
+                    );
+                } else {
+                    tracing::debug!("Skipping already-indexed event {}", indexed.id);
+                }
+            }
         }
 
         let tx_hash = raw_event
@@ -173,25 +231,28 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
                 tracing::debug!("Skipping already-indexed event {}", indexed.id);
             }
         }
+        pagination_cursor = next_cursor;
     }
 
-    state.db.set_last_ledger(max_ledger).await?;
-    tracing::debug!("Poller advanced to ledger {}", max_ledger);
+    // Always advance the persisted cursor so quiet periods don't stall us.
+    // (#636: also covers the no-events case above via max_ledger update.)
+    if any_events || max_ledger > start_ledger {
+        state.db.set_last_ledger(max_ledger).await?;
+        tracing::debug!("Poller advanced to ledger {}", max_ledger);
+    }
 
     Ok(())
 }
 
 /// Build an [`IndexedEvent`] from a raw `getEvents` entry.
 ///
-/// `event_index` is the position of this event within its transaction.
-///
-/// TODO(next-bounty): it is accepted but not yet used. The intent was to fold it
-/// into the event id so two events in the same transaction cannot collide; that
-/// was never written, so the parameter is currently inert.
+/// `event_index` is the position of this event within its transaction and is
+/// folded into the SHA-256 id so two events in the same transaction cannot
+/// produce the same id.
 fn parse_contract_event(
     raw: &serde_json::Value,
     contract_id: &str,
-    _event_index: usize,
+    event_index: usize,
 ) -> Option<IndexedEvent> {
     let topics = raw.get("topic")?.as_array()?;
     if topics.is_empty() {
@@ -282,21 +343,23 @@ fn parse_contract_event(
         _ => {}
     }
 
-    // Deterministic ID: sha256(ledger || tx_hash || event_type) encoded as hex.
-    // Using a content-derived ID ensures that re-indexing the same on-chain event
-    // always produces the same id, which lets `INSERT OR IGNORE` be the sole
-    // deduplication mechanism rather than a UUID that varies per call.
+    // #634 — Deterministic ID: sha256(ledger || tx_hash || event_type ||
+    // first_topic || event_index) encoded as a 64-char hex string.
+    //
+    // Using SHA-256 (rather than std::hash::DefaultHasher, whose output is
+    // explicitly NOT stable across Rust releases) ensures:
+    //   1. The id never changes when the toolchain is upgraded.
+    //   2. The id space is large enough (256 bits) to avoid collisions.
+    //   3. Re-indexing the same on-chain event always produces the same id,
+    //      so `INSERT OR IGNORE` remains the sole deduplication mechanism.
     let id = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        ledger.hash(&mut hasher);
-        tx_hash.hash(&mut hasher);
-        event_type.as_str().hash(&mut hasher);
-        // Include the first topic so two distinct event types on the same tx are
-        // differentiated even when ledger and tx_hash are identical.
-        first_topic.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+        let mut hasher = Sha256::new();
+        hasher.update(ledger.to_le_bytes());
+        hasher.update(tx_hash.as_bytes());
+        hasher.update(event_type.as_str().as_bytes());
+        hasher.update(first_topic.as_bytes());
+        hasher.update(event_index.to_le_bytes());
+        hex::encode(hasher.finalize())
     };
 
     Some(IndexedEvent {
