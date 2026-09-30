@@ -29,6 +29,7 @@ type WebhookDeliveryRow = (
     String,
 );
 
+#[derive(Clone)]
 pub struct Database {
     pub(crate) pool: SqlitePool,
 }
@@ -482,6 +483,82 @@ impl Database {
         Ok(row.map(row_to_event))
     }
 
+    pub async fn list_deliveries(
+        &self,
+        status: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<WebhookDelivery>, sqlx::Error> {
+        let rows: Vec<WebhookDeliveryRow> = match status {
+            Some(s) => {
+                sqlx::query_as(
+                    "SELECT id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at
+                     FROM webhook_deliveries
+                     WHERE status = ?1
+                     ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+                )
+                .bind(s)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at
+                     FROM webhook_deliveries
+                     ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
+                )
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    subscription_id,
+                    event_id,
+                    status,
+                    attempts,
+                    next_retry_at,
+                    last_error,
+                    created_at,
+                )| {
+                    WebhookDelivery {
+                        id,
+                        subscription_id,
+                        event_id,
+                        status,
+                        attempts,
+                        next_retry_at,
+                        last_error,
+                        created_at,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    pub async fn retry_delivery(&self, id: &str) -> Result<bool, sqlx::Error> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE webhook_deliveries
+             SET status = 'pending', next_retry_at = ?2, attempts = 0
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn get_stats(&self) -> Result<serde_json::Value, sqlx::Error> {
         let total_events: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events")
             .fetch_one(&self.pool)
@@ -494,6 +571,11 @@ impl Database {
 
         let pending_deliveries: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'pending'")
+                .fetch_one(&self.pool)
+                .await?;
+
+        let dead_deliveries: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'dead'")
                 .fetch_one(&self.pool)
                 .await?;
 
@@ -514,6 +596,7 @@ impl Database {
             "total_events": total_events.0,
             "active_subscriptions": total_subs.0,
             "pending_deliveries": pending_deliveries.0,
+            "dead_deliveries": dead_deliveries.0,
             "last_indexed_ledger": last_ledger,
             "event_counts": counts,
         }))

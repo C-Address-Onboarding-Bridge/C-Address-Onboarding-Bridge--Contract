@@ -682,6 +682,11 @@ mod tests {
             pending_count, 0,
             "pending_deliveries counter must be 0 after marking dead"
         );
+        let dead_count = stats["dead_deliveries"].as_i64().unwrap_or(-1);
+        assert_eq!(
+            dead_count, 1,
+            "dead_deliveries counter must be 1 after marking dead"
+        );
 
         let _ = sub; // suppress unused warning
     }

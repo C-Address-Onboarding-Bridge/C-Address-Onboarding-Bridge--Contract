@@ -349,6 +349,40 @@ async fn replay_events(
     Ok(Json(serde_json::json!({ "replayed": count })))
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct DeliveryQuery {
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+async fn list_deliveries(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<DeliveryQuery>,
+) -> Result<Json<Vec<webhook::WebhookDelivery>>, StatusCode> {
+    state
+        .db
+        .list_deliveries(
+            params.status.as_deref(),
+            params.limit.unwrap_or(50),
+            params.offset.unwrap_or(0),
+        )
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn retry_delivery(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    match state.db.retry_delivery(&id).await {
+        Ok(true) => Ok(StatusCode::OK),
+        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
 async fn get_stats(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
