@@ -876,3 +876,14 @@ for (const event of events) {
 ## License
 
 MIT
+
+## Handsoff notes
+
+<!-- handsoff-issue-680 -->
+- #680: sdk: add wrappers for pause/unpause and blocklist/allowlist administration
+
+<!-- handsoff-issue-681 -->
+- #681: sdk: add wrappers for asset whitelist and limit configuration
+
+<!-- handsoff-issue-682 -->
+- #682: sdk: add register_meta_signer and a helper that builds the exact meta-tx payload the contract verifies
