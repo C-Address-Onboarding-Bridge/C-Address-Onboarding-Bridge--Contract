@@ -502,6 +502,8 @@ export class OnboardingBridgeSDK {
         amount: options.amount,
         releaseTime: options.releaseTime,
         cliffTime: options.cliffTime ?? 0,
+        nonce: options.nonce,
+        deadline: options.deadline,
       },
       async () => {
         try {
@@ -516,6 +518,13 @@ export class OnboardingBridgeSDK {
             () => this.provider.getAccount(options.source),
           );
 
+          const nonceScVal = options.nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+          const deadlineScVal = options.deadline === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
+
           const tx = new TransactionBuilder(sourceAccount, {
             fee: BASE_FEE,
             networkPassphrase: this.networkPassphrase,
@@ -529,6 +538,8 @@ export class OnboardingBridgeSDK {
                 nativeToScVal(BigInt(options.amount), { type: 'i128' }),
                 nativeToScVal(BigInt(options.releaseTime), { type: 'u64' }),
                 nativeToScVal(BigInt(options.cliffTime ?? 0), { type: 'u64' }),
+                nonceScVal,
+                deadlineScVal,
               ),
             )
             .setTimeout(this.config.timeout ?? 30)
@@ -706,6 +717,8 @@ export class OnboardingBridgeSDK {
         targetAsset: options.targetAsset,
         sourceAmount: options.sourceAmount,
         minTargetAmount: options.minTargetAmount,
+        nonce: options.nonce,
+        deadline: options.deadline,
       },
       async () => {
         try {
@@ -721,6 +734,13 @@ export class OnboardingBridgeSDK {
             { address: options.source },
             () => this.provider.getAccount(options.source),
           );
+
+          const nonceScVal = options.nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+          const deadlineScVal = options.deadline === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
 
           const tx = new TransactionBuilder(sourceAccount, {
             fee: BASE_FEE,
@@ -738,6 +758,8 @@ export class OnboardingBridgeSDK {
                   options.minTargetAmount,
                   options.swapRoute,
                 ]),
+                nonceScVal,
+                deadlineScVal,
               ),
             )
             .setTimeout(this.config.timeout ?? 30)
@@ -1916,6 +1938,376 @@ export class OnboardingBridgeSDK {
   }
 
   /**
+   * Propose an admin handover to a new G-address (admin only).
+   *
+   * This two-step path is preferred over `setAdmin` for normal operations
+   * because it proves the proposed admin controls the key (via
+   * {@link acceptAdmin}) before the role is moved — `setAdmin` transfers
+   * control immediately and unrecoverably if the new key is unusable.
+   *
+   * @param newAdmin     - G-address of the proposed admin.
+   * @param adminKeypair - Keypair of the current admin account.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * await sdk.proposeNewAdmin('G...newAdmin', adminKeypair);
+   * // newAdmin then calls:
+   * await sdk.acceptAdmin(newAdminKeypair);
+   * ```
+   */
+  async proposeNewAdmin(
+    newAdmin: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'proposeNewAdmin',
+      { newAdmin, nonce },
+      async () => {
+        try {
+          assertAccountAddress(newAdmin, 'newAdmin');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const nonceScVal = nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(nonce), { type: 'u64' });
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'propose_new_admin',
+                new Address(newAdmin).toScVal(),
+                nonceScVal,
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'propose_new_admin' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'propose_new_admin' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Accept a pending admin handover (must be signed by the proposed admin).
+   *
+   * Completes the handover started by {@link proposeNewAdmin}. Fails if there
+   * is no pending admin, or if `pendingAdminKeypair` does not match the
+   * address that was proposed.
+   *
+   * @param pendingAdminKeypair - Keypair of the proposed (pending) admin.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * await sdk.acceptAdmin(newAdminKeypair);
+   * ```
+   */
+  async acceptAdmin(pendingAdminKeypair: Keypair): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'acceptAdmin',
+      {},
+      async () => {
+        try {
+          const pendingAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: pendingAdminKeypair.publicKey() },
+            () => this.provider.getAccount(pendingAdminKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(pendingAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(this.contract.call('accept_admin'))
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'accept_admin' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(pendingAdminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'accept_admin' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Get the pending admin G-address, if an admin handover is in progress.
+   *
+   * @returns The pending admin's G-address, or `null` if there is no pending
+   *          handover.
+   *
+   * @throws {Error} On RPC failure.
+   */
+  async getPendingAdmin(): Promise<string | null> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_pending_admin' },
+      () => this.provider.simulateTransaction(this.buildSimulationTx('query_pending_admin', [])),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get pending admin: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    if (!scVal) return null;
+    const native = scValToNative(scVal);
+    return native ? native.toString() : null;
+  }
+
+  /**
+   * Propose a fee-collector handover to a new G-address (admin only).
+   *
+   * This two-step path is preferred over `setFeeCollector` for normal
+   * operations because it proves the proposed collector controls the key
+   * (via {@link acceptFeeCollector}) before the role is moved.
+   *
+   * @param newCollector - G-address of the proposed fee collector.
+   * @param adminKeypair - Keypair of the admin account.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * await sdk.proposeNewFeeCollector('G...newCollector', adminKeypair);
+   * // newCollector then calls:
+   * await sdk.acceptFeeCollector(newCollectorKeypair);
+   * ```
+   */
+  async proposeNewFeeCollector(
+    newCollector: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'proposeNewFeeCollector',
+      { newCollector, nonce },
+      async () => {
+        try {
+          assertAccountAddress(newCollector, 'newCollector');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const nonceScVal = nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(nonce), { type: 'u64' });
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'propose_new_fee_collector',
+                new Address(newCollector).toScVal(),
+                nonceScVal,
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'propose_new_fee_collector' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'propose_new_fee_collector' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Accept a pending fee-collector handover (must be signed by the proposed
+   * fee collector).
+   *
+   * Completes the handover started by {@link proposeNewFeeCollector}. Fails
+   * if there is no pending fee collector, or if `pendingCollectorKeypair`
+   * does not match the address that was proposed.
+   *
+   * @param pendingCollectorKeypair - Keypair of the proposed (pending) fee collector.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * await sdk.acceptFeeCollector(newCollectorKeypair);
+   * ```
+   */
+  async acceptFeeCollector(pendingCollectorKeypair: Keypair): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'acceptFeeCollector',
+      {},
+      async () => {
+        try {
+          const pendingAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: pendingCollectorKeypair.publicKey() },
+            () => this.provider.getAccount(pendingCollectorKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(pendingAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(this.contract.call('accept_fee_collector'))
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'accept_fee_collector' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(pendingCollectorKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'accept_fee_collector' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'ERROR' ? 'failed' : 'pending',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Get the pending fee-collector G-address, if a handover is in progress.
+   *
+   * @returns The pending fee collector's G-address, or `null` if there is no
+   *          pending handover.
+   *
+   * @throws {Error} On RPC failure.
+   */
+  async getPendingFeeCollector(): Promise<string | null> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_pending_fee_collector' },
+      () => this.provider.simulateTransaction(this.buildSimulationTx('query_pending_fee_collector', [])),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get pending fee collector: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    if (!scVal) return null;
+    const native = scValToNative(scVal);
+    return native ? native.toString() : null;
+  }
+
+  /**
    * Upgrade the contract to a new wasm implementation (admin only).
    * The new_wasm_hash must reference wasm already uploaded to the network.
    * Preserves all instance storage (admin, fee settings, etc.).
@@ -2490,25 +2882,11 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Slice a full list into a paginated page.
-   * @internal
-   */
-  private paginate<T>(items: T[], offset: number, limit: number): PaginatedResult<T> {
-    const page = items.slice(offset, offset + limit);
-    const nextOffset = offset + page.length;
-    const hasMore = nextOffset < items.length;
-    return {
-      items: page,
-      cursor: hasMore ? this.encodeCursor(nextOffset) : undefined,
-      hasMore,
-    };
-  }
-
-  /**
    * Return a paginated list of whitelisted asset contract addresses.
    *
    * Only whitelisted assets can be used in `fundCAddress` and batch calls.
-   * The full list is fetched from the contract and paginated client-side.
+   * Pagination happens on-chain: the cursor encodes the offset, and the
+   * contract only returns up to `limit` entries starting at that offset.
    *
    * @param cursor - Opaque cursor from a previous call.  Omit to start from page 1.
    * @param limit  - Maximum items per page.  Defaults to 20.
@@ -2529,129 +2907,99 @@ export class OnboardingBridgeSDK {
     cursor?: string,
     limit = 20,
   ): Promise<PaginatedResult<string>> {
+    const offset = this.decodeCursor(cursor);
     const result = await withRpcHook(
       this.hooks,
       'simulateTransaction',
       { contractMethod: 'query_whitelisted_assets' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_whitelisted_assets', []),
+        this.buildSimulationTx('query_whitelisted_assets', [
+          nativeToScVal(offset, { type: 'u32' }),
+          nativeToScVal(limit, { type: 'u32' }),
+        ]),
       ),
     );
     if ('error' in result && result.error) {
       throw new Error(`Failed to query whitelisted assets: ${result.error}`);
     }
     const scVal = (result as any).results?.[0]?.retval;
-    const all: string[] = scVal
+    const page: string[] = scVal
       ? (scValToNative(scVal) as Address[]).map((a) => a.toString())
       : [];
-    return this.paginate(all, this.decodeCursor(cursor), limit);
+    const nextOffset = offset + page.length;
+    return {
+      items: page,
+      cursor: page.length === limit ? this.encodeCursor(nextOffset) : undefined,
+      hasMore: page.length === limit,
+    };
   }
 
   /**
-   * Return a paginated list of fee-exempt addresses.
-   *
-   * Fee-exempt addresses pay zero protocol fee on every transfer regardless of
-   * the configured `fee_bps`.  The full list is fetched from the contract and
-   * paginated client-side.
-   *
-   * @param cursor - Opaque cursor from a previous call.  Omit to start from page 1.
-   * @param limit  - Maximum items per page.  Defaults to 20.
-   *
-   * @returns A {@link PaginatedResult} of address strings.
-   *
-   * @throws {Error} On RPC failure.
-   */
-  async getFeeExemptAddresses(
-    cursor?: string,
-    limit = 20,
-  ): Promise<PaginatedResult<string>> {
-    const result = await withRpcHook(
-      this.hooks,
-      'simulateTransaction',
-      { contractMethod: 'query_fee_exempt_addresses' },
-      () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_fee_exempt_addresses', []),
-      ),
-    );
-    if ('error' in result && result.error) {
-      throw new Error(`Failed to query fee-exempt addresses: ${result.error}`);
-    }
-    const scVal = (result as any).results?.[0]?.retval;
-    const all: string[] = scVal
-      ? (scValToNative(scVal) as Address[]).map((a) => a.toString())
-      : [];
-    return this.paginate(all, this.decodeCursor(cursor), limit);
-  }
-
-  /**
-   * Return a paginated list of addresses on the blocklist.
+   * Check whether an address is on the blocklist.
    *
    * Blocklisted addresses cannot receive funds via `fundCAddress` or batch calls.
    * Transfers to them are silently skipped (in batch) or rejected (single).
    *
-   * @param cursor - Opaque cursor from a previous call.  Omit to start from page 1.
-   * @param limit  - Maximum items per page.  Defaults to 20.
+   * There is no contract call that lists the full blocklist — only a
+   * per-address membership check (`query_is_blocked`) — so this replaces the
+   * previous (non-functional) `getBlocklistedAddresses` listing method. Build
+   * a full listing from indexer events instead, once blocklist events exist.
    *
-   * @returns A {@link PaginatedResult} of address strings.
+   * @param address - The address to check.
+   *
+   * @returns `true` if `address` is blocklisted.
    *
    * @throws {Error} On RPC failure.
    */
-  async getBlocklistedAddresses(
-    cursor?: string,
-    limit = 20,
-  ): Promise<PaginatedResult<string>> {
+  async isBlocked(address: string): Promise<boolean> {
     const result = await withRpcHook(
       this.hooks,
       'simulateTransaction',
-      { contractMethod: 'query_blocklist' },
+      { contractMethod: 'query_is_blocked' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_blocklist', []),
+        this.buildSimulationTx('query_is_blocked', [address]),
       ),
     );
     if ('error' in result && result.error) {
-      throw new Error(`Failed to query blocklist: ${result.error}`);
+      throw new Error(`Failed to query blocklist status: ${result.error}`);
     }
     const scVal = (result as any).results?.[0]?.retval;
-    const all: string[] = scVal
-      ? (scValToNative(scVal) as Address[]).map((a) => a.toString())
-      : [];
-    return this.paginate(all, this.decodeCursor(cursor), limit);
+    return scVal ? Boolean(scValToNative(scVal)) : false;
   }
 
   /**
-   * Return a paginated list of addresses on the allowlist.
+   * Check whether an address is on the allowlist.
    *
    * When the contract is in allowlist mode, only allowlisted addresses can
    * receive funds.  Non-allowlisted targets in batch calls are skipped and
    * their amounts refunded to the source.
    *
-   * @param cursor - Opaque cursor from a previous call.  Omit to start from page 1.
-   * @param limit  - Maximum items per page.  Defaults to 20.
+   * There is no contract call that lists the full allowlist — only a
+   * per-address membership check (`query_is_allowlisted`) — so this replaces
+   * the previous (non-functional) `getAllowlistedAddresses` listing method.
+   * Build a full listing from indexer events instead, once allowlist events
+   * exist.
    *
-   * @returns A {@link PaginatedResult} of address strings.
+   * @param address - The address to check.
+   *
+   * @returns `true` if `address` is allowlisted.
    *
    * @throws {Error} On RPC failure.
    */
-  async getAllowlistedAddresses(
-    cursor?: string,
-    limit = 20,
-  ): Promise<PaginatedResult<string>> {
+  async isAllowlisted(address: string): Promise<boolean> {
     const result = await withRpcHook(
       this.hooks,
       'simulateTransaction',
-      { contractMethod: 'query_allowlist' },
+      { contractMethod: 'query_is_allowlisted' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_allowlist', []),
+        this.buildSimulationTx('query_is_allowlisted', [address]),
       ),
     );
     if ('error' in result && result.error) {
-      throw new Error(`Failed to query allowlist: ${result.error}`);
+      throw new Error(`Failed to query allowlist status: ${result.error}`);
     }
     const scVal = (result as any).results?.[0]?.retval;
-    const all: string[] = scVal
-      ? (scValToNative(scVal) as Address[]).map((a) => a.toString())
-      : [];
-    return this.paginate(all, this.decodeCursor(cursor), limit);
+    return scVal ? Boolean(scValToNative(scVal)) : false;
   }
 
   /**
@@ -2689,6 +3037,13 @@ export class OnboardingBridgeSDK {
     const dummySource = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
     const dummyAccount = new Account(dummySource, '0');
 
+    const nonceScVal = options.nonce === undefined
+      ? xdr.ScVal.scvVoid()
+      : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+    const deadlineScVal = options.deadline === undefined
+      ? xdr.ScVal.scvVoid()
+      : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
+
     const tx = new TransactionBuilder(dummyAccount, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
@@ -2702,6 +3057,8 @@ export class OnboardingBridgeSDK {
             options.asset,
             options.amount,
           ]),
+          nonceScVal,
+          deadlineScVal,
         ),
       )
       .setTimeout(this.config.timeout ?? 30)
@@ -2880,7 +3237,10 @@ export class OnboardingBridgeSDK {
   }
 
   private metaFundParamsToScVal(params: MetaFundParams): xdr.ScVal {
-    return xdr.ScVal.scvMap([
+    // Soroban `ScMap` entries must be sorted by key (canonical XDR encoding);
+    // the host rejects maps whose keys are out of order. Build the entries
+    // via `scMapEntry` and sort them rather than relying on declaration order.
+    return this.sortedScMap([
       this.scMapEntry('source', new Address(params.source).toScVal()),
       this.scMapEntry('target', new Address(params.target).toScVal()),
       this.scMapEntry('asset', new Address(params.asset).toScVal()),
@@ -2897,6 +3257,22 @@ export class OnboardingBridgeSDK {
     });
   }
 
+  /**
+   * Sorts `ScMapEntry` values by their (symbol) key and wraps them in an
+   * `ScVal` map. Soroban's canonical XDR encoding requires map keys to be
+   * sorted; the host rejects maps whose keys are out of order. Use this
+   * (instead of `xdr.ScVal.scvMap` directly) for every struct encoder that
+   * builds an `ScMap` from field entries.
+   */
+  private sortedScMap(entries: xdr.ScMapEntry[]): xdr.ScVal {
+    const sorted = [...entries].sort((a, b) => {
+      const aKey = a.key().sym().toString();
+      const bKey = b.key().sym().toString();
+      return aKey < bKey ? -1 : aKey > bKey ? 1 : 0;
+    });
+    return xdr.ScVal.scvMap(sorted);
+  }
+
   private bytesToHex(value: unknown): string {
     if (typeof value === 'string') return value;
     if (value instanceof Uint8Array) return Buffer.from(value).toString('hex');
@@ -2908,19 +3284,10 @@ export class OnboardingBridgeSDK {
   }
 
   private feeTierToScVal(tier: FeeTier): xdr.ScVal {
-    return xdr.ScVal.scvMap([
-      new xdr.ScMapEntry({
-        key: xdr.ScVal.scvSymbol('fee_bps'),
-        val: nativeToScVal(tier.fee_bps, { type: 'u32' }),
-      }),
-      new xdr.ScMapEntry({
-        key: xdr.ScVal.scvSymbol('max_volume'),
-        val: nativeToScVal(BigInt(tier.max_volume), { type: 'i128' }),
-      }),
-      new xdr.ScMapEntry({
-        key: xdr.ScVal.scvSymbol('min_volume'),
-        val: nativeToScVal(BigInt(tier.min_volume), { type: 'i128' }),
-      }),
+    return this.sortedScMap([
+      this.scMapEntry('fee_bps', nativeToScVal(tier.fee_bps, { type: 'u32' })),
+      this.scMapEntry('max_volume', nativeToScVal(BigInt(tier.max_volume), { type: 'i128' })),
+      this.scMapEntry('min_volume', nativeToScVal(BigInt(tier.min_volume), { type: 'i128' })),
     ]);
   }
 }

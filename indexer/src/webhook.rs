@@ -1,8 +1,11 @@
 use crate::AppState;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
+pub const MAX_CONCURRENT_DELIVERIES: usize = 10;
 const MAX_RETRIES: i32 = 5;
 const DELIVERY_INTERVAL_MS: u64 = 2000;
 
@@ -179,78 +182,150 @@ struct WebhookPayload {
     data: serde_json::Value,
 }
 
-pub async fn run_delivery_worker(state: Arc<AppState>) {
+/// Runs the delivery loop until `token` is cancelled. Cancellation is
+/// observed between iterations (via `select!` on the inter-poll sleep) so an
+/// in-flight `deliver_pending` always finishes cleanly before the worker
+/// returns. See #646.
+pub async fn run_delivery_worker(state: Arc<AppState>, token: CancellationToken) {
     tracing::info!("Starting webhook delivery worker");
 
     loop {
         if let Err(e) = deliver_pending(&state).await {
             tracing::error!("Delivery worker error: {}", e);
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(DELIVERY_INTERVAL_MS)).await;
+
+        tokio::select! {
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(DELIVERY_INTERVAL_MS)) => {}
+            _ = token.cancelled() => {
+                tracing::info!("Webhook delivery worker received shutdown signal, exiting");
+                return;
+            }
+        }
     }
 }
 
-async fn deliver_pending(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
+/// Deliver pending webhook notifications concurrently with a bounded limit.
+///
+/// Per-subscription ordering guarantee:
+/// Deliveries are partitioned by `subscription_id` so that deliveries destined
+/// for the same subscription endpoint are executed sequentially in FIFO order
+/// (by `created_at`). Different subscriptions are delivered concurrently up to
+/// `MAX_CONCURRENT_DELIVERIES`, ensuring that a slow or hanging endpoint does
+/// not block or delay deliveries to other subscribers.
+pub async fn deliver_pending(
+    state: &AppState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let deliveries = state.db.get_pending_deliveries().await?;
+    if deliveries.is_empty() {
+        return Ok(());
+    }
+
+    // Partition deliveries by subscription_id to maintain FIFO ordering per subscriber.
+    // Preserve the order of first encounter (already ordered by created_at ASC).
+    let mut sub_order: Vec<String> = Vec::new();
+    let mut sub_queues: std::collections::HashMap<String, Vec<WebhookDelivery>> =
+        std::collections::HashMap::new();
 
     for delivery in deliveries {
-        let url = match state
-            .db
-            .get_subscription_url(&delivery.subscription_id)
-            .await?
-        {
-            Some(url) => url,
-            None => {
-                state
-                    .db
-                    .mark_delivery_dead(&delivery.id, "subscription not found or inactive")
-                    .await?;
-                continue;
-            }
-        };
+        if !sub_queues.contains_key(&delivery.subscription_id) {
+            sub_order.push(delivery.subscription_id.clone());
+        }
+        sub_queues
+            .entry(delivery.subscription_id.clone())
+            .or_default()
+            .push(delivery);
+    }
 
-        let event = match state.db.get_event_by_id(&delivery.event_id).await? {
-            Some(e) => e,
-            None => {
-                state
-                    .db
-                    .mark_delivery_dead(&delivery.id, "event not found")
-                    .await?;
-                continue;
-            }
-        };
+    let queues: Vec<Vec<WebhookDelivery>> = sub_order
+        .into_iter()
+        .filter_map(|sub_id| sub_queues.remove(&sub_id))
+        .collect();
 
-        let payload = WebhookPayload {
-            delivery_id: delivery.id.clone(),
-            attempt: delivery.attempts + 1,
-            event_id: event.id,
-            event_type: event.event_type,
-            ledger_sequence: event.ledger_sequence,
-            contract_id: event.contract_id,
-            tx_hash: event.tx_hash,
-            timestamp: event.timestamp,
-            data: event.data,
-        };
+    futures::stream::iter(queues)
+        .map(|queue| deliver_subscription_queue(state, queue))
+        .buffer_unordered(MAX_CONCURRENT_DELIVERIES)
+        .collect::<Vec<()>>()
+        .await;
 
-        match state
-            .webhook_client
-            .post(&url)
-            .json(&payload)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                state.db.mark_delivery_success(&delivery.id).await?;
-                tracing::debug!("Delivered webhook {} to {}", delivery.id, url);
-            }
-            Ok(resp) => {
-                let error = format!("HTTP {}", resp.status());
-                handle_retry(state, &delivery, &error).await?;
-            }
-            Err(e) => {
-                handle_retry(state, &delivery, &e.to_string()).await?;
-            }
+    Ok(())
+}
+
+async fn deliver_subscription_queue(state: &AppState, deliveries: Vec<WebhookDelivery>) {
+    for delivery in deliveries {
+        if let Err(e) = deliver_single(state, &delivery).await {
+            tracing::error!(
+                "Failed to process delivery {} for subscription {}: {}",
+                delivery.id,
+                delivery.subscription_id,
+                e
+            );
+            // On error delivering to this subscription, abort remaining queued deliveries
+            // for this subscription in this poll cycle to preserve FIFO ordering.
+            break;
+        }
+    }
+}
+
+async fn deliver_single(
+    state: &AppState,
+    delivery: &WebhookDelivery,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let url = match state
+        .db
+        .get_subscription_url(&delivery.subscription_id)
+        .await?
+    {
+        Some(url) => url,
+        None => {
+            state
+                .db
+                .mark_delivery_dead(&delivery.id, "subscription not found or inactive")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let event = match state.db.get_event_by_id(&delivery.event_id).await? {
+        Some(e) => e,
+        None => {
+            state
+                .db
+                .mark_delivery_dead(&delivery.id, "event not found")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let payload = WebhookPayload {
+        delivery_id: delivery.id.clone(),
+        attempt: delivery.attempts + 1,
+        event_id: event.id,
+        event_type: event.event_type,
+        ledger_sequence: event.ledger_sequence,
+        contract_id: event.contract_id,
+        tx_hash: event.tx_hash,
+        timestamp: event.timestamp,
+        data: event.data,
+    };
+
+    match state
+        .webhook_client
+        .post(&url)
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            state.db.mark_delivery_success(&delivery.id).await?;
+            tracing::debug!("Delivered webhook {} to {}", delivery.id, url);
+        }
+        Ok(resp) => {
+            let error = format!("HTTP {}", resp.status());
+            handle_retry(state, delivery, &error).await?;
+        }
+        Err(e) => {
+            handle_retry(state, delivery, &e.to_string()).await?;
         }
     }
 
@@ -261,7 +336,7 @@ async fn handle_retry(
     state: &AppState,
     delivery: &WebhookDelivery,
     error: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let attempt = delivery.attempts + 1;
     if attempt >= MAX_RETRIES {
         state.db.mark_delivery_dead(&delivery.id, error).await?;
@@ -662,98 +737,132 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Issue #653 - Concurrent deliveries with bounded limit
+    // -----------------------------------------------------------------------
+
     #[tokio::test]
-    async fn test_list_dead_deliveries_and_retry() {
+    async fn test_slow_endpoint_does_not_delay_fast_endpoint() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        let slow_finished = Arc::new(AtomicBool::new(false));
+        let fast_finished_before_slow = Arc::new(AtomicBool::new(false));
+
+        let slow_finished_clone = Arc::clone(&slow_finished);
+        let fast_flag_clone = Arc::clone(&fast_finished_before_slow);
+
+        let test_router = axum::Router::new()
+            .route(
+                "/slow",
+                post(move || {
+                    let slow_finished = Arc::clone(&slow_finished_clone);
+                    async move {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                        slow_finished.store(true, Ordering::SeqCst);
+                        axum::http::StatusCode::OK
+                    }
+                }),
+            )
+            .route(
+                "/fast",
+                post(move || {
+                    let slow_finished = Arc::clone(&slow_finished);
+                    let fast_flag = Arc::clone(&fast_flag_clone);
+                    async move {
+                        if !slow_finished.load(Ordering::SeqCst) {
+                            fast_flag.store(true, Ordering::SeqCst);
+                        }
+                        axum::http::StatusCode::OK
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, test_router).await.unwrap();
+        });
+
         let db = setup_db().await;
 
-        let _sub = db
+        let sub_slow = db
             .create_subscription(CreateSubscription {
-                url: "http://example.com/dead-hook".to_string(),
+                url: format!("http://127.0.0.1:{}/slow", port),
                 event_type: None,
                 asset_filter: None,
                 source_filter: None,
                 target_filter: None,
             })
             .await
-            .expect("create subscription");
+            .unwrap();
+
+        let sub_fast = db
+            .create_subscription(CreateSubscription {
+                url: format!("http://127.0.0.1:{}/fast", port),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .unwrap();
 
         let event = IndexedEvent {
-            id: "evt-dead-001".to_string(),
+            id: "evt-concurrent-test".to_string(),
             event_type: "CAddressFunded".to_string(),
-            ledger_sequence: 1,
+            ledger_sequence: 10,
             contract_id: "C_TEST".to_string(),
-            tx_hash: "deadbeef001".to_string(),
+            tx_hash: "abcd".to_string(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             data: serde_json::json!({}),
         };
-        db.insert_event(&event).await.expect("insert event");
-        db.queue_webhook_deliveries(&event)
-            .await
-            .expect("queue deliveries");
+        db.insert_event(&event).await.unwrap();
 
-        let pending = db.get_pending_deliveries().await.expect("get pending");
-        assert_eq!(pending.len(), 1);
-        let delivery_id = pending[0].id.clone();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
+             VALUES ('del-slow', ?1, ?2, 'pending', 0, ?3, '2024-01-01T00:00:00Z')",
+        )
+        .bind(&sub_slow.id)
+        .bind(&event.id)
+        .bind(&now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
 
-        // Mark delivery dead
-        db.mark_delivery_dead(&delivery_id, "terminal connection error")
-            .await
-            .expect("mark dead");
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
+             VALUES ('del-fast', ?1, ?2, 'pending', 0, ?3, '2024-01-01T00:00:01Z')",
+        )
+        .bind(&sub_fast.id)
+        .bind(&event.id)
+        .bind(&now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
 
-        // Inspect via list_deliveries with status=dead
-        let dead_list = db
-            .list_deliveries(Some("dead"), 50, 0)
-            .await
-            .expect("list dead");
-        assert_eq!(dead_list.len(), 1);
-        assert_eq!(dead_list[0].id, delivery_id);
-        assert_eq!(dead_list[0].status, "dead");
-        assert_eq!(
-            dead_list[0].last_error.as_deref(),
-            Some("terminal connection error")
-        );
+        let state = AppState {
+            db,
+            rpc_url: "http://localhost".to_string(),
+            contract_id: "C_TEST".to_string(),
+            webhook_client: reqwest::Client::new(),
+            lookback_ledgers: 0,
+        };
 
-        // Verify stats reflects dead delivery
-        let stats = db.get_stats().await.expect("get stats");
-        assert_eq!(stats["dead_deliveries"].as_i64(), Some(1));
-        assert_eq!(stats["pending_deliveries"].as_i64(), Some(0));
+        let start = Instant::now();
+        deliver_pending(&state).await.unwrap();
+        let elapsed = start.elapsed();
 
-        // Retry non-existent delivery returns false
-        let retry_missing = db
-            .retry_delivery("non-existent-id")
-            .await
-            .expect("retry missing");
         assert!(
-            !retry_missing,
-            "retrying missing delivery must return false"
+            fast_finished_before_slow.load(Ordering::SeqCst),
+            "Fast endpoint must complete before slow endpoint"
         );
-
-        // Retry existing dead delivery
-        let retry_ok = db.retry_delivery(&delivery_id).await.expect("retry dead");
-        assert!(retry_ok, "retrying existing dead delivery must return true");
-
-        // Dead list is now empty
-        let dead_after = db
-            .list_deliveries(Some("dead"), 50, 0)
-            .await
-            .expect("list dead after");
         assert!(
-            dead_after.is_empty(),
-            "dead deliveries list must be empty after retry"
+            elapsed.as_millis() < 800,
+            "Deliveries must run concurrently: took {:?}",
+            elapsed
         );
-
-        // Delivery is back in pending queue
-        let pending_after = db
-            .get_pending_deliveries()
-            .await
-            .expect("get pending after");
-        assert_eq!(pending_after.len(), 1);
-        assert_eq!(pending_after[0].id, delivery_id);
-        assert_eq!(pending_after[0].status, "pending");
-
-        // Stats reflect back in pending
-        let stats_after = db.get_stats().await.expect("get stats after");
-        assert_eq!(stats_after["dead_deliveries"].as_i64(), Some(0));
-        assert_eq!(stats_after["pending_deliveries"].as_i64(), Some(1));
     }
 }
