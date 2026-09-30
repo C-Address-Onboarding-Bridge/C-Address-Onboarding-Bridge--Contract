@@ -104,6 +104,34 @@ export interface FeeCollectorTransferredEvent {
   pagingToken: string;
 }
 
+/**
+ * Emitted when a new fee collector is proposed (contract
+ * `FeeCollectorProposed`).
+ */
+export interface FeeCollectorProposedEvent {
+  name: 'FeeCollectorProposed';
+  /** Current fee collector proposing the change */
+  feeCollector: string;
+  /** Proposed new fee collector address */
+  proposedFeeCollector: string;
+  ledger: number;
+  pagingToken: string;
+}
+
+/**
+ * Emitted when a proposed fee collector accepts and the fee collector address
+ * changes (contract `FeeCollectorTransferred`).
+ */
+export interface FeeCollectorTransferredEvent {
+  name: 'FeeCollectorTransferred';
+  /** Previous fee collector address */
+  oldFeeCollector: string;
+  /** New fee collector address */
+  newFeeCollector: string;
+  ledger: number;
+  pagingToken: string;
+}
+
 /** Emitted when a meta-transaction fund is executed (issue #35). */
 export interface MetaFundExecutedEvent {
   name: 'MetaFundExecuted';
@@ -209,8 +237,11 @@ export interface EventSubscriberConfig {
  * Polls the Soroban RPC for contract events and dispatches them to registered
  * handlers.
  *
- * All polling happens in a `setInterval` loop. Call `destroy()` to stop it and
- * release all listeners.
+ * Polling uses a self-scheduling `setTimeout` loop: the next poll is only
+ * scheduled after the previous `getEvents` call settles. This guarantees that
+ * a slow RPC cannot cause overlapping fetches with the same cursor (which
+ * would dispatch duplicate events and race on `this.cursor`). Call `destroy()`
+ * to stop the loop and release all listeners.
  *
  * @example
  * ```ts
@@ -241,8 +272,11 @@ export class EventSubscriber {
   /** Registry of active listeners keyed by event name (including '*'). */
   private listeners: Map<string, Set<BridgeEventCallback<any>>>;
 
-  /** NodeJS/browser interval handle. */
-  private intervalHandle: ReturnType<typeof setInterval> | null = null;
+  /** NodeJS/browser timeout handle for the self-scheduling poll loop. */
+  private intervalHandle: ReturnType<typeof setTimeout> | null = null;
+
+  /** Whether a fetch is currently in flight (guards against overlap). */
+  private polling = false;
 
   /** Whether destroy() has been called. */
   private destroyed = false;
@@ -281,7 +315,7 @@ export class EventSubscriber {
     this.listeners.get(eventName)!.add(callback as BridgeEventCallback<any>);
 
     // Auto-start polling when the first listener is registered
-    if (this.intervalHandle === null) {
+    if (this.intervalHandle === null && !this.polling) {
       this.startPolling();
     }
 
@@ -293,24 +327,7 @@ export class EventSubscriber {
           this.listeners.delete(eventName);
         }
       }
-      // Stop polling when no listeners remain (preserve 'error' listeners for
-      // the polling loop — only stop when ALL listeners are gone, including
-      // error listeners).
-      if (this.listenerCount() === 0) {
-        this.stopPolling();
-      }
-    };
-  }
-
-  /**
-   * Remove all listeners for a specific event name.
-   */
-  off(eventName: BridgeEventName): void {
-    this.listeners.delete(eventName);
-    if (this.listenerCount() === 0) {
-      this.stopPolling();
-    }
-  }
+      // Stop polling when no listeners remain (preserve 'error' lis
 
   /**
    * Total number of registered callbacks across all event names.
