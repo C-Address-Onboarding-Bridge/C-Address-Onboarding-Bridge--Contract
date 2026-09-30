@@ -344,25 +344,25 @@ impl Database {
             }
 
             let data = &event.data;
+
+            // #640: filters must fail CLOSED — if the event does not carry the
+            // filtered field at all, it does NOT match the subscription.
             if let Some(ref af) = sub.asset_filter {
-                if let Some(asset) = data.get("asset").and_then(|v| v.as_str()) {
-                    if asset != af {
-                        continue;
-                    }
+                match data.get("asset").and_then(|v| v.as_str()) {
+                    Some(asset) if asset == af => {} // field present and matches → keep going
+                    _ => continue,                   // missing or non-matching → skip
                 }
             }
             if let Some(ref sf) = sub.source_filter {
-                if let Some(source) = data.get("source").and_then(|v| v.as_str()) {
-                    if source != sf {
-                        continue;
-                    }
+                match data.get("source").and_then(|v| v.as_str()) {
+                    Some(source) if source == sf => {}
+                    _ => continue,
                 }
             }
             if let Some(ref tf) = sub.target_filter {
-                if let Some(target) = data.get("target").and_then(|v| v.as_str()) {
-                    if target != tf {
-                        continue;
-                    }
+                match data.get("target").and_then(|v| v.as_str()) {
+                    Some(target) if target == tf => {}
+                    _ => continue,
                 }
             }
 
@@ -699,7 +699,7 @@ mod tests {
         use crate::poller::parse_contract_event_for_test;
 
         let raw = serde_json::json!({
-            "topic": ["CAddressFunded", "GSOURCE", "CTARGET"],
+            "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
             "ledger": 42,
             "txHash": "abcdef1234567890",
             "createdAt": "2024-01-01T00:00:00Z",

@@ -109,6 +109,22 @@ async fn main() {
     let database = db::Database::new(&db_url).await;
     database.migrate().await;
 
+    // Build a dedicated RPC client with timeouts so a hung RPC node cannot
+    // stall the poll loop indefinitely (#638).
+    let rpc_connect_timeout_secs: u64 = std::env::var("RPC_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let rpc_request_timeout_secs: u64 = std::env::var("RPC_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let rpc_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(rpc_connect_timeout_secs))
+        .timeout(std::time::Duration::from_secs(rpc_request_timeout_secs))
+        .build()
+        .expect("failed to build RPC HTTP client");
+
     let state = Arc::new(AppState {
         db: database,
         rpc_url,

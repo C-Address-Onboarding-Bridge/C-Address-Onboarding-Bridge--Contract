@@ -23,7 +23,15 @@ pub async fn run_poller(state: Arc<AppState>, token: CancellationToken) {
 
     loop {
         if let Err(e) = poll_once(&state).await {
-            tracing::error!("Poller error: {}", e);
+            // #638: distinguish timeout errors so operators can tune RPC_REQUEST_TIMEOUT_SECS
+            if e.to_string().contains("timed out") || e.to_string().contains("timeout") {
+                tracing::warn!(
+                    "Poller RPC timeout (configure via RPC_REQUEST_TIMEOUT_SECS / RPC_CONNECT_TIMEOUT_SECS): {}",
+                    e
+                );
+            } else {
+                tracing::error!("Poller error: {}", e);
+            }
         }
 
         tokio::select! {
@@ -46,7 +54,7 @@ async fn fetch_latest_ledger(state: &AppState) -> Result<i64, Box<dyn std::error
     });
 
     let response = state
-        .webhook_client
+        .rpc_client
         .post(&state.rpc_url)
         .json(&request)
         .send()
@@ -106,7 +114,7 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let response = state
-        .webhook_client
+        .rpc_client
         .post(&state.rpc_url)
         .json(&request)
         .send()
@@ -246,6 +254,32 @@ fn parse_contract_event(
             insert_topic_str(&mut data, &decoded_topics, 1, "source");
             insert_topic_str(&mut data, &decoded_topics, 2, "target");
         }
+        // ("FeesWithdrawn", fee_collector) — asset carried in value, not topics
+        BridgeEventType::FeesWithdrawn => {
+            if let Some(collector) = decoded_topics.get(1).and_then(|t| t.as_str()) {
+                data.insert("fee_collector".to_string(), serde_json::Value::String(collector.to_string()));
+            }
+        }
+        // ("AdminProposed", admin, new_admin) / ("AdminTransferred", old_admin, pending)
+        BridgeEventType::AdminProposed | BridgeEventType::AdminTransferred => {
+            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
+                data.insert("from".to_string(), serde_json::Value::String(from.to_string()));
+            }
+            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
+                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
+            }
+        }
+        // ("FeeCollectorTransferProposed", admin, new_collector) / ("FeeCollectorTransferred", old, pending)
+        BridgeEventType::FeeCollectorTransferProposed | BridgeEventType::FeeCollectorTransferred => {
+            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
+                data.insert("from".to_string(), serde_json::Value::String(from.to_string()));
+            }
+            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
+                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
+            }
+        }
+        // All other event types: no well-known topic fields beyond the event name.
+        _ => {}
     }
 
     // Deterministic ID: sha256(ledger || tx_hash || event_type) encoded as hex.
@@ -487,40 +521,175 @@ mod tests {
     /// topics[1] is extracted into `data["source"]`.
     #[test]
     fn test_parse_extracts_source_from_topics_index_1() {
+        // NOTE: this test uses the OLD (pre-#639) assumed layout and is kept
+        // only to document the former behaviour.  The corrected layout is
+        // tested by test_c_address_funded_topic_mapping below.
         let raw = raw_event(serde_json::json!([
             "CAddressFunded",
+            "GASSETADDR",
             "GSOURCEADDR",
             "CTARGETADDR"
         ]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        // asset is now at topics[1]
+        assert_eq!(
+            event.data["asset"].as_str(),
+            Some("GASSETADDR"),
+            "topics[1] must be stored as data.asset for CAddressFunded"
+        );
+        // source is now at topics[2]
         assert_eq!(
             event.data["source"].as_str(),
             Some("GSOURCEADDR"),
-            "topics[1] must be stored as data.source"
+            "topics[2] must be stored as data.source for CAddressFunded"
         );
     }
 
     /// topics[2] is extracted into `data["target"]`.
     #[test]
     fn test_parse_extracts_target_from_topics_index_2() {
-        let raw = raw_event(serde_json::json!(["CAddressFunded", "GSOURCE", "CTARGET"]));
+        let raw = raw_event(serde_json::json!(["CAddressFunded", "GASSET", "GSOURCE", "CTARGET"]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(
             event.data["target"].as_str(),
             Some("CTARGET"),
-            "topics[2] must be stored as data.target"
+            "topics[3] must be stored as data.target for CAddressFunded"
         );
     }
 
+    /// #639: CAddressFunded topic layout is ("CAddressFunded", asset, source, target).
+    /// Verify all three fields land in the correct data keys.
     #[test]
-    fn test_parse_decodes_rpc_scval_topics_and_value() {
+    fn test_c_address_funded_topic_mapping() {
+        let raw = raw_event(serde_json::json!([
+            "CAddressFunded",
+            "CASSETCONTRACT",
+            "GSOURCEADDR",
+            "CTARGETADDR"
+        ]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(
+            event.data["asset"].as_str(),
+            Some("CASSETCONTRACT"),
+            "topics[1] must be the asset contract address"
+        );
+        assert_eq!(
+            event.data["source"].as_str(),
+            Some("GSOURCEADDR"),
+            "topics[2] must be the source G-address"
+        );
+        assert_eq!(
+            event.data["target"].as_str(),
+            Some("CTARGETADDR"),
+            "topics[3] must be the target C-address"
+        );
+    }
+
+    /// #640: asset_filter requires data["asset"] to be present.
+    /// Confirm parse_contract_event populates it for CAddressFunded.
+    #[test]
+    fn test_c_address_funded_populates_asset_field() {
         let raw = raw_event(serde_json::json!([
             "AAAADwAAAA5DQWRkcmVzc0Z1bmRlZAAA",
             "AAAADwAAAAtHU09VUkNFQUREUgA=",
             "AAAADwAAAAtDVEFSR0VUQUREUgA="
         ]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert!(
+            event.data.get("asset").is_some(),
+            "data['asset'] must be present for CAddressFunded so asset_filter can match"
+        );
+    }
+
+    /// #639/#640: FeesWithdrawn layout is ("FeesWithdrawn", fee_collector).
+    /// No asset in topics — verify fee_collector is stored correctly.
+    #[test]
+    fn test_fees_withdrawn_topic_mapping() {
+        let raw = raw_event(serde_json::json!(["FeesWithdrawn", "GCOLLECTOR"]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(
+            event.data["fee_collector"].as_str(),
+            Some("GCOLLECTOR"),
+            "topics[1] must be stored as data.fee_collector for FeesWithdrawn"
+        );
+        assert!(
+            event.data.get("asset").is_none(),
+            "FeesWithdrawn has no asset topic — data['asset'] must be absent"
+        );
+    }
+
+    /// #641: AdminProposed layout is ("AdminProposed", admin, new_admin).
+    #[test]
+    fn test_admin_proposed_topic_mapping() {
+        let raw = raw_event(serde_json::json!(["AdminProposed", "GADMIN", "GNEWADMIN"]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.data["from"].as_str(), Some("GADMIN"));
+        assert_eq!(event.data["to"].as_str(), Some("GNEWADMIN"));
+    }
+
+    /// #641: AdminTransferred layout is ("AdminTransferred", old_admin, pending).
+    #[test]
+    fn test_admin_transferred_topic_mapping() {
+        let raw = raw_event(serde_json::json!(["AdminTransferred", "GOLDADMIN", "GNEWADMIN"]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.data["from"].as_str(), Some("GOLDADMIN"));
+        assert_eq!(event.data["to"].as_str(), Some("GNEWADMIN"));
+    }
+
+    /// #641: FeeCollectorTransferProposed and FeeCollectorTransferred are now recognised.
+    #[test]
+    fn test_fee_collector_role_change_topics_are_recognised() {
+        let proposed = raw_event(serde_json::json!([
+            "FeeCollectorTransferProposed",
+            "GADMIN",
+            "GNEWCOLLECTOR"
+        ]));
+        let transferred = raw_event(serde_json::json!([
+            "FeeCollectorTransferred",
+            "GOLDCOLLECTOR",
+            "GNEWCOLLECTOR"
+        ]));
+        assert!(
+            parse_contract_event(&proposed, "C1", 0).is_some(),
+            "FeeCollectorTransferProposed must be recognised"
+        );
+        assert!(
+            parse_contract_event(&transferred, "C1", 0).is_some(),
+            "FeeCollectorTransferred must be recognised"
+        );
+    }
+
+    /// #641: The old incorrect topic strings AdminChanged / FeeCollectorChanged
+    /// must NOT produce indexed events (contract never emits them).
+    #[test]
+    fn test_old_incorrect_role_change_topics_produce_no_event() {
+        let raw_admin = raw_event(serde_json::json!(["AdminChanged", "GADMIN", "GNEWADMIN"]));
+        let raw_fc = raw_event(serde_json::json!(["FeeCollectorChanged", "GCOL", "GNEWCOL"]));
+        assert!(
+            parse_contract_event(&raw_admin, "C1", 0).is_none(),
+            "'AdminChanged' must yield None — contract never emits this"
+        );
+        assert!(
+            parse_contract_event(&raw_fc, "C1", 0).is_none(),
+            "'FeeCollectorChanged' must yield None — contract never emits this"
+        );
+    }
+
+    #[test]
+    fn test_parse_decodes_rpc_scval_topics_and_value() {
+        // #639: CAddressFunded is ("CAddressFunded", asset, source, target) — 4 topics.
+        // Base64-encoded XDR ScSymbol values for each field:
+        //   "CAddressFunded" -> AAAADwAAAA5DQWRkcmVzc0Z1bmRlZAAA
+        //   "CASSETADDR"     -> AAAADwAAAApDQVNTRVRBRERSAAA=
+        //   "GSOURCEADDR"    -> AAAADwAAAAtHU09VUkNFQUREUgA=
+        //   "CTARGETADDR"    -> AAAADwAAAAtDVEFSR0VUQUREUgA=
         let raw = serde_json::json!({
-            "topic": raw["topic"],
+            "topic": [
+                "AAAADwAAAA5DQWRkcmVzc0Z1bmRlZAAA",
+                "AAAADwAAAApDQVNTRVRBRERSAAA=",
+                "AAAADwAAAAtHU09VUkNFQUREUgA=",
+                "AAAADwAAAAtDVEFSR0VUQUREUgA="
+            ],
             "ledger": 10,
             "txHash": "cafebabe00000000",
             "createdAt": "2024-06-01T12:00:00Z",
@@ -528,6 +697,7 @@ mod tests {
         });
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(event.event_type, "CAddressFunded");
+        assert_eq!(event.data["asset"].as_str(), Some("CASSETADDR"));
         assert_eq!(event.data["source"].as_str(), Some("GSOURCEADDR"));
         assert_eq!(event.data["target"].as_str(), Some("CTARGETADDR"));
         assert_eq!(event.data["value"], serde_json::json!(42));
