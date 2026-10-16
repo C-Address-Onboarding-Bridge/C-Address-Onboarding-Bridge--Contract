@@ -31,13 +31,6 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      # `--all-targets` compiles the test target, and the upgrade tests in
-      # src/tests.rs `include_bytes!` the release wasm -- so on a clean runner
-      # clippy fails with "couldn't read ...onboarding_bridge.wasm" unless the
-      # wasm is built first (same ordering fix as the Soroban Contract job).
-      - name: Build WASM fixture for the test target
-        run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
-
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -99,11 +92,8 @@ jobs:
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      # The wasm has to exist BEFORE anything compiles the test target: the
-      # upgrade tests in src/tests.rs `include_bytes!` it, so `cargo check
-      # --all-targets` fails outright on a clean checkout if the build runs
-      # after it. This ordering bug is why the job never reached the suite.
-      - name: Build WASM (release)
+      # Build the legacy WASM artifact used by the hash check and upload step.
+      - name: Build WASM (wasm32-unknown-unknown)
         run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
 
       # Fast fail on type errors (including the test target) before paying for
@@ -303,10 +293,6 @@ jobs:
 
       - name: Build contract
         run: cargo build -p onboarding-bridge --release
-
-      # The upgrade tests include_bytes! the compiled wasm; build it first.
-      - name: Build WASM fixture for tests
-        run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
 
       - name: Run contract tests
         run: cargo test -p onboarding-bridge --features testutils
