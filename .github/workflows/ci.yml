@@ -55,8 +55,8 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
-      # Covers the contract, indexer, and relayer crates via the workspace lockfile.
-      #
+      # The root lockfile covers the contract workspace only; indexer has its
+      # own lockfile and is audited separately below.
       - name: Audit Rust dependencies
         # These are transitive Soroban-host advisories with no compatible
         # upstream replacement in the SDK 22 dependency graph. Keep the audit
@@ -66,6 +66,9 @@ jobs:
           --ignore RUSTSEC-2024-0388
           --ignore RUSTSEC-2024-0436
           --ignore RUSTSEC-2023-0031
+
+      - name: Audit indexer Rust dependencies
+        run: cargo audit --file indexer/Cargo.lock --deny warnings
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -79,6 +82,12 @@ jobs:
       - name: Audit SDK dependencies
         working-directory: sdk
         run: npm audit --audit-level=high
+        continue-on-error: true
+
+      # Advisory until known vulnerabilities in the shared workspace lockfile
+      # are resolved; retain the audit report without making CI permanently red.
+      - name: Audit relayer dependencies
+        run: npm audit --workspace=@stellar/c-address-onboarding-bridge-relayer --audit-level=high
         continue-on-error: true
 
   contract:
