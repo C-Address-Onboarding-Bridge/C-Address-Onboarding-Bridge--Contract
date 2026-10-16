@@ -1230,7 +1230,22 @@ describe("OnboardingBridgeSDK", () => {
         results: [{ retval: {} }],
       });
 
-      await expect(sdk.queryCurrentTier(MOCK_ADDRESS)).resolves.toBe(tier);
+      await expect(sdk.queryCurrentTier(MOCK_ADDRESS, MOCK_ASSET)).resolves.toBe(tier);
+
+      expect(Address).toHaveBeenNthCalledWith(1, MOCK_ADDRESS);
+      expect(Address).toHaveBeenNthCalledWith(2, MOCK_ASSET);
+      expect((sdk as any).contract.call).toHaveBeenCalledWith(
+        "query_current_tier",
+        {},
+        {},
+      );
+    });
+
+    it("rejects an invalid asset address", async () => {
+      await expect(sdk.queryCurrentTier(MOCK_ADDRESS, "not-a-contract")).rejects.toThrow(
+        'Invalid contract address for "asset"',
+      );
+      expect(mockProvider.simulateTransaction).not.toHaveBeenCalled();
     });
   });
 

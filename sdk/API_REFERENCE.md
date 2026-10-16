@@ -185,6 +185,17 @@ Queries accrued, uncollected protocol fees for a given token contract.
   - `asset`: `string` — Token contract address.
 - **Returns**: `Promise<string>`
 
+##### `queryCurrentTier`
+```ts
+async queryCurrentTier(source: string, asset: string): Promise<FeeTier | null>
+```
+Queries the current fee tier for a source account and token asset. The fee
+tier is selected using the source's bridged volume for that specific asset.
+- **Parameters**:
+  - `source`: `string` — Stellar account (G-address).
+  - `asset`: `string` — Token contract (C-address).
+- **Returns**: `Promise<FeeTier | null>`
+
 ##### `getContractBalance`
 ```ts
 async getContractBalance(asset: string): Promise<string>

@@ -112,7 +112,7 @@ graph TD
 | Asset and pool lists | `query_is_pool_whitelisted` | Check whether a swap pool is whitelisted |
 | Tiered fees | `set_fee_tiers` | Configure volume-based fee tiers |
 | Tiered fees | `query_fee_tiers` | Read configured fee tiers |
-| Tiered fees | `query_current_tier` | Read the current fee tier for a source |
+| Tiered fees | `query_current_tier` | Read the current fee tier for a source and asset |
 | Cross-chain relay | `fund_c_address_crosschain` | Fund a C-address from an external chain event with relayer signatures |
 | Cross-chain relay | `add_relayer` | Add an authorized relayer public key |
 | Cross-chain relay | `remove_relayer` | Remove an authorized relayer public key |

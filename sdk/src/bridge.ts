@@ -1335,13 +1335,16 @@ export class OnboardingBridgeSDK {
     return scVal ? scValToNative(scVal) as FeeTier[] : [];
   }
 
-  async queryCurrentTier(source: string): Promise<FeeTier | null> {
+  async queryCurrentTier(source: string, asset: string): Promise<FeeTier | null> {
     assertAccountAddress(source, 'source');
+    assertContractAddress(asset, 'asset');
     const result = await withRpcHook(
       this.hooks,
       'simulateTransaction',
       { contractMethod: 'query_current_tier' },
-      () => this.provider.simulateTransaction(this.buildSimulationTx('query_current_tier', [source])),
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_current_tier', [new Address(source), new Address(asset)]),
+      ),
     );
 
     if ('error' in result && result.error) {
