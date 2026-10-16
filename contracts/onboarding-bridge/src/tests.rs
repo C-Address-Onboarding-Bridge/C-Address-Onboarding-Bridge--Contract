@@ -2076,7 +2076,7 @@ fn test_swap_records_volume_in_target_asset_units() {
         &None,
     );
 
-    assert_eq!(bridge.query_current_tier(&user).fee_bps, 100);
+    assert_eq!(bridge.query_current_tier(&user, &target_token_id).fee_bps, 100);
 }
 
 #[test]

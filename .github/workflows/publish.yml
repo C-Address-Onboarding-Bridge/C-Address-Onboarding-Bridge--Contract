@@ -18,7 +18,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.84.0
+          toolchain: 1.88.0
           targets: wasm32v1-none
 
       - name: Cache cargo dependencies

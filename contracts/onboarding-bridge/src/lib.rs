@@ -2573,7 +2573,7 @@ impl OnboardingBridge {
 
         increment_user_deposit(&env, &source, &asset, amount)?;
         update_asset_counters_split(&env, &asset, protocol_fee, fee, net_amount)?;
-        increment_source_bridged_volume(&env, &source, amount)?;
+        increment_source_bridged_volume(&env, &source, &asset, amount)?;
 
         extend_instance_ttl(&env);
 
@@ -5287,7 +5287,7 @@ impl OnboardingBridge {
         }
 
         update_asset_counters(&env, &target_asset, fee, net_amount)?;
-        increment_source_bridged_volume(&env, &source, received_amount)?;
+        increment_source_bridged_volume(&env, &source, &target_asset, received_amount)?;
 
         mint_loyalty_tokens(&env, &source);
 
