@@ -924,7 +924,7 @@ export class SolanaSignatureStore {
 /**
  * Listens to Solana program log notifications over WebSocket.
  * Expects the Solana program to emit a structured log line:
- *   "bridge_fund:<signature>:<target>:<asset>:<amount>"
+ *   "bridge_fund:<target>:<asset>:<amount>"
  *
  * `logsSubscribe({ mentions: [programId] })` matches any transaction that
  * touches the program, so a `bridge_fund` line is only accepted when the
@@ -998,7 +998,7 @@ export class SolanaChainListener implements ChainListener {
         const data = JSON.parse(typeof msg === 'string' ? msg : msg.data);
         const signature: string | undefined = data?.params?.result?.value?.signature;
         const logs: string[] = data?.params?.result?.value?.logs ?? [];
-        for (const event of this.extractBridgeFundEvents(logs)) {
+        for (const event of signature ? this.extractBridgeFundEvents(logs, signature) : []) {
           if (this.onEvent) this.onEvent(event);
         }
         if (signature) this.recordSignature(signature);
@@ -1035,11 +1035,12 @@ export class SolanaChainListener implements ChainListener {
    * only treats a `bridge_fund` line as genuine when the bridge program
    * itself is the currently-executing program (top of the invoke stack).
    */
-  private extractBridgeFundEvents(logs: string[]): BridgeEvent[] {
+  private extractBridgeFundEvents(logs: string[], signature: string): BridgeEvent[] {
     const events: BridgeEvent[] = [];
     const stack: string[] = [];
     const invokeRe = /^Program (\S+) invoke \[\d+\]$/;
     const endRe = /^Program (\S+) (?:success|failed:.*)$/;
+    let bridgeFundLineIndex = 0;
 
     for (const line of logs) {
       const invokeMatch = line.match(invokeRe);
@@ -1054,6 +1055,7 @@ export class SolanaChainListener implements ChainListener {
         continue;
       }
       if (!line.startsWith('Program log: bridge_fund:')) continue;
+      const lineIndex = bridgeFundLineIndex++;
 
       const executingProgram = stack[stack.length - 1];
       if (executingProgram !== this.config.programId) {
@@ -1064,7 +1066,7 @@ export class SolanaChainListener implements ChainListener {
         continue;
       }
 
-      const event = this.decodeLine(line);
+      const event = this.decodeLine(line, signature, lineIndex);
       if (event) events.push(event);
     }
 
@@ -1072,34 +1074,36 @@ export class SolanaChainListener implements ChainListener {
   }
 
   /**
-   * Parse: "Program log: bridge_fund:<signature>:<target>:<asset>:<amount>"
+   * Parse: "Program log: bridge_fund:<target>:<asset>:<amount>"
    *
-   * `<signature>` is the base58-encoded 64-byte Solana transaction
-   * signature. The payload hash / contract nonce need a 32-byte `txHash`
-   * (see `computeNonce`), so the signature is base58-decoded, validated to
-   * be exactly 64 bytes, and mapped to 32 bytes via `sha256(signature)`
-   * rather than being used as-is (which would silently truncate/garble a
-   * real signature into an arbitrary buffer).
+   * The replay key comes from the transaction signature supplied by the RPC
+   * notification plus the position of this bridge_fund line, not from data
+   * chosen by the program.
    */
-  private decodeLine(line: string): BridgeEvent | null {
+  private decodeLine(line: string, signature: string, lineIndex: number): BridgeEvent | null {
     try {
       const payload = line.replace('Program log: bridge_fund:', '');
       const parts = payload.split(':');
-      if (parts.length !== 4) return this.rejectLine(line, 'expected 4 fields');
-      const [signature, target, asset, amount] = parts;
-      if (!signature || !target || !asset || !amount) return this.rejectLine(line, 'missing field');
+      if (parts.length !== 3) return this.rejectLine(line, 'expected 3 fields');
+      const [target, asset, amount] = parts;
+      if (!target || !asset || !amount) return this.rejectLine(line, 'missing field');
       if (!/^\d+$/.test(amount)) return this.rejectLine(line, 'amount is not numeric');
 
       let sigBytes: Buffer;
       try {
         sigBytes = base58Decode(signature);
       } catch {
-        return this.rejectLine(line, 'signature is not valid base58');
+        return this.rejectLine(line, 'notification signature is not valid base58');
       }
       if (sigBytes.length !== 64) {
-        return this.rejectLine(line, `signature must decode to 64 bytes, got ${sigBytes.length}`);
+        return this.rejectLine(line, `notification signature must decode to 64 bytes, got ${sigBytes.length}`);
       }
-      const txHash = crypto.createHash('sha256').update(sigBytes).digest('hex');
+      const lineIndexBytes = Buffer.alloc(4);
+      lineIndexBytes.writeUInt32BE(lineIndex);
+      const txHash = crypto.createHash('sha256')
+        .update(sigBytes)
+        .update(lineIndexBytes)
+        .digest('hex');
 
       return { chainId: this.config.chainId, txHash, target, asset, amount };
     } catch {
@@ -1753,20 +1757,44 @@ export function test_solana_listener_rejects_bad_log_lines(): void {
     chainId: 101,
   });
 
-  const decodeLine = (line: string) => (listener as any).decodeLine(line);
-  assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset'), null, 'missing amount should be rejected');
-  assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset:100:extra'), null, 'extra colon should be rejected');
-  assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset:not-a-number'), null, 'non-numeric amount should be rejected');
+  const decodeLine = (line: string, signature = '1'.repeat(64)) =>
+    (listener as any).decodeLine(line, signature, 0);
+  assertEqual(decodeLine('Program log: bridge_fund:target:asset'), null, 'missing amount should be rejected');
+  assertEqual(decodeLine('Program log: bridge_fund:target:asset:100:extra'), null, 'extra colon should be rejected');
+  assertEqual(decodeLine('Program log: bridge_fund:target:asset:not-a-number'), null, 'non-numeric amount should be rejected');
   assertEqual(
-    decodeLine('Program log: bridge_fund:tx:target:asset:100'),
+    decodeLine('Program log: bridge_fund:target:asset:100', 'invalid-signature'),
     null,
-    'a signature that does not base58-decode to 64 bytes should be rejected',
+    'a notification signature that does not base58-decode to 64 bytes should be rejected',
   );
   assertEqual(
-    decodeLine('Program log: bridge_fund:not*base58!:target:asset:100'),
+    decodeLine('Program log: bridge_fund:target:asset:100', 'not*base58!'),
     null,
-    'a signature with characters outside the base58 alphabet should be rejected',
+    'a notification signature with characters outside the base58 alphabet should be rejected',
   );
+}
+
+export function test_solana_replay_key_uses_notification_signature_and_line_index(): void {
+  const listener = new SolanaChainListener({
+    wsUrl: 'ws://localhost',
+    programId: 'bridge-program',
+    chainId: 101,
+  });
+  const log = 'Program log: bridge_fund:GDEST:CASSET:100';
+  const logs = [
+    'Program bridge-program invoke [1]',
+    log,
+    log,
+    'Program bridge-program success',
+  ];
+  const first = (listener as any).extractBridgeFundEvents(logs, '1'.repeat(64)) as BridgeEvent[];
+  const replay = (listener as any).extractBridgeFundEvents(logs, '1'.repeat(64)) as BridgeEvent[];
+  const otherTransaction = (listener as any).extractBridgeFundEvents(logs, '1'.repeat(63) + '2') as BridgeEvent[];
+
+  assertEqual(first.length, 2, 'both bridge_fund lines should be decoded');
+  assertEqual(first[0].txHash, replay[0].txHash, 'replaying the same notification should preserve the replay key');
+  assert(first[0].txHash !== first[1].txHash, 'bridge_fund lines in one transaction need distinct replay keys');
+  assert(first[0].txHash !== otherTransaction[0].txHash, 'identical log text from different transactions needs distinct replay keys');
 }
 
 // ---------------------------------------------------------------------------
@@ -2110,10 +2138,10 @@ export async function test_solana_listener_backfills_missed_events_after_reconne
     (listener as any).rpcCall = async (method: string, _params: unknown[]) => {
       rpcCalls.push(method);
       if (method === 'getSignaturesForAddress') {
-        return [{ signature: 'sig-new', err: null }];
+        return [{ signature: '1'.repeat(64), err: null }];
       }
       if (method === 'getTransaction') {
-        return { meta: { logMessages: ['Program log: bridge_fund:' + 'ab'.repeat(32) + ':GDEST:CASSET:100'] } };
+        return { meta: { logMessages: ['Program log: bridge_fund:GDEST:CASSET:100'] } };
       }
       return null;
     };
@@ -2125,7 +2153,7 @@ export async function test_solana_listener_backfills_missed_events_after_reconne
 
     assertEqual(rpcCalls, ['getSignaturesForAddress', 'getTransaction'], 'backfill should query signatures then fetch the transaction');
     assertEqual(events.length, 1, 'backfill should replay the missed bridge_fund event');
-    assertEqual((listener as any).lastSignature, 'sig-new', 'lastSignature should advance to the newest replayed signature');
+    assertEqual((listener as any).lastSignature, '1'.repeat(64), 'lastSignature should advance to the newest replayed signature');
 
     // Simulate a restart: a fresh instance pointed at the same file should
     // resume backfilling from the persisted signature, not from scratch.
@@ -2136,7 +2164,7 @@ export async function test_solana_listener_backfills_missed_events_after_reconne
       httpUrl: 'http://localhost',
       signatureStorePath: filePath,
     });
-    assertEqual((restarted as any).lastSignature, 'sig-new', 'signature persisted before restart must be loaded on construction');
+    assertEqual((restarted as any).lastSignature, '1'.repeat(64), 'signature persisted before restart must be loaded on construction');
   } finally {
     try { fs.unlinkSync(filePath); } catch { /* ignore */ }
   }
@@ -2220,6 +2248,7 @@ async function runRelayerSelfTests(): Promise<void> {
   await test_eth_listener_withholds_logs_within_confirmation_depth();
   await test_eth_listener_skips_removed_reorged_logs();
   test_solana_listener_rejects_bad_log_lines();
+  test_solana_replay_key_uses_notification_signature_and_line_index();
   test_solana_listener_subscribes_with_finalized_commitment();
   await test_solana_listener_backfills_missed_events_after_reconnect();
   await test_solana_listener_skips_backfill_without_persisted_signature();
