@@ -53,7 +53,7 @@ export interface ChainListener {
  *
  * Two shapes are supported:
  *
- * - `{ signerUrl }` (recommended): the key never enters this process. The
+ * - `{ signerUrl, expectedPubkey }` (recommended): the key never enters this process. The
  *   relayer POSTs the payload hash to an independent signer service — run by
  *   the operator that owns that key, on its own host/process — and receives
  *   back a signature. See `relayer/signer-service.ts` and
@@ -66,7 +66,7 @@ export interface ChainListener {
  */
 export type RelayerNodeConfig =
   | { privateKey: string; signerUrl?: undefined }
-  | { signerUrl: string; privateKey?: undefined };
+  | { signerUrl: string; expectedPubkey: string; privateKey?: undefined };
 
 /** Timeout for a remote signer HTTP call, in ms. */
 const SIGNER_REQUEST_TIMEOUT_MS = 5_000;
@@ -75,7 +75,14 @@ const SIGNER_REQUEST_TIMEOUT_MS = 5_000;
  * Request a signature from an independent per-operator signer service that
  * holds exactly one key. The relayer process never sees that key's material.
  */
-async function requestRemoteSignature(signerUrl: string, payloadHash: Buffer): Promise<RelayerSig> {
+async function requestRemoteSignature(
+  signerUrl: string,
+  expectedPubkey: string,
+  payloadHash: Buffer,
+): Promise<RelayerSig> {
+  if (!/^[0-9a-f]{64}$/i.test(expectedPubkey)) {
+    throw new Error(`signer at ${signerUrl} has an invalid expectedPubkey configuration`);
+  }
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SIGNER_REQUEST_TIMEOUT_MS);
   try {
@@ -88,9 +95,19 @@ async function requestRemoteSignature(signerUrl: string, payloadHash: Buffer): P
     if (!res.ok) {
       throw new Error(`signer at ${signerUrl} responded ${res.status}`);
     }
-    const json: any = await res.json();
-    if (typeof json.pubkey !== 'string' || typeof json.signature !== 'string') {
+    const json: unknown = await res.json();
+    if (
+      json === null ||
+      typeof json !== 'object' ||
+      !('pubkey' in json) ||
+      !('signature' in json) ||
+      typeof json.pubkey !== 'string' ||
+      typeof json.signature !== 'string'
+    ) {
       throw new Error(`signer at ${signerUrl} returned a malformed response`);
+    }
+    if (json.pubkey.toLowerCase() !== expectedPubkey.toLowerCase()) {
+      throw new Error(`signer at ${signerUrl} returned an unexpected public key`);
     }
     return { pubkey: json.pubkey, signature: json.signature };
   } finally {
@@ -101,9 +118,26 @@ async function requestRemoteSignature(signerUrl: string, payloadHash: Buffer): P
 /** Sign the payload hash with a single node, using whichever custody mode it's configured for. */
 async function signWithNode(node: RelayerNodeConfig, payloadHash: Buffer): Promise<RelayerSig> {
   if (node.signerUrl) {
-    return requestRemoteSignature(node.signerUrl, payloadHash);
+    return requestRemoteSignature(node.signerUrl, node.expectedPubkey, payloadHash);
   }
   return signPayload(node.privateKey!, payloadHash);
+}
+
+function verifyRelayerSignature(sig: RelayerSig, payloadHash: Buffer): boolean {
+  if (!/^[0-9a-f]{64}$/i.test(sig.pubkey) || !/^[0-9a-f]{128}$/i.test(sig.signature)) {
+    return false;
+  }
+  try {
+    const spkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
+    const publicKey = crypto.createPublicKey({
+      key: Buffer.concat([spkiPrefix, Buffer.from(sig.pubkey, 'hex')]),
+      format: 'der',
+      type: 'spki',
+    });
+    return crypto.verify(null, payloadHash, publicKey, Buffer.from(sig.signature, 'hex'));
+  } catch {
+    return false;
+  }
 }
 
 export interface RelayerServiceConfig {
@@ -329,6 +363,7 @@ export class RelayerService {
   private lastEventPerChain: Map<number, string> = new Map();
   private dlqRetryTimer: ReturnType<typeof setInterval> | null = null;
   readonly dlq = new DeadLetterQueue();
+  private inFlight = new Set<string>();
 
   constructor(config: RelayerServiceConfig) {
     this.config = config;
@@ -415,63 +450,69 @@ export class RelayerService {
       console.log(`[relayer] duplicate event ignored: chain=${event.chainId} tx=${event.txHash}`);
       return;
     }
-
-    console.log(`[relayer] event received: chain=${event.chainId} tx=${event.txHash} target=${event.target} amount=${event.amount}`);
-
-    const payloadHash = computePayloadHash(event);
-
-    // Collect signatures from all configured nodes, then deduplicate by pubkey.
-    // The contract does NOT verify that sigs contains distinct pubkeys — the doc
-    // comment on fund_c_address_crosschain explicitly delegates deduplication to
-    // relayer infrastructure.  A config mistake (two nodes sharing a key) or a
-    // malicious injection must not inflate the effective signature count past
-    // what distinct keys actually authorize.
-    const rawSigs: RelayerSig[] = await Promise.all(
-      this.config.nodes.map((node) => signWithNode(node, payloadHash)),
-    );
-    const seenPubkeys = new Set<string>();
-    const sigs: RelayerSig[] = rawSigs.filter((sig) => {
-      if (seenPubkeys.has(sig.pubkey)) {
-        console.warn(`[relayer] duplicate pubkey detected and removed: ${sig.pubkey}`);
-        return false;
-      }
-      seenPubkeys.add(sig.pubkey);
-      return true;
-    });
-
-    if (sigs.length < this.config.threshold) {
-      console.warn(`[relayer] not enough signers after dedup: have ${sigs.length}, need ${this.config.threshold}`);
-      this.dlq.enqueue(event, sigs.length, this.config.threshold, 'insufficient signers after dedup');
+    if (this.inFlight.has(key)) {
+      console.log(`[relayer] event already in flight: chain=${event.chainId} tx=${event.txHash}`);
       return;
     }
     this.inFlight.add(key);
 
+    console.log(`[relayer] event received: chain=${event.chainId} tx=${event.txHash} target=${event.target} amount=${event.amount}`);
+    let availableSigners = 0;
     try {
-      console.log(`[relayer] event received: chain=${event.chainId} tx=${event.txHash} target=${event.target} amount=${event.amount}`);
-
       const payloadHash = computePayloadHash(event);
-
       // Collect signatures from all configured nodes, then deduplicate by pubkey.
       // The contract does NOT verify that sigs contains distinct pubkeys — the doc
       // comment on fund_c_address_crosschain explicitly delegates deduplication to
       // relayer infrastructure.  A config mistake (two nodes sharing a key) or a
       // malicious injection must not inflate the effective signature count past
       // what distinct keys actually authorize.
-      const rawSigs: RelayerSig[] = this.config.nodes.map((node) =>
-        signPayload(node.privateKey, payloadHash),
+      const rawResults = await Promise.all(
+        this.config.nodes.map(async (node): Promise<RelayerSig | null> => {
+          try {
+            const sig = await signWithNode(node, payloadHash);
+            if (!verifyRelayerSignature(sig, payloadHash)) {
+              throw new Error('signature failed local Ed25519 verification');
+            }
+            return sig;
+          } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : String(err);
+            console.warn(`[relayer] dropping invalid signer response: ${message}`);
+            return null;
+          }
+        }),
       );
+      const rawSigs = rawResults.filter((sig): sig is RelayerSig => sig !== null);
       const seenPubkeys = new Set<string>();
       const sigs: RelayerSig[] = rawSigs.filter((sig) => {
-        if (seenPubkeys.has(sig.pubkey)) {
+        const pubkey = sig.pubkey.toLowerCase();
+        if (seenPubkeys.has(pubkey)) {
           console.warn(`[relayer] duplicate pubkey detected and removed: ${sig.pubkey}`);
           return false;
         }
-        seenPubkeys.add(sig.pubkey);
+        seenPubkeys.add(pubkey);
         return true;
       });
+      availableSigners = sigs.length;
 
+      if (sigs.length < this.config.threshold) {
+        console.warn(`[relayer] not enough signers after verification: have ${sigs.length}, need ${this.config.threshold}`);
+        this.dlq.enqueue(event, sigs.length, this.config.threshold, 'insufficient valid signers');
+        return;
+      }
+
+      const result = await this.sdk.fundCrosschain(
+        {
+          chainId: event.chainId,
+          txHash: event.txHash,
+          target: event.target,
+          asset: event.asset,
+          amount: event.amount,
+          sigs,
+        },
+        this.submitterKeypair,
+      );
       if (result.status === 'failed') {
-        console.error(`[relayer] fundCrosschain failed: ${result.error}`);
+        console.error(`[relayer] fundCrosschain failed: ${result.error ?? 'unknown error'}`);
         this.dlq.enqueue(event, sigs.length, this.config.threshold, `submission failed: ${result.error}`);
         return;
       }
@@ -481,9 +522,12 @@ export class RelayerService {
       this.lastEventPerChain.set(event.chainId, new Date().toISOString());
       this.dlq.remove(event.chainId, event.txHash);
       console.log(`[relayer] submitted tx=${result.hash} for chain=${event.chainId} src-tx=${event.txHash}`);
-    } catch (err: any) {
-      console.error(`[relayer] unexpected error: ${err.message}`);
-      this.dlq.enqueue(event, sigs.length, this.config.threshold, `unexpected error: ${err.message}`);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[relayer] unexpected error: ${message}`);
+      this.dlq.enqueue(event, availableSigners, this.config.threshold, `unexpected error: ${message}`);
+    } finally {
+      this.inFlight.delete(key);
     }
   }
 }
@@ -1399,22 +1443,25 @@ export async function test_successful_retry_removes_dlq_entry(): Promise<void> {
 
 export async function test_signer_url_node_signs_via_remote_call_not_local_key(): Promise<void> {
   const originalFetch = (globalThis as any).fetch;
+  const seed = '11'.repeat(32);
+  const expectedPubkey = signPayload(seed, Buffer.alloc(32)).pubkey;
   let calledUrl = '';
   let sentBody: any = null;
   (globalThis as any).fetch = async (url: string, opts: any) => {
     calledUrl = url;
     sentBody = JSON.parse(opts.body);
+    const sig = signPayload(seed, Buffer.from(sentBody.payloadHash, 'hex'));
     return {
       ok: true,
       status: 200,
-      json: async () => ({ pubkey: 'aa'.repeat(32), signature: 'bb'.repeat(64) }),
+      json: async () => sig,
     };
   };
   try {
     let capturedSigCount = 0;
     const service = makeTestService({
       threshold: 1,
-      nodes: [{ signerUrl: 'http://signer-a.internal:4000' }],
+      nodes: [{ signerUrl: 'http://signer-a.internal:4000', expectedPubkey }],
       fundCrosschain: async (options: CrossChainFundOptions) => {
         capturedSigCount = options.sigs.length;
         return { status: 'pending', hash: 'hash' };
@@ -1433,16 +1480,21 @@ export async function test_signer_url_node_signs_via_remote_call_not_local_key()
 
 export async function test_mixed_signer_url_and_private_key_nodes_meet_threshold(): Promise<void> {
   const originalFetch = (globalThis as any).fetch;
-  (globalThis as any).fetch = async () => ({
-    ok: true,
-    status: 200,
-    json: async () => ({ pubkey: 'cc'.repeat(32), signature: 'dd'.repeat(64) }),
-  });
+  const seed = '22'.repeat(32);
+  const expectedPubkey = signPayload(seed, Buffer.alloc(32)).pubkey;
+  (globalThis as any).fetch = async (_url: string, opts: any) => {
+    const payloadHash = Buffer.from(JSON.parse(opts.body).payloadHash, 'hex');
+    return {
+      ok: true,
+      status: 200,
+      json: async () => signPayload(seed, payloadHash),
+    };
+  };
   try {
     let calls = 0;
     const service = makeTestService({
       threshold: 2,
-      nodes: [{ signerUrl: 'http://signer-b.internal:4000' }, { privateKey: '05'.repeat(32) }],
+      nodes: [{ signerUrl: 'http://signer-b.internal:4000', expectedPubkey }, { privateKey: '05'.repeat(32) }],
       fundCrosschain: async () => {
         calls += 1;
         return { status: 'pending', hash: 'hash' };
@@ -1452,6 +1504,39 @@ export async function test_mixed_signer_url_and_private_key_nodes_meet_threshold
     await (service as any).handleEvent(makeTestEvent());
 
     assertEqual(calls, 1, 'a mix of remote and local signers should still meet the threshold');
+  } finally {
+    (globalThis as any).fetch = originalFetch;
+  }
+}
+
+export async function test_invalid_remote_signature_is_dropped_when_threshold_is_met(): Promise<void> {
+  const originalFetch = (globalThis as any).fetch;
+  const expectedPubkey = signPayload('33'.repeat(32), Buffer.alloc(32)).pubkey;
+  (globalThis as any).fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ pubkey: expectedPubkey, signature: 'ff'.repeat(64) }),
+  });
+  try {
+    let submittedSigCount = 0;
+    let calls = 0;
+    const service = makeTestService({
+      threshold: 1,
+      nodes: [
+        { signerUrl: 'http://signer-bad.internal:4000', expectedPubkey },
+        { privateKey: '05'.repeat(32) },
+      ],
+      fundCrosschain: async (options: CrossChainFundOptions) => {
+        calls += 1;
+        submittedSigCount = options.sigs.length;
+        return { status: 'pending', hash: 'hash' };
+      },
+    });
+
+    await (service as any).handleEvent(makeTestEvent());
+
+    assertEqual(calls, 1, 'a valid signer should still submit when another signer is invalid');
+    assertEqual(submittedSigCount, 1, 'the invalid remote signature must not be submitted');
   } finally {
     (globalThis as any).fetch = originalFetch;
   }
@@ -2209,6 +2294,7 @@ async function runRelayerSelfTests(): Promise<void> {
   await test_successful_retry_removes_dlq_entry();
   await test_signer_url_node_signs_via_remote_call_not_local_key();
   await test_mixed_signer_url_and_private_key_nodes_meet_threshold();
+  await test_invalid_remote_signature_is_dropped_when_threshold_is_met();
   test_eth_listener_decodes_realistic_abi_log_fixture();
   test_eth_listener_derives_txhash_from_log_not_event_data();
   test_eth_listener_rejects_log_missing_transaction_hash();
@@ -2263,7 +2349,10 @@ if (require.main === module) {
       // over in-process keys (RELAYER_PRIVATE_KEYS, legacy/dev only — see
       // adr/ADR-007-signer-key-isolation.md).
       nodes: process.env.RELAYER_SIGNER_URLS
-        ? process.env.RELAYER_SIGNER_URLS.split(',').map((url) => ({ signerUrl: url.trim() }))
+        ? process.env.RELAYER_SIGNER_URLS.split(',').map((url, index) => ({
+          signerUrl: url.trim(),
+          expectedPubkey: (process.env.RELAYER_SIGNER_PUBKEYS ?? '').split(',')[index]?.trim() ?? '',
+        }))
         : (process.env.RELAYER_PRIVATE_KEYS ?? '').split(',').map((pk) => ({ privateKey: pk.trim() })),
       listeners: [
         ...(process.env.ETH_RPC_URL ? [new EthChainListener({

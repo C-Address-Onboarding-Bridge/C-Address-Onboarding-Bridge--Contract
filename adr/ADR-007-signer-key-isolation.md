@@ -17,7 +17,7 @@ degrades to 1-of-1 in practice, even though it looks like M-of-N on paper.
 
 Split key custody from the relayer process:
 
-- `RelayerNodeConfig` is now a union: `{ signerUrl: string }` or
+- `RelayerNodeConfig` is now a union: `{ signerUrl: string, expectedPubkey: string }` or
   `{ privateKey: string }`.
 - For `signerUrl` nodes, the main relayer process never receives that key's
   material. It POSTs the payload hash to `${signerUrl}/sign` and receives
@@ -28,7 +28,10 @@ Split key custody from the relayer process:
   and exposes only `POST /sign`. Each signing operator runs their own
   instance, on infrastructure they control, and gives the main relayer their
   service's URL (`RELAYER_SIGNER_URLS`, comma-separated, in the same order as
-  the on-chain relayer registration).
+  the on-chain relayer registration) and the matching public keys
+  (`RELAYER_SIGNER_PUBKEYS`, in the same order). The relayer checks each
+  response against its configured key and verifies the Ed25519 signature
+  locally before counting it toward the threshold.
 - `{ privateKey }` nodes remain supported for local development only. The
   `RelayerService` constructor logs a loud warning whenever more than one
   in-process key is configured, since that's exactly the setup this ADR
