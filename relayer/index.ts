@@ -324,7 +324,8 @@ export class RelayerService {
   private sdk: OnboardingBridgeSDK;
   private submitterKeypair: ReturnType<typeof Keypair.fromSecret>;
   private config: RelayerServiceConfig;
-  private nonces: NonceStore;
+  private nonces = new NonceStore();
+  private inFlight = new Set<string>();
   private startedAt = Date.now();
   private lastEventPerChain: Map<number, string> = new Map();
   private dlqRetryTimer: ReturnType<typeof setInterval> | null = null;
@@ -353,7 +354,12 @@ export class RelayerService {
 
   start(): void {
     for (const listener of this.config.listeners) {
-      listener.start((event) => this.handleEvent(event));
+      listener.start((event) => {
+        void this.handleEvent(event).catch((err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          console.error(`[relayer] event handler failed after dead-lettering: ${message}`);
+        });
+      });
     }
 
     const retryIntervalMs = this.config.dlqRetryIntervalMs ?? 60_000;
@@ -410,58 +416,39 @@ export class RelayerService {
 
   private async handleEvent(event: BridgeEvent): Promise<void> {
     const key = `${event.chainId}:${event.txHash}`;
-
-    if (this.nonces.has(event.chainId, event.txHash)) {
-      console.log(`[relayer] duplicate event ignored: chain=${event.chainId} tx=${event.txHash}`);
-      return;
-    }
-
-    console.log(`[relayer] event received: chain=${event.chainId} tx=${event.txHash} target=${event.target} amount=${event.amount}`);
-
-    const payloadHash = computePayloadHash(event);
-
-    // Collect signatures from all configured nodes, then deduplicate by pubkey.
-    // The contract does NOT verify that sigs contains distinct pubkeys — the doc
-    // comment on fund_c_address_crosschain explicitly delegates deduplication to
-    // relayer infrastructure.  A config mistake (two nodes sharing a key) or a
-    // malicious injection must not inflate the effective signature count past
-    // what distinct keys actually authorize.
-    const rawSigs: RelayerSig[] = await Promise.all(
-      this.config.nodes.map((node) => signWithNode(node, payloadHash)),
-    );
-    const seenPubkeys = new Set<string>();
-    const sigs: RelayerSig[] = rawSigs.filter((sig) => {
-      if (seenPubkeys.has(sig.pubkey)) {
-        console.warn(`[relayer] duplicate pubkey detected and removed: ${sig.pubkey}`);
-        return false;
-      }
-      seenPubkeys.add(sig.pubkey);
-      return true;
-    });
-
-    if (sigs.length < this.config.threshold) {
-      console.warn(`[relayer] not enough signers after dedup: have ${sigs.length}, need ${this.config.threshold}`);
-      this.dlq.enqueue(event, sigs.length, this.config.threshold, 'insufficient signers after dedup');
-      return;
-    }
-    this.inFlight.add(key);
+    let availableSigners = 0;
+    let ownsInFlightSlot = false;
 
     try {
+      if (this.nonces.has(event.chainId, event.txHash) || this.inFlight.has(key)) {
+        console.log(`[relayer] duplicate event ignored: chain=${event.chainId} tx=${event.txHash}`);
+        return;
+      }
+      this.inFlight.add(key);
+      ownsInFlightSlot = true;
+
       console.log(`[relayer] event received: chain=${event.chainId} tx=${event.txHash} target=${event.target} amount=${event.amount}`);
 
       const payloadHash = computePayloadHash(event);
 
-      // Collect signatures from all configured nodes, then deduplicate by pubkey.
-      // The contract does NOT verify that sigs contains distinct pubkeys — the doc
-      // comment on fund_c_address_crosschain explicitly delegates deduplication to
-      // relayer infrastructure.  A config mistake (two nodes sharing a key) or a
-      // malicious injection must not inflate the effective signature count past
-      // what distinct keys actually authorize.
-      const rawSigs: RelayerSig[] = this.config.nodes.map((node) =>
-        signPayload(node.privateKey, payloadHash),
+      // Collect whatever signatures are available, then deduplicate by pubkey.
+      const settled = await Promise.allSettled(
+        this.config.nodes.map((node) => signWithNode(node, payloadHash)),
       );
+      const rawSigs: RelayerSig[] = [];
+      settled.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          rawSigs.push(result.value);
+        } else {
+          const message = result.reason instanceof Error
+            ? result.reason.message
+            : String(result.reason);
+          console.error(`[relayer] signer ${index + 1} failed: ${message}`);
+        }
+      });
+
       const seenPubkeys = new Set<string>();
-      const sigs: RelayerSig[] = rawSigs.filter((sig) => {
+      const sigs = rawSigs.filter((sig) => {
         if (seenPubkeys.has(sig.pubkey)) {
           console.warn(`[relayer] duplicate pubkey detected and removed: ${sig.pubkey}`);
           return false;
@@ -469,6 +456,25 @@ export class RelayerService {
         seenPubkeys.add(sig.pubkey);
         return true;
       });
+      availableSigners = sigs.length;
+
+      if (sigs.length < this.config.threshold) {
+        console.warn(`[relayer] not enough signers after dedup: have ${sigs.length}, need ${this.config.threshold}`);
+        this.dlq.enqueue(event, sigs.length, this.config.threshold, 'insufficient signers after dedup');
+        return;
+      }
+
+      const result = await this.sdk.fundCrosschain(
+        {
+          chainId: event.chainId,
+          txHash: event.txHash,
+          target: event.target,
+          asset: event.asset,
+          amount: event.amount,
+          sigs: sigs.slice(0, this.config.threshold),
+        },
+        this.submitterKeypair,
+      );
 
       if (result.status === 'failed') {
         console.error(`[relayer] fundCrosschain failed: ${result.error}`);
@@ -481,9 +487,12 @@ export class RelayerService {
       this.lastEventPerChain.set(event.chainId, new Date().toISOString());
       this.dlq.remove(event.chainId, event.txHash);
       console.log(`[relayer] submitted tx=${result.hash} for chain=${event.chainId} src-tx=${event.txHash}`);
-    } catch (err: any) {
-      console.error(`[relayer] unexpected error: ${err.message}`);
-      this.dlq.enqueue(event, sigs.length, this.config.threshold, `unexpected error: ${err.message}`);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[relayer] unexpected error: ${message}`);
+      this.dlq.enqueue(event, availableSigners, this.config.threshold, `unexpected error: ${message}`);
+    } finally {
+      if (ownsInFlightSlot) this.inFlight.delete(key);
     }
   }
 }
@@ -1457,6 +1466,44 @@ export async function test_mixed_signer_url_and_private_key_nodes_meet_threshold
   }
 }
 
+export async function test_failed_signer_does_not_block_threshold_met(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.includes('signer-fails')) {
+      throw new Error('signer unavailable');
+    }
+    const pubkey = url.includes('signer-b') ? 'bb'.repeat(32) : 'aa'.repeat(32);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ pubkey, signature: 'cc'.repeat(64) }),
+    } as Response;
+  };
+  try {
+    let calls = 0;
+    const service = makeTestService({
+      threshold: 2,
+      nodes: [
+        { signerUrl: 'http://signer-a.internal:4000' },
+        { signerUrl: 'http://signer-b.internal:4000' },
+        { signerUrl: 'http://signer-fails.internal:4000' },
+      ],
+      fundCrosschain: async () => {
+        calls += 1;
+        return { status: 'pending', hash: 'hash' };
+      },
+    });
+
+    await (service as any).handleEvent(makeTestEvent());
+
+    assertEqual(calls, 1, 'two successful signers should meet threshold despite one failed signer');
+    assertEqual(service.dlq.size(), 0, 'meeting threshold should not dead-letter the event');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 function word(hex: string): string {
   return hex.padStart(64, '0');
 }
@@ -2209,6 +2256,7 @@ async function runRelayerSelfTests(): Promise<void> {
   await test_successful_retry_removes_dlq_entry();
   await test_signer_url_node_signs_via_remote_call_not_local_key();
   await test_mixed_signer_url_and_private_key_nodes_meet_threshold();
+  await test_failed_signer_does_not_block_threshold_met();
   test_eth_listener_decodes_realistic_abi_log_fixture();
   test_eth_listener_derives_txhash_from_log_not_event_data();
   test_eth_listener_rejects_log_missing_transaction_hash();
