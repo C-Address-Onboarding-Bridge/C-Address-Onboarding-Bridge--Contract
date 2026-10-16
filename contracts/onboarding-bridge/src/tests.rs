@@ -1163,14 +1163,7 @@ fn test_timelocked_funds_can_be_claimed_after_emergency_migration() {
     let target = Address::generate(&env);
     let destination = Address::generate(&env);
     let id = bridge.fund_c_address_timelocked(
-        &user,
-        &target,
-        &token_id,
-        &500i128,
-        &1_100u64,
-        &0u64,
-        &None,
-        &None,
+        &user, &target, &token_id, &500i128, &1_100u64, &0u64, &None, &None,
     );
 
     let new_contract = Address::generate(&env);
