@@ -119,12 +119,34 @@ export interface RelayerServiceConfig {
   threshold: number;
   /** Chain listeners to watch. */
   listeners: ChainListener[];
+  /** Directory for persistent nonce and dead-letter state. */
+  stateDir?: string;
   /**
    * How often to retry dead-lettered events, in ms. Set to 0 to disable the
    * automatic retry timer (the DLQ can still be drained manually via
    * `retryDeadLetters()`). Defaults to 60_000 (1 minute).
    */
   dlqRetryIntervalMs?: number;
+}
+
+function readJsonFile<T>(filePath: string): T | undefined {
+  if (!fs.existsSync(filePath)) return undefined;
+  return JSON.parse(fs.readFileSync(filePath, 'utf8')) as T;
+}
+
+function writeJsonFileAtomic(filePath: string, value: unknown): void {
+  const directory = path.dirname(filePath);
+  fs.mkdirSync(directory, { recursive: true });
+  const tempPath = path.join(
+    directory,
+    `.${path.basename(filePath)}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`,
+  );
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(value), { mode: 0o600 });
+    fs.renameSync(tempPath, filePath);
+  } finally {
+    if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -144,9 +166,8 @@ export interface DeadLetterEntry {
 }
 
 /**
- * In-memory dead-letter store for under-threshold events and failed
- * submissions. Replace with a persistent store (e.g. Redis, SQLite) in
- * production.
+ * Stores under-threshold events and failed submissions in memory or in a
+ * JSON file when a path is configured.
  */
 export class DeadLetterQueue {
   private entries: DeadLetterEntry[] = [];
@@ -328,10 +349,16 @@ export class RelayerService {
   private startedAt = Date.now();
   private lastEventPerChain: Map<number, string> = new Map();
   private dlqRetryTimer: ReturnType<typeof setInterval> | null = null;
-  readonly dlq = new DeadLetterQueue();
+  readonly dlq: DeadLetterQueue;
 
   constructor(config: RelayerServiceConfig) {
     this.config = config;
+    this.nonces = new NonceStore(
+      config.stateDir ? path.join(config.stateDir, 'nonces.json') : undefined,
+    );
+    this.dlq = new DeadLetterQueue(
+      config.stateDir ? path.join(config.stateDir, 'dead-letter-queue.json') : undefined,
+    );
     this.sdk = new OnboardingBridgeSDK({
       contractId: config.contractId,
       rpcUrl: config.rpcUrl,
@@ -2181,11 +2208,41 @@ export function test_nonce_store_persists_across_restart(): void {
   }
 }
 
+export function test_service_persistent_state_survives_reconstruction(): void {
+  const stateDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'relayer-service-state-'));
+  const config: RelayerServiceConfig = {
+    contractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4',
+    rpcUrl: 'http://localhost:8000',
+    networkPassphrase: 'Test SDF Network ; September 2015',
+    submitterSecretKey: Keypair.random().secret(),
+    threshold: 1,
+    nodes: [],
+    listeners: [],
+    dlqRetryIntervalMs: 0,
+    stateDir,
+  };
+  const event = makeTestEvent();
+  try {
+    const before = new RelayerService(config);
+    (before as any).nonces.mark(event.chainId, event.txHash);
+    before.dlq.enqueue(event, 0, 1, 'persistence test');
+
+    const after = new RelayerService(config);
+    assert(
+      (after as any).nonces.has(event.chainId, event.txHash),
+      'nonce marked before service reconstruction must remain present',
+    );
+    assertEqual(after.dlq.size(), 1, 'dead-letter entry must survive service reconstruction');
+  } finally {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+}
+
 export function test_dead_letter_queue_persists_across_restart(): void {
   const filePath = tempStorePath('dlq');
   try {
     const before = new DeadLetterQueue(filePath);
-    before.enqueue(makeTestEvent(), 1, 2);
+    before.enqueue(makeTestEvent(), 1, 2, 'persistence test');
     assertEqual(before.size(), 1, 'entry should be enqueued');
 
     // Simulate a restart: construct a brand-new instance pointed at the same file.
@@ -2209,6 +2266,9 @@ async function runRelayerSelfTests(): Promise<void> {
   await test_successful_retry_removes_dlq_entry();
   await test_signer_url_node_signs_via_remote_call_not_local_key();
   await test_mixed_signer_url_and_private_key_nodes_meet_threshold();
+  test_nonce_store_persists_across_restart();
+  test_service_persistent_state_survives_reconstruction();
+  test_dead_letter_queue_persists_across_restart();
   test_eth_listener_decodes_realistic_abi_log_fixture();
   test_eth_listener_derives_txhash_from_log_not_event_data();
   test_eth_listener_rejects_log_missing_transaction_hash();
@@ -2265,6 +2325,7 @@ if (require.main === module) {
       nodes: process.env.RELAYER_SIGNER_URLS
         ? process.env.RELAYER_SIGNER_URLS.split(',').map((url) => ({ signerUrl: url.trim() }))
         : (process.env.RELAYER_PRIVATE_KEYS ?? '').split(',').map((pk) => ({ privateKey: pk.trim() })),
+      stateDir: process.env.RELAYER_STATE_DIR,
       listeners: [
         ...(process.env.ETH_RPC_URL ? [new EthChainListener({
           rpcUrl: process.env.ETH_RPC_URL,
