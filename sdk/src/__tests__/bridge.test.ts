@@ -357,7 +357,7 @@ describe("OnboardingBridgeSDK", () => {
   });
 
   describe("fundCAddressWithReferral", () => {
-    it("submits fund_c_address_with_referral", async () => {
+    it("submits fund_c_address_with_referral with all contract arguments", async () => {
       const result = await sdk.fundCAddressWithReferral(
         {
           source: MOCK_ADDRESS,
@@ -365,6 +365,8 @@ describe("OnboardingBridgeSDK", () => {
           asset: MOCK_ASSET,
           amount: "1000",
           referrer: MOCK_ADDRESS,
+          nonce: 7,
+          deadline: 123456,
         },
         mockKeypair,
       );
@@ -373,6 +375,8 @@ describe("OnboardingBridgeSDK", () => {
       expect(result.status).toBe("pending");
       expect(contract.call).toHaveBeenCalledWith(
         "fund_c_address_with_referral",
+        expect.anything(),
+        expect.anything(),
         expect.anything(),
         expect.anything(),
         expect.anything(),

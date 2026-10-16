@@ -278,7 +278,15 @@ export class OnboardingBridgeSDK {
     return withTransactionHooks(
       this.hooks,
       'fundCAddressWithReferral',
-      { source: options.source, target: options.target, asset: options.asset, amount: options.amount, referrer: options.referrer },
+      {
+        source: options.source,
+        target: options.target,
+        asset: options.asset,
+        amount: options.amount,
+        referrer: options.referrer,
+        nonce: options.nonce,
+        deadline: options.deadline,
+      },
       async () => {
         try {
           assertAccountAddress(options.source, 'source');
@@ -295,6 +303,16 @@ export class OnboardingBridgeSDK {
             () => this.provider.getAccount(options.source),
           );
 
+          const referrerScVal = options.referrer === undefined
+            ? xdr.ScVal.scvVoid()
+            : new Address(options.referrer).toScVal();
+          const nonceScVal = options.nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+          const deadlineScVal = options.deadline === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
+
           const tx = new TransactionBuilder(sourceAccount, {
             fee: BASE_FEE,
             networkPassphrase: this.networkPassphrase,
@@ -307,8 +325,10 @@ export class OnboardingBridgeSDK {
                   options.target,
                   options.asset,
                   options.amount,
-                  options.referrer,
                 ]),
+                referrerScVal,
+                nonceScVal,
+                deadlineScVal,
               ),
             )
             .setTimeout(this.config.timeout ?? 30)
