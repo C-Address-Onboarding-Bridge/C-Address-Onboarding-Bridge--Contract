@@ -3934,8 +3934,9 @@ mod crosschain_tests {
         bridge.initialize(&admin, &fee_collector, &100u32, &None); // 1% fee
         bridge.add_asset(&token_id, &None);
 
-        // Fund the bridge contract so it can pay out cross-chain claims
-        TestTokenClient::new(env, &token_id).mint(&bridge_id, &10_000i128);
+        // Seed dedicated cross-chain liquidity via the admin deposit path.
+        TestTokenClient::new(env, &token_id).mint(&admin, &10_000i128);
+        bridge.fund_crosschain_reserve(&token_id, &10_000i128);
 
         (bridge_id, token_id, admin, bridge)
     }
@@ -4198,6 +4199,106 @@ mod crosschain_tests {
         bridge.fund_c_address_crosschain(&chain_id, &tx_hash, &target, &token_id, &amount, &sigs);
 
         assert_eq!(check_balance(&env, &loyalty_token_id, &target), 3i128);
+    }
+
+    #[test]
+    fn test_crosschain_reserve_preserves_fees_and_timelocked_funds() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge_id, token_id, admin, bridge) = setup(&env);
+
+        let timelock_target = soroban_sdk::Address::generate(&env);
+        TestTokenClient::new(&env, &token_id).mint(&admin, &500i128);
+        let timelock_id = bridge.fund_c_address_timelocked(
+            &admin,
+            &timelock_target,
+            &token_id,
+            &500i128,
+            &1_100u64,
+            &0u64,
+            &None,
+            &None,
+        );
+        let reclaim_destination = soroban_sdk::Address::generate(&env);
+        assert_eq!(
+            bridge.try_reclaim_tokens(
+                &token_id,
+                &1i128,
+                &reclaim_destination,
+                &None,
+            ),
+            Err(Ok(crate::BridgeError::InsufficientReclaimable))
+        );
+
+        let signing_key = make_signing_key([8u8; 32]);
+        let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+        bridge.add_relayer(&pubkey, &None);
+        bridge.set_relayer_threshold(&1u32);
+
+        for (chain_id, hash_byte) in [(1u32, 0x31u8), (2u32, 0x32u8)] {
+            let target = soroban_sdk::Address::generate(&env);
+            let tx_hash = BytesN::from_array(&env, &[hash_byte; 32]);
+            let amount = 4_000i128;
+            let payload_hash =
+                build_payload_hash(&env, chain_id, &tx_hash, &target, &token_id, amount);
+            let sigs = Vec::from_array(
+                &env,
+                [make_relayer_sig(&env, &signing_key, &payload_hash)],
+            );
+            bridge.fund_c_address_crosschain(
+                &chain_id, &tx_hash, &target, &token_id, &amount, &sigs,
+            );
+            assert_eq!(TestTokenClient::new(&env, &token_id).balance(&target), 3_960i128);
+        }
+
+        assert_eq!(bridge.query_crosschain_reserve(&token_id), 2_080i128);
+        assert_eq!(bridge.query_accrued_fees(&token_id), 0i128);
+        let insufficient_target = soroban_sdk::Address::generate(&env);
+        let insufficient_hash = BytesN::from_array(&env, &[0x33; 32]);
+        let insufficient_payload = build_payload_hash(
+            &env,
+            1,
+            &insufficient_hash,
+            &insufficient_target,
+            &token_id,
+            3_000,
+        );
+        let insufficient_sigs = Vec::from_array(
+            &env,
+            [make_relayer_sig(&env, &signing_key, &insufficient_payload)],
+        );
+        assert_eq!(
+            bridge.try_fund_c_address_crosschain(
+                &1u32,
+                &insufficient_hash,
+                &insufficient_target,
+                &token_id,
+                &3_000i128,
+                &insufficient_sigs,
+            ),
+            Err(Ok(crate::BridgeError::InsufficientCrossChainReserve))
+        );
+
+        let token = TestTokenClient::new(&env, &token_id);
+        let contract_balance = token.balance(&bridge_id);
+        let locked = crate::read_asset_counters(&env, &token_id).locked_timelock;
+        assert!(bridge.query_accrued_fees(&token_id) + locked <= contract_balance);
+
+        advance_ledger_time(&env, 1_100);
+        bridge.claim_timelocked(&timelock_id);
+        assert_eq!(token.balance(&timelock_target), 495i128);
+        assert_eq!(bridge.query_accrued_fees(&token_id), 5i128);
+        assert_eq!(crate::read_asset_counters(&env, &token_id).locked_timelock, 0i128);
+        assert_eq!(bridge.query_contract_balance(&token_id), 2_085i128);
+        assert!(
+            bridge.query_accrued_fees(&token_id)
+                + crate::read_asset_counters(&env, &token_id).locked_timelock
+                <= bridge.query_contract_balance(&token_id)
+        );
+
+        bridge.withdraw_crosschain_reserve(&token_id, &2_080i128);
+        assert_eq!(bridge.query_crosschain_reserve(&token_id), 0i128);
+        assert_eq!(bridge.query_contract_balance(&token_id), 5i128);
     }
 }
 
@@ -5874,6 +5975,8 @@ fn test_extend_persistent_ttl_extends_asset_keys() {
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
     bridge.add_asset(&token_id, &None);
     mint_tokens(&env, &token_id, &user, 1000i128);
+    mint_tokens(&env, &token_id, &admin, 1000i128);
+    bridge.fund_crosschain_reserve(&token_id, &1000i128);
     bridge.fund_c_address(
         &user,
         &Address::generate(&env),
@@ -5889,7 +5992,7 @@ fn test_extend_persistent_ttl_extends_asset_keys() {
 
     let expected_keys = [
         DataKey::AssetStats(token_id.clone()),
-        DataKey::AssetFeeCap(token_id.clone()),
+        DataKey::CrossChainReserve(token_id.clone()),
     ];
     for key in expected_keys.iter() {
         let ttl = env.as_contract(&bridge_id, || env.storage().persistent().get_ttl(key));

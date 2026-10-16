@@ -442,8 +442,9 @@ fn bench_fund_c_address_crosschain() {
     bridge.add_relayer(&relayer_pubkey, &None);
     bridge.set_relayer_threshold(&1u32);
 
-    // Fund the bridge so it can transfer to target.
-    mint(&env, &token_id, &bridge_id, 10_000i128);
+    // Seed the dedicated reserve through the admin deposit path.
+    mint(&env, &token_id, &admin, 10_000i128);
+    bridge.fund_crosschain_reserve(&token_id, &10_000i128);
 
     let target = Address::generate(&env);
     let chain_id = 1u32;

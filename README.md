@@ -299,6 +299,13 @@ etc.) rather than Stellar directly:
    `fund_c_address_crosschain` method via the SDK — no single relayer can
    authorize a cross-chain fund on its own.
 
+Before enabling relayers for an asset, the admin must whitelist it and seed
+its payout liquidity with `fund_crosschain_reserve`. Cross-chain payouts draw
+only from that reserve; their calculated fees are not credited as accrued fees
+because the payout call does not receive tokens. Use `query_crosschain_reserve`
+to monitor available liquidity and `withdraw_crosschain_reserve` to withdraw
+unused reserve funds.
+
 ### SDK (`sdk/`)
 
 Detailed type definitions, classes, and method signatures are available in the [SDK API Reference](sdk/API_REFERENCE.md).
