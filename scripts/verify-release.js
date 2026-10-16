@@ -64,7 +64,7 @@ async function main() {
     if (rpcUrlOverride) {
       rpcUrl = rpcUrlOverride;
     } else if (network === 'public' || network === 'mainnet') {
-      rpcUrl = 'https://soroban-rpc.stellar.org';
+      rpcUrl = 'https://mainnet.sorobanrpc.com';
     } else if (network === 'testnet') {
       rpcUrl = 'https://soroban-testnet.stellar.org';
     } else if (network === 'standalone' || network === 'local') {

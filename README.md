@@ -658,11 +658,13 @@ import { Keypair, Networks } from '@stellar/stellar-sdk';
 
 const sdk = new OnboardingBridgeSDK({
   contractId: 'CA...', // deployed contract C-address
-  rpcUrl: 'https://soroban-mainnet.stellar.org',
+  rpcUrl: 'https://mainnet.sorobanrpc.com',
   networkPassphrase: Networks.PUBLIC,
   timeout: 30, // optional, seconds
 });
 ```
+
+For mainnet, choose a Soroban RPC provider; the Stellar Development Foundation does not operate a public mainnet endpoint.
 
 ### Funding a C-Address
 

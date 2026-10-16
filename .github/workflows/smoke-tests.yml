@@ -51,7 +51,7 @@ jobs:
 
           case "$NETWORK" in
             testnet) RPC_URL="https://soroban-testnet.stellar.org" ;;
-            mainnet) RPC_URL="https://soroban-rpc.stellar.org" ;;
+            mainnet) RPC_URL="https://mainnet.sorobanrpc.com" ;;
             *) echo "::error::Unknown network '$NETWORK'."; exit 1 ;;
           esac
 
