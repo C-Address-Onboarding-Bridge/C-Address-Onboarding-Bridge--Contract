@@ -244,6 +244,191 @@ export class OffRampIntegration {
       ramp: {
         provider: 'ramp',
         supportedAssets: ['XLM', 'USDC', 'ETH', 'BTC', 'DAI', 'USDT'],
-        s
+        supportedFiatCurrencies: [
+          'USD', 'EUR', 'GBP', 'SEK', 'NOK', 'DKK', 'CHF', 'PLN', 'CZK',
+        ],
+        supportedCountries: [
+          'US', 'GB', 'DE', 'FR', 'IT', 'ES', 'NL', 'BE', 'AT', 'CH',
+          'SE', 'NO', 'DK', 'FI', 'PL', 'CZ', 'SK', 'HU', 'RO',
+        ],
+        minAmount: '15',
+        maxAmount: '20000',
+        feePercentage: '2.9',
+        testModeAvailable: false,
+      },
+      banxa: {
+        provider: 'banxa',
+        supportedAssets: ['XLM', 'USDC', 'ETH', 'BTC', 'ADA', 'DOGE'],
+        supportedFiatCurrencies: [
+          'USD', 'EUR', 'GBP', 'AUD', 'CAD', 'NZD', 'SGD', 'ZAR',
+        ],
+        supportedCountries: [
+          'US', 'GB', 'DE', 'FR', 'AU', 'NZ', 'CA', 'SG', 'ZA', 'NL',
+          'BE', 'AT', 'IT', 'ES', 'IE',
+        ],
+        minAmount: '10',
+        maxAmount: '75000',
+        feePercentage: '3.5',
+        testModeAvailable: false,
+      },
+    };
 
-/* … truncated 6898 chars — edit only what you need near the top … */
+    return configs[provider];
+  }
+
+  /**
+   * Compare all providers for a given transaction and return fee/settlement data.
+   *
+   * Filters to providers that support both `asset` and `fiatCurrency`, then
+   * calculates the fee amount, net amount, and approximate settlement time for
+   * each. Useful for rendering a "best rate" comparison UI.
+   */
+  compareProviders(
+    amount: string,
+    asset: string,
+    fiatCurrency: string = 'USD',
+  ): Partial<Record<OffRampProvider, ProviderComparison>> {
+    const providers: OffRampProvider[] = ['moonpay', 'transak', 'ramp', 'banxa'];
+    const result: Partial<Record<OffRampProvider, ProviderComparison>> = {};
+
+    for (const provider of providers) {
+      const config = this.getProviderConfig(provider);
+      if (
+        !config.supportedAssets.includes(asset) ||
+        !config.supportedFiatCurrencies.includes(fiatCurrency)
+      ) {
+        continue;
+      }
+
+      const gross = parseFloat(amount);
+      const fee = (gross * parseFloat(config.feePercentage)) / 100;
+      const net = gross - fee;
+
+      result[provider] = {
+        feePercentage: config.feePercentage,
+        feeAmount: fee.toFixed(2),
+        netAmount: net.toFixed(2),
+        settlementTime: provider === 'moonpay' ? 0.25 : 0.5,
+      };
+    }
+
+    return result;
+  }
+
+  /** @internal */
+  private getMoonpayOnRampUrl(params: OnRampUrlParams): string {
+    const base = this.config.testMode
+      ? 'https://buy-sandbox.moonpay.com'
+      : 'https://buy.moonpay.com';
+    const query = new URLSearchParams({
+      apiKey: this.config.moonpayApiKey ?? '',
+      currencyCode: params.asset.toLowerCase(),
+      walletAddress: params.gAddress,
+      baseCurrencyAmount: params.amount,
+      baseCurrencyCode: params.fiatCurrency.toLowerCase(),
+    });
+    return `${base}?${query.toString()}`;
+  }
+
+  /** @internal */
+  private getMoonpayOffRampUrl(params: OffRampUrlParams): string {
+    const base = this.config.testMode
+      ? 'https://sell-sandbox.moonpay.com'
+      : 'https://sell.moonpay.com';
+    const query = new URLSearchParams({
+      apiKey: this.config.moonpayApiKey ?? '',
+      currencyCode: params.asset.toLowerCase(),
+      walletAddress: params.gAddress,
+      baseCurrencyAmount: params.amount,
+      baseCurrencyCode: params.fiatCurrency.toLowerCase(),
+    });
+    return `${base}?${query.toString()}`;
+  }
+
+  /** @internal */
+  private getTransakOnRampUrl(params: OnRampUrlParams): string {
+    const base = this.config.testMode
+      ? 'https://global-stg.transak.com'
+      : 'https://global.transak.com';
+    const query = new URLSearchParams({
+      apiKey: this.config.transakApiKey ?? '',
+      cryptoCurrencyCode: params.asset,
+      walletAddress: params.gAddress,
+      fiatAmount: params.amount,
+      fiatCurrency: params.fiatCurrency,
+    });
+    return `${base}?${query.toString()}`;
+  }
+
+  /** @internal */
+  private getTransakOffRampUrl(params: OffRampUrlParams): string {
+    const base = this.config.testMode
+      ? 'https://global-stg.transak.com'
+      : 'https://global.transak.com';
+    const query = new URLSearchParams({
+      apiKey: this.config.transakApiKey ?? '',
+      cryptoCurrencyCode: params.asset,
+      walletAddress: params.gAddress,
+      fiatAmount: params.amount,
+      fiatCurrency: params.fiatCurrency,
+      isOffRamp: 'true',
+    });
+    return `${base}?${query.toString()}`;
+  }
+
+  /** @internal */
+  private getRampOnRampUrl(params: OnRampUrlParams): string {
+    const query = new URLSearchParams({
+      hostApiKey: this.config.rampApiKey ?? '',
+      userAddress: params.gAddress,
+      swapAsset: params.asset,
+      fiatValue: params.amount,
+      fiatCurrency: params.fiatCurrency,
+    });
+    return `https://app.ramp.network?${query.toString()}`;
+  }
+
+  /** @internal */
+  private getRampOffRampUrl(params: OffRampUrlParams): string {
+    const query = new URLSearchParams({
+      hostApiKey: this.config.rampApiKey ?? '',
+      userAddress: params.gAddress,
+      swapAsset: params.asset,
+      fiatValue: params.amount,
+      fiatCurrency: params.fiatCurrency,
+      offramp: 'true',
+    });
+    return `https://app.ramp.network?${query.toString()}`;
+  }
+
+  /** @internal */
+  private getBanxaOnRampUrl(params: OnRampUrlParams): string {
+    const base = this.config.testMode
+      ? 'https://checkout.banxa-sandbox.com'
+      : 'https://checkout.banxa.com';
+    const query = new URLSearchParams({
+      apiKey: this.config.banxaApiKey ?? '',
+      coinType: params.asset,
+      walletAddress: params.gAddress,
+      fiatAmount: params.amount,
+      fiatType: params.fiatCurrency,
+    });
+    return `${base}?${query.toString()}`;
+  }
+
+  /** @internal */
+  private getBanxaOffRampUrl(params: OffRampUrlParams): string {
+    const base = this.config.testMode
+      ? 'https://checkout.banxa-sandbox.com'
+      : 'https://checkout.banxa.com';
+    const query = new URLSearchParams({
+      apiKey: this.config.banxaApiKey ?? '',
+      coinType: params.asset,
+      walletAddress: params.gAddress,
+      fiatAmount: params.amount,
+      fiatType: params.fiatCurrency,
+      orderType: 'sell',
+    });
+    return `${base}?${query.toString()}`;
+  }
+}

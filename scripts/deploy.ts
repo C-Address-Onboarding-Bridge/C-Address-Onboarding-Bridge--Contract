@@ -31,6 +31,7 @@ import {
   Keypair,
   Address,
   Networks,
+  StrKey,
   xdr,
 } from '@stellar/stellar-sdk';
 import * as fs from 'fs';
@@ -214,7 +215,9 @@ async function submitAndConfirm(
   provider: SorobanRpc.Server,
   cfg: DeployConfig,
   admin: Keypair,
-  build: (account: SorobanRpc.Api.AccountResponse) => ReturnType<TransactionBuilder['build']>,
+  build: (
+    account: Awaited<ReturnType<SorobanRpc.Server['getAccount']>>,
+  ) => ReturnType<TransactionBuilder['build']>,
 ): Promise<SorobanRpc.Api.GetTransactionResponse> {
   const account = await provider.getAccount(admin.publicKey());
   const tx = build(account);
@@ -255,16 +258,138 @@ async function deployContract(
 
   console.log('Creating contract instance…');
   const salt = parseSaltArg();
-  const constructorArgs = [
-    Address.fromString(admin.publicKey()).toScVal(),
-    Address.fromString(cfg.feeCollectorPublicKey).toScVal(),
-    nativeToScVal(cfg.feeBps, { type: 'u32' }),
-    nativeToScVal(null),
-    nativeToScVal(wasmHash, { type: 'bytes' }),
-  ];
+  const contractId = deriveContractId(admin.publicKey(), salt, cfg.networkPassphrase);
+  const contract = new Contract(contractId);
   const createResult = await submitAndConfirm(provider, cfg, admin, (account) =>
     new TransactionBuilder(account, {
       fee: BASE_FEE,
-      netw
+      networkPassphrase: cfg.networkPassphrase,
+    })
+      .addOperation(
+        Operation.createCustomContract({
+          address: Address.fromString(admin.publicKey()),
+          wasmHash,
+          salt,
+        }),
+      )
+      .addOperation(
+        contract.call(
+          'initialize_with_wasm_hash',
+          Address.fromString(admin.publicKey()).toScVal(),
+          Address.fromString(cfg.feeCollectorPublicKey).toScVal(),
+          nativeToScVal(cfg.feeBps, { type: 'u32' }),
+          nativeToScVal(null),
+          nativeToScVal(wasmHash, { type: 'bytes' }),
+        ),
+      )
+      .setTimeout(30)
+      .build(),
+  );
+  if (createResult.status !== 'SUCCESS') {
+    throw new Error(`Contract creation and initialization did not succeed: ${createResult.status}`);
+  }
+  console.log(`  Contract ID: ${contractId} ✓`);
+  return contractId;
+}
 
-/* … truncated 1649 chars — edit only what you need near the top … */
+function deriveContractId(
+  creatorPublicKey: string,
+  salt: Buffer,
+  networkPassphrase: string,
+): string {
+  const contractIdPreimage = xdr.ContractIdPreimage.contractIdPreimageFromAddress(
+    new xdr.ContractIdPreimageFromAddress({
+      address: Address.fromString(creatorPublicKey).toScAddress(),
+      salt,
+    }),
+  );
+  const preimage = xdr.HashIdPreimage.envelopeTypeContractId(
+    new xdr.HashIdPreimageContractId({
+      networkId: createHash('sha256').update(networkPassphrase).digest(),
+      contractIdPreimage,
+    }),
+  );
+  return StrKey.encodeContract(createHash('sha256').update(preimage.toXDR()).digest());
+}
+
+async function initialize(
+  provider: SorobanRpc.Server,
+  cfg: DeployConfig,
+  admin: Keypair,
+  contractId: string,
+  wasmHash: Buffer,
+): Promise<void> {
+  console.log(`Initializing contract ${contractId}…`);
+  const contract = new Contract(contractId);
+  await submitAndConfirm(provider, cfg, admin, (account) =>
+    new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: cfg.networkPassphrase,
+    })
+      .addOperation(
+        contract.call(
+          'initialize_with_wasm_hash',
+          Address.fromString(admin.publicKey()).toScVal(),
+          Address.fromString(cfg.feeCollectorPublicKey).toScVal(),
+          nativeToScVal(cfg.feeBps, { type: 'u32' }),
+          nativeToScVal(null),
+          nativeToScVal(wasmHash, { type: 'bytes' }),
+        ),
+      )
+      .setTimeout(30)
+      .build(),
+  );
+  console.log('  Initialized successfully ✓');
+}
+
+async function main(): Promise<void> {
+  const filteredArgs = process.argv.slice(2).filter((arg, index, args) =>
+    arg !== '--network' && arg !== '--salt' &&
+    args[index - 1] !== '--network' && args[index - 1] !== '--salt',
+  );
+  const [command, contractId] = filteredArgs;
+  const network = parseNetworkArg();
+  const cfg = loadConfig(network);
+
+  if (!cfg.adminSecretKey || cfg.adminSecretKey.startsWith('S...')) {
+    throw new Error('adminSecretKey is not set in your deploy-config file');
+  }
+  if (!cfg.feeCollectorPublicKey || cfg.feeCollectorPublicKey.startsWith('G...')) {
+    throw new Error('feeCollectorPublicKey is not set in your deploy-config file');
+  }
+  if (!Number.isInteger(cfg.feeBps) || cfg.feeBps < 0 || cfg.feeBps > 1000) {
+    throw new Error('feeBps must be an integer between 0 and 1000');
+  }
+  if (!command || !['all', 'deploy', 'init'].includes(command)) {
+    throw new Error('Usage: npx ts-node scripts/deploy.ts <all|deploy|init> [contract_id] [options]');
+  }
+  if (command === 'init' && !contractId) {
+    throw new Error('Usage: npx ts-node scripts/deploy.ts init <contract_id> [--network <network>]');
+  }
+
+  const admin = Keypair.fromSecret(cfg.adminSecretKey);
+  const provider = new SorobanRpc.Server(cfg.rpcUrl, { allowHttp: cfg.network === 'dev' });
+  const wasm = fs.readFileSync(cfg.wasmPath);
+  const wasmHash = createHash('sha256').update(wasm).digest();
+
+  console.log('\n=== C-Address Onboarding Bridge Deployment ===');
+  console.log(`Network:  ${cfg.network}`);
+  console.log(`RPC:      ${cfg.rpcUrl}`);
+  console.log(`Admin:    ${admin.publicKey()}`);
+  console.log(`FeeBps:   ${cfg.feeBps}\n`);
+
+  if (command === 'init') {
+    await initialize(provider, cfg, admin, contractId!, wasmHash);
+    return;
+  }
+
+  const deployedContractId = await deployContract(provider, cfg, admin, wasmHash);
+  console.log(`\nDeployment complete. CONTRACT_ID=${deployedContractId}`);
+}
+
+if (require.main === module) {
+  main().catch((err: unknown) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exitCode = 1;
+  });
+}

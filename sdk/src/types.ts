@@ -614,7 +614,7 @@ export interface ProviderComparison {
  * {@link OffRampIntegration.getOnRampUrl}.
  *
  * An on-ramp URL redirects the user to a provider's checkout page where they
- * pay with a credit card or bank transfer and receive crypto at `cAddress`.
+ * pay with a credit card or bank transfer and receive crypto at `gAddress`.
  */
 export interface OnRampUrlParams {
   /** Provider to use for this transaction. */
@@ -639,10 +639,13 @@ export interface OnRampUrlParams {
   asset: string;
 
   /**
-   * Target C-address that will receive the purchased crypto.
-   * The provider will route funds to this address on Stellar.
+   * Target G-address that receives the purchased crypto before it is bridged
+   * to a C-address.
    */
-  cAddress: string;
+  gAddress: string;
+
+  /** Optional callback for attaching a server-side provider signature. */
+  signer?: (url: string) => string;
 }
 
 /**
