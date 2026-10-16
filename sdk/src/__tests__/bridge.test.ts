@@ -1201,12 +1201,28 @@ describe("OnboardingBridgeSDK", () => {
   describe("queryLoyaltyToken", () => {
     it("returns loyalty token config from simulation result", async () => {
       const config = { token: MOCK_ASSET, amount_per_fund: "10" };
-      (scValToNative as jest.Mock).mockReturnValue(config);
+      (scValToNative as jest.Mock).mockReturnValue([MOCK_ASSET, 10n]);
       mockProvider.simulateTransaction.mockResolvedValue({
         results: [{ retval: {} }],
       });
 
-      await expect(sdk.queryLoyaltyToken()).resolves.toBe(config);
+      await expect(sdk.queryLoyaltyToken()).resolves.toEqual(config);
+    });
+
+    it("returns null when the contract has no loyalty token", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({
+        error: "HostError: Error(Contract, #14)",
+      });
+
+      await expect(sdk.queryLoyaltyToken()).resolves.toBeNull();
+    });
+
+    it("throws for other contract errors", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({
+        error: "HostError: Error(Contract, #10)",
+      });
+
+      await expect(sdk.queryLoyaltyToken()).rejects.toThrow("Failed to get loyalty token");
     });
   });
 
