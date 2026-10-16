@@ -7,13 +7,13 @@ async function main() {
   const version = process.env.VERSION || 'v0.0.0-dev';
   const commit = process.env.COMMIT_SHA || 'unknown';
 
-  const wasmPath = path.join(__dirname, '../target/wasm32-unknown-unknown/release/onboarding_bridge.wasm');
+  const wasmPath = path.join(__dirname, '../target/wasm32v1-none/release/onboarding_bridge.wasm');
   const registryDir = path.join(__dirname, '../registry');
   const registryPath = path.join(registryDir, 'releases.json');
 
   if (!fs.existsSync(wasmPath)) {
     console.error(`Error: WASM file not found at: ${wasmPath}`);
-    console.error('Please run "cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown" first.');
+    console.error('Please run "cargo build -p onboarding-bridge --release --target wasm32v1-none" first.');
     process.exit(1);
   }
 
