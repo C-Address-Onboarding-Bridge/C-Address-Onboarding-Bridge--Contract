@@ -1404,7 +1404,7 @@ export async function test_below_threshold_event_is_enqueued_to_dlq(): Promise<v
   await (service as any).handleEvent(event);
 
   assertEqual(service.dlq.size(), 1, 'under-threshold event should be enqueued to the DLQ');
-  assertEqual(service.dlq.all()[0].reason, 'insufficient signers after dedup', 'DLQ entry should record the reason');
+  assertEqual(service.dlq.all()[0].reason, 'insufficient valid signers', 'DLQ entry should record the reason');
 }
 
 export async function test_failed_submission_is_enqueued_to_dlq(): Promise<void> {
