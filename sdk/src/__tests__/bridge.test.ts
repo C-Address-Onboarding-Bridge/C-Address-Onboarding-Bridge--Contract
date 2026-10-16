@@ -107,6 +107,7 @@ describe("OnboardingBridgeSDK", () => {
       sendTransaction: jest
         .fn()
         .mockResolvedValue({ hash: "mock_tx_hash", status: "PENDING" }),
+      getTransaction: jest.fn(),
       simulateTransaction: jest.fn().mockResolvedValue({}),
       getLedgerEntries: jest.fn().mockResolvedValue(ledgerEntriesFor(0)),
     };
@@ -551,6 +552,33 @@ describe("OnboardingBridgeSDK", () => {
       expect(results[1].hash).toBe("tx_hash_2");
       expect(results[2].hash).toBe("tx_hash_3");
       results.forEach((r) => expect(r.status).toBe("pending"));
+    });
+
+    it("increments nonces and confirms each chunk before submitting the next", async () => {
+      const targets = Array(101).fill(MOCK_ASSET);
+      const amounts = Array(101).fill("100");
+      const submissionSequence: string[] = [];
+      mockProvider.sendTransaction.mockImplementation(async () => {
+        submissionSequence.push("send");
+        return { hash: "nonce_tx", status: "PENDING" };
+      });
+      mockProvider.getTransaction.mockImplementation(async () => {
+        submissionSequence.push("confirm");
+        return { status: "SUCCESS" };
+      });
+
+      const results = await sdk.batchFundCAddresses(
+        { source: MOCK_ADDRESS, targets, amounts, asset: MOCK_ASSET, nonce: 7 },
+        mockKeypair,
+      );
+
+      const nonceValues = (nativeToScVal as jest.Mock).mock.calls
+        .filter(([, options]) => options?.type === "u64")
+        .map(([value]) => value);
+      expect(nonceValues).toEqual([7n, 8n]);
+      expect(submissionSequence).toEqual(["send", "confirm", "send"]);
+      expect(results).toHaveLength(2);
+      expect(results.every((result) => result.status === "pending")).toBe(true);
     });
 
     it("does not split when targets count equals BATCH_TX_LIMIT exactly", async () => {

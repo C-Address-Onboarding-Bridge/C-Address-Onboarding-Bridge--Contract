@@ -879,9 +879,7 @@ export class OnboardingBridgeSDK {
         const results: TransactionResult[] = [];
         let completed = 0;
 
-        const nonceScVal = options.nonce === undefined
-          ? xdr.ScVal.scvVoid()
-          : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+        const baseNonce = options.nonce === undefined ? undefined : BigInt(options.nonce);
         const deadlineScVal = options.deadline === undefined
           ? xdr.ScVal.scvVoid()
           : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
@@ -890,6 +888,12 @@ export class OnboardingBridgeSDK {
         for (let offset = 0; offset < total; offset += BATCH_TX_LIMIT) {
           const chunkTargets = options.targets.slice(offset, offset + BATCH_TX_LIMIT);
           const chunkAmounts = options.amounts.slice(offset, offset + BATCH_TX_LIMIT);
+          const nonceScVal = baseNonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(
+                baseNonce + BigInt(offset / BATCH_TX_LIMIT),
+                { type: 'u64' },
+              );
 
           let result: TransactionResult;
           try {
@@ -956,6 +960,60 @@ export class OnboardingBridgeSDK {
               total,
               result.hash || undefined,
             );
+          }
+
+          if (baseNonce !== undefined && offset + BATCH_TX_LIMIT < total) {
+            if (result.status === 'failed') {
+              results.push(...Array.from(
+                { length: Math.ceil((total - offset - chunkTargets.length) / BATCH_TX_LIMIT) },
+                (): TransactionResult => ({
+                  hash: '',
+                  status: 'failed',
+                  error: 'Not submitted because an earlier nonce transaction failed',
+                }),
+              ));
+              return results;
+            }
+
+            try {
+              let confirmation = await this.provider.getTransaction(result.hash);
+              while (confirmation.status === 'NOT_FOUND') {
+                await new Promise((resolve) => setTimeout(resolve, 1_000));
+                confirmation = await this.provider.getTransaction(result.hash);
+              }
+
+              if (confirmation.status === 'FAILED') {
+                results[results.length - 1] = {
+                  ...result,
+                  status: 'failed',
+                  error: 'Transaction failed on-chain',
+                };
+                results.push(...Array.from(
+                  { length: Math.ceil((total - offset - chunkTargets.length) / BATCH_TX_LIMIT) },
+                  (): TransactionResult => ({
+                    hash: '',
+                    status: 'failed',
+                    error: 'Not submitted because an earlier nonce transaction failed',
+                  }),
+                ));
+                return results;
+              }
+            } catch (error: any) {
+              results[results.length - 1] = {
+                ...result,
+                status: 'failed',
+                error: error.message || 'Unable to confirm nonce transaction',
+              };
+              results.push(...Array.from(
+                { length: Math.ceil((total - offset - chunkTargets.length) / BATCH_TX_LIMIT) },
+                (): TransactionResult => ({
+                  hash: '',
+                  status: 'failed',
+                  error: 'Not submitted because an earlier nonce transaction could not be confirmed',
+                }),
+              ));
+              return results;
+            }
           }
         }
 
