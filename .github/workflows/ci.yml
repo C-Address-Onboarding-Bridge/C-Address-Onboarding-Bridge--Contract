@@ -443,6 +443,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Run deployment script tests
+        run: npm run test:scripts
+
       - name: Build SDK
         run: npm run build --workspace=sdk
 
