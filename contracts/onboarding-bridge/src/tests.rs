@@ -3986,7 +3986,6 @@ mod crosschain_tests {
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x77; 32]);
-        let payload_hash = build_payload_hash(&env, 1, &tx_hash, &target, &token_id, 100);
         let wrong_payload_hash = build_payload_hash(&env, 2, &tx_hash, &target, &token_id, 100);
         let sigs = Vec::from_array(
             &env,
