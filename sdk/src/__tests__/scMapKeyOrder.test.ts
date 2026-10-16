@@ -7,12 +7,6 @@ import type { MetaFundParams, FeeTier } from '../types';
 // Soroban's canonical XDR encoding requires those keys to be sorted; the host
 // rejects any map whose keys are out of order.
 
-const CONFIG = {
-  contractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4',
-  rpcUrl: 'https://soroban-testnet.stellar.org',
-  networkPassphrase: 'Test SDF Network ; September 2015',
-};
-
 const MOCK_ADDRESS = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 const MOCK_ASSET = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4';
 
@@ -24,11 +18,12 @@ describe('ScMap key ordering (canonical XDR)', () => {
   let sdk: OnboardingBridgeSDK;
 
   beforeEach(() => {
-    sdk = new OnboardingBridgeSDK(CONFIG);
+    sdk = Object.create(OnboardingBridgeSDK.prototype) as OnboardingBridgeSDK;
   });
 
   it('encodes MetaFundParams with sorted map keys', () => {
     const params: MetaFundParams = {
+      networkId: '11'.repeat(32),
       source: MOCK_ADDRESS,
       target: MOCK_ASSET,
       asset: MOCK_ASSET,
@@ -40,9 +35,25 @@ describe('ScMap key ordering (canonical XDR)', () => {
     const scVal = (sdk as any).metaFundParamsToScVal(params);
     const keys = mapKeyOrder(scVal);
 
-    expect(keys).toEqual(['amount', 'asset', 'deadline', 'nonce', 'source', 'target']);
+    expect(keys).toEqual(['amount', 'asset', 'deadline', 'network_id', 'nonce', 'source', 'target']);
     // Sorted order is required for any valid ScMap encoding.
     expect(keys).toEqual([...keys].sort());
+  });
+
+  it('rejects a MetaFundParams networkId that is not 32 bytes', () => {
+    const params: MetaFundParams = {
+      networkId: '11'.repeat(31),
+      source: MOCK_ADDRESS,
+      target: MOCK_ASSET,
+      asset: MOCK_ASSET,
+      amount: '1000',
+      nonce: 1,
+      deadline: 9999999999,
+    };
+
+    expect(() => (sdk as any).metaFundParamsToScVal(params)).toThrow(
+      'networkId must be a 32-byte hex string',
+    );
   });
 
   it('encodes FeeTier with sorted map keys', () => {

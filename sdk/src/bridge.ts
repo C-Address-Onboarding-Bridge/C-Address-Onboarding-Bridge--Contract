@@ -3241,6 +3241,7 @@ export class OnboardingBridgeSDK {
     // the host rejects maps whose keys are out of order. Build the entries
     // via `scMapEntry` and sort them rather than relying on declaration order.
     return this.sortedScMap([
+      this.scMapEntry('network_id', this.hexBytesToScVal(params.networkId, 32, 'networkId')),
       this.scMapEntry('source', new Address(params.source).toScVal()),
       this.scMapEntry('target', new Address(params.target).toScVal()),
       this.scMapEntry('asset', new Address(params.asset).toScVal()),
