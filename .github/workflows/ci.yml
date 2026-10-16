@@ -370,6 +370,9 @@ jobs:
       - name: TypeScript type-check
         run: npx tsc --noEmit
 
+      - name: Lint SDK
+        run: npm run lint
+
       - name: Build SDK
         run: npm run build
 
