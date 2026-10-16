@@ -1536,6 +1536,22 @@ export function test_eth_listener_derives_txhash_from_log_not_event_data(): void
   );
 }
 
+export function test_eth_listener_rejects_log_missing_transaction_hash(): void {
+  const listener = new EthChainListener({
+    rpcUrl: 'http://localhost',
+    bridgeContractAddress: '0xbridge',
+    eventTopic: '0xtopic',
+    chainId: 1,
+  });
+
+  const event = (listener as any).decode({
+    ...makeAbiLog('GDESTINATION', 'CASSET', 1n),
+    transactionHash: undefined,
+  });
+
+  assertEqual(event, null, 'log without transactionHash must not decode');
+}
+
 /**
  * Issue #664 regression: a JSON-RPC `error` (e.g. "block range too large")
  * must be thrown, not silently treated as "no logs".
@@ -1634,6 +1650,18 @@ function withFakeFetch<T>(handler: (method: string, params: any) => any, fn: () 
 
 function tmpBlockStorePath(name: string): string {
   return path.join(require('os').tmpdir(), `eth-block-${name}-${Date.now()}-${Math.random()}.json`);
+}
+
+export function test_block_store_save_and_load(): void {
+  const filePath = tmpBlockStorePath('save-load');
+  try {
+    new BlockStore(filePath).save('0x123abc');
+
+    const restored = new BlockStore(filePath);
+    assertEqual(restored.load(), '0x123abc', 'block store should restore the saved hex block');
+  } finally {
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+  }
 }
 
 export async function test_eth_listener_resolves_latest_to_concrete_block_on_first_poll(): Promise<void> {
@@ -2185,13 +2213,14 @@ export function test_dead_letter_queue_persists_across_restart(): void {
   const filePath = tempStorePath('dlq');
   try {
     const before = new DeadLetterQueue(filePath);
-    before.enqueue(makeTestEvent(), 1, 2);
+    before.enqueue(makeTestEvent(), 1, 2, 'test retry reason');
     assertEqual(before.size(), 1, 'entry should be enqueued');
 
     // Simulate a restart: construct a brand-new instance pointed at the same file.
     const after = new DeadLetterQueue(filePath);
     assertEqual(after.size(), 1, 'dead-letter entry must survive a restart');
     assertEqual(after.all()[0].event.txHash, makeTestEvent().txHash, 'restored entry must match the original event');
+    assertEqual(after.all()[0].reason, 'test retry reason', 'dead-letter reason must survive a restart');
   } finally {
     try { fs.unlinkSync(filePath); } catch { /* ignore */ }
   }
