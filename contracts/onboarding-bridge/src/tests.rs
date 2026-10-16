@@ -1155,6 +1155,37 @@ fn test_emergency_migration_keeps_reserved_tokens_recoverable() {
     );
 }
 
+#[test]
+fn test_timelocked_funds_can_be_claimed_after_emergency_migration() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+    let destination = Address::generate(&env);
+    let id = bridge.fund_c_address_timelocked(
+        &user,
+        &target,
+        &token_id,
+        &500i128,
+        &1_100u64,
+        &0u64,
+        &None,
+        &None,
+    );
+
+    let new_contract = Address::generate(&env);
+    bridge.emergency_migrate(&new_contract, &true, &None);
+    assert_eq!(
+        bridge.try_reclaim_tokens(&token_id, &1i128, &destination, &None),
+        Err(Ok(crate::BridgeError::InsufficientReclaimable))
+    );
+
+    advance_ledger_time(&env, 1_101);
+    bridge.claim_timelocked(&id);
+
+    assert_eq!(check_balance(&env, &token_id, &target), 500i128);
+}
+
 #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_reclaim_cannot_take_accrued_fees() {
