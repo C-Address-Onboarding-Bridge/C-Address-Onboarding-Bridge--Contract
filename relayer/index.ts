@@ -1896,13 +1896,24 @@ export function requireChainId(env: NodeJS.ProcessEnv, name: string): number {
   return chainId;
 }
 
-export function validateEnv(env: NodeJS.ProcessEnv = process.env): {
+export interface ValidatedEthEnv {
+  rpcUrl: string;
+  bridgeContractAddress: string;
+  eventTopic: string;
+}
+
+export interface ValidatedSolanaEnv {
+  wsUrl: string;
+  programId: string;
+}
+
+export interface ValidatedEnv {
   contractId: string;
   rpcUrl: string;
   networkPassphrase: string;
   submitterSecretKey: string;
   threshold: number;
-  relayerPrivateKeys: string[];
+  relayerNodes: RelayerNodeConfig[];
   eth?: ValidatedEthEnv;
   solana?: ValidatedSolanaEnv;
 }
@@ -1930,13 +1941,22 @@ export function validateEnv(env: NodeJS.ProcessEnv = process.env): ValidatedEnv 
     );
   }
 
+  const signerUrls = (env['RELAYER_SIGNER_URLS'] ?? '')
+    .split(',')
+    .map((url) => url.trim())
+    .filter(Boolean);
   const relayerPrivateKeys = (env['RELAYER_PRIVATE_KEYS'] ?? '')
     .split(',')
-    .map((pk) => pk.trim())
+    .map((key) => key.trim())
     .filter(Boolean);
+  const relayerNodes: RelayerNodeConfig[] = signerUrls.length > 0
+    ? signerUrls.map((signerUrl) => ({ signerUrl }))
+    : relayerPrivateKeys.map((privateKey) => ({ privateKey }));
 
-  if (relayerPrivateKeys.length === 0) {
-    throw new Error('RELAYER_PRIVATE_KEYS is required and must contain at least one key');
+  if (relayerNodes.length === 0) {
+    throw new Error(
+      'RELAYER_SIGNER_URLS or RELAYER_PRIVATE_KEYS is required and must contain at least one entry',
+    );
   }
 
   let eth: ValidatedEthEnv | undefined;
@@ -1969,7 +1989,7 @@ export function validateEnv(env: NodeJS.ProcessEnv = process.env): ValidatedEnv 
     networkPassphrase,
     submitterSecretKey,
     threshold,
-    relayerPrivateKeys,
+    relayerNodes,
     eth,
     solana,
   };
@@ -2077,7 +2097,22 @@ export function test_valid_env_parses_correctly(): void {
   const result = validateEnv(env);
   assertEqual(result.contractId, 'C_TEST', 'contractId');
   assertEqual(result.threshold, 2, 'threshold');
-  assertEqual(result.relayerPrivateKeys.length, 2, 'relayer key count');
+  assertEqual(result.relayerNodes.length, 2, 'relayer node count');
+  assertEqual(result.relayerNodes[0].privateKey, '01'.repeat(32), 'first private key');
+}
+
+export function test_valid_env_accepts_signer_urls_only(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test network',
+    RELAYER_SECRET_KEY: 'my-secret',
+    RELAYER_SIGNER_URLS: 'http://signer-a.internal:4000, http://signer-b.internal:4000',
+  };
+  const result = validateEnv(env);
+  assertEqual(result.relayerNodes.length, 2, 'relayer node count');
+  assertEqual(result.relayerNodes[0].signerUrl, 'http://signer-a.internal:4000', 'first signer URL');
+  assertEqual(result.relayerNodes[1].signerUrl, 'http://signer-b.internal:4000', 'second signer URL');
 }
 
 // ---------------------------------------------------------------------------
@@ -2235,6 +2270,7 @@ async function runRelayerSelfTests(): Promise<void> {
   test_nan_threshold_is_rejected();
   test_zero_threshold_is_rejected();
   test_valid_env_parses_correctly();
+  test_valid_env_accepts_signer_urls_only();
   // Issue #672: chain ids must come from env, not be hard-coded to 1/101.
   test_missing_chain_id_throws();
   test_non_numeric_chain_id_throws();
