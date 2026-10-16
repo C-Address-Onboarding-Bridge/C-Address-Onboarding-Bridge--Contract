@@ -3940,6 +3940,24 @@ mod crosschain_tests {
         (bridge_id, token_id, admin, bridge)
     }
 
+    #[test]
+    fn test_crosschain_rejects_amount_below_minimum() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+        bridge.set_minimum_amount(&100i128, &None);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0x44; 32]);
+        let sigs = Vec::new(&env);
+
+        assert_eq!(
+            bridge.try_fund_c_address_crosschain(
+                &1u32, &tx_hash, &target, &token_id, &99i128, &sigs
+            ),
+            Err(Ok(BridgeError::InvalidAmount))
+        );
+    }
+
     #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_crosschain_happy_path_single_relayer() {
