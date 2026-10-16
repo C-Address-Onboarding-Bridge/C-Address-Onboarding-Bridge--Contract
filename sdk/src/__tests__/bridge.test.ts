@@ -1,7 +1,7 @@
 import { OnboardingBridgeSDK, BASE_RESERVE_STROOPS } from "../bridge";
 import { OffRampIntegration } from "../offramp";
 import {
-  SorobanRpc,
+  rpc as SorobanRpc,
   Contract,
   scValToNative,
   xdr,
@@ -12,7 +12,7 @@ import {
 } from "@stellar/stellar-sdk";
 
 jest.mock("@stellar/stellar-sdk", () => ({
-  SorobanRpc: {
+  rpc: {
     Server: jest.fn(),
   },
   Contract: jest.fn().mockImplementation(() => ({
@@ -1377,9 +1377,8 @@ describe("OnboardingBridgeSDK", () => {
   });
 
   describe("getAllBalances", () => {
-    it("returns a record of asset → balance strings", async () => {
-      const mockMap = new Map([[MOCK_ASSET, BigInt(1000)]]);
-      (scValToNative as jest.Mock).mockReturnValue(mockMap);
+    it("returns a record of asset → balance strings from a plain object", async () => {
+      (scValToNative as jest.Mock).mockReturnValue({ [MOCK_ASSET]: BigInt(1000) });
       mockProvider.simulateTransaction.mockResolvedValue({
         results: [{ retval: {} }],
       });
@@ -1388,6 +1387,41 @@ describe("OnboardingBridgeSDK", () => {
 
       expect(result).toEqual({ [MOCK_ASSET]: "1000" });
       expect(mockProvider.simulateTransaction).toHaveBeenCalled();
+    });
+
+    it("decodes a real scvMap into balance strings", async () => {
+      const stellarSdk = jest.requireActual<typeof import("@stellar/stellar-sdk")>(
+        "@stellar/stellar-sdk",
+      );
+      const scvMap = stellarSdk.xdr.ScVal.scvMap([
+        new stellarSdk.xdr.ScMapEntry({
+          key: stellarSdk.xdr.ScVal.scvAddress(
+            stellarSdk.Address.fromString(MOCK_ASSET).toScAddress(),
+          ),
+          val: stellarSdk.nativeToScVal(1000n, { type: "i128" }),
+        }),
+      ]);
+      (scValToNative as jest.Mock).mockImplementationOnce(stellarSdk.scValToNative);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: scvMap }],
+      });
+
+      const result = await sdk.getAllBalances([MOCK_ASSET]);
+
+      expect(result).toEqual({ [MOCK_ASSET]: "1000" });
+    });
+
+    it("also supports Map values", async () => {
+      (scValToNative as jest.Mock).mockReturnValue(
+        new Map([[MOCK_ASSET, BigInt(1000)]]),
+      );
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const result = await sdk.getAllBalances([MOCK_ASSET]);
+
+      expect(result).toEqual({ [MOCK_ASSET]: "1000" });
     });
 
     it("returns empty object when no results", async () => {

@@ -1,9 +1,9 @@
 import { CachedContractClient } from '../cachedBridge';
 import { InMemoryCache } from '../cache';
-import { SorobanRpc, scValToNative, xdr, Contract, TransactionBuilder, Address, Account } from '@stellar/stellar-sdk';
+import { rpc as SorobanRpc, scValToNative, xdr, Contract, TransactionBuilder, Address, Account } from '@stellar/stellar-sdk';
 
 jest.mock('@stellar/stellar-sdk', () => ({
-  SorobanRpc: {
+  rpc: {
     Server: jest.fn(),
   },
   Contract: jest.fn().mockImplementation(() => ({

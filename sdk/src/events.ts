@@ -21,7 +21,7 @@
  * ```
  */
 
-import { SorobanRpc, scValToNative } from '@stellar/stellar-sdk';
+import { rpc as SorobanRpc, scValToNative } from '@stellar/stellar-sdk';
 
 // ---------------------------------------------------------------------------
 // Event payload types

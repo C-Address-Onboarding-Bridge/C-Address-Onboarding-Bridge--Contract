@@ -11,7 +11,7 @@ import {
 import { assertAccountAddress, assertContractAddress } from './validate';
 import { withRpcRetry } from './retry';
 import {
-  SorobanRpc,
+  rpc as SorobanRpc,
   Contract,
   xdr,
   Keypair,
