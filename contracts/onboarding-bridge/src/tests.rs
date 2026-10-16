@@ -2076,7 +2076,58 @@ fn test_swap_records_volume_in_target_asset_units() {
         &None,
     );
 
-    assert_eq!(bridge.query_current_tier(&user).fee_bps, 100);
+    assert_eq!(bridge.query_current_tier(&user, &target_token_id).fee_bps, 100);
+}
+
+#[test]
+fn test_referral_and_swap_record_volume_for_the_correct_asset() {
+    let env = Env::default();
+    let (bridge, user, source_asset, target_asset) = setup_swap(&env);
+    let tiers = Vec::from_array(
+        &env,
+        [
+            FeeTier {
+                min_volume: 0,
+                max_volume: 150,
+                fee_bps: 0,
+            },
+            FeeTier {
+                min_volume: 151,
+                max_volume: i128::MAX,
+                fee_bps: 100,
+            },
+        ],
+    );
+    bridge.set_fee_tiers(&tiers);
+
+    bridge.fund_c_address_with_referral(
+        &user,
+        &Address::generate(&env),
+        &source_asset,
+        &100i128,
+        &None,
+        &None,
+        &None,
+    );
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_asset, &target_asset, &2i128);
+    mint_tokens(&env, &target_asset, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+    bridge.fund_c_address_with_swap(
+        &user,
+        &Address::generate(&env),
+        &source_asset,
+        &target_asset,
+        &100i128,
+        &200i128,
+        &Vec::from_array(&env, [pool_id]),
+        &None,
+        &None,
+    );
+
+    assert_eq!(bridge.query_current_tier(&user, &source_asset).fee_bps, 0);
+    assert_eq!(bridge.query_current_tier(&user, &target_asset).fee_bps, 100);
 }
 
 #[test]

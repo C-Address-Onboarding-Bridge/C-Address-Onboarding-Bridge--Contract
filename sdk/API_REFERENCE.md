@@ -754,7 +754,7 @@ function withRpcRetry<T extends object>(
 ```
 Wraps an RPC provider in a transparent proxy so each method is retried under the policy matching its nature: read methods use `VIEW_RETRY_POLICY`, `sendTransaction` uses `STATE_CHANGING_RETRY_POLICY`, and anything else passes through untouched. Method signatures and return values are unchanged, so the proxy can replace the provider in place. The SDK applies this to its own RPC server automatically.
 - **Parameters**:
-  - `provider`: `T` — typically a `SorobanRpc.Server`.
+  - `provider`: `T` — typically an `rpc.Server`.
   - `options`: [`RpcRetryOptions`](#rpcretryoptions) (optional)
 - **Returns**: `T`
 
@@ -796,7 +796,7 @@ const data = await withRetry(() => fetch(url).then((r) => r.json()), {
 });
 
 // Or wrap a whole RPC provider.
-const server = withRpcRetry(new SorobanRpc.Server(rpcUrl), { maxRetries: 4 });
+const server = withRpcRetry(new rpc.Server(rpcUrl), { maxRetries: 4 });
 
 if (!isRetryableRpcError(err)) throw err;
 ```

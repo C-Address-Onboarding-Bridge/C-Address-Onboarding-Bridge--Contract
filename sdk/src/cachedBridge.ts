@@ -11,7 +11,7 @@ import {
 import { assertAccountAddress, assertContractAddress } from './validate';
 import { withRpcRetry } from './retry';
 import {
-  SorobanRpc,
+  rpc,
   Contract,
   xdr,
   Keypair,
@@ -116,7 +116,7 @@ class ContractClient {
   private ttls: Record<CacheKey, number>;
   private sdk: any;
   private contract: Contract;
-  private provider: SorobanRpc.Server;
+  private provider: rpc.Server;
   private networkPassphrase: string;
 
   constructor(config: BridgeConfig, cache: ICacheProvider, ttls: Record<CacheKey, number>) {
@@ -126,7 +126,7 @@ class ContractClient {
     this.ttls = ttls;
     this.contract = new Contract(config.contractId);
     this.provider = withRpcRetry(
-      new SorobanRpc.Server(config.rpcUrl),
+      new rpc.Server(config.rpcUrl),
       config.retry,
     );
     this.networkPassphrase = config.networkPassphrase;
