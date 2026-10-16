@@ -61,6 +61,9 @@ export function toSingleScVal(arg: any): xdr.ScVal {
     if (value instanceof Address) {
       return value.toScVal();
     }
+    if (Array.isArray(value)) {
+      return xdr.ScVal.scvVec(value.map((item) => toSingleScVal(item)));
+    }
     return type ? nativeToScVal(value, { type }) : nativeToScVal(value);
   }
 
@@ -69,6 +72,9 @@ export function toSingleScVal(arg: any): xdr.ScVal {
   }
   if (arg instanceof Address) {
     return arg.toScVal();
+  }
+  if (Array.isArray(arg)) {
+    return xdr.ScVal.scvVec(arg.map((item) => toSingleScVal(item)));
   }
   return nativeToScVal(arg);
 }
