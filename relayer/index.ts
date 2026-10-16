@@ -23,6 +23,24 @@ import {
   RelayerSig,
 } from '@stellar/c-address-onboarding-bridge-sdk';
 
+function readJsonFile<T>(filePath: string): T | null {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8')) as T;
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonFileAtomic(filePath: string, value: unknown): void {
+  const dir = path.dirname(filePath);
+  if (dir && dir !== '.') {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  const temporaryPath = `${filePath}.${process.pid}.tmp`;
+  fs.writeFileSync(temporaryPath, JSON.stringify(value), 'utf8');
+  fs.renameSync(temporaryPath, filePath);
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -537,13 +555,7 @@ export class BlockStore {
 
   /** Atomically persist the current fromBlock value. */
   save(fromBlock: string): void {
-    const dir = path.dirname(this.filePath);
-    if (dir && dir !== '.') {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    const tmp = this.filePath + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify({ fromBlock }), 'utf8');
-    fs.renameSync(tmp, this.filePath);
+    writeJsonFileAtomic(this.filePath, { fromBlock });
   }
 }
 
@@ -2224,7 +2236,11 @@ export async function test_solana_listener_backfills_missed_events_after_reconne
 
     await (listener as any).backfill();
 
-    assertEqual(rpcCalls, ['getSignaturesForAddress', 'getTransaction'], 'backfill should query signatures then fetch the transaction');
+    assertEqual(
+      rpcCalls.join(','),
+      'getSignaturesForAddress,getTransaction',
+      'backfill should query signatures then fetch the transaction',
+    );
     assertEqual(signatureParams[0], 'program', 'backfill should query the configured program');
     assertEqual(
       JSON.stringify(signatureParams[1]),
@@ -2292,7 +2308,11 @@ export async function test_solana_listener_skips_failed_transactions_during_back
     };
 
     await (listener as any).backfill();
-    assertEqual(fetchedTransactions, ['sig-new'], 'failed finalized transactions must not be fetched or replayed');
+    assertEqual(
+      fetchedTransactions.join(','),
+      'sig-new',
+      'failed finalized transactions must not be fetched or replayed',
+    );
     assertEqual((listener as any).lastSignature, 'sig-new', 'backfill should persist its newest processed signature');
   } finally {
     try { fs.unlinkSync(filePath); } catch { /* ignore */ }
