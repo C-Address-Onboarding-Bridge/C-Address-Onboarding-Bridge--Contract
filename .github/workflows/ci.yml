@@ -281,8 +281,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.88.0
           targets: wasm32-unknown-unknown
 
       - name: Pin Soroban SDK major version
@@ -316,8 +317,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.88.0
           components: rustfmt, clippy
 
       - name: Cache cargo dependencies
