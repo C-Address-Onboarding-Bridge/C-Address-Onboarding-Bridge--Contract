@@ -17,10 +17,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.84.0
           components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -47,7 +48,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.84.0
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -88,8 +91,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.84.0
           targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Cache cargo dependencies
@@ -117,12 +121,8 @@ jobs:
       - name: Build WASM (wasm32v1-none)
         run: cargo build -p onboarding-bridge --release --target wasm32v1-none
 
-      # TODO(next-bounty): advisory only. wasm_hash.txt does not match a build of
-      # this source on any current stable toolchain -- rustc codegen changes
-      # between releases, and this job pins `dtolnay/rust-toolchain@stable`,
-      # which moves. A meaningful artifact hash needs a pinned toolchain and a
-      # reproducible build (e.g. `stellar contract build` in a pinned image).
-      # Until then this reports the drift instead of failing every run.
+      # TODO(next-bounty): advisory only until wasm_hash.txt is refreshed from
+      # the pinned toolchain's reproducible build.
       - name: Verify WASM Hash
         continue-on-error: true
         run: |
@@ -285,9 +285,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
-          targets: wasm32-unknown-unknown
+          toolchain: 1.84.0
+          targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Pin Soroban SDK major version
         run: |
@@ -320,9 +321,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.84.0
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2

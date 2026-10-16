@@ -24,7 +24,7 @@ Ensure you have the following installed:
 |---|---|---|
 | Docker + Docker Compose | 24+ | [docs.docker.com](https://docs.docker.com/get-docker/) |
 | Node.js | 20+ LTS (18, 20, 22 recommended) | [nodejs.org](https://nodejs.org) or `nvm install 20` |
-| Rust + wasm32 target | stable | `curl https://sh.rustup.rs -sSf \| sh` then `rustup target add wasm32-unknown-unknown` |
+| Rust + wasm32 targets | 1.84.0 (pinned by `rust-toolchain.toml`) | `curl https://sh.rustup.rs -sSf \| sh` then `rustup target add --toolchain 1.84.0 wasm32-unknown-unknown wasm32v1-none` |
 | Soroban CLI | latest | `cargo install --locked stellar-cli` |
 | Git | any | — |
 
