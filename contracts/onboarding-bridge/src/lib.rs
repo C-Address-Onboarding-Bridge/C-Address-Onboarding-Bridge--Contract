@@ -3939,6 +3939,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::ReplayedNonce`] — This `(chain_id, tx_hash)` combination
     ///   has already been processed.
     /// * [`BridgeError::NotRelayer`] — A signature's pubkey is not a registered relayer.
+    /// * [`BridgeError::MetaTxInvalidSignature`] — A registered relayer's signature is invalid.
     /// * [`BridgeError::DuplicateRelayerSignature`] — The same relayer pubkey
     ///   appears more than once in `sigs`.
     /// * [`BridgeError::BelowThreshold`] — Fewer than `threshold` valid signatures.
@@ -3951,12 +3952,12 @@ impl OnboardingBridge {
     /// # Security Considerations
     ///
     /// The nonce is derived deterministically from `(chain_id, tx_hash)` and
-    /// marked used before the token transfer, preventing replay attacks. An
-    /// invalid Ed25519 signature causes a host-level trap (panic) rather than
-    /// returning an error code, so callers should pre-validate signatures
-    /// off-chain. The contract verifies that `sigs` contains distinct
-    /// pubkeys — a relayer submitting the same signature twice only counts
-    /// once toward the threshold; duplicates are rejected with
+    /// marked used before the token transfer, preventing replay attacks.
+    /// Ed25519 signatures are verified strictly before the nonce is consumed;
+    /// invalid signatures return [`BridgeError::MetaTxInvalidSignature`].
+    /// The contract verifies that `sigs` contains distinct pubkeys — a relayer
+    /// submitting the same signature twice only counts once toward the
+    /// threshold; duplicates are rejected with
     /// [`BridgeError::DuplicateRelayerSignature`].
     pub fn fund_c_address_crosschain(
         env: Env,
@@ -4023,8 +4024,12 @@ impl OnboardingBridge {
                 return Err(BridgeError::DuplicateRelayerSignature);
             }
             seen.push_back(sig.pubkey.clone());
-            env.crypto()
-                .ed25519_verify(&sig.pubkey, &payload_hash.clone().into(), &sig.signature);
+            let verifying_key = VerifyingKey::from_bytes(&sig.pubkey.to_array())
+                .map_err(|_| BridgeError::MetaTxInvalidSignature)?;
+            let signature = Signature::from_bytes(&sig.signature.to_array());
+            verifying_key
+                .verify_strict(&payload_hash.to_array(), &signature)
+                .map_err(|_| BridgeError::MetaTxInvalidSignature)?;
         }
         if seen.len() < relayer_threshold(&env) {
             return Err(BridgeError::BelowThreshold);

@@ -3974,6 +3974,33 @@ mod crosschain_tests {
         );
     }
 
+    #[test]
+    fn test_crosschain_invalid_signature_returns_contract_error() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+
+        let signing_key = make_signing_key([7u8; 32]);
+        let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+        bridge.add_relayer(&pubkey, &None);
+        bridge.set_relayer_threshold(&1u32);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0x77; 32]);
+        let payload_hash = build_payload_hash(&env, 1, &tx_hash, &target, &token_id, 100);
+        let wrong_payload_hash = build_payload_hash(&env, 2, &tx_hash, &target, &token_id, 100);
+        let sigs = Vec::from_array(
+            &env,
+            [make_relayer_sig(&env, &signing_key, &wrong_payload_hash)],
+        );
+
+        assert_eq!(
+            bridge.try_fund_c_address_crosschain(
+                &1u32, &tx_hash, &target, &token_id, &100i128, &sigs
+            ),
+            Err(Ok(BridgeError::MetaTxInvalidSignature))
+        );
+    }
+
     #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_crosschain_happy_path_2_of_3() {
