@@ -2076,7 +2076,10 @@ fn test_swap_records_volume_in_target_asset_units() {
         &None,
     );
 
-    assert_eq!(bridge.query_current_tier(&user, &target_token_id).fee_bps, 100);
+    assert_eq!(
+        bridge.query_current_tier(&user, &target_token_id).fee_bps,
+        100
+    );
 }
 
 #[test]
@@ -3074,7 +3077,10 @@ fn test_batch_all_blocked_no_loyalty_minted() {
     // No loyalty reward must be minted — user's loyalty balance stays at 0.
     assert_eq!(check_balance(&env, &loyalty_token_id, &user), 0i128);
     // Bridge loyalty reserve is untouched.
-    assert_eq!(check_balance(&env, &loyalty_token_id, &bridge_id), 1_000i128);
+    assert_eq!(
+        check_balance(&env, &loyalty_token_id, &bridge_id),
+        1_000i128
+    );
     // Full refund of the funding token.
     assert_eq!(check_balance(&env, &token_id, &user), 1_000i128);
 }
@@ -3144,7 +3150,10 @@ fn test_fee_tiers_keyed_per_asset() {
 
     // Query current tier for token_id — should be in the 0 bps tier.
     let tier_token1 = bridge.query_current_tier(&user, &token_id);
-    assert_eq!(tier_token1.fee_bps, 0u32, "token_id volume should reach zero-fee tier");
+    assert_eq!(
+        tier_token1.fee_bps, 0u32,
+        "token_id volume should reach zero-fee tier"
+    );
 
     // Query current tier for token2_id — volume is still 0, must NOT inherit token_id's volume.
     let tier_token2 = bridge.query_current_tier(&user, &token2_id);
@@ -3158,7 +3167,10 @@ fn test_fee_tiers_keyed_per_asset() {
     let target2 = Address::generate(&env);
     bridge.fund_c_address(&user, &target2, &token2_id, &1_000i128, &None, &None);
     let tier_token2_after = bridge.query_current_tier(&user, &token2_id);
-    assert_eq!(tier_token2_after.fee_bps, 0u32, "token2_id should now be in zero-fee tier");
+    assert_eq!(
+        tier_token2_after.fee_bps, 0u32,
+        "token2_id should now be in zero-fee tier"
+    );
 }
 
 /// Batches larger than MAX_BATCH_SIZE (100) must be rejected.
