@@ -5324,7 +5324,7 @@ fn test_meta_fund_rejects_unregistered_source() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
-    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
+    let network_id = env.ledger().network_id();
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
@@ -5441,7 +5441,7 @@ fn test_meta_fund_happy_path() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
-    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
+    let network_id = env.ledger().network_id();
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
