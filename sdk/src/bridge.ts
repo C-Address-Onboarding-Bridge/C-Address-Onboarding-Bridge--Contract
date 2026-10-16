@@ -69,7 +69,7 @@ import { assertAccountAddress, assertContractAddress, assertRelayerPubkey } from
 import { withRpcRetry } from './retry';
 import { toScVals, buildSimulationTx as buildSharedSimTx } from './encoding';
 import {
-  SorobanRpc,
+  rpc,
   Contract,
   xdr,
   Address,
@@ -115,7 +115,7 @@ import {
 export class OnboardingBridgeSDK {
   private config: BridgeConfig;
   private contract: Contract;
-  private provider: SorobanRpc.Server;
+  private provider: rpc.Server;
   private networkPassphrase: string;
   private hooks: ObservabilityHooks | undefined;
 
@@ -148,7 +148,7 @@ export class OnboardingBridgeSDK {
     // failures (network/timeout/rate-limit) with exponential backoff + jitter.
     // Reads use an aggressive policy; writes use a conservative one (see retry.ts).
     this.provider = withRpcRetry(
-      new SorobanRpc.Server(config.rpcUrl),
+      new rpc.Server(config.rpcUrl),
       config.retry,
     );
     this.networkPassphrase = config.networkPassphrase;
@@ -170,7 +170,7 @@ export class OnboardingBridgeSDK {
    *
    * @returns A {@link TransactionResult} with `status: 'pending'` on successful
    *          submission, or `status: 'failed'` with an `error` message.
-   *          Poll `SorobanRpc.Server.getTransaction(result.hash)` to confirm
+   *          Poll `rpc.Server.getTransaction(result.hash)` to confirm
    *          finality before showing success to the user.
    *
    * @throws Never — errors are returned as `status: 'failed'`.
@@ -3077,7 +3077,7 @@ export class OnboardingBridgeSDK {
     }
 
     // Extract fees from simulation result
-    // SorobanRpc.Api.SimulateTransactionSuccessResponse shape:
+    // rpc.Api.SimulateTransactionSuccessResponse shape:
     //   minResourceFee: string   (resource fee in stroops)
     //   cost: { cpuInsns, memBytes }
     const simResult = result as any;

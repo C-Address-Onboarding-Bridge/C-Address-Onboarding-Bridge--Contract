@@ -8,7 +8,7 @@ const mockGetEvents = jest.fn();
 const mockGetLatestLedger = jest.fn();
 
 jest.mock('@stellar/stellar-sdk', () => ({
-  SorobanRpc: {
+  rpc: {
     Server: jest.fn().mockImplementation(() => ({
       getEvents: mockGetEvents,
       getLatestLedger: mockGetLatestLedger,
@@ -78,6 +78,17 @@ describe('EventSubscriber', () => {
       expect(subscriber.listenerCount()).toBe(0);
     });
 
+    it('stops polling when only error listeners remain after unsubscribe', () => {
+      const unsubscribe = subscriber.on('CAddressFunded', jest.fn());
+      subscriber.on('error', jest.fn());
+
+      unsubscribe();
+      jest.advanceTimersByTime(3_000);
+
+      expect(subscriber.listenerCount()).toBe(1);
+      expect(mockGetEvents).not.toHaveBeenCalled();
+    });
+
     it('throws when registering on a destroyed subscriber', () => {
       subscriber.destroy();
       expect(() => subscriber.on('CAddressFunded', jest.fn())).toThrow(
@@ -87,13 +98,13 @@ describe('EventSubscriber', () => {
   });
 
   describe('polling loop', () => {
-    it('starts polling on the first listener and stops when the last unsubscribes', () => {
+    it('starts polling on the first listener and stops when the last unsubscribes', async () => {
       const unsub = subscriber.on('CAddressFunded', jest.fn());
-      jest.advanceTimersByTime(3_000);
+      await jest.advanceTimersByTimeAsync(3_000);
       expect(mockGetEvents).toHaveBeenCalledTimes(3);
 
       unsub();
-      jest.advanceTimersByTime(3_000);
+      await jest.advanceTimersByTimeAsync(3_000);
       expect(mockGetEvents).toHaveBeenCalledTimes(3);
     });
 
@@ -101,9 +112,7 @@ describe('EventSubscriber', () => {
       mockGetEvents.mockRejectedValueOnce(new Error('rpc down'));
       subscriber.on('CAddressFunded', jest.fn());
 
-      jest.advanceTimersByTime(1_000);
-      await Promise.resolve();
-      jest.advanceTimersByTime(1_000);
+      await jest.advanceTimersByTimeAsync(2_000);
       expect(mockGetEvents).toHaveBeenCalledTimes(2);
     });
 
@@ -122,8 +131,7 @@ describe('EventSubscriber', () => {
       subscriber.on('*', jest.fn());
 
       // Advance well past several intervals while the first fetch is in flight.
-      jest.advanceTimersByTime(10_000);
-      await Promise.resolve();
+      await jest.advanceTimersByTimeAsync(10_000);
 
       // Only one fetch may ever be in flight at a time.
       expect(maxConcurrent).toBe(1);
@@ -140,8 +148,7 @@ describe('EventSubscriber', () => {
         return fundedEventResponse('tok-1');
       });
 
-      jest.advanceTimersByTime(10_000);
-      await Promise.resolve();
+      await jest.advanceTimersByTimeAsync(10_000);
 
       expect(received).toHaveLength(1);
     });
@@ -245,9 +252,9 @@ describe('EventSubscriber', () => {
       mockGetEvents.mockRejectedValueOnce(new Error('rpc down'));
       subscriber.on('error', jest.fn());
 
-      jest.advanceTimersByTime(1_000);
+      await jest.advanceTimersByTimeAsync(1_000);
       // The existing test pattern: just verify the loop stays alive (call count)
-      jest.advanceTimersByTime(1_000);
+      await jest.advanceTimersByTimeAsync(1_000);
       expect(mockGetEvents).toHaveBeenCalledTimes(2);
     });
 

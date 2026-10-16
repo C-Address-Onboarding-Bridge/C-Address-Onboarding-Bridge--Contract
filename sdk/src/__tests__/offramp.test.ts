@@ -11,7 +11,7 @@ describe('OffRampIntegration', () => {
       amount: '100',
       fiatCurrency: 'USD',
       asset: 'XLM',
-      cAddress: TARGET_C_ADDRESS,
+      gAddress: SOURCE_G_ADDRESS,
     };
 
     providers.forEach((provider) => {
@@ -27,7 +27,7 @@ describe('OffRampIntegration', () => {
         const url = offramp.getOnRampUrl({ ...baseParams, provider });
         
         expect(url).toBeTruthy();
-        expect(url).toContain(TARGET_C_ADDRESS);
+        expect(url).toContain(SOURCE_G_ADDRESS);
       });
 
       it(`generates ${provider} on-ramp URL in test mode`, () => {
@@ -94,7 +94,7 @@ describe('OffRampIntegration', () => {
         amount: '250.50',
         fiatCurrency: 'EUR',
         asset: 'USDC',
-        cAddress: TARGET_C_ADDRESS,
+        gAddress: SOURCE_G_ADDRESS,
       });
 
       expect(url).toContain('https://buy.moonpay.com');
@@ -102,7 +102,7 @@ describe('OffRampIntegration', () => {
       expect(url).toContain('currencyCode=USDC');
       expect(url).toContain('baseCurrencyAmount=250.50');
       expect(url).toContain('baseCurrencyCode=EUR');
-      expect(url).toContain(encodeURIComponent(TARGET_C_ADDRESS));
+      expect(url).toContain(encodeURIComponent(SOURCE_G_ADDRESS));
       expect(url).toContain('showWalletAddressForm=false');
     });
 
@@ -133,7 +133,7 @@ describe('OffRampIntegration', () => {
         amount: '100',
         fiatCurrency: 'USD',
         asset: 'XLM',
-        cAddress: TARGET_C_ADDRESS,
+        gAddress: SOURCE_G_ADDRESS,
       });
       const offRampUrl = offramp.getOffRampUrl({
         provider: 'moonpay',
@@ -157,7 +157,7 @@ describe('OffRampIntegration', () => {
         amount: '200',
         fiatCurrency: 'GBP',
         asset: 'USDC',
-        cAddress: TARGET_C_ADDRESS,
+        gAddress: SOURCE_G_ADDRESS,
       });
 
       expect(url).toContain('https://global.transak.com');
@@ -166,7 +166,7 @@ describe('OffRampIntegration', () => {
       expect(url).toContain('defaultFiatAmount=200');
       expect(url).toContain('fiatCurrency=GBP');
       expect(url).toContain('network=stellar');
-      expect(url).toContain('walletAddress=' + encodeURIComponent(TARGET_C_ADDRESS));
+      expect(url).toContain('walletAddress=' + encodeURIComponent(SOURCE_G_ADDRESS));
     });
 
     it('generates correct off-ramp URL with isSellMode', () => {
@@ -194,7 +194,7 @@ describe('OffRampIntegration', () => {
         amount: '100',
         fiatCurrency: 'USD',
         asset: 'XLM',
-        cAddress: TARGET_C_ADDRESS,
+        gAddress: SOURCE_G_ADDRESS,
       });
       const offRampUrl = offramp.getOffRampUrl({
         provider: 'transak',
@@ -218,12 +218,12 @@ describe('OffRampIntegration', () => {
         amount: '500',
         fiatCurrency: 'EUR',
         asset: 'USDC',
-        cAddress: TARGET_C_ADDRESS,
+        gAddress: SOURCE_G_ADDRESS,
       });
 
       expect(url).toContain('https://buy.ramp.network');
       expect(url).toContain('hostApiKey=ramp_key');
-      expect(url).toContain('userAddress=' + encodeURIComponent(TARGET_C_ADDRESS));
+      expect(url).toContain('userAddress=' + encodeURIComponent(SOURCE_G_ADDRESS));
       expect(url).toContain('assetCode=USDC_stellar');
       expect(url).toContain('fiatCurrency=EUR');
       expect(url).toContain('fiatAmount=500');
@@ -253,7 +253,7 @@ describe('OffRampIntegration', () => {
         amount: '100',
         fiatCurrency: 'USD',
         asset: 'XLM',
-        cAddress: TARGET_C_ADDRESS,
+        gAddress: SOURCE_G_ADDRESS,
       });
 
       expect(url).toContain('https://buy.ramp.network');
@@ -270,12 +270,12 @@ describe('OffRampIntegration', () => {
         amount: '750',
         fiatCurrency: 'AUD',
         asset: 'XLM',
-        cAddress: TARGET_C_ADDRESS,
+        gAddress: SOURCE_G_ADDRESS,
       });
 
       expect(url).toContain('https://app.banxa.com');
       expect(url).toContain('apiKey=banxa_key');
-      expect(url).toContain('walletAddress=' + encodeURIComponent(TARGET_C_ADDRESS));
+      expect(url).toContain('walletAddress=' + encodeURIComponent(SOURCE_G_ADDRESS));
       expect(url).toContain('blockchain=stellar');
       expect(url).toContain('cryptoCurrency=XLM');
       expect(url).toContain('fiatType=AUD');
@@ -490,13 +490,13 @@ describe('OffRampIntegration', () => {
         amount: '100',
         fiatCurrency: 'USD',
         asset: 'XLM',
-        cAddress: TARGET_C_ADDRESS,
+        gAddress: SOURCE_G_ADDRESS,
       });
       
       expect(url).toContain('apiKey=');
     });
 
-    it('getOnRampUrl rejects invalid cAddress format', () => {
+    it('getOnRampUrl rejects invalid gAddress format', () => {
       const offramp = new OffRampIntegration({ moonpayApiKey: 'test', testMode: false });
 
       expect(() => offramp.getOnRampUrl({
@@ -504,11 +504,11 @@ describe('OffRampIntegration', () => {
         amount: '100',
         fiatCurrency: 'USD',
         asset: 'XLM',
-        cAddress: 'not-a-c-address',
-      })).toThrow(/Invalid contract address for "cAddress"/);
+        gAddress: 'not-a-g-address',
+      })).toThrow(/Invalid account address for "gAddress"/);
     });
 
-    it('getOnRampUrl rejects G-address as cAddress', () => {
+    it('getOnRampUrl rejects C-address as gAddress', () => {
       const offramp = new OffRampIntegration({ moonpayApiKey: 'test', testMode: false });
 
       expect(() => offramp.getOnRampUrl({
@@ -516,8 +516,8 @@ describe('OffRampIntegration', () => {
         amount: '100',
         fiatCurrency: 'USD',
         asset: 'XLM',
-        cAddress: SOURCE_G_ADDRESS,
-      })).toThrow(/Invalid contract address for "cAddress"/);
+        gAddress: TARGET_C_ADDRESS,
+      })).toThrow(/Invalid account address for "gAddress"/);
     });
 
     it('getOffRampUrl rejects invalid gAddress format', () => {

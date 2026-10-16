@@ -294,6 +294,11 @@ fn parse_contract_event(
     // labelled fields instead of a generic, sometimes-wrong source/target.
     // See #642.
     match &event_type {
+        BridgeEventType::CAddressFunded => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "asset");
+            insert_topic_str(&mut data, &decoded_topics, 2, "source");
+            insert_topic_str(&mut data, &decoded_topics, 3, "target");
+        }
         BridgeEventType::SwapAndFunded => {
             insert_topic_str(&mut data, &decoded_topics, 1, "source_asset");
             insert_topic_str(&mut data, &decoded_topics, 2, "target_asset");
@@ -309,38 +314,22 @@ fn parse_contract_event(
             insert_topic_str(&mut data, &decoded_topics, 1, "source");
             insert_topic_str(&mut data, &decoded_topics, 2, "referrer");
         }
+        BridgeEventType::FeesWithdrawn => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "fee_collector");
+        }
+        BridgeEventType::AdminProposed | BridgeEventType::AdminTransferred => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "from");
+            insert_topic_str(&mut data, &decoded_topics, 2, "to");
+        }
+        BridgeEventType::FeeCollectorTransferProposed | BridgeEventType::FeeCollectorTransferred => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "from");
+            insert_topic_str(&mut data, &decoded_topics, 2, "to");
+        }
         _ => {
-            // CAddressFunded, CommitFund, BatchTransferFailed, and the
-            // remaining admin/config events all publish (name, source, target).
+            // CommitFund and BatchTransferFailed publish (name, source, target).
             insert_topic_str(&mut data, &decoded_topics, 1, "source");
             insert_topic_str(&mut data, &decoded_topics, 2, "target");
         }
-        // ("FeesWithdrawn", fee_collector) — asset carried in value, not topics
-        BridgeEventType::FeesWithdrawn => {
-            if let Some(collector) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert("fee_collector".to_string(), serde_json::Value::String(collector.to_string()));
-            }
-        }
-        // ("AdminProposed", admin, new_admin) / ("AdminTransferred", old_admin, pending)
-        BridgeEventType::AdminProposed | BridgeEventType::AdminTransferred => {
-            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert("from".to_string(), serde_json::Value::String(from.to_string()));
-            }
-            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
-                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
-            }
-        }
-        // ("FeeCollectorTransferProposed", admin, new_collector) / ("FeeCollectorTransferred", old, pending)
-        BridgeEventType::FeeCollectorTransferProposed | BridgeEventType::FeeCollectorTransferred => {
-            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert("from".to_string(), serde_json::Value::String(from.to_string()));
-            }
-            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
-                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
-            }
-        }
-        // All other event types: no well-known topic fields beyond the event name.
-        _ => {}
     }
 
     // #634 — Deterministic ID: sha256(ledger || tx_hash || event_type ||
@@ -403,26 +392,47 @@ fn decode_scval(bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
     if bytes.len() < 4 {
         return Err("missing ScVal type");
     }
-    let kind = u32::from_be_bytes(bytes[0..4].try_into().map_err(|_| "invalid type")?);
-    let mut cursor = 4;
+    let mut cursor = 0;
+    let value = decode_scval_at(bytes, &mut cursor)?;
+    if cursor != bytes.len() {
+        return Err("trailing ScVal data");
+    }
+    Ok(value)
+}
+
+fn decode_scval_at(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<serde_json::Value, &'static str> {
+    let kind = read_u32(bytes, cursor)?;
     match kind {
-        0 => Ok(serde_json::Value::Bool(read_u32(bytes, &mut cursor)? != 0)),
+        0 => Ok(serde_json::Value::Bool(read_u32(bytes, cursor)? != 0)),
         1 => Ok(serde_json::Value::Null),
         3 => Ok(serde_json::Value::Number(
-            read_u32(bytes, &mut cursor)?.into(),
+            read_u32(bytes, cursor)?.into(),
         )),
         4 => Ok(serde_json::Value::Number(
-            (read_u32(bytes, &mut cursor)? as i32).into(),
+            (read_u32(bytes, cursor)? as i32).into(),
         )),
         5 | 7 | 8 => {
-            let number = read_u64(bytes, &mut cursor)?;
+            let number = read_u64(bytes, cursor)?;
             Ok(serde_json::Value::Number(number.into()))
         }
         6 => Ok(serde_json::Value::Number(
-            (read_u64(bytes, &mut cursor)? as i64).into(),
+            (read_u64(bytes, cursor)? as i64).into(),
         )),
+        9 => {
+            let raw = read_bytes(bytes, cursor, 16)?;
+            let number = u128::from_be_bytes(raw.try_into().map_err(|_| "invalid u128")?);
+            Ok(number_to_json_u128(number))
+        }
+        10 => {
+            let raw = read_bytes(bytes, cursor, 16)?;
+            let number = i128::from_be_bytes(raw.try_into().map_err(|_| "invalid i128")?);
+            Ok(number_to_json_i128(number))
+        }
         13..=15 => {
-            let raw = read_opaque(bytes, &mut cursor)?;
+            let raw = read_opaque(bytes, cursor)?;
             if kind == 15 || kind == 14 {
                 Ok(serde_json::Value::String(
                     String::from_utf8(raw).map_err(|_| "invalid ScVal text")?,
@@ -432,15 +442,79 @@ fn decode_scval(bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
             }
         }
         18 => {
-            let address_kind = read_u32(bytes, &mut cursor)?;
-            let address = read_bytes(bytes, &mut cursor, 32)?;
+            let address_kind = read_u32(bytes, cursor)?;
+            let address = read_bytes(bytes, cursor, 32)?;
             Ok(serde_json::Value::String(format!(
                 "scaddress:{}:{}",
                 address_kind,
                 hex::encode(address)
             )))
         }
+        16 => decode_scval_sequence(bytes, cursor),
+        17 => decode_scval_map(bytes, cursor),
         _ => Err("unsupported ScVal type"),
+    }
+}
+
+fn decode_scval_sequence(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<serde_json::Value, &'static str> {
+    match read_u32(bytes, cursor)? {
+        0 => Ok(serde_json::Value::Null),
+        1 => {
+            let length = read_u32(bytes, cursor)? as usize;
+            let mut values = Vec::with_capacity(length);
+            for _ in 0..length {
+                values.push(decode_scval_at(bytes, cursor)?);
+            }
+            Ok(serde_json::Value::Array(values))
+        }
+        _ => Err("invalid ScVal vector pointer"),
+    }
+}
+
+fn decode_scval_map(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<serde_json::Value, &'static str> {
+    match read_u32(bytes, cursor)? {
+        0 => Ok(serde_json::Value::Null),
+        1 => {
+            let length = read_u32(bytes, cursor)? as usize;
+            let mut values = serde_json::Map::new();
+            for _ in 0..length {
+                let key = decode_scval_at(bytes, cursor)?;
+                let value = decode_scval_at(bytes, cursor)?;
+                let key = match key {
+                    serde_json::Value::String(key) => key,
+                    serde_json::Value::Number(key) => key.to_string(),
+                    serde_json::Value::Bool(key) => key.to_string(),
+                    _ => return Err("unsupported ScVal map key type"),
+                };
+                values.insert(key, value);
+            }
+            Ok(serde_json::Value::Object(values))
+        }
+        _ => Err("invalid ScVal map pointer"),
+    }
+}
+
+fn number_to_json_i128(number: i128) -> serde_json::Value {
+    if let Ok(number) = i64::try_from(number) {
+        serde_json::Value::Number(number.into())
+    } else if let Ok(number) = u64::try_from(number) {
+        serde_json::Value::Number(number.into())
+    } else {
+        serde_json::Value::String(number.to_string())
+    }
+}
+
+fn number_to_json_u128(number: u128) -> serde_json::Value {
+    if let Ok(number) = u64::try_from(number) {
+        serde_json::Value::Number(number.into())
+    } else {
+        serde_json::Value::String(number.to_string())
     }
 }
 
@@ -764,6 +838,50 @@ mod tests {
         assert_eq!(event.data["source"].as_str(), Some("GSOURCEADDR"));
         assert_eq!(event.data["target"].as_str(), Some("CTARGETADDR"));
         assert_eq!(event.data["value"], serde_json::json!(42));
+    }
+
+    #[test]
+    fn test_c_address_funded_decodes_amount_and_fee_vector() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&16u32.to_be_bytes());
+        encoded.extend_from_slice(&1u32.to_be_bytes());
+        encoded.extend_from_slice(&2u32.to_be_bytes());
+        for amount in [123i128, 5i128] {
+            encoded.extend_from_slice(&10u32.to_be_bytes());
+            encoded.extend_from_slice(&amount.to_be_bytes());
+        }
+        let raw = serde_json::json!({
+            "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
+            "ledger": 10,
+            "txHash": "cafebabe00000000",
+            "createdAt": "2024-06-01T12:00:00Z",
+            "value": base64::engine::general_purpose::STANDARD.encode(encoded)
+        });
+
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.data["asset"].as_str(), Some("CASSET"));
+        assert_eq!(event.data["source"].as_str(), Some("GSOURCE"));
+        assert_eq!(event.data["target"].as_str(), Some("CTARGET"));
+        assert_eq!(event.data["value"], serde_json::json!([123, 5]));
+    }
+
+    #[test]
+    fn test_decode_scval_map_recursively() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&17u32.to_be_bytes());
+        encoded.extend_from_slice(&1u32.to_be_bytes());
+        encoded.extend_from_slice(&1u32.to_be_bytes());
+        encoded.extend_from_slice(&15u32.to_be_bytes());
+        encoded.extend_from_slice(&5u32.to_be_bytes());
+        encoded.extend_from_slice(b"count");
+        encoded.extend_from_slice(&[0, 0, 0]);
+        encoded.extend_from_slice(&3u32.to_be_bytes());
+        encoded.extend_from_slice(&42u32.to_be_bytes());
+
+        assert_eq!(
+            decode_scval(&encoded).expect("map must decode"),
+            serde_json::json!({"count": 42})
+        );
     }
 
     /// When only one topic is present, `data["source"]` and `data["target"]`

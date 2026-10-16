@@ -21,7 +21,7 @@
  * ```
  */
 
-import { SorobanRpc, scValToNative } from '@stellar/stellar-sdk';
+import { rpc, scValToNative } from '@stellar/stellar-sdk';
 
 // ---------------------------------------------------------------------------
 // Event payload types
@@ -114,20 +114,6 @@ export interface FeeCollectorProposedEvent {
   feeCollector: string;
   /** Proposed new fee collector address */
   proposedFeeCollector: string;
-  ledger: number;
-  pagingToken: string;
-}
-
-/**
- * Emitted when a proposed fee collector accepts and the fee collector address
- * changes (contract `FeeCollectorTransferred`).
- */
-export interface FeeCollectorTransferredEvent {
-  name: 'FeeCollectorTransferred';
-  /** Previous fee collector address */
-  oldFeeCollector: string;
-  /** New fee collector address */
-  newFeeCollector: string;
   ledger: number;
   pagingToken: string;
 }
@@ -262,7 +248,7 @@ export interface EventSubscriberConfig {
  */
 export class EventSubscriber {
   private readonly contractId: string;
-  private readonly server: SorobanRpc.Server;
+  private readonly server: rpc.Server;
   private readonly pollingIntervalMs: number;
   private readonly limit: number;
 
@@ -278,12 +264,18 @@ export class EventSubscriber {
   /** Whether a fetch is currently in flight (guards against overlap). */
   private polling = false;
 
+  /** Whether listener changes currently allow the polling loop to run. */
+  private pollingEnabled = false;
+
+  /** Paging tokens from the previous response, used to ignore replayed pages. */
+  private lastPagePagingTokens = new Set<string>();
+
   /** Whether destroy() has been called. */
   private destroyed = false;
 
   constructor(config: EventSubscriberConfig) {
     this.contractId = config.contractId;
-    this.server = new SorobanRpc.Server(config.rpcUrl);
+    this.server = new rpc.Server(config.rpcUrl);
     this.pollingIntervalMs = config.pollingIntervalMs ?? 5_000;
     this.limit = config.limit ?? 100;
     this.cursor = config.startLedger ?? 'now';
@@ -313,9 +305,10 @@ export class EventSubscriber {
       this.listeners.set(eventName, new Set());
     }
     this.listeners.get(eventName)!.add(callback as BridgeEventCallback<any>);
+    this.pollingEnabled = true;
 
     // Auto-start polling when the first listener is registered
-    if (this.intervalHandle === null && !this.polling) {
+    if (this.intervalHandle === null) {
       this.startPolling();
     }
 
@@ -327,7 +320,17 @@ export class EventSubscriber {
           this.listeners.delete(eventName);
         }
       }
-      // Stop polling when no listeners remain (preserve 'error' lis
+      this.stopPollingIfNoEventListeners();
+    };
+  }
+
+  /**
+   * Remove all listeners registered for an event name.
+   */
+  off<K extends BridgeEventName>(eventName: K): void {
+    this.listeners.delete(eventName);
+    this.stopPollingIfNoEventListeners();
+  }
 
   /**
    * Total number of registered callbacks across all event names.
@@ -346,6 +349,7 @@ export class EventSubscriber {
    */
   destroy(): void {
     this.stopPolling();
+    this.pollingEnabled = false;
     this.listeners.clear();
     this.destroyed = true;
   }
@@ -357,11 +361,15 @@ export class EventSubscriber {
    * 'error' listeners before the exception propagates to the caller.
    */
   async poll(): Promise<void> {
+    if (this.polling) return;
+    this.polling = true;
     try {
       await this.fetchAndDispatch();
     } catch (err) {
       this.dispatchError(err instanceof Error ? err : new Error(String(err)));
       throw err;
+    } finally {
+      this.polling = false;
     }
   }
 
@@ -371,12 +379,17 @@ export class EventSubscriber {
 
   private startPolling(): void {
     if (this.intervalHandle !== null) return;
-    this.intervalHandle = setInterval(() => {
-      this.fetchAndDispatch().catch((err) => {
-        // Emit to error listeners so consumers can detect persistently-down
-        // RPC endpoints and react (e.g. circuit break, alert, reconnect).
-        this.dispatchError(err instanceof Error ? err : new Error(String(err)));
-      });
+    this.intervalHandle = setTimeout(() => {
+      this.intervalHandle = null;
+      this.poll()
+        .catch(() => {
+          // poll() dispatches the error before rethrowing it.
+        })
+        .finally(() => {
+          if (!this.destroyed && this.pollingEnabled && this.listenerCount() > 0) {
+            this.startPolling();
+          }
+        });
     }, this.pollingIntervalMs);
   }
 
@@ -387,13 +400,25 @@ export class EventSubscriber {
     }
   }
 
+  private stopPollingIfNoEventListeners(): void {
+    if (!this.hasEventListeners()) {
+      this.pollingEnabled = false;
+      this.stopPolling();
+    }
+  }
+
+  private hasEventListeners(): boolean {
+    return Array.from(this.listeners.entries()).some(
+      ([eventName, callbacks]) => eventName !== 'error' && callbacks.size > 0,
+    );
+  }
+
   private async fetchAndDispatch(): Promise<void> {
-    const params: SorobanRpc.Server.GetEventsRequest = {
+    const params: rpc.Server.GetEventsRequest = {
       filters: [
         {
           type: 'contract',
           contractIds: [this.contractId],
-          topics: [['*']],
         },
       ],
       limit: this.limit,
@@ -409,23 +434,31 @@ export class EventSubscriber {
 
     const response = await this.server.getEvents(params);
 
+    const nextPagePagingTokens = new Set<string>();
     for (const raw of response.events) {
-      const payload = this.parseEvent(raw);
-      if (payload) {
-        this.dispatch(payload);
+      const pagingToken = raw.pagingToken;
+      if (pagingToken) {
+        nextPagePagingTokens.add(pagingToken);
+      }
+      if (!pagingToken || !this.lastPagePagingTokens.has(pagingToken)) {
+        const payload = this.parseEvent(raw);
+        if (payload) {
+          this.dispatch(payload);
+        }
       }
       // Advance cursor to the last received paging token
-      if (raw.pagingToken) {
-        this.cursor = raw.pagingToken as string;
+      if (pagingToken) {
+        this.cursor = pagingToken;
       }
     }
+    this.lastPagePagingTokens = nextPagePagingTokens;
   }
 
   // -------------------------------------------------------------------------
   // Event parsing
   // -------------------------------------------------------------------------
 
-  private parseEvent(raw: SorobanRpc.Api.EventResponse): BridgeEventPayload | null {
+  private parseEvent(raw: rpc.Api.EventResponse): BridgeEventPayload | null {
     try {
       const topics = raw.topic.map((t) => scValToNative(t));
       const value = scValToNative(raw.value);
