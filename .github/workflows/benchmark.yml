@@ -10,9 +10,6 @@ env:
   CARGO_TERM_COLOR: always
 
 permissions:
-  contents: write
-  pages: write
-  id-token: write
   pull-requests: write
 
 jobs:
@@ -178,10 +175,10 @@ jobs:
               f.write(html)
           "
 
-      - name: Deploy to GitHub Pages
+      - name: Upload benchmark dashboard
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        uses: peaceiris/actions-gh-pages@v4
+        uses: actions/upload-artifact@v4
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./benchmark-dashboard
-          destination_dir: benchmarks
+          name: benchmark-dashboard
+          path: benchmark-dashboard
+          retention-days: 7
