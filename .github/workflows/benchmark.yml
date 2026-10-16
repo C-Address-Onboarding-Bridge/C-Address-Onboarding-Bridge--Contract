@@ -44,17 +44,25 @@ jobs:
 
       - name: Extract benchmark JSON
         run: |
-          # Extract the JSON block from test output
-          python3 -c "
-          import re, sys
-          with open('benchmark_output.txt') as f:
-              content = f.read()
-          match = re.search(r'\{[\s\S]*benchmark_results[\s\S]*\}', content)
-          if match:
-              print(match.group())
-          else:
-              print('{\"benchmark_results\": []}')
-          " > benchmark_results.json
+          python3 - <<'PY' > benchmark_results.json
+          import json
+          from pathlib import Path
+
+          output = Path("benchmark_output.txt").read_text()
+          begin = "===BENCHMARK_JSON_BEGIN==="
+          end = "===BENCHMARK_JSON_END==="
+          if output.count(begin) != 1 or output.count(end) != 1:
+              raise SystemExit("ERROR: benchmark JSON markers are missing or repeated")
+
+          payload = output.split(begin, 1)[1].split(end, 1)[0].strip()
+          try:
+              data = json.loads(payload)
+          except json.JSONDecodeError as error:
+              raise SystemExit(f"ERROR: benchmark JSON is invalid: {error}") from error
+          if not isinstance(data.get("benchmark_results"), list):
+              raise SystemExit("ERROR: benchmark_results must be a JSON array")
+          print(json.dumps(data, indent=2))
+          PY
           cat benchmark_results.json
 
       - name: Download previous benchmark results
