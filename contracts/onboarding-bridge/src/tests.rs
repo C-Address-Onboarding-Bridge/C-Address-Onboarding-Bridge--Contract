@@ -4229,6 +4229,49 @@ fn test_batch_fund_mints_loyalty_once() {
     assert_eq!(check_balance(&env, &loyalty_token_id, &user), 10i128);
 }
 
+#[test]
+fn test_loyalty_rewards_preserve_bridged_asset_reserves() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (bridge, user, asset, _admin) = setup_bridge(&env);
+    let bridge_id = bridge.address.clone();
+    let target = Address::generate(&env);
+
+    bridge.set_fee_bps(&1_000u32, &None);
+    bridge.set_loyalty_token(&asset, &200i128);
+    mint_tokens(&env, &asset, &bridge_id, 300i128);
+
+    bridge.fund_c_address_timelocked(
+        &user,
+        &target,
+        &asset,
+        &500i128,
+        &2_000u64,
+        &0u64,
+        &None,
+        &None,
+    );
+
+    let locked = 500i128;
+    assert!(
+        bridge.query_contract_balance(&asset) >= bridge.query_accrued_fees(&asset) + locked
+    );
+
+    for _ in 0..5 {
+        let target = Address::generate(&env);
+        bridge.fund_c_address(&user, &target, &asset, &100i128, &None, &None);
+        assert!(
+            bridge.query_contract_balance(&asset) >= bridge.query_accrued_fees(&asset) + locked
+        );
+    }
+
+    assert!(
+        count_events_with_topic(&env, &bridge_id, "LoyaltyMintSkipped") > 0,
+        "funding should skip rewards when only reserved funds remain"
+    );
+
+}
+
 #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_batch_fund_all_blocked_mints_no_loyalty() {
