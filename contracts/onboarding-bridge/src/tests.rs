@@ -5277,7 +5277,7 @@ fn test_meta_fund_rejects_pubkey_source_mismatch() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
-    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
+    let network_id = env.ledger().network_id();
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
@@ -5445,7 +5445,6 @@ fn test_meta_fund_happy_path() {
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
-    bridge.set_meta_tx_network_id(&network_id);
     bridge.add_asset(&token_id, &None);
     mint_tokens(&env, &token_id, &user, 1000i128);
 
@@ -5499,11 +5498,10 @@ fn test_meta_fund_expired_deadline_fails() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
-    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
+    let network_id = env.ledger().network_id();
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
-    bridge.set_meta_tx_network_id(&network_id);
     bridge.add_asset(&token_id, &None);
     mint_tokens(&env, &token_id, &user, 1000i128);
 
@@ -5554,11 +5552,10 @@ fn test_meta_fund_nonce_replay_rejected() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
-    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
+    let network_id = env.ledger().network_id();
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &0u32, &None);
-    bridge.set_meta_tx_network_id(&network_id);
     bridge.add_asset(&token_id, &None);
     mint_tokens(&env, &token_id, &user, 2000i128);
 
@@ -5625,11 +5622,10 @@ fn test_meta_fund_invalid_signature_fails() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
-    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
+    let network_id = env.ledger().network_id();
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
-    bridge.set_meta_tx_network_id(&network_id);
     bridge.add_asset(&token_id, &None);
     mint_tokens(&env, &token_id, &user, 1000i128);
 

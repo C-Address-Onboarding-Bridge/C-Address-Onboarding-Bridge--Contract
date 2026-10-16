@@ -252,7 +252,6 @@ pub enum DataKey {
     // Registry binding a source address to the one Ed25519 pubkey it will
     // accept meta-transaction signatures from.
     MetaSigner(Address),
-    MetaTxNetworkId,
     Deactivated,
     // Admin-managed whitelist of DEX pool addresses usable in `swap_route`.
     PoolWhitelist,
@@ -1121,10 +1120,6 @@ fn read_meta_signer(env: &Env, source: &Address) -> Option<BytesN<32>> {
     env.storage()
         .persistent()
         .get(&DataKey::MetaSigner(source.clone()))
-}
-
-fn read_meta_tx_network_id(env: &Env) -> Option<BytesN<32>> {
-    env.storage().instance().get(&DataKey::MetaTxNetworkId)
 }
 
 fn relayer_threshold(env: &Env) -> u32 {
@@ -5369,20 +5364,6 @@ impl OnboardingBridge {
         read_meta_signer(&env, &source)
     }
 
-    /// Configures the network identifier included in every meta-transaction
-    /// signature. The value should be the canonical identifier of the network
-    /// where this contract is deployed.
-    pub fn set_meta_tx_network_id(env: Env, network_id: BytesN<32>) -> Result<(), BridgeError> {
-        check_initialized(&env)?;
-        let admin = read_admin(&env);
-        admin.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::MetaTxNetworkId, &network_id);
-        extend_instance_ttl(&env);
-        Ok(())
-    }
-
     /// Execute a fund_c_address on behalf of a user who signed the parameters
     /// off-chain.
     ///
@@ -5490,7 +5471,7 @@ impl OnboardingBridge {
             _ => return Err(BridgeError::MetaTxPubkeySourceMismatch),
         }
 
-        let network_id = read_meta_tx_network_id(&env).ok_or(BridgeError::NotInitialized)?;
+        let network_id = env.ledger().network_id();
         if params.network_id != network_id {
             return Err(BridgeError::MetaTxInvalidSignature);
         }
@@ -5629,7 +5610,7 @@ impl OnboardingBridge {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetaFundParams {
-    /// Network identifier configured by the bridge admin.
+    /// Network identifier provided by the ledger (SHA-256 of its passphrase).
     pub network_id: BytesN<32>,
     /// The user's Stellar address (source of funds). `pubkey` must be the key
     /// registered for this address via `register_meta_signer` — enforced by
