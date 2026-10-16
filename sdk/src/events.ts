@@ -21,7 +21,7 @@
  * ```
  */
 
-import { SorobanRpc, scValToNative } from '@stellar/stellar-sdk';
+import { rpc, scValToNative } from '@stellar/stellar-sdk';
 
 // ---------------------------------------------------------------------------
 // Event payload types
@@ -262,7 +262,7 @@ export interface EventSubscriberConfig {
  */
 export class EventSubscriber {
   private readonly contractId: string;
-  private readonly server: SorobanRpc.Server;
+  private readonly server: rpc.Server;
   private readonly pollingIntervalMs: number;
   private readonly limit: number;
 
@@ -283,7 +283,7 @@ export class EventSubscriber {
 
   constructor(config: EventSubscriberConfig) {
     this.contractId = config.contractId;
-    this.server = new SorobanRpc.Server(config.rpcUrl);
+    this.server = new rpc.Server(config.rpcUrl);
     this.pollingIntervalMs = config.pollingIntervalMs ?? 5_000;
     this.limit = config.limit ?? 100;
     this.cursor = config.startLedger ?? 'now';
@@ -388,7 +388,7 @@ export class EventSubscriber {
   }
 
   private async fetchAndDispatch(): Promise<void> {
-    const params: SorobanRpc.Server.GetEventsRequest = {
+    const params: rpc.Server.GetEventsRequest = {
       filters: [
         {
           type: 'contract',
@@ -425,7 +425,7 @@ export class EventSubscriber {
   // Event parsing
   // -------------------------------------------------------------------------
 
-  private parseEvent(raw: SorobanRpc.Api.EventResponse): BridgeEventPayload | null {
+  private parseEvent(raw: rpc.Api.EventResponse): BridgeEventPayload | null {
     try {
       const topics = raw.topic.map((t) => scValToNative(t));
       const value = scValToNative(raw.value);
