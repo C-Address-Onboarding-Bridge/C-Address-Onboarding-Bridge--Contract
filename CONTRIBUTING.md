@@ -24,7 +24,7 @@ Ensure you have the following installed:
 |---|---|---|
 | Docker + Docker Compose | 24+ | [docs.docker.com](https://docs.docker.com/get-docker/) |
 | Node.js | 20+ LTS (18, 20, 22 recommended) | [nodejs.org](https://nodejs.org) or `nvm install 20` |
-| Rust + wasm32 target | stable | `curl https://sh.rustup.rs -sSf \| sh` then `rustup target add wasm32-unknown-unknown` |
+| Rust + wasm32 target | see `rust-toolchain.toml` | Install with `rustup` |
 | Soroban CLI | latest | `cargo install --locked stellar-cli` |
 | Git | any | — |
 
@@ -70,12 +70,12 @@ cargo build -p onboarding-bridge --release
 ### Build WASM (Soroban)
 
 ```bash
-cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
+cargo build -p onboarding-bridge --release --target wasm32v1-none
 ```
 
 The compiled WASM binary will be at:
 ```
-target/wasm32-unknown-unknown/release/onboarding_bridge.wasm
+target/wasm32v1-none/release/onboarding_bridge.wasm
 ```
 
 ## Running Tests
@@ -106,7 +106,7 @@ cd ..
 ```bash
 # Contract
 cargo build -p onboarding-bridge --release
-cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
+cargo build -p onboarding-bridge --release --target wasm32v1-none
 cargo test -p onboarding-bridge --features testutils
 
 # SDK

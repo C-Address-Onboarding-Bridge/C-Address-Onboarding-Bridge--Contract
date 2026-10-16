@@ -718,15 +718,10 @@ fn test_fund_works_after_unpause() {
     assert_eq!(check_balance(&env, &token_id, &target), 495i128);
 }
 
-// The soroban-sdk ships a known-good compiled wasm fixture used for doc/unit
-// tests. We reuse it here as our "v2" wasm to get a real BytesN<32> hash that
-// the host accepts, so we can exercise the full auth → wasm-swap → event path.
-const V2_WASM: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/wasm32-unknown-unknown/release/onboarding_bridge.wasm"
-));
+// Keep a Soroban-compatible upgrade payload in the repository so tests do not
+// depend on a previous build or a particular CARGO_TARGET_DIR.
+const V2_WASM: &[u8] = include_bytes!("../test_fixtures/onboarding_bridge.wasm");
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_upgrade_admin_only_and_event() {
     let env = Env::default();
@@ -775,9 +770,10 @@ fn test_upgrade_non_admin_rejected() {
 
 /********** Timelocked upgrade tests (execute_upgrade) **********/
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_execute_upgrade_succeeds_at_timelock_boundary_and_clears_pending() {
+    use soroban_sdk::TryFromVal;
+
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
     let (bridge_id, _) = register_all_contracts_mocked(&env);
@@ -789,7 +785,13 @@ fn test_execute_upgrade_succeeds_at_timelock_boundary_and_clears_pending() {
     // budget allows; lift the limit so the test exercises logic, not gas.
     env.cost_estimate().budget().reset_unlimited();
     let wasm_bytes = Bytes::from_slice(&env, V2_WASM);
-    let wasm_hash: BytesN<32> = env.deployer().upload_contract_wasm(wasm_bytes);
+    let wasm_hash: BytesN<32> = env.deployer().upload_contract_wasm(wasm_bytes.clone());
+    let fixture_contract = env
+        .deployer()
+        .with_address(admin.clone(), BytesN::from_array(&env, &[0xFF; 32]))
+        .deploy_v2(wasm_hash.clone(), ());
+    env.deployer()
+        .extend_ttl_for_code(fixture_contract, 25_000, 40_000);
 
     let executable_after_ledger = bridge.schedule_upgrade(&wasm_hash, &None);
     assert_eq!(
@@ -806,17 +808,20 @@ fn test_execute_upgrade_succeeds_at_timelock_boundary_and_clears_pending() {
     advance_ledger_sequence(&env, executable_after_ledger);
     bridge.execute_upgrade(&wasm_hash, &None);
 
+    let events = env.events().all();
+    let (contract_id, topics, _) = &events.get(events.len() - 1).unwrap();
+    assert_eq!(contract_id, &bridge_id);
+    assert_eq!(
+        soroban_sdk::String::try_from_val(&env, &topics.get(0).unwrap()).unwrap(),
+        "ContractUpgraded".into_val(&env)
+    );
+
     // The pending record is cleared before the wasm swap, so a second
     // execute now reports "not scheduled" rather than replaying the upgrade.
     assert_eq!(bridge.query_pending_upgrade(), None);
     assert_eq!(
         bridge.try_execute_upgrade(&wasm_hash, &None),
         Err(Ok(BridgeError::UpgradeNotScheduled))
-    );
-
-    assert_eq!(
-        count_events_with_topic(&env, &bridge_id, "ContractUpgraded"),
-        1
     );
 }
 
@@ -2076,7 +2081,10 @@ fn test_swap_records_volume_in_target_asset_units() {
         &None,
     );
 
-    assert_eq!(bridge.query_current_tier(&user).fee_bps, 100);
+    assert_eq!(
+        bridge.query_current_tier(&user, &target_token_id).fee_bps,
+        100
+    );
 }
 
 #[test]

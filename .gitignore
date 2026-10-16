@@ -14,6 +14,9 @@ deploy-config.dev.json
 
 # Compiled contract artifacts
 *.wasm
+# Checked-in Soroban-compatible upgrade fixture used by contract tests
+!contracts/onboarding-bridge/test_fixtures/
+!contracts/onboarding-bridge/test_fixtures/onboarding_bridge.wasm
 
 # Logs
 *.log
