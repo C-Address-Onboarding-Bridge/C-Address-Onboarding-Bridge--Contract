@@ -327,6 +327,7 @@ export class RelayerService {
   private nonces: NonceStore;
   private startedAt = Date.now();
   private lastEventPerChain: Map<number, string> = new Map();
+  private inFlight = new Set<string>();
   private dlqRetryTimer: ReturnType<typeof setInterval> | null = null;
   readonly dlq = new DeadLetterQueue();
 
@@ -416,49 +417,19 @@ export class RelayerService {
       return;
     }
 
-    console.log(`[relayer] event received: chain=${event.chainId} tx=${event.txHash} target=${event.target} amount=${event.amount}`);
-
-    const payloadHash = computePayloadHash(event);
-
-    // Collect signatures from all configured nodes, then deduplicate by pubkey.
-    // The contract does NOT verify that sigs contains distinct pubkeys — the doc
-    // comment on fund_c_address_crosschain explicitly delegates deduplication to
-    // relayer infrastructure.  A config mistake (two nodes sharing a key) or a
-    // malicious injection must not inflate the effective signature count past
-    // what distinct keys actually authorize.
-    const rawSigs: RelayerSig[] = await Promise.all(
-      this.config.nodes.map((node) => signWithNode(node, payloadHash)),
-    );
-    const seenPubkeys = new Set<string>();
-    const sigs: RelayerSig[] = rawSigs.filter((sig) => {
-      if (seenPubkeys.has(sig.pubkey)) {
-        console.warn(`[relayer] duplicate pubkey detected and removed: ${sig.pubkey}`);
-        return false;
-      }
-      seenPubkeys.add(sig.pubkey);
-      return true;
-    });
-
-    if (sigs.length < this.config.threshold) {
-      console.warn(`[relayer] not enough signers after dedup: have ${sigs.length}, need ${this.config.threshold}`);
-      this.dlq.enqueue(event, sigs.length, this.config.threshold, 'insufficient signers after dedup');
+    if (this.inFlight.has(key)) {
+      console.log(`[relayer] event already in flight: chain=${event.chainId} tx=${event.txHash}`);
       return;
     }
-    this.inFlight.add(key);
 
+    this.inFlight.add(key);
+    let availableSignatures = 0;
     try {
       console.log(`[relayer] event received: chain=${event.chainId} tx=${event.txHash} target=${event.target} amount=${event.amount}`);
 
       const payloadHash = computePayloadHash(event);
-
-      // Collect signatures from all configured nodes, then deduplicate by pubkey.
-      // The contract does NOT verify that sigs contains distinct pubkeys — the doc
-      // comment on fund_c_address_crosschain explicitly delegates deduplication to
-      // relayer infrastructure.  A config mistake (two nodes sharing a key) or a
-      // malicious injection must not inflate the effective signature count past
-      // what distinct keys actually authorize.
-      const rawSigs: RelayerSig[] = this.config.nodes.map((node) =>
-        signPayload(node.privateKey, payloadHash),
+      const rawSigs: RelayerSig[] = await Promise.all(
+        this.config.nodes.map((node) => signWithNode(node, payloadHash)),
       );
       const seenPubkeys = new Set<string>();
       const sigs: RelayerSig[] = rawSigs.filter((sig) => {
@@ -469,10 +440,27 @@ export class RelayerService {
         seenPubkeys.add(sig.pubkey);
         return true;
       });
+      availableSignatures = sigs.length;
+
+      if (sigs.length < this.config.threshold) {
+        console.warn(`[relayer] not enough signers after dedup: have ${sigs.length}, need ${this.config.threshold}`);
+        this.dlq.enqueue(event, sigs.length, this.config.threshold, 'insufficient signers after dedup');
+        return;
+      }
+
+      const result = await this.sdk.fundCrosschain({
+        chainId: event.chainId,
+        txHash: event.txHash,
+        target: event.target,
+        asset: event.asset,
+        amount: event.amount,
+        sigs,
+      }, this.submitterKeypair);
 
       if (result.status === 'failed') {
-        console.error(`[relayer] fundCrosschain failed: ${result.error}`);
-        this.dlq.enqueue(event, sigs.length, this.config.threshold, `submission failed: ${result.error}`);
+        const reason = result.error ?? 'unknown SDK submission failure';
+        console.error(`[relayer] fundCrosschain failed: ${reason}`);
+        this.dlq.enqueue(event, sigs.length, this.config.threshold, `submission failed: ${reason}`);
         return;
       }
 
@@ -481,9 +469,12 @@ export class RelayerService {
       this.lastEventPerChain.set(event.chainId, new Date().toISOString());
       this.dlq.remove(event.chainId, event.txHash);
       console.log(`[relayer] submitted tx=${result.hash} for chain=${event.chainId} src-tx=${event.txHash}`);
-    } catch (err: any) {
-      console.error(`[relayer] unexpected error: ${err.message}`);
-      this.dlq.enqueue(event, sigs.length, this.config.threshold, `unexpected error: ${err.message}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[relayer] unexpected error: ${message}`);
+      this.dlq.enqueue(event, availableSignatures, this.config.threshold, `unexpected error: ${message}`);
+    } finally {
+      this.inFlight.delete(key);
     }
   }
 }
