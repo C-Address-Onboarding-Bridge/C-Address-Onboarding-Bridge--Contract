@@ -16,7 +16,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as http from 'http';
 import * as path from 'path';
-import { Keypair } from '@stellar/stellar-sdk';
+import { Keypair, StrKey } from '@stellar/stellar-sdk';
 import {
   OnboardingBridgeSDK,
   CrossChainFundOptions,
@@ -242,6 +242,21 @@ function encodeAddress(address: string): Buffer {
   return crypto.createHash('sha256').update(raw).digest();
 }
 
+export function validateBridgeEvent(event: BridgeEvent): void {
+  if (!Number.isInteger(event.chainId) || event.chainId < 0 || event.chainId > 0xffffffff) {
+    throw new Error('chainId must be a u32');
+  }
+  if (!/^[0-9a-fA-F]{64}$/.test(event.txHash)) throw new Error('txHash must be 32-byte hex');
+  const amount = BigInt(event.amount);
+  if (!/^\d+$/.test(event.amount) || amount <= 0n || amount > (1n << 127n) - 1n) {
+    throw new Error('amount must be a positive i128 decimal');
+  }
+  if (!StrKey.isValidEd25519PublicKey(event.target) && !StrKey.isValidContract(event.target)) {
+    throw new Error('target must be a valid G or C address');
+  }
+  if (!StrKey.isValidContract(event.asset)) throw new Error('asset must be a valid C address');
+}
+
 function computePayloadHash(event: BridgeEvent): Buffer {
   const chainIdBuf = Buffer.alloc(4);
   chainIdBuf.writeUInt32BE(event.chainId);
@@ -413,6 +428,13 @@ export class RelayerService {
 
     if (this.nonces.has(event.chainId, event.txHash)) {
       console.log(`[relayer] duplicate event ignored: chain=${event.chainId} tx=${event.txHash}`);
+      return;
+    }
+
+    try {
+      validateBridgeEvent(event);
+    } catch (error: any) {
+      console.error(`[relayer] terminal invalid event: ${error.message}`);
       return;
     }
 

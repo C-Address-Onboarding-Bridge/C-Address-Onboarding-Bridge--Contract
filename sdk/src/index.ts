@@ -51,7 +51,8 @@
  * @packageDocumentation
  */
 
-export { OnboardingBridgeSDK, BATCH_TX_LIMIT, BASE_RESERVE_STROOPS } from './bridge';
+export { OnboardingBridgeSDK, BATCH_TX_LIMIT, BASE_RESERVE_STROOPS, computeCommitmentHash } from './bridge';
+export type { CommitmentHashOptions } from './bridge';
 export { OffRampIntegration } from './offramp';
 export { assertAccountAddress, assertContractAddress } from './validate';
 export { CachedContractClient } from './cachedBridge';

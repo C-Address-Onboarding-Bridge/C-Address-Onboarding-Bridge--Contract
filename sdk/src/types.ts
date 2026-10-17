@@ -196,8 +196,8 @@ export interface FundCAddressWithReferralOptions extends FundCOptions {
   referrer?: string;
 }
 
-export interface CommitFundOptions extends FundCOptions {
-  /** 32-byte sha256(amount_be16 || nonce_be8) commitment hash as hex. */
+export interface CommitFundOptions extends Omit<FundCOptions, 'amount'> {
+  /** Domain-separated commitment produced by `computeCommitmentHash`. */
   amountHash: string;
 
   /** Unix timestamp deadline for revealing the commitment. */

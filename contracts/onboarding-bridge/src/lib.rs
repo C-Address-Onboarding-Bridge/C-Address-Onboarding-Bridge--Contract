@@ -1087,10 +1087,17 @@ fn remove_relayer(env: &Env, pubkey: &BytesN<32>) {
         env.storage()
             .persistent()
             .remove(&DataKey::Relayer(pubkey.clone()));
-        let count = relayer_count(env);
+        let mut relayers = read_relayer_set(env);
+        if let Some(index) = relayers.first_index_of(pubkey.clone()) {
+            relayers.remove(index);
+        }
+        let count = relayers.len();
         env.storage()
             .instance()
-            .set(&DataKey::RelayerCount, &(count.saturating_sub(1)));
+            .set(&DataKey::RelayerSet, &relayers);
+        env.storage()
+            .instance()
+            .set(&DataKey::RelayerCount, &count);
     }
 }
 
