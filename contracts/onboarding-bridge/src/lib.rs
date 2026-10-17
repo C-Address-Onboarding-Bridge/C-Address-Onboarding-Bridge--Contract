@@ -4391,7 +4391,7 @@ impl OnboardingBridge {
     ///
     /// * `ttl` (`u32`) — Desired TTL in ledgers. Values below
     ///   `MIN_ALLOWED_TTL` are rejected; larger values are capped at the
-    ///   configured `MaxPersistentTtl`.
+    ///   configured `MaxInstanceTtl`.
     ///
     /// # Authorization
     ///
@@ -4408,12 +4408,8 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
-        let max_ttl = if ttl > MAX_ALLOWED_TTL {
-            MAX_ALLOWED_TTL
-        } else {
-            ttl
-        };
-        env.storage().instance().extend_ttl(max_ttl / 4, max_ttl);
+        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_instance_ttl(&env))?;
+        env.storage().instance().extend_ttl(threshold, max_ttl);
         env.events()
             .publish(("InstanceTtlExtended",), (admin, max_ttl));
         Ok(())
@@ -4452,12 +4448,7 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
-        let max_ttl = if ttl > MAX_ALLOWED_TTL {
-            MAX_ALLOWED_TTL
-        } else {
-            ttl
-        };
-        let threshold = max_ttl / 4;
+        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
         let key = DataKey::AssetStats(key_asset.clone());
         if env.storage().persistent().has(&key) {
             env.storage()
@@ -4519,7 +4510,7 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `id` (`u64`) — The commitment ID, as returned by `commit_fund`.
-    /// * `ttl` (`u32`) — Desired TTL in ledgers (capped at `MAX_ALLOWED_TTL`).
+    /// * `ttl` (`u32`) — Desired TTL in ledgers, capped at `MaxPersistentTtl`.
     ///
     /// # Authorization
     ///
@@ -4621,12 +4612,7 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
-        let max_ttl = if ttl > MAX_ALLOWED_TTL {
-            MAX_ALLOWED_TTL
-        } else {
-            ttl
-        };
-        let threshold = max_ttl / 4;
+        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
         for key in [
             DataKey::SourceDailyLimit(source.clone(), asset.clone()),
             DataKey::DailyUsage(source.clone(), asset.clone(), current_day(&env)),

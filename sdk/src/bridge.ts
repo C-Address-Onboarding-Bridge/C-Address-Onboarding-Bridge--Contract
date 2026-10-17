@@ -2432,7 +2432,7 @@ export class OnboardingBridgeSDK {
                 this.optionalNonceToScVal(options.nonce),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -2524,7 +2524,7 @@ export class OnboardingBridgeSDK {
                 this.hexBytesToScVal(options.signature, 64, 'signature'),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -3190,7 +3190,7 @@ export class OnboardingBridgeSDK {
                 this.optionalNonceToScVal(nonce),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
