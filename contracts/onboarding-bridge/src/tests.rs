@@ -5434,9 +5434,17 @@ fn sign_meta_fund_payload(
     BytesN::from_array(env, &sig.to_bytes())
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
+fn hash_meta_fund_address(env: &Env, address: &Address) -> BytesN<32> {
+    let address_str = address.to_string();
+    let address_len = address_str.len() as usize;
+    let mut address_buf = [0u8; 64];
+    address_str.copy_into_slice(&mut address_buf[..address_len]);
+    let address_bytes = Bytes::from_slice(env, &address_buf[..address_len]);
+    env.crypto().sha256(&address_bytes).into()
+}
+
 #[test]
-fn test_meta_fund_happy_path() {
+fn test_meta_fund_accepts_documented_payload_layout() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
@@ -5461,17 +5469,23 @@ fn test_meta_fund_happy_path() {
     let nonce: u64 = 0;
     let deadline: u64 = 2_000_000;
 
-    let payload_hash = build_meta_fund_payload_hash(
-        &env,
-        &bridge_id,
-        &network_id,
-        &user,
-        &target,
-        &token_id,
-        amount,
-        nonce,
-        deadline,
-    );
+    let contract_hash = hash_meta_fund_address(&env, &bridge_id);
+    let source_hash = hash_meta_fund_address(&env, &user);
+    let target_hash = hash_meta_fund_address(&env, &target);
+    let asset_hash = hash_meta_fund_address(&env, &token_id);
+
+    let mut payload = Bytes::from_slice(&env, b"meta_fund");
+    payload.append(&network_id.clone().into());
+    payload.append(&contract_hash.into());
+    payload.append(&source_hash.into());
+    payload.append(&target_hash.into());
+    payload.append(&asset_hash.into());
+    payload.extend_from_array(&amount.to_be_bytes());
+    payload.extend_from_array(&nonce.to_be_bytes());
+    payload.extend_from_array(&deadline.to_be_bytes());
+    assert_eq!(payload.len(), 201);
+
+    let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
     let signature = sign_meta_fund_payload(&env, &signing_key, &payload_hash);
 
     let params = MetaFundParams {

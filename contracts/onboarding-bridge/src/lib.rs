@@ -5391,9 +5391,9 @@ impl OnboardingBridge {
     /// 1. The *user* constructs a `MetaFundParams` struct, serialises it as:
     ///    ```text
     ///    payload = sha256(
-    ///        "meta_fund"           (8 bytes, ASCII)
+    ///        "meta_fund"           (9 bytes, ASCII)
     ///        || network_id         (32 bytes)
-    ///        || current_contract_address (address bytes)
+    ///        || current_contract_address (sha256 of strkey bytes, 32 bytes)
     ///        || source_strkey      (sha256 of strkey bytes, 32 bytes)
     ///        || target_strkey      (sha256 of strkey bytes, 32 bytes)
     ///        || asset_strkey       (sha256 of strkey bytes, 32 bytes)
