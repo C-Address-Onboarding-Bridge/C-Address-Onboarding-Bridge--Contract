@@ -141,6 +141,9 @@ export interface DeadLetterEntry {
   requiredSigners: number;
   /** Human-readable reason the event could not be submitted. */
   reason: string;
+  attempts: number;
+  nextRetryAt: string;
+  terminal?: boolean;
 }
 
 /**
@@ -164,9 +167,13 @@ export class DeadLetterQueue {
     if (this.filePath) writeJsonFileAtomic(this.filePath, this.entries);
   }
 
-  enqueue(event: BridgeEvent, available: number, required: number, reason: string): void {
+  enqueue(event: BridgeEvent, available: number, required: number, reason: string, terminal = false): void {
     // Replace any stale entry for the same event so retries don't pile up
     // duplicate rows for the same tx.
+    const previous = this.entries.find(
+      (entry) => entry.event.chainId === event.chainId && entry.event.txHash === event.txHash,
+    );
+    const attempts = (previous?.attempts ?? 0) + 1;
     this.remove(event.chainId, event.txHash);
     this.entries.push({
       event,
@@ -174,6 +181,9 @@ export class DeadLetterQueue {
       availableSigners: available,
       requiredSigners: required,
       reason,
+      attempts,
+      nextRetryAt: new Date(Date.now() + Math.min(60_000 * 2 ** (attempts - 1), 3_600_000)).toISOString(),
+      terminal,
     });
     this.persist();
     console.warn(
@@ -328,6 +338,8 @@ export class RelayerService {
   private startedAt = Date.now();
   private lastEventPerChain: Map<number, string> = new Map();
   private dlqRetryTimer: ReturnType<typeof setInterval> | null = null;
+  private retrySweepRunning = false;
+  private inFlight = new Set<string>();
   readonly dlq = new DeadLetterQueue();
 
   constructor(config: RelayerServiceConfig) {
@@ -385,11 +397,18 @@ export class RelayerService {
    * and removes the entry on success, so this simply drains what it can.
    */
   async retryDeadLetters(): Promise<void> {
-    const pending = this.dlq.all();
-    if (pending.length === 0) return;
-    console.log(`[relayer] retrying ${pending.length} dead-lettered event(s)`);
-    for (const entry of pending) {
-      await this.handleEvent(entry.event);
+    if (this.retrySweepRunning) return;
+    this.retrySweepRunning = true;
+    try {
+      const now = Date.now();
+      const pending = this.dlq.all().filter((entry) =>
+        !entry.terminal && (entry.attempts ?? 0) < 5 && Date.parse(entry.nextRetryAt ?? entry.enqueuedAt) <= now,
+      );
+      if (pending.length === 0) return;
+      console.log(`[relayer] retrying ${pending.length} dead-lettered event(s)`);
+      for (const entry of pending) await this.handleEvent(entry.event);
+    } finally {
+      this.retrySweepRunning = false;
     }
   }
 
@@ -415,6 +434,7 @@ export class RelayerService {
       console.log(`[relayer] duplicate event ignored: chain=${event.chainId} tx=${event.txHash}`);
       return;
     }
+    if (this.inFlight.has(key)) return;
 
     console.log(`[relayer] event received: chain=${event.chainId} tx=${event.txHash} target=${event.target} amount=${event.amount}`);
 
@@ -447,32 +467,18 @@ export class RelayerService {
     this.inFlight.add(key);
 
     try {
-      console.log(`[relayer] event received: chain=${event.chainId} tx=${event.txHash} target=${event.target} amount=${event.amount}`);
-
-      const payloadHash = computePayloadHash(event);
-
-      // Collect signatures from all configured nodes, then deduplicate by pubkey.
-      // The contract does NOT verify that sigs contains distinct pubkeys — the doc
-      // comment on fund_c_address_crosschain explicitly delegates deduplication to
-      // relayer infrastructure.  A config mistake (two nodes sharing a key) or a
-      // malicious injection must not inflate the effective signature count past
-      // what distinct keys actually authorize.
-      const rawSigs: RelayerSig[] = this.config.nodes.map((node) =>
-        signPayload(node.privateKey, payloadHash),
-      );
-      const seenPubkeys = new Set<string>();
-      const sigs: RelayerSig[] = rawSigs.filter((sig) => {
-        if (seenPubkeys.has(sig.pubkey)) {
-          console.warn(`[relayer] duplicate pubkey detected and removed: ${sig.pubkey}`);
-          return false;
-        }
-        seenPubkeys.add(sig.pubkey);
-        return true;
-      });
+      const result = await this.sdk.fundCrosschain({ ...event, sigs }, this.submitterKeypair);
 
       if (result.status === 'failed') {
         console.error(`[relayer] fundCrosschain failed: ${result.error}`);
-        this.dlq.enqueue(event, sigs.length, this.config.threshold, `submission failed: ${result.error}`);
+        const message = String(result.error ?? 'unknown contract error');
+        if (/ReplayedNonce/.test(message)) {
+          this.nonces.mark(event.chainId, event.txHash);
+          this.dlq.remove(event.chainId, event.txHash);
+          return;
+        }
+        const terminal = /InvalidAmount|AssetNotWhitelisted|AddressBlocked/.test(message);
+        this.dlq.enqueue(event, sigs.length, this.config.threshold, `submission failed: ${message}`, terminal);
         return;
       }
 
@@ -484,6 +490,8 @@ export class RelayerService {
     } catch (err: any) {
       console.error(`[relayer] unexpected error: ${err.message}`);
       this.dlq.enqueue(event, sigs.length, this.config.threshold, `unexpected error: ${err.message}`);
+    } finally {
+      this.inFlight.delete(key);
     }
   }
 }

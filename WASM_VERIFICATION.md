@@ -74,7 +74,7 @@ NODE_PATH=sdk/node_modules node scripts/verify-release.js --contract <CONTRACT_A
 If you built the WASM locally and want to verify it against the registry before deploying:
 
 ```bash
-NODE_PATH=sdk/node_modules node scripts/verify-release.js --wasm target/wasm32-unknown-unknown/release/onboarding_bridge.wasm
+NODE_PATH=sdk/node_modules node scripts/verify-release.js --wasm target/wasm32v1-none/release/address_onboarding_bridge.wasm
 ```
 
 ---
