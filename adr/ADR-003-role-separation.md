@@ -13,7 +13,7 @@ Split privileges into **two distinct roles**:
 
 | Role | Key stored | Can do |
 |---|---|---|
-| `admin` | `DataKey::Admin` | `set_fee_bps`, `set_fee_collector`, `propose_new_fee_collector`, `set_admin`, `propose_new_admin`, `upgrade`, `pause`, `unpause`, `add_asset`, `remove_asset`, `add_to_blocklist`, `set_daily_limit`, etc. |
+| `admin` | `DataKey::Admin` | `set_fee_bps`, `set_fee_collector`, `propose_new_fee_collector`, `set_admin`, `propose_new_admin`, `upgrade`, `pause`, `unpause`, `add_asset`, `remove_asset`, `add_to_blocklist`, `set_source_daily_limit`, etc. |
 | `fee_collector` | `DataKey::FeeCollector` | `withdraw_fees` only |
 
 - Both roles are set at `initialize` time and can be rotated by their respective current holder (`set_admin` requires admin auth; `set_fee_collector` requires admin auth too, to prevent a compromised fee collector from locking the admin out).

@@ -145,7 +145,7 @@ jobs:
       # test target is completely broken. `cargo test` is the only thing that
       # actually compiles and runs the suite.
       - name: Run contract tests
-        run: cargo test -p onboarding-bridge --features testutils 2>&1 | tee contract_test_output.txt
+        run: set -o pipefail; cargo test -p onboarding-bridge --features testutils 2>&1 | tee contract_test_output.txt
 
       # Surfaces the pass/fail count in the job summary so a suite that
       # silently shrinks (fewer tests collected, not just fewer passing) is
@@ -169,7 +169,7 @@ jobs:
       # and runs it too — same rationale as the contract test step above.
       - name: Run indexer tests
         working-directory: indexer
-        run: cargo test 2>&1 | tee ../indexer_test_output.txt
+        run: set -o pipefail; cargo test 2>&1 | tee ../indexer_test_output.txt
 
       - name: Report indexer test count
         run: |

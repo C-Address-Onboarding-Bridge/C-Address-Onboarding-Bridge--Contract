@@ -21,8 +21,7 @@ Use a **basis-points fee model** with the following properties:
 - Calculation: `fee = amount × fee_bps / 10_000` using integer arithmetic (floors to nearest stroop).
 - Per-asset fee caps: individual assets can have a tighter cap via `set_asset_fee_cap`, making `effective_bps = min(global_bps, cap)`.
 - Tiered fees: high-volume sources can receive a reduced rate stored per-source-address.
-- Fee-exempt addresses: specific addresses can be marked exempt via `add_fee_exempt`.
-- Fees accumulate in the contract under `DataKey::AccruedFees(asset)` and are claimed by the fee collector via `withdraw_fees`.
+- Fees accumulate in the `DataKey::AssetStats(asset)` record and are claimed by the fee collector via `withdraw_fees`.
 
 ## Consequences
 

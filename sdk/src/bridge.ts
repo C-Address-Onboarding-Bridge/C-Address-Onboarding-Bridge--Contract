@@ -3067,7 +3067,7 @@ export class OnboardingBridgeSDK {
     const result = await withRpcHook(
       this.hooks,
       'simulateTransaction',
-      { contractMethod: 'estimate_cost' },
+      { contractMethod: 'fund_c_address' },
       () => this.provider.simulateTransaction(tx),
     );
     const executionTimeMs = Date.now() - start;
@@ -3087,10 +3087,8 @@ export class OnboardingBridgeSDK {
         ? String(simResult.minResourceFee)
         : '0';
 
-    // The inclusion (base) fee is BASE_FEE plus any surge pricing
-    const inclusionFee = simResult.cost?.feeCharged != null
-      ? String(simResult.cost.feeCharged)
-      : BASE_FEE;
+    const feeStats = await this.provider.getFeeStats();
+    const inclusionFee = String(feeStats.sorobanInclusionFee?.p50 ?? BASE_FEE);
 
     // Total fee = inclusion + resource
     const totalFee = String(
@@ -3105,7 +3103,9 @@ export class OnboardingBridgeSDK {
     const minBalance = String(BigInt(2 + subentryCount) * baseReserve);
 
     return {
-      fee: totalFee,
+      fee: inclusionFee,
+      inclusionFee,
+      totalFee,
       minBalance,
       resourceFee,
       executionTimeMs,
