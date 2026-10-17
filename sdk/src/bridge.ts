@@ -30,6 +30,7 @@ import {
   MetaFundParams,
   ReclaimTokensOptions,
   TransactionResult,
+  ConfirmedTransactionResult,
   CrossChainFundOptions,
   RelayerManagementOptions,
   FundCAddressWithSwapOptions,
@@ -412,6 +413,22 @@ export class OnboardingBridgeSDK {
     );
   }
 
+  /**
+   * Submit a commitment and wait until the network confirms it.
+   *
+   * Unlike {@link commitFund}, this method returns the commitment ID decoded
+   * from the confirmed transaction's return value.
+   */
+  async commitFundAndWait(
+    options: CommitFundOptions,
+    sourceKeypair: Keypair,
+  ): Promise<ConfirmedTransactionResult<{ commitmentId: bigint }>> {
+    const result = await this.commitFund(options, sourceKeypair);
+    return this.waitForContractReturnValue(result, 'commitFund', (returnValue) => ({
+      commitmentId: this.decodeU64ReturnValue(returnValue),
+    }));
+  }
+
   async revealFund(
     options: RevealFundOptions,
     sourceKeypair: Keypair,
@@ -573,6 +590,22 @@ export class OnboardingBridgeSDK {
         }
       },
     );
+  }
+
+  /**
+   * Submit timelocked funding and wait for confirmation.
+   *
+   * Unlike {@link fundCAddressTimelocked}, this method returns the timelock ID
+   * decoded from the confirmed transaction's return value.
+   */
+  async fundCAddressTimelockedAndWait(
+    options: FundCTimelockedOptions,
+    sourceKeypair: Keypair,
+  ): Promise<ConfirmedTransactionResult<{ timelockId: bigint }>> {
+    const result = await this.fundCAddressTimelocked(options, sourceKeypair);
+    return this.waitForContractReturnValue(result, 'fundCAddressTimelocked', (returnValue) => ({
+      timelockId: this.decodeU64ReturnValue(returnValue),
+    }));
   }
 
   /**
@@ -2392,6 +2425,22 @@ export class OnboardingBridgeSDK {
     );
   }
 
+  /**
+   * Schedule an upgrade and wait for confirmation.
+   *
+   * Unlike {@link scheduleUpgrade}, this method returns the executable ledger
+   * decoded from the confirmed transaction's return value.
+   */
+  async scheduleUpgradeAndWait(
+    options: ScheduleUpgradeOptions,
+    adminKeypair: Keypair,
+  ): Promise<ConfirmedTransactionResult<{ executableAfterLedger: number }>> {
+    const result = await this.scheduleUpgrade(options, adminKeypair);
+    return this.waitForContractReturnValue(result, 'scheduleUpgrade', (returnValue) => ({
+      executableAfterLedger: this.decodeU32ReturnValue(returnValue),
+    }));
+  }
+
   async executeUpgrade(
     options: ExecuteUpgradeOptions,
     adminKeypair: Keypair,
@@ -3157,6 +3206,76 @@ export class OnboardingBridgeSDK {
       .addOperation(this.contract.call(method, ...args))
       .setTimeout(this.config.timeout ?? 30)
       .build();
+  }
+
+  private async waitForContractReturnValue<T>(
+    submitted: TransactionResult,
+    method: string,
+    decode: (returnValue: xdr.ScVal) => T,
+  ): Promise<ConfirmedTransactionResult<T>> {
+    if (submitted.status === 'failed') {
+      return { hash: submitted.hash, status: 'failed', error: submitted.error };
+    }
+
+    try {
+      const getTransaction = () =>
+        withRpcHook(
+          this.hooks,
+          'getTransaction',
+          { hash: submitted.hash, contractMethod: method },
+          () => this.provider.getTransaction(submitted.hash),
+        );
+      let response = await getTransaction();
+
+      while (response.status === 'NOT_FOUND') {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        response = await getTransaction();
+      }
+
+      if (response.status === 'FAILED') {
+        return {
+          hash: submitted.hash,
+          status: 'failed',
+          error: `Transaction ${submitted.hash} failed on chain`,
+        };
+      }
+
+      if (!response.returnValue) {
+        throw new Error(`Confirmed ${method} transaction did not include a return value`);
+      }
+
+      return {
+        hash: submitted.hash,
+        status: 'success',
+        ...decode(response.returnValue),
+      };
+    } catch (error: any) {
+      return {
+        hash: submitted.hash,
+        status: 'failed',
+        error: error.message || 'Failed while waiting for transaction confirmation',
+      };
+    }
+  }
+
+  private decodeU64ReturnValue(returnValue: xdr.ScVal): bigint {
+    const value = scValToNative(returnValue);
+    if (typeof value !== 'bigint' && typeof value !== 'number' && typeof value !== 'string') {
+      throw new Error('Expected a u64 transaction return value');
+    }
+    const decoded = BigInt(value);
+    if (decoded < 0n || decoded > 0xffff_ffff_ffff_ffffn) {
+      throw new Error('Transaction return value is outside the u64 range');
+    }
+    return decoded;
+  }
+
+  private decodeU32ReturnValue(returnValue: xdr.ScVal): number {
+    const value = this.decodeU64ReturnValue(returnValue);
+    if (value > 0xffff_ffffn) {
+      throw new Error('Transaction return value is outside the u32 range');
+    }
+    return Number(value);
   }
 
   private async submitAdminWasmHashMutation(

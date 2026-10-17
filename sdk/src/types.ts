@@ -725,6 +725,15 @@ export interface TransactionResult {
   error?: string;
 }
 
+/**
+ * Result returned by an SDK method that waits for transaction finality.
+ *
+ * A failed transaction has no decoded contract return value.
+ */
+export type ConfirmedTransactionResult<T> =
+  | ({ hash: string; status: 'success' } & T)
+  | { hash: string; status: 'failed'; error?: string };
+
 // ---------------------------------------------------------------------------
 // Cross-chain types
 // ---------------------------------------------------------------------------

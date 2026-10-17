@@ -107,6 +107,7 @@ describe("OnboardingBridgeSDK", () => {
       sendTransaction: jest
         .fn()
         .mockResolvedValue({ hash: "mock_tx_hash", status: "PENDING" }),
+      getTransaction: jest.fn(),
       simulateTransaction: jest.fn().mockResolvedValue({}),
       getLedgerEntries: jest.fn().mockResolvedValue(ledgerEntriesFor(0)),
     };
@@ -287,6 +288,32 @@ describe("OnboardingBridgeSDK", () => {
         expect.anything(),
       );
     });
+
+    it("returns the confirmed timelock ID", async () => {
+      mockProvider.getTransaction.mockResolvedValue({
+        status: "SUCCESS",
+        returnValue: {},
+      });
+      (scValToNative as jest.Mock).mockReturnValueOnce(12n);
+
+      const result = await sdk.fundCAddressTimelockedAndWait(
+        {
+          source: MOCK_ADDRESS,
+          target: MOCK_ASSET,
+          asset: MOCK_ASSET,
+          amount: "1000",
+          releaseTime: 2000000000,
+        },
+        mockKeypair,
+      );
+
+      expect(result).toEqual({
+        hash: "mock_tx_hash",
+        status: "success",
+        timelockId: 12n,
+      });
+      expect(mockProvider.getTransaction).toHaveBeenCalledWith("mock_tx_hash");
+    });
   });
 
   describe("fundCAddressWithSwap", () => {
@@ -406,6 +433,33 @@ describe("OnboardingBridgeSDK", () => {
         expect.anything(),
         expect.anything(),
       );
+    });
+
+    it("returns the confirmed commitment ID", async () => {
+      mockProvider.getTransaction.mockResolvedValue({
+        status: "SUCCESS",
+        returnValue: {},
+      });
+      (scValToNative as jest.Mock).mockReturnValueOnce(7n);
+
+      const result = await sdk.commitFundAndWait(
+        {
+          source: MOCK_ADDRESS,
+          target: MOCK_ASSET,
+          asset: MOCK_ASSET,
+          amount: "1000",
+          amountHash: "ab".repeat(32),
+          deadline: 123456,
+        },
+        mockKeypair,
+      );
+
+      expect(result).toEqual({
+        hash: "mock_tx_hash",
+        status: "success",
+        commitmentId: 7n,
+      });
+      expect(mockProvider.getTransaction).toHaveBeenCalledWith("mock_tx_hash");
     });
   });
 
@@ -994,6 +1048,26 @@ describe("OnboardingBridgeSDK", () => {
         expect.anything(),
         expect.anything(),
       );
+    });
+
+    it("returns the confirmed executable ledger", async () => {
+      mockProvider.getTransaction.mockResolvedValue({
+        status: "SUCCESS",
+        returnValue: {},
+      });
+      (scValToNative as jest.Mock).mockReturnValueOnce(1234);
+
+      const result = await sdk.scheduleUpgradeAndWait(
+        { newWasmHash: wasmHash, nonce: 1 },
+        mockKeypair,
+      );
+
+      expect(result).toEqual({
+        hash: "mock_tx_hash",
+        status: "success",
+        executableAfterLedger: 1234,
+      });
+      expect(mockProvider.getTransaction).toHaveBeenCalledWith("mock_tx_hash");
     });
 
     it("submits execute_upgrade", async () => {
