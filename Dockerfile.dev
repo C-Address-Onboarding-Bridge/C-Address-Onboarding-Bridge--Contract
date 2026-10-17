@@ -5,13 +5,12 @@ RUN apk add --no-cache curl
 WORKDIR /app
 
 # Install root-level deps (relayer uses sdk as a local path dep)
-COPY package*.json ./
-RUN npm install --ignore-scripts 2>/dev/null || true
-
-# Install SDK deps
 COPY sdk/package*.json ./sdk/
-RUN cd sdk && npm install
+COPY relayer/package*.json ./relayer/
+COPY package*.json ./
+RUN npm ci --ignore-scripts
 
 COPY . .
+RUN npm run build --workspace=sdk
 
 EXPOSE 3000
