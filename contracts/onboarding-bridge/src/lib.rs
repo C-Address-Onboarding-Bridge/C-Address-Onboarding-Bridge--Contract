@@ -1197,9 +1197,10 @@ fn check_daily_limit(
 // --- Asset fee cap helpers ---
 
 fn save_asset_fee_cap(env: &Env, asset: &Address, max_fee_bps: u32) {
-    env.storage()
-        .persistent()
-        .set(&DataKey::AssetFeeCap(asset.clone()), &max_fee_bps);
+    let key = DataKey::AssetFeeCap(asset.clone());
+    env.storage().persistent().set(&key, &max_fee_bps);
+    let max_ttl = read_max_persistent_ttl(env);
+    env.storage().persistent().extend_ttl(&key, max_ttl / 4, max_ttl);
 }
 
 fn read_asset_fee_cap(env: &Env, asset: &Address) -> u32 {
@@ -4464,6 +4465,10 @@ impl OnboardingBridge {
                 .persistent()
                 .extend_ttl(&key, threshold, max_ttl);
         }
+        let fee_cap_key = DataKey::AssetFeeCap(key_asset.clone());
+        if env.storage().persistent().has(&fee_cap_key) {
+            env.storage().persistent().extend_ttl(&fee_cap_key, threshold, max_ttl);
+        }
         env.events()
             .publish(("PersistentTtlExtended",), (admin, key_asset, max_ttl));
         Ok(())
@@ -4634,6 +4639,9 @@ impl OnboardingBridge {
             DataKey::SourceBridgedVolume(source.clone(), asset.clone()),
             DataKey::Nonce(source.clone()),
             DataKey::AuthNonce(source.clone()),
+            DataKey::Blocked(source.clone()),
+            DataKey::Allowlisted(source.clone()),
+            DataKey::MetaSigner(source.clone()),
         ] {
             if env.storage().persistent().has(&key) {
                 env.storage()

@@ -2907,6 +2907,8 @@ export class OnboardingBridgeSDK {
     cursor?: string,
     limit = 20,
   ): Promise<PaginatedResult<string>> {
+    if (!Number.isInteger(limit) || limit < 1) throw new RangeError('limit must be a positive integer');
+    const effectiveLimit = Math.min(limit, 100);
     const offset = this.decodeCursor(cursor);
     const result = await withRpcHook(
       this.hooks,
@@ -2915,7 +2917,7 @@ export class OnboardingBridgeSDK {
       () => this.provider.simulateTransaction(
         this.buildSimulationTx('query_whitelisted_assets', [
           nativeToScVal(offset, { type: 'u32' }),
-          nativeToScVal(limit, { type: 'u32' }),
+          nativeToScVal(effectiveLimit, { type: 'u32' }),
         ]),
       ),
     );
@@ -2929,8 +2931,8 @@ export class OnboardingBridgeSDK {
     const nextOffset = offset + page.length;
     return {
       items: page,
-      cursor: page.length === limit ? this.encodeCursor(nextOffset) : undefined,
-      hasMore: page.length === limit,
+      cursor: page.length === effectiveLimit ? this.encodeCursor(nextOffset) : undefined,
+      hasMore: page.length === effectiveLimit,
     };
   }
 

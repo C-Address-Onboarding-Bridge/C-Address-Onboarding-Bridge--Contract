@@ -796,7 +796,7 @@ await sdk.withdrawFees(
 
 ```ts
 const offramp = new OffRampIntegration({
-  moonpayApiKey: process.env.MOONPAY_API_KEY,
+  moonpayApiKey: process.env.MOONPAY_KEY,
   transakApiKey: process.env.TRANSAK_API_KEY,
   testMode: false, // true → sandbox URLs
 });
