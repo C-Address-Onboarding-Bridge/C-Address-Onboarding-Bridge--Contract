@@ -4114,11 +4114,13 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
-        if is_relayer(&env, &pubkey) && relayer_count(&env) - 1 < relayer_threshold(&env) {
+        let was_registered = is_relayer(&env, &pubkey);
+        if was_registered && relayer_count(&env) - 1 < relayer_threshold(&env) {
             return Err(BridgeError::BelowThreshold);
         }
         remove_relayer(&env, &pubkey);
         extend_instance_ttl(&env);
+        if was_registered { env.events().publish(("RelayerRemoved",), (admin, pubkey)); }
         Ok(())
     }
 
@@ -4145,8 +4147,10 @@ impl OnboardingBridge {
         if threshold > relayer_count(&env) {
             return Err(BridgeError::ThresholdExceedsRelayers);
         }
+        let old_threshold = relayer_threshold(&env);
         save_relayer_threshold(&env, threshold);
         extend_instance_ttl(&env);
+        env.events().publish(("RelayerThresholdChanged",), (admin, old_threshold, threshold));
         Ok(())
     }
 
@@ -4681,10 +4685,12 @@ impl OnboardingBridge {
         } else {
             ttl
         };
+        let old_ttl = read_max_instance_ttl(&env);
         env.storage()
             .instance()
             .set(&DataKey::MaxInstanceTtl, &capped);
         extend_instance_ttl(&env);
+        env.events().publish(("MaxInstanceTtlChanged",), (admin, old_ttl, capped));
         Ok(())
     }
 
@@ -5376,10 +5382,12 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        let old_network_id = read_meta_tx_network_id(&env);
         env.storage()
             .instance()
             .set(&DataKey::MetaTxNetworkId, &network_id);
         extend_instance_ttl(&env);
+        env.events().publish(("MetaTxNetworkIdChanged",), (admin, old_network_id, network_id));
         Ok(())
     }
 

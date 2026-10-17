@@ -1,6 +1,7 @@
 use crate::events::IndexedEvent;
 use crate::webhook::{CreateSubscription, Subscription, WebhookDelivery};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::{Sqlite, Transaction};
 use std::str::FromStr;
 
 /// Raw column tuple for a `subscriptions` row, in SELECT order:
@@ -128,7 +129,7 @@ impl Database {
         .bind(&event.tx_hash)
         .bind(&event.timestamp)
         .bind(&data_str)
-        .execute(&mut tx)
+        .execute(&mut *tx)
         .await?;
         let inserted = result.rows_affected() > 0;
 
@@ -149,7 +150,7 @@ impl Database {
         event: &IndexedEvent,
     ) -> Result<(), sqlx::Error> {
         let subs: Vec<SubscriptionRow> = sqlx::query_as(
-            "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, created_at
+            "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, secret, created_at
              FROM subscriptions WHERE active = 1",
         )
         .fetch_all(&mut *tx)
@@ -158,7 +159,7 @@ impl Database {
         let now = chrono::Utc::now().to_rfc3339();
         let data = &event.data;
 
-        for (sub_id, _url, event_type, asset_filter, source_filter, target_filter, _active, _created_at) in
+        for (sub_id, _url, event_type, asset_filter, source_filter, target_filter, _active, _secret, _created_at) in
             subs
         {
             if let Some(ref et) = event_type {
@@ -167,25 +168,13 @@ impl Database {
                 }
             }
             if let Some(ref af) = asset_filter {
-                if let Some(asset) = data.get("asset").and_then(|v| v.as_str()) {
-                    if asset != af {
-                        continue;
-                    }
-                }
+                match data.get("asset").and_then(|v| v.as_str()) { Some(asset) if asset == af => {}, _ => continue }
             }
             if let Some(ref sf) = source_filter {
-                if let Some(source) = data.get("source").and_then(|v| v.as_str()) {
-                    if source != sf {
-                        continue;
-                    }
-                }
+                match data.get("source").and_then(|v| v.as_str()) { Some(source) if source == sf => {}, _ => continue }
             }
             if let Some(ref tf) = target_filter {
-                if let Some(target) = data.get("target").and_then(|v| v.as_str()) {
-                    if target != tf {
-                        continue;
-                    }
-                }
+                match data.get("target").and_then(|v| v.as_str()) { Some(target) if target == tf => {}, _ => continue }
             }
 
             let delivery_id = uuid::Uuid::new_v4().to_string();

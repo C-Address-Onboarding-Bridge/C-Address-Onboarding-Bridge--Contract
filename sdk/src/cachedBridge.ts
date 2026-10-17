@@ -239,10 +239,17 @@ class ContractClient {
   private async invalidateAfterConfirmation(hash: string): Promise<void> {
     try {
       let result = await this.provider.getTransaction(hash);
-      while (result.status === 'NOT_FOUND') {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+      const maxAttempts = Math.max(1, (this.config.timeout ?? 30) * 2);
+      let attempts = 0;
+      while (result.status === 'NOT_FOUND' && attempts < maxAttempts) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 500);
+          if (typeof timer.unref === 'function') timer.unref();
+        });
+        attempts += 1;
         result = await this.provider.getTransaction(hash);
       }
+      if (result.status === 'NOT_FOUND') return;
       await Promise.all(CACHE_KEYS.map((key) => this.cache.delete(key)));
     } catch {
       // Cache was already invalidated on submission; confirmation invalidation
