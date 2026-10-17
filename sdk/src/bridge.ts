@@ -258,7 +258,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -331,7 +331,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -399,7 +399,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -468,7 +468,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -562,7 +562,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -625,7 +625,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -782,7 +782,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -937,7 +937,7 @@ export class OnboardingBridgeSDK {
 
             result = {
               hash: response.hash,
-              status: response.status === 'ERROR' ? 'failed' : 'pending',
+              status: response.status === 'PENDING' ? 'pending' : 'failed',
             };
           } catch (error: any) {
             result = {
@@ -1036,7 +1036,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -1120,7 +1120,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -1568,7 +1568,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -1630,7 +1630,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -1693,7 +1693,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -1753,7 +1753,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -1838,7 +1838,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -1924,7 +1924,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -2013,7 +2013,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -2083,7 +2083,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -2197,7 +2197,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -2268,7 +2268,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -2366,7 +2366,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -2452,7 +2452,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -2544,7 +2544,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -2635,7 +2635,7 @@ export class OnboardingBridgeSDK {
             () => this.provider.sendTransaction(preparedTx),
           );
 
-          return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+          return { hash: response.hash, status: response.status === 'PENDING' ? 'pending' : 'failed' };
         } catch (error: any) {
           return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
         }
@@ -2692,7 +2692,7 @@ export class OnboardingBridgeSDK {
             { contractMethod: 'add_relayer' },
             () => this.provider.sendTransaction(preparedTx),
           );
-          return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+          return { hash: response.hash, status: response.status === 'PENDING' ? 'pending' : 'failed' };
         } catch (error: any) {
           return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
         }
@@ -2745,7 +2745,7 @@ export class OnboardingBridgeSDK {
             { contractMethod: 'remove_relayer' },
             () => this.provider.sendTransaction(preparedTx),
           );
-          return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+          return { hash: response.hash, status: response.status === 'PENDING' ? 'pending' : 'failed' };
         } catch (error: any) {
           return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
         }
@@ -2802,7 +2802,7 @@ export class OnboardingBridgeSDK {
             { contractMethod: 'set_relayer_threshold' },
             () => this.provider.sendTransaction(preparedTx),
           );
-          return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+          return { hash: response.hash, status: response.status === 'PENDING' ? 'pending' : 'failed' };
         } catch (error: any) {
           return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
         }
@@ -3210,7 +3210,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {

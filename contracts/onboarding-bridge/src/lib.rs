@@ -3829,10 +3829,18 @@ impl OnboardingBridge {
         if tiers.len() > MAX_FEE_TIERS {
             return Err(BridgeError::BatchTooLarge);
         }
+        let mut previous_max: Option<i128> = None;
         for tier in tiers.iter() {
+            if tier.min_volume < 0
+                || tier.max_volume < tier.min_volume
+                || previous_max.is_some_and(|max| tier.min_volume <= max)
+            {
+                return Err(BridgeError::InvalidAmount);
+            }
             if tier.fee_bps > MAX_FEE_BPS {
                 return Err(BridgeError::FeeTooHigh);
             }
+            previous_max = Some(tier.max_volume);
         }
         let admin = read_admin(&env);
         admin.require_auth();
