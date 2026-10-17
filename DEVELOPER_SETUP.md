@@ -1,5 +1,8 @@
 # Developer Setup Guide
 
+The checked-in `.env.example` uses `API_KEY=dev-only-change-me` so the local
+indexer starts successfully. Replace it with a strong secret outside local development.
+
 Local development environment for the C-Address Onboarding Bridge — Soroban smart contract, TypeScript SDK, and off-chain relayer service.
 
 ---

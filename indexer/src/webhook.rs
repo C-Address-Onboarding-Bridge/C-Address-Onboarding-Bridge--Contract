@@ -339,11 +339,19 @@ async fn deliver_single(
         timestamp: event.timestamp,
         data: event.data,
     };
+    let body = serde_json::to_string(&payload).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+    let timestamp = chrono::Utc::now().timestamp().to_string();
+    let secret = state.db.get_subscription_secret(&delivery.subscription_id).await?
+        .ok_or_else(|| sqlx::Error::Protocol("subscription secret not found".into()))?;
+    let signature = generate_signature(&secret, &timestamp, &body);
 
     match state
         .webhook_client
         .post(&url)
-        .json(&payload)
+        .header("X-Webhook-Timestamp", &timestamp)
+        .header("X-Webhook-Signature", signature)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
