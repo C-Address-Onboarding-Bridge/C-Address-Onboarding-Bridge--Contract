@@ -50,11 +50,17 @@ export function signHex(privateKeyHex: string, payloadHashHex: string): SignResp
  * Start the signer HTTP server. `privateKeyHex` is held only in this
  * process's memory — it is never logged or echoed back in any response.
  */
-export function startSignerService(privateKeyHex: string, port: number): http.Server {
+export function startSignerService(privateKeyHex: string, port: number, authToken: string): http.Server {
+  if (!authToken) throw new Error('SIGNER_AUTH_TOKEN is required');
   const server = http.createServer((req, res) => {
     if (req.method !== 'POST' || req.url !== '/sign') {
       res.writeHead(404);
       res.end('Not Found');
+      return;
+    }
+    if (req.headers.authorization !== `Bearer ${authToken}`) {
+      res.writeHead(401);
+      res.end('Unauthorized');
       return;
     }
 
@@ -77,8 +83,9 @@ export function startSignerService(privateKeyHex: string, port: number): http.Se
     });
   });
 
-  server.listen(port, () => {
-    console.log(`[signer-service] listening on :${port} (holds one signing key only)`);
+  const host = process.env.SIGNER_HOST ?? '127.0.0.1';
+  server.listen(port, host, () => {
+    console.log(`[signer-service] listening on ${host}:${port} (holds one signing key only)`);
   });
 
   return server;
@@ -131,6 +138,11 @@ if (require.main === module) {
       process.exit(1);
     }
     const port = parseInt(process.env.SIGNER_PORT ?? '4000', 10);
-    startSignerService(privateKeyHex, port);
+    const authToken = process.env.SIGNER_AUTH_TOKEN;
+    if (!authToken) {
+      console.error('SIGNER_AUTH_TOKEN is required');
+      process.exit(1);
+    }
+    startSignerService(privateKeyHex, port, authToken);
   }
 }

@@ -180,12 +180,14 @@ pub enum BridgeError {
     MultiHopNotSupported = 43,
     /// A mutating call was re-entered while another call was already in progress.
     Reentrant = 44,
-    /// `tiers.len()` exceeds `MAX_FEE_TIERS`.
+    /// A referral points back to the source or target address.
     InvalidReferrer = 47,
     /// A requested TTL is below `MIN_ALLOWED_TTL` or above the configured maximum.
     InvalidTtl = 48,
     /// The supplied pubkey is not the registered meta-signer for `source`.
     MetaTxPubkeySourceMismatch = 49,
+    /// `tiers.len()` exceeds `MAX_FEE_TIERS`.
+    TooManyFeeTiers = 51,
     // Next free discriminant: 51. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
@@ -1735,7 +1737,7 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
 
         if targets.len() > MAX_BATCH_SIZE {
-            return Err(BridgeError::BatchTooLarge);
+            return Err(BridgeError::TooManyFeeTiers);
         }
         // #594: reject empty batches — a zero-length call transfers nothing but
         // would still emit BatchCompleted and mint loyalty rewards.
