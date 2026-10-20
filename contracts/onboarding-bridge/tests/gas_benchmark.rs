@@ -508,7 +508,7 @@ fn bench_tiered_fee_lookup() -> BenchResult {
             },
         ],
     );
-    bridge.set_fee_tiers(&tiers);
+    bridge.set_fee_tiers(&tiers, &None);
 
     // Fund once to build volume so tiered lookup is exercised.
     bridge.fund_c_address(

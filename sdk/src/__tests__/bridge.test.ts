@@ -802,7 +802,7 @@ describe("OnboardingBridgeSDK", () => {
 
   describe("setLoyaltyToken", () => {
     it("submits set_loyalty_token", async () => {
-      const result = await sdk.setLoyaltyToken(MOCK_ASSET, "10", mockKeypair);
+      const result = await sdk.setLoyaltyToken(MOCK_ASSET, "10", mockKeypair, 123);
 
       const contract = (Contract as jest.Mock).mock.results[0].value;
       expect(result.status).toBe("pending");
@@ -810,7 +810,9 @@ describe("OnboardingBridgeSDK", () => {
         "set_loyalty_token",
         expect.anything(),
         expect.anything(),
+        expect.anything(),
       );
+      expect(nativeToScVal).toHaveBeenCalledWith(BigInt(123), { type: "u64" });
     });
   });
 
@@ -819,6 +821,7 @@ describe("OnboardingBridgeSDK", () => {
       const result = await sdk.setFeeTiers(
         [{ min_volume: "0", max_volume: "1000", fee_bps: 50 }],
         mockKeypair,
+        123,
       );
 
       const contract = (Contract as jest.Mock).mock.results[0].value;
@@ -826,7 +829,9 @@ describe("OnboardingBridgeSDK", () => {
       expect(contract.call).toHaveBeenCalledWith(
         "set_fee_tiers",
         expect.anything(),
+        expect.anything(),
       );
+      expect(nativeToScVal).toHaveBeenCalledWith(BigInt(123), { type: "u64" });
     });
   });
 
@@ -1551,11 +1556,18 @@ describe("OnboardingBridgeSDK", () => {
   describe("removeRelayer", () => {
     it("returns pending status on success", async () => {
       const result = await sdk.removeRelayer(
-        { pubkey: "a".repeat(64) },
+        { pubkey: "a".repeat(64), nonce: 123 },
         mockKeypair,
       );
 
       expect(result.status).toBe("pending");
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith(
+        "remove_relayer",
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(nativeToScVal).toHaveBeenCalledWith(BigInt(123), { type: "u64" });
     });
 
     it("returns failed on network error", async () => {
@@ -1655,10 +1667,17 @@ describe("OnboardingBridgeSDK", () => {
 
   describe("setRelayerThreshold", () => {
     it("returns pending status on success", async () => {
-      const result = await sdk.setRelayerThreshold(2, mockKeypair);
+      const result = await sdk.setRelayerThreshold(2, mockKeypair, 123);
 
       expect(result.status).toBe("pending");
       expect(mockProvider.sendTransaction).toHaveBeenCalled();
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith(
+        "set_relayer_threshold",
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(nativeToScVal).toHaveBeenCalledWith(BigInt(123), { type: "u64" });
     });
   });
 

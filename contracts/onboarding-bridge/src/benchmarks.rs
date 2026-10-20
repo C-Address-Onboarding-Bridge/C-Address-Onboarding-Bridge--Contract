@@ -440,7 +440,7 @@ fn bench_fund_c_address_crosschain() {
     let relayer_signing_key = SigningKey::from_bytes(&relayer_secret);
     let relayer_pubkey = BytesN::from_array(&env, relayer_signing_key.verifying_key().as_bytes());
     bridge.add_relayer(&relayer_pubkey, &None);
-    bridge.set_relayer_threshold(&1u32);
+    bridge.set_relayer_threshold(&1u32, &None);
 
     // Fund the bridge so it can transfer to target.
     mint(&env, &token_id, &bridge_id, 10_000i128);
@@ -659,7 +659,7 @@ fn bench_execute_meta_fund() {
     let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
     bridge.register_meta_signer(&source, &pubkey);
     let network_id = BytesN::from_array(&env, &[9u8; 32]);
-    bridge.set_meta_tx_network_id(&network_id);
+    bridge.set_meta_tx_network_id(&network_id, &None);
 
     // Build the canonical meta-fund payload and sign it.
     use soroban_sdk::Bytes;
@@ -734,7 +734,7 @@ fn bench_tiered_fee_lookup() {
             },
         ],
     );
-    bridge.set_fee_tiers(&tiers);
+    bridge.set_fee_tiers(&tiers, &None);
     mint(&env, &token_id, &user, 1_000_000i128 * 2);
 
     // Fund once to build volume so the tiered lookup activates.

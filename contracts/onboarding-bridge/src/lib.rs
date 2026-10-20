@@ -3753,6 +3753,7 @@ impl OnboardingBridge {
         env: Env,
         token: Address,
         amount_per_fund: i128,
+        nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         if amount_per_fund < 0 {
@@ -3760,6 +3761,7 @@ impl OnboardingBridge {
         }
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         save_loyalty_token(&env, &token);
         save_loyalty_amount_per_fund(&env, &amount_per_fund);
         extend_instance_ttl(&env);
@@ -3823,7 +3825,11 @@ impl OnboardingBridge {
     /// # Events
     ///
     /// * `("FeeTiersSet", admin)` — data: `(tiers.len(),)`
-    pub fn set_fee_tiers(env: Env, tiers: Vec<FeeTier>) -> Result<(), BridgeError> {
+    pub fn set_fee_tiers(
+        env: Env,
+        tiers: Vec<FeeTier>,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         check_not_paused(&env)?;
         if tiers.len() > MAX_FEE_TIERS {
@@ -3836,6 +3842,7 @@ impl OnboardingBridge {
         }
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         save_fee_tiers(&env, &tiers);
         extend_instance_ttl(&env);
         env.events().publish(("FeeTiersSet", admin), (tiers.len(),));
@@ -4110,10 +4117,15 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::BelowThreshold`] — Removing this relayer would drop the
     ///   count below the required threshold.
-    pub fn remove_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
+    pub fn remove_relayer(
+        env: Env,
+        pubkey: BytesN<32>,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         if is_relayer(&env, &pubkey) && relayer_count(&env) - 1 < relayer_threshold(&env) {
             return Err(BridgeError::BelowThreshold);
         }
@@ -4138,10 +4150,15 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ThresholdExceedsRelayers`] — `threshold` is greater than
     ///   the number of registered relayers.
-    pub fn set_relayer_threshold(env: Env, threshold: u32) -> Result<(), BridgeError> {
+    pub fn set_relayer_threshold(
+        env: Env,
+        threshold: u32,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         if threshold > relayer_count(&env) {
             return Err(BridgeError::ThresholdExceedsRelayers);
         }
@@ -4404,10 +4421,15 @@ impl OnboardingBridge {
     /// # Events
     ///
     /// * `("InstanceTtlExtended",)` — data: `(admin, actual_ttl)`
-    pub fn extend_instance_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
+    pub fn extend_instance_ttl(
+        env: Env,
+        ttl: u32,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         let max_ttl = if ttl > MAX_ALLOWED_TTL {
             MAX_ALLOWED_TTL
         } else {
@@ -4448,10 +4470,12 @@ impl OnboardingBridge {
         env: Env,
         key_asset: Address,
         ttl: u32,
+        nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         let max_ttl = if ttl > MAX_ALLOWED_TTL {
             MAX_ALLOWED_TTL
         } else {
@@ -4617,10 +4641,12 @@ impl OnboardingBridge {
         source: Address,
         asset: Address,
         ttl: u32,
+        nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         let max_ttl = if ttl > MAX_ALLOWED_TTL {
             MAX_ALLOWED_TTL
         } else {
@@ -4669,10 +4695,15 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::InvalidTtl`] — `ttl` is below `MIN_ALLOWED_TTL`.
-    pub fn set_max_instance_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
+    pub fn set_max_instance_ttl(
+        env: Env,
+        ttl: u32,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         if ttl < MIN_ALLOWED_TTL {
             return Err(BridgeError::InvalidTtl);
         }
@@ -4707,7 +4738,11 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::InvalidTtl`] — `ttl` is below `MIN_ALLOWED_TTL`.
-    pub fn set_max_persistent_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
+    pub fn set_max_persistent_ttl(
+        env: Env,
+        ttl: u32,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
 
         if ttl < MIN_ALLOWED_TTL {
@@ -4716,6 +4751,7 @@ impl OnboardingBridge {
 
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
 
         let capped = ttl.min(MAX_ALLOWED_TTL);
         let old_ttl = read_max_persistent_ttl(&env);
@@ -5372,10 +5408,15 @@ impl OnboardingBridge {
     /// Configures the network identifier included in every meta-transaction
     /// signature. The value should be the canonical identifier of the network
     /// where this contract is deployed.
-    pub fn set_meta_tx_network_id(env: Env, network_id: BytesN<32>) -> Result<(), BridgeError> {
+    pub fn set_meta_tx_network_id(
+        env: Env,
+        network_id: BytesN<32>,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         env.storage()
             .instance()
             .set(&DataKey::MetaTxNetworkId, &network_id);

@@ -1647,11 +1647,12 @@ export class OnboardingBridgeSDK {
     token: string,
     amountPerFund: string | number | bigint,
     adminKeypair: Keypair,
+    nonce?: string | number | bigint,
   ): Promise<TransactionResult> {
     return withTransactionHooks(
       this.hooks,
       'setLoyaltyToken',
-      { token, amountPerFund },
+      { token, amountPerFund, nonce },
       async () => {
         try {
           assertContractAddress(token, 'token');
@@ -1671,6 +1672,7 @@ export class OnboardingBridgeSDK {
                 'set_loyalty_token',
                 new Address(token).toScVal(),
                 nativeToScVal(BigInt(amountPerFund), { type: 'i128' }),
+                this.optionalNonceToScVal(nonce),
               ),
             )
             .setTimeout(this.config.timeout ?? 30)
@@ -1709,11 +1711,12 @@ export class OnboardingBridgeSDK {
   async setFeeTiers(
     tiers: FeeTier[],
     adminKeypair: Keypair,
+    nonce?: string | number | bigint,
   ): Promise<TransactionResult> {
     return withTransactionHooks(
       this.hooks,
       'setFeeTiers',
-      { tierCount: tiers.length },
+      { tierCount: tiers.length, nonce },
       async () => {
         try {
           const adminAccount = await withRpcHook(
@@ -1731,6 +1734,7 @@ export class OnboardingBridgeSDK {
               this.contract.call(
                 'set_fee_tiers',
                 xdr.ScVal.scvVec(tiers.map((tier) => this.feeTierToScVal(tier))),
+                this.optionalNonceToScVal(nonce),
               ),
             )
             .setTimeout(this.config.timeout ?? 30)
@@ -2729,7 +2733,11 @@ export class OnboardingBridgeSDK {
             () => this.provider.getAccount(adminKeypair.publicKey()),
           );
           const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
-            .addOperation(this.contract.call('remove_relayer', xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex'))))
+            .addOperation(this.contract.call(
+              'remove_relayer',
+              xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex')),
+              this.optionalNonceToScVal(options.nonce),
+            ))
             .setTimeout(this.config.timeout ?? 30)
             .build();
           const preparedTx = await withRpcHook(
@@ -2772,11 +2780,15 @@ export class OnboardingBridgeSDK {
    * await sdk.setRelayerThreshold(2, adminKeypair);
    * ```
    */
-  async setRelayerThreshold(threshold: number, adminKeypair: Keypair): Promise<TransactionResult> {
+  async setRelayerThreshold(
+    threshold: number,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
     return withTransactionHooks(
       this.hooks,
       'setRelayerThreshold',
-      { threshold },
+      { threshold, nonce },
       async () => {
         try {
           const adminAccount = await withRpcHook(
@@ -2786,7 +2798,11 @@ export class OnboardingBridgeSDK {
             () => this.provider.getAccount(adminKeypair.publicKey()),
           );
           const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
-            .addOperation(this.contract.call('set_relayer_threshold', nativeToScVal(threshold, { type: 'u32' })))
+            .addOperation(this.contract.call(
+              'set_relayer_threshold',
+              nativeToScVal(threshold, { type: 'u32' }),
+              this.optionalNonceToScVal(nonce),
+            ))
             .setTimeout(this.config.timeout ?? 30)
             .build();
           const preparedTx = await withRpcHook(
