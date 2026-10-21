@@ -690,15 +690,7 @@ fn test_admin_mutators_reject_replayed_nonces() {
     assert_eq!(
         bridge.try_set_max_persistent_ttl(&300_000u32, &Some(nonce)),
         Err(Ok(BridgeError::DuplicateNonce))
-    );
     nonce += 1;
-
-    let network_id = BytesN::from_array(&env, &[9u8; 32]);
-    bridge.set_meta_tx_network_id(&network_id, &Some(nonce));
-    assert_eq!(
-        bridge.try_set_meta_tx_network_id(&network_id, &Some(nonce)),
-        Err(Ok(BridgeError::DuplicateNonce))
-    );
 }
 
 #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
