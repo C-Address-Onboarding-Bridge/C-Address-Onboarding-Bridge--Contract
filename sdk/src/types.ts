@@ -648,6 +648,9 @@ export interface OnRampUrlParams {
    * The provider will route funds to this address on Stellar.
    */
   cAddress: string;
+
+  /** Optional callback for signing the generated URL server-side. */
+  signer?: (url: string) => string;
 }
 
 /**

@@ -143,6 +143,10 @@ jobs:
             echo "::error::No 'test result:' line found in contract test output — the suite may not have run at all."
             exit 1
           fi
+          if [[ "$COUNT_LINE" == "test result: FAILED"* ]]; then
+            echo "::error::Contract tests reported failures: $COUNT_LINE"
+            exit 1
+          fi
           echo "$COUNT_LINE"
           {
             echo "### Contract test results"
@@ -164,6 +168,10 @@ jobs:
             echo "::error::No 'test result:' line found in indexer test output — the suite may not have run at all."
             exit 1
           fi
+          if [[ "$COUNT_LINE" == "test result: FAILED"* ]]; then
+            echo "::error::Indexer tests reported failures: $COUNT_LINE"
+            exit 1
+          fi
           echo "$COUNT_LINE"
           {
             echo "### Indexer test results"
@@ -172,6 +180,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run benchmarks
+        shell: bash
         run: |
           cargo test -p onboarding-bridge --features testutils bench_ -- --nocapture 2>/dev/null \
             | grep '^BENCH' \
