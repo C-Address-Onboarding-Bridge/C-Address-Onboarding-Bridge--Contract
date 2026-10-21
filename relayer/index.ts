@@ -117,7 +117,7 @@ async function requestRemoteSignature(
 
 /** Sign the payload hash with a single node, using whichever custody mode it's configured for. */
 async function signWithNode(node: RelayerNodeConfig, payloadHash: Buffer): Promise<RelayerSig> {
-  if (node.signerUrl) {
+  if (node.signerUrl !== undefined) {
     return requestRemoteSignature(node.signerUrl, node.expectedPubkey, payloadHash);
   }
   return signPayload(node.privateKey!, payloadHash);

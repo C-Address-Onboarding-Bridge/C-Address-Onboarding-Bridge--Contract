@@ -293,7 +293,7 @@ Workspace settings (`.vscode/settings.json`) are already configured for:
 | `ETH_EVENT_TOPIC` | optional | keccak256 of the BridgeFund event signature |
 | `SOLANA_WS_URL` | optional | Solana WebSocket endpoint |
 | `SOLANA_PROGRAM_ID` | optional | Solana bridge program id |
-| `MOONPAY_API_KEY` | optional | Moonpay on-ramp API key |
+| `MOONPAY_KEY` | optional | Moonpay on-ramp API key |
 | `TRANSAK_API_KEY` | optional | Transak on-ramp API key |
 
 ---
