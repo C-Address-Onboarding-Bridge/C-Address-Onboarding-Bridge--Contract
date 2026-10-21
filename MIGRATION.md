@@ -66,7 +66,7 @@ import { Keypair } from '@stellar/stellar-sdk';
 
 const sdk = new OnboardingBridgeSDK({
   contractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4',
-  rpcUrl: 'https://soroban-mainnet.stellar.org',
+  rpcUrl: 'https://mainnet.sorobanrpc.com',
   networkPassphrase: 'Public Global Stellar Network ; September 2015',
 });
 

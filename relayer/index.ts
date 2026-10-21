@@ -2830,6 +2830,7 @@ export function test_dead_letter_queue_persists_across_restart(): void {
     const after = new DeadLetterQueue(filePath);
     assertEqual(after.size(), 1, 'dead-letter entry must survive a restart');
     assertEqual(after.all()[0].event.txHash, makeTestEvent().txHash, 'restored entry must match the original event');
+    assertEqual(after.all()[0].reason, 'threshold not met', 'dead-letter reason must survive a restart');
   } finally {
     try { fs.unlinkSync(filePath); } catch { /* ignore */ }
   }

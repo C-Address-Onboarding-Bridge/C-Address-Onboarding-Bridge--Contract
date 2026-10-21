@@ -4363,7 +4363,10 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
     /// * [`BridgeError::TransactionExpired`] — `deadline` is in the past.
-    /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
+    /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0 or below the configured
+    ///   minimum transfer amount.
+    /// * [`BridgeError::DailyLimitExceeded`] — Transfer would exceed `source`'s
+    ///   daily limit for this asset.
     /// * [`BridgeError::InvalidReleaseTime`] — `release_time` ≤ current timestamp,
     ///   or `cliff_time > release_time`.
     /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
@@ -4402,7 +4405,7 @@ impl OnboardingBridge {
                 return Err(BridgeError::TransactionExpired);
             }
         }
-        if amount <= 0 {
+        if amount <= 0 || amount < read_minimum_amount(&env) {
             return Err(BridgeError::InvalidAmount);
         }
         if release_time <= env.ledger().timestamp() || (cliff_time > 0 && cliff_time > release_time)
@@ -4412,6 +4415,7 @@ impl OnboardingBridge {
 
         check_access(&env, &target)?;
         check_asset_whitelisted(&env, &asset)?;
+        check_daily_limit(&env, &source, &asset, amount)?;
 
         source.require_auth();
         consume_nonce(&env, &source, nonce)?;

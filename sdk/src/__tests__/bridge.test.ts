@@ -611,6 +611,33 @@ describe("OnboardingBridgeSDK", () => {
       results.forEach((r) => expect(r.status).toBe("pending"));
     });
 
+    it("increments nonces and confirms each chunk before submitting the next", async () => {
+      const targets = Array(101).fill(MOCK_ASSET);
+      const amounts = Array(101).fill("100");
+      const submissionSequence: string[] = [];
+      mockProvider.sendTransaction.mockImplementation(async () => {
+        submissionSequence.push("send");
+        return { hash: "nonce_tx", status: "PENDING" };
+      });
+      mockProvider.getTransaction.mockImplementation(async () => {
+        submissionSequence.push("confirm");
+        return { status: "SUCCESS" };
+      });
+
+      const results = await sdk.batchFundCAddresses(
+        { source: MOCK_ADDRESS, targets, amounts, asset: MOCK_ASSET, nonce: 7 },
+        mockKeypair,
+      );
+
+      const nonceValues = (nativeToScVal as jest.Mock).mock.calls
+        .filter(([, options]) => options?.type === "u64")
+        .map(([value]) => value);
+      expect(nonceValues).toEqual([7n, 8n]);
+      expect(submissionSequence).toEqual(["send", "confirm", "send"]);
+      expect(results).toHaveLength(2);
+      expect(results.every((result) => result.status === "pending")).toBe(true);
+    });
+
     it("does not split when targets count equals BATCH_TX_LIMIT exactly", async () => {
       const targets = Array(100).fill(MOCK_ASSET);
       const amounts = Array(100).fill("100");

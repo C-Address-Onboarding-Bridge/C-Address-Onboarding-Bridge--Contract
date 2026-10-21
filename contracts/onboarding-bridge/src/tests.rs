@@ -3438,6 +3438,36 @@ mod timelocked_tests {
         (bridge, user, token_id, fee_collector, admin)
     }
 
+    #[test]
+    fn test_timelocked_funding_rejects_amount_below_minimum() {
+        let env = Env::default();
+        let (bridge, user, token_id, _fee_collector, _admin) = setup_timelocked(&env);
+        let target = Address::generate(&env);
+        bridge.set_minimum_amount(&100i128, &None);
+
+        assert_eq!(
+            bridge.try_fund_c_address_timelocked(
+                &user, &target, &token_id, &50i128, &1u64, &0u64, &None, &None,
+            ),
+            Err(Ok(BridgeError::InvalidAmount))
+        );
+    }
+
+    #[test]
+    fn test_timelocked_funding_respects_daily_limit() {
+        let env = Env::default();
+        let (bridge, user, token_id, _fee_collector, _admin) = setup_timelocked(&env);
+        let target = Address::generate(&env);
+        bridge.set_source_daily_limit(&user, &token_id, &100i128, &None);
+
+        assert_eq!(
+            bridge.try_fund_c_address_timelocked(
+                &user, &target, &token_id, &101i128, &1u64, &0u64, &None, &None,
+            ),
+            Err(Ok(BridgeError::DailyLimitExceeded))
+        );
+    }
+
     #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_timelocked_happy_path() {
