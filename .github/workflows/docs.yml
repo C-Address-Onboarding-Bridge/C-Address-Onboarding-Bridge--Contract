@@ -1,11 +1,13 @@
 name: Docs
 
 on:
-  push:
+  workflow_run:
+    workflows: ["Gas Benchmarks"]
+    types: [completed]
     branches: [main]
-  workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
   pages: write
   id-token: write
@@ -17,9 +19,20 @@ concurrency:
 jobs:
   build:
     name: Build Documentation
+    if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Download benchmark dashboard
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-dashboard
+          path: _site/benchmarks
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -75,9 +88,16 @@ jobs:
             <p>Auto-generated API documentation</p>
             <a href="rust/index.html">📦 Rust Contract (cargo doc)</a>
             <a href="sdk/index.html">📘 TypeScript SDK (typedoc)</a>
+            <a href="benchmarks/index.html">📊 Gas Benchmark Dashboard</a>
           </body>
           </html>
           EOF
+
+      - name: Verify Pages site sections
+        run: |
+          test -f _site/rust/index.html
+          test -f _site/sdk/index.html
+          test -f _site/benchmarks/index.html
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

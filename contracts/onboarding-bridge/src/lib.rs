@@ -3500,10 +3500,10 @@ impl OnboardingBridge {
     /// Allows the admin to recover tokens that were accidentally sent to the
     /// contract and are not owed as fees.
     ///
-    /// While active, the reclaimable amount is
-    /// `contract_token_balance − accrued_fees − locked_timelock − crosschain_reserve`.
-    /// After an emergency migration deactivates the contract, the full
-    /// remaining balance is reclaimable so the old contract cannot strand funds.
+    /// The reclaimable amount is
+    /// `contract_token_balance − accrued_fees − locked_timelock − crosschain_reserve`,
+    /// including after an emergency migration. Existing timelocks remain
+    /// reserved and may still be claimed after deactivation.
     ///
     /// # Arguments
     ///
@@ -3520,8 +3520,8 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
-    /// * [`BridgeError::InsufficientReclaimable`] — `amount` exceeds the
-    ///   unreserved contract balance.
+    /// * [`BridgeError::InsufficientReclaimable`] — `amount` exceeds
+    ///   `contract_balance − accrued_fees − locked_timelock − crosschain_reserve`.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     ///
     /// # Events
@@ -3530,14 +3530,13 @@ impl OnboardingBridge {
     ///
     /// # Security Considerations
     ///
-    /// While active, the check
+    /// The check
     /// `reclaimable = balance − accrued_fees − locked_timelock − crosschain_reserve`
     /// ensures that fee reserves, unclaimed `TimelockEntry` deposits, and
-    /// cross-chain liquidity are ring-fenced.
-    /// After `emergency_migrate`, recovery intentionally takes precedence over
-    /// those reservations because the old contract is permanently disabled.
-    /// Unrevealed `CommitmentEntry` records never hold contract balance in the
-    /// first place.
+    /// cross-chain liquidity remain ring-fenced, including after
+    /// `emergency_migrate`. Existing timelocks can still be claimed after
+    /// deactivation; unrevealed `CommitmentEntry` records never hold contract
+    /// balance in the first place.
     pub fn reclaim_tokens(
         env: Env,
         asset: Address,
@@ -4463,7 +4462,7 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused and not deactivated.
     /// * [`BridgeError::TimelockNotFound`] — No entry exists for `id`.
     /// * [`BridgeError::TimelockNotMatured`] — `release_time` has not passed yet.
     /// * [`BridgeError::Unauthorized`] — The entry has already been claimed.
@@ -4478,10 +4477,12 @@ impl OnboardingBridge {
     /// Soroban execution is single-threaded within a ledger, this effectively
     /// prevents re-entrancy. The fee rate is the **current** global rate at
     /// claim time, which may differ from the rate at deposit time.
+    /// Claims remain available after emergency deactivation so existing
+    /// timelock deposits are not stranded.
     pub fn claim_timelocked(env: Env, id: u64) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
+        check_recovery_allowed(&env)?;
 
         let mut entry = read_timelock_entry(&env, id).ok_or(BridgeError::TimelockNotFound)?;
         if entry.claimed {

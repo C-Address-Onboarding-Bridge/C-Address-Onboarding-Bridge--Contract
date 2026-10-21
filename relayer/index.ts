@@ -2237,7 +2237,7 @@ export function validateEnv(env: NodeJS.ProcessEnv = process.env): ValidatedEnv 
 
   const relayerPrivateKeys = (env['RELAYER_PRIVATE_KEYS'] ?? '')
     .split(',')
-    .map((pk) => pk.trim())
+    .map((key) => key.trim())
     .filter(Boolean);
   const relayerSignerUrls = (env['RELAYER_SIGNER_URLS'] ?? '')
     .split(',')
@@ -2245,7 +2245,9 @@ export function validateEnv(env: NodeJS.ProcessEnv = process.env): ValidatedEnv 
     .filter(Boolean);
 
   if (relayerPrivateKeys.length === 0 && relayerSignerUrls.length === 0) {
-    throw new Error('RELAYER_PRIVATE_KEYS is required and must contain at least one key');
+    throw new Error(
+      'RELAYER_SIGNER_URLS or RELAYER_PRIVATE_KEYS is required and must contain at least one entry',
+    );
   }
 
   const stateDir = env['RELAYER_STATE_DIR']?.trim() || '.';
@@ -2473,6 +2475,21 @@ export function test_solana_env_includes_http_backfill_configuration(): void {
   const result = validateEnv(env);
   assertEqual(result.solana?.httpUrl, 'http://localhost', 'Solana HTTP URL');
   assertEqual(result.stateDir, '/tmp/relayer-state', 'relayer state directory');
+}
+
+export function test_valid_env_accepts_signer_urls_only(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test network',
+    RELAYER_SECRET_KEY: 'my-secret',
+    RELAYER_SIGNER_URLS: 'http://signer-a.internal:4000, http://signer-b.internal:4000',
+  };
+  const result = validateEnv(env);
+  assertEqual(result.relayerSignerUrls.length, 2, 'relayer signer URL count');
+  assertEqual(result.relayerSignerUrls[0], 'http://signer-a.internal:4000', 'first signer URL');
+  assertEqual(result.relayerSignerUrls[1], 'http://signer-b.internal:4000', 'second signer URL');
+  assertEqual(result.relayerPrivateKeys.length, 0, 'no private keys required with signer URLs');
 }
 
 // ---------------------------------------------------------------------------
@@ -2870,6 +2887,7 @@ export async function runRelayerSelfTests(): Promise<void> {
   test_invalid_health_port_is_rejected();
   test_valid_env_parses_correctly();
   test_solana_env_includes_http_backfill_configuration();
+  test_valid_env_accepts_signer_urls_only();
   // Issue #672: chain ids must come from env, not be hard-coded to 1/101.
   test_missing_chain_id_throws();
   test_non_numeric_chain_id_throws();
