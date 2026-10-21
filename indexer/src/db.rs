@@ -168,25 +168,13 @@ impl Database {
                 }
             }
             if let Some(ref af) = asset_filter {
-                if let Some(asset) = data.get("asset").and_then(|v| v.as_str()) {
-                    if asset != af {
-                        continue;
-                    }
-                }
+                match data.get("asset").and_then(|v| v.as_str()) { Some(asset) if asset == af => {}, _ => continue }
             }
             if let Some(ref sf) = source_filter {
-                if let Some(source) = data.get("source").and_then(|v| v.as_str()) {
-                    if source != sf {
-                        continue;
-                    }
-                }
+                match data.get("source").and_then(|v| v.as_str()) { Some(source) if source == sf => {}, _ => continue }
             }
             if let Some(ref tf) = target_filter {
-                if let Some(target) = data.get("target").and_then(|v| v.as_str()) {
-                    if target != tf {
-                        continue;
-                    }
-                }
+                match data.get("target").and_then(|v| v.as_str()) { Some(target) if target == tf => {}, _ => continue }
             }
 
             let delivery_id = uuid::Uuid::new_v4().to_string();
