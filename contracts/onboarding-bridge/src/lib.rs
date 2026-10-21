@@ -1246,9 +1246,10 @@ fn increment_source_bridged_volume(
 ) -> Result<(), BridgeError> {
     let current = read_source_bridged_volume(env, source, asset);
     let updated = safe_math::safe_add(current, amount)?;
-    env.storage()
-        .persistent()
-        .set(&DataKey::SourceBridgedVolume(source.clone(), asset.clone()), &updated);
+    env.storage().persistent().set(
+        &DataKey::SourceBridgedVolume(source.clone(), asset.clone()),
+        &updated,
+    );
     Ok(())
 }
 
@@ -1663,7 +1664,6 @@ impl OnboardingBridge {
 
         Ok(())
     }
-
 
     /// Funds multiple C-addresses in a single transaction from one source account.
     ///
@@ -2572,7 +2572,7 @@ impl OnboardingBridge {
 
         increment_user_deposit(&env, &source, &asset, amount)?;
         update_asset_counters_split(&env, &asset, protocol_fee, fee, net_amount)?;
-        increment_source_bridged_volume(&env, &source, amount)?;
+        increment_source_bridged_volume(&env, &source, &asset, amount)?;
 
         extend_instance_ttl(&env);
 
@@ -3889,7 +3889,11 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    pub fn query_current_tier(env: Env, source: Address, asset: Address) -> Result<FeeTier, BridgeError> {
+    pub fn query_current_tier(
+        env: Env,
+        source: Address,
+        asset: Address,
+    ) -> Result<FeeTier, BridgeError> {
         check_initialized(&env)?;
         Ok(find_current_tier(&env, &source, &asset).unwrap_or(FeeTier {
             min_volume: 0,
@@ -4825,7 +4829,13 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         check_not_paused(&env)?;
         source.require_auth();
-        consume_auth_nonce(&env, &source, nonce, valid_after_ledger, valid_before_ledger)
+        consume_auth_nonce(
+            &env,
+            &source,
+            nonce,
+            valid_after_ledger,
+            valid_before_ledger,
+        )
     }
 
     /// Returns the next unused auth nonce for `source`.
@@ -5292,7 +5302,7 @@ impl OnboardingBridge {
         }
 
         update_asset_counters(&env, &target_asset, fee, net_amount)?;
-        increment_source_bridged_volume(&env, &source, received_amount)?;
+        increment_source_bridged_volume(&env, &source, &target_asset, received_amount)?;
 
         mint_loyalty_tokens(&env, &source);
 
@@ -5563,7 +5573,8 @@ impl OnboardingBridge {
         );
 
         let global_fee_bps = read_fee_bps(&env);
-        let tiered_fee_bps = get_tiered_fee_bps(&env, &params.source, &params.asset, global_fee_bps);
+        let tiered_fee_bps =
+            get_tiered_fee_bps(&env, &params.source, &params.asset, global_fee_bps);
         let effective_fee_bps = get_effective_fee_bps(&env, &params.asset, tiered_fee_bps);
         let fee = calculate_fee(params.amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(params.amount, fee)?;

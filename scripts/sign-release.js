@@ -18,6 +18,7 @@ async function main() {
 
   if (!fs.existsSync(wasmPath)) {
     console.error(`Error: WASM file not found at: ${wasmPath}`);
+    console.error('Please run "cargo build -p onboarding-bridge --release --target wasm32v1-none" first.');
     process.exit(1);
   }
 

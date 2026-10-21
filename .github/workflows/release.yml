@@ -19,7 +19,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.84.0
+          toolchain: 1.88.0
           targets: wasm32v1-none
 
       - name: Cache cargo registry
@@ -34,13 +34,21 @@ jobs:
             ${{ runner.os }}-cargo-release-
 
       - name: Build release WASM
-        run: cargo build --release --target wasm32v1-none
+        run: cargo build -p onboarding-bridge --release --target wasm32v1-none
 
       - name: Verify WASM hash
         run: |
-          WASM_PATH="target/wasm32v1-none/release/address_onboarding_bridge.wasm"
+          WASM_PATH="target/wasm32v1-none/release/onboarding_bridge.wasm"
           if [ ! -f "$WASM_PATH" ]; then
             echo "::error::Expected WASM artifact not found at $WASM_PATH"
+            exit 1
+          fi
+          ACTUAL_HASH=$(sha256sum "$WASM_PATH" | awk '{print $1}')
+          EXPECTED_HASH=$(cat wasm_hash.txt | tr -d '[:space:]')
+          echo "Expected: $EXPECTED_HASH"
+          echo "Actual:   $ACTUAL_HASH"
+          if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
+            echo "::error::WASM hash mismatch. wasm_hash.txt is not reproducible with the pinned toolchain."
             exit 1
           fi
 
@@ -57,21 +65,13 @@ jobs:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
           VERSION: ${{ github.ref_name }}
           COMMIT_SHA: ${{ github.sha }}
-        run: node scripts/sign-release.js target/wasm32v1-none/release/address_onboarding_bridge.wasm
-          ACTUAL_HASH=$(sha256sum "$WASM_PATH" | awk '{print $1}')
-          EXPECTED_HASH=$(cat wasm_hash.txt | tr -d '[:space:]')
-          echo "Expected: $EXPECTED_HASH"
-          echo "Actual:   $ACTUAL_HASH"
-          if [ "$ACTUAL_HASH" != "$EXPECTED_HASH" ]; then
-            echo "::error::WASM hash mismatch. wasm_hash.txt is not reproducible with the pinned toolchain."
-            exit 1
-          fi
+        run: node scripts/sign-release.js target/wasm32v1-none/release/onboarding_bridge.wasm
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            target/wasm32v1-none/release/address_onboarding_bridge.wasm
+            target/wasm32v1-none/release/onboarding_bridge.wasm
             registry/releases.json
             registry/address_onboarding_bridge-${{ github.ref_name }}-verification.json
           generate_release_notes: true

@@ -2694,6 +2694,37 @@ export function test_nonce_store_persists_across_restart(): void {
   }
 }
 
+export function test_service_persistent_state_survives_reconstruction(): void {
+  const stateDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'relayer-service-state-'));
+  const config: RelayerServiceConfig = {
+    contractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4',
+    rpcUrl: 'http://localhost:8000',
+    networkPassphrase: 'Test SDF Network ; September 2015',
+    submitterSecretKey: Keypair.random().secret(),
+    threshold: 1,
+    nodes: [],
+    listeners: [],
+    dlqRetryIntervalMs: 0,
+    nonceStorePath: path.join(stateDir, 'nonces.json'),
+    deadLetterQueuePath: path.join(stateDir, 'dead-letter-queue.json'),
+  };
+  const event = makeTestEvent();
+  try {
+    const before = new RelayerService(config);
+    (before as any).nonces.mark(event.chainId, event.txHash);
+    before.dlq.enqueue(event, 0, 1, 'persistence test');
+
+    const after = new RelayerService(config);
+    assert(
+      (after as any).nonces.has(event.chainId, event.txHash),
+      'nonce marked before service reconstruction must remain present',
+    );
+    assertEqual(after.dlq.size(), 1, 'dead-letter entry must survive service reconstruction');
+  } finally {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+}
+
 export function test_dead_letter_queue_persists_across_restart(): void {
   const filePath = tempStorePath('dlq');
   try {
@@ -2722,6 +2753,7 @@ export async function runRelayerSelfTests(): Promise<void> {
   await test_successful_retry_removes_dlq_entry();
   await test_signer_url_node_signs_via_remote_call_not_local_key();
   await test_mixed_signer_url_and_private_key_nodes_meet_threshold();
+  test_service_persistent_state_survives_reconstruction();
   test_eth_listener_decodes_realistic_abi_log_fixture();
   test_eth_listener_derives_txhash_from_log_not_event_data();
   test_eth_listener_rejects_log_missing_transaction_hash();

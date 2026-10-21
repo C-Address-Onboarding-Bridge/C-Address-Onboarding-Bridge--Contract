@@ -19,7 +19,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.84.0
+          toolchain: 1.88.0
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown,wasm32v1-none
 
@@ -43,7 +43,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.84.0
+          toolchain: 1.88.0
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -86,7 +86,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.84.0
+          toolchain: 1.88.0
           targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Cache cargo dependencies
@@ -105,18 +105,14 @@ jobs:
       - name: Build contract
         run: cargo build -p onboarding-bridge --release
 
-      # wasm32v1-none is the current canonical Soroban deployment target; build
-      # it too so CI actually exercises the artifact that gets deployed, not
-      # just the legacy wasm32-unknown-unknown target the hash below is pinned to.
+      # wasm32v1-none is the canonical Soroban release artifact. Its hash is
+      # verified below using the same Rust toolchain and target as release.yml.
       - name: Build WASM (wasm32v1-none)
         run: cargo build -p onboarding-bridge --release --target wasm32v1-none
 
-      # TODO(next-bounty): advisory only until wasm_hash.txt is refreshed from
-      # the pinned toolchain's reproducible build.
       - name: Verify WASM Hash
-        continue-on-error: true
         run: |
-          COMPUTED_HASH=$(sha256sum target/wasm32-unknown-unknown/release/onboarding_bridge.wasm | cut -d' ' -f1)
+          COMPUTED_HASH=$(sha256sum target/wasm32v1-none/release/onboarding_bridge.wasm | cut -d' ' -f1)
           if [ ! -f wasm_hash.txt ]; then
             echo "::error::wasm_hash.txt not found!"
             exit 1
@@ -277,7 +273,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.84.0
+          toolchain: 1.88.0
           targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Pin Soroban SDK major version
@@ -309,7 +305,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.84.0
+          toolchain: 1.88.0
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown,wasm32v1-none
 

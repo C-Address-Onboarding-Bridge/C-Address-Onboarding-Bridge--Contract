@@ -1,8 +1,8 @@
 # Soroban Contract WASM Verification Guide
 
-This repository implements a robust, reproducible build and verification system for the **C-Address Onboarding Bridge** Soroban smart contract. 
+This repository documents how to build and verify the **C-Address Onboarding Bridge** Soroban smart contract.
 
-Every release is compiled in a clean CI environment, its SHA-256 hash is computed, signed by the release authority, and published to a verification registry. Users and auditors can independently verify that the deployed on-chain contract matches the audited source code.
+`wasm_hash.txt` is the SHA-256 hash of `onboarding_bridge.wasm`, built for `wasm32v1-none` with Rust 1.88.0 from `rust-toolchain.toml`. CI and release workflows build and verify that same artifact. The release signing script can publish a matching hash and signature to the verification registry.
 
 ---
 
@@ -10,8 +10,8 @@ Every release is compiled in a clean CI environment, its SHA-256 hash is compute
 
 ```mermaid
 graph TD
-    A[Source Code] -->|Git Tag / Release| B(GitHub Actions CI)
-    B -->|Build WASM| C[onboarding_bridge.wasm]
+    A[Source Code] -->|contract-v* / v* tags| B(GitHub Actions)
+    B -->|Rust 1.88.0, wasm32v1-none| C[onboarding_bridge.wasm]
     C -->|Compute SHA-256| D[WASM Hash]
     D -->|Sign with Release Key| E[Signature]
     E -->|Publish| F[registry/releases.json]
@@ -24,29 +24,28 @@ graph TD
 
 ---
 
-## 1. Continuous Integration (CI) Verification
+## 1. Release tag convention
 
-In every PR and push to `main`, the CI workflow [ci.yml](.github/workflows/ci.yml) builds the contract WASM and verifies its SHA-256 hash matches the known good hash in [wasm_hash.txt](wasm_hash.txt):
+`contract-v*` is the canonical contract release path. The [publish.yml](.github/workflows/publish.yml) workflow verifies the pinned WASM artifact, publishes the crate, and creates the GitHub Release. The [release.yml](.github/workflows/release.yml) `v*` workflow is retained as a legacy artifact-only path; it also builds and verifies the same artifact but does not publish the crate.
+
+## 2. Continuous Integration (CI) Verification
+
+In every PR and push to `main`, [ci.yml](.github/workflows/ci.yml) builds the contract WASM using Rust 1.88.0 and `wasm32v1-none`, then verifies its SHA-256 hash against [wasm_hash.txt](wasm_hash.txt):
 
 ```bash
-# Verify steps executed in CI
-COMPUTED_HASH=$(sha256sum target/wasm32-unknown-unknown/release/onboarding_bridge.wasm | cut -d' ' -f1)
+cargo build -p onboarding-bridge --release --target wasm32v1-none
+COMPUTED_HASH=$(sha256sum target/wasm32v1-none/release/onboarding_bridge.wasm | cut -d' ' -f1)
 KNOWN_HASH=$(cat wasm_hash.txt | xargs)
 test "$COMPUTED_HASH" = "$KNOWN_HASH"
 ```
 
-If you intentionally modify the contract, you must update the hash in `wasm_hash.txt` to match the new build output.
+If you intentionally modify the contract or change the pinned toolchain, rebuild with the pinned toolchain and update `wasm_hash.txt` to match.
 
 ---
 
-## 2. Release Registry
+## 3. Release Registry
 
-For each official release, the [release.yml](.github/workflows/release.yml) workflow:
-1. Builds the contract WASM in a clean runner.
-2. Computes the SHA-256 hash.
-3. Signs the hash using the `RELEASE_SIGNING_KEY` (stored securely in GitHub Secrets).
-4. Appends/updates the release metadata in [registry/releases.json](registry/releases.json).
-5. Uploads the standalone verification metadata file (`onboarding_bridge-<version>-verification.json`) directly to the GitHub Release assets.
+The [scripts/sign-release.js](scripts/sign-release.js) script signs the pinned WASM hash using `RELEASE_SIGNING_KEY` and writes release metadata to [registry/releases.json](registry/releases.json). This registry-signing step is separate from the GitHub Actions release workflows.
 
 ---
 
@@ -74,7 +73,7 @@ NODE_PATH=sdk/node_modules node scripts/verify-release.js --contract <CONTRACT_A
 If you built the WASM locally and want to verify it against the registry before deploying:
 
 ```bash
-NODE_PATH=sdk/node_modules node scripts/verify-release.js --wasm target/wasm32v1-none/release/address_onboarding_bridge.wasm
+NODE_PATH=sdk/node_modules node scripts/verify-release.js --wasm target/wasm32v1-none/release/onboarding_bridge.wasm
 ```
 
 ---
