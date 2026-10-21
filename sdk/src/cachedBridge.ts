@@ -274,6 +274,8 @@ class ContractClient {
             new Address(options.asset),
             { value: BigInt(options.amount), type: 'i128' },
           ]),
+          options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' }),
+          options.deadline === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.deadline), { type: 'u64' }),
         ),
       );
 
@@ -304,6 +306,8 @@ class ContractClient {
             { value: BigInt(options.minTargetAmount), type: 'i128' },
             options.swapRoute.map((address: string) => new Address(address)),
           ]),
+          options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' }),
+          options.deadline === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.deadline), { type: 'u64' }),
         ),
       );
 
@@ -336,7 +340,7 @@ class ContractClient {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(
-        this.contract.call('set_fee_bps', ...toScVals([newFeeBps])),
+        this.contract.call('set_fee_bps', nativeToScVal(newFeeBps, { type: 'u32' }), xdr.ScVal.scvVoid()),
       );
 
     return this.submitMutation('setFee', tx, adminKeypair);
@@ -350,7 +354,7 @@ class ContractClient {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(
-        this.contract.call('set_fee_collector', ...toScVals([new Address(newFeeCollector)])),
+        this.contract.call('set_fee_collector', ...toScVals([new Address(newFeeCollector)]), xdr.ScVal.scvVoid()),
       );
 
     return this.submitMutation('setFeeCollector', tx, adminKeypair);
@@ -364,7 +368,7 @@ class ContractClient {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(
-        this.contract.call('set_admin', ...toScVals([new Address(newAdmin)])),
+        this.contract.call('set_admin', ...toScVals([new Address(newAdmin)]), xdr.ScVal.scvVoid()),
       );
 
     return this.submitMutation('setAdmin', tx, adminKeypair);

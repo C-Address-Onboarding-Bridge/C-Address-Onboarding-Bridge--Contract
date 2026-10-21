@@ -3642,8 +3642,10 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         let mut whitelist = read_whitelist(&env);
-        whitelist.remove(asset);
+        let was_present = whitelist.get(asset.clone()).unwrap_or(false);
+        whitelist.remove(asset.clone());
         save_whitelist(&env, &whitelist);
+        env.events().publish(("AssetRemoved",), (admin, asset, was_present));
         Ok(())
     }
 
@@ -3727,8 +3729,10 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         let mut whitelist = read_pool_whitelist(&env);
-        whitelist.set(pool, true);
+        let was_present = whitelist.get(pool.clone()).unwrap_or(false);
+        whitelist.set(pool.clone(), true);
         save_pool_whitelist(&env, &whitelist);
+        env.events().publish(("SwapPoolAdded",), (admin, pool, was_present));
         Ok(())
     }
 
@@ -3762,8 +3766,10 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         let mut whitelist = read_pool_whitelist(&env);
-        whitelist.remove(pool);
+        let was_present = whitelist.get(pool.clone()).unwrap_or(false);
+        whitelist.remove(pool.clone());
         save_pool_whitelist(&env, &whitelist);
+        env.events().publish(("SwapPoolRemoved",), (admin, pool, was_present));
         Ok(())
     }
 
