@@ -16,7 +16,7 @@ reqwest = { version = "0.11", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "migrate"] }
-axum = "0.7"
+axum = "0.8"
 tower-http = { version = "0.5", features = ["cors"] }
 subtle = "2"
 tracing = "0.1"
