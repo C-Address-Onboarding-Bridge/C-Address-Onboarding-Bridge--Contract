@@ -611,10 +611,13 @@ export class OnboardingBridgeSDK {
 
   /**
    * Claim a matured timelocked funding entry.
+   * Smart-contract targets must provide `authorizeTarget`, which signs the
+   * Soroban authorization entries added during transaction preparation.
    */
   async claimTimelocked(
-    id: number,
-    targetKeypair: Keypair,
+    id: string | number | bigint,
+    transactionSourceKeypair: Keypair,
+    authorizeTarget?: (preparedTransaction: any) => Promise<void>,
   ): Promise<TransactionResult> {
     return withTransactionHooks(
       this.hooks,
@@ -625,8 +628,8 @@ export class OnboardingBridgeSDK {
           const targetAccount = await withRpcHook(
             this.hooks,
             'getAccount',
-            { address: targetKeypair.publicKey() },
-            () => this.provider.getAccount(targetKeypair.publicKey()),
+            { address: transactionSourceKeypair.publicKey() },
+            () => this.provider.getAccount(transactionSourceKeypair.publicKey()),
           );
 
           const tx = new TransactionBuilder(targetAccount, {
@@ -648,7 +651,11 @@ export class OnboardingBridgeSDK {
             { contractMethod: 'claim_timelocked' },
             () => this.provider.prepareTransaction(tx),
           );
-          preparedTx.sign(targetKeypair);
+          if (!authorizeTarget) {
+            throw new Error('authorizeTarget is required for the C-address timelock target');
+          }
+          await authorizeTarget(preparedTx);
+          preparedTx.sign(transactionSourceKeypair);
 
           const response = await withRpcHook(
             this.hooks,

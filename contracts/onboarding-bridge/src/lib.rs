@@ -1787,15 +1787,6 @@ impl OnboardingBridge {
         let contract_addr = env.current_contract_address();
         token_client.transfer(&source, &contract_addr, &total);
 
-        // Aggregate amounts per unique target to minimize transfer count.
-        let mut aggregated: Map<Address, i128> = Map::new(&env);
-        for i in 0..targets.len() {
-            let target = targets.get(i).unwrap();
-            let amount = amounts.get(i).unwrap();
-            let updated = safe_math::safe_add(aggregated.get(target.clone()).unwrap_or(0), amount)?;
-            aggregated.set(target, updated);
-        }
-
         let global_fee_bps = read_fee_bps(&env);
         let tiered_fee_bps = get_tiered_fee_bps(&env, &source, &asset, global_fee_bps);
         let effective_fee_bps = get_effective_fee_bps(&env, &asset, tiered_fee_bps);
@@ -1804,7 +1795,9 @@ impl OnboardingBridge {
         let mut num_failures: u32 = 0;
         let mut refund_total: i128 = 0;
 
-        for (target, amount) in aggregated.iter() {
+        for i in 0..targets.len() {
+            let target = targets.get(i).unwrap();
+            let amount = amounts.get(i).unwrap();
             if check_access(&env, &target).is_err() {
                 num_failures += 1;
                 refund_total = safe_math::safe_add(refund_total, amount)?;

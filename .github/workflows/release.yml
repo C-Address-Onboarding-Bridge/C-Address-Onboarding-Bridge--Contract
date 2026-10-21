@@ -43,6 +43,21 @@ jobs:
             echo "::error::Expected WASM artifact not found at $WASM_PATH"
             exit 1
           fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install release dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Sign release metadata
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          VERSION: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: node scripts/sign-release.js target/wasm32v1-none/release/address_onboarding_bridge.wasm
           ACTUAL_HASH=$(sha256sum "$WASM_PATH" | awk '{print $1}')
           EXPECTED_HASH=$(cat wasm_hash.txt | tr -d '[:space:]')
           echo "Expected: $EXPECTED_HASH"
@@ -55,5 +70,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/wasm32v1-none/release/address_onboarding_bridge.wasm
+          files: |
+            target/wasm32v1-none/release/address_onboarding_bridge.wasm
+            registry/releases.json
+            registry/address_onboarding_bridge-${{ github.ref_name }}-verification.json
           generate_release_notes: true
