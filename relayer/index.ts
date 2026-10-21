@@ -413,7 +413,13 @@ export class RelayerService {
 
   start(): void {
     for (const listener of this.config.listeners) {
-      listener.start((event) => this.handleEvent(event));
+      // Return the promise so listeners only advance their cursors once the
+      // event has been handled; swallow (and log) rejections so a handler
+      // failure cannot surface as an unhandled rejection in the listener.
+      listener.start((event) => this.handleEvent(event).catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[relayer] event handler failed after dead-lettering: ${message}`);
+      }));
     }
 
     const retryIntervalMs = this.config.dlqRetryIntervalMs ?? 60_000;
@@ -507,9 +513,23 @@ export class RelayerService {
     try {
       console.log(`[relayer] event received: chain=${event.chainId} tx=${event.txHash} target=${event.target} amount=${event.amount}`);
       const payloadHash = computePayloadHash(event);
-      const rawSigs: RelayerSig[] = await Promise.all(
+
+      // Collect whatever signatures are available, then deduplicate by pubkey.
+      const settled = await Promise.allSettled(
         this.config.nodes.map((node) => signWithNode(node, payloadHash)),
       );
+      const rawSigs: RelayerSig[] = [];
+      settled.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          rawSigs.push(result.value);
+        } else {
+          const message = result.reason instanceof Error
+            ? result.reason.message
+            : String(result.reason);
+          console.error(`[relayer] signer ${index + 1} failed: ${message}`);
+        }
+      });
+
       const seenPubkeys = new Set<string>();
       sigs = rawSigs.filter((sig) => {
         if (seenPubkeys.has(sig.pubkey)) {
@@ -519,7 +539,6 @@ export class RelayerService {
         seenPubkeys.add(sig.pubkey);
         return true;
       });
-
       if (sigs.length < this.config.threshold) {
         this.dlq.enqueue(event, sigs.length, this.config.threshold, 'insufficient signers after dedup');
         return;
@@ -1597,6 +1616,44 @@ export async function test_mixed_signer_url_and_private_key_nodes_meet_threshold
     assertEqual(calls, 1, 'a mix of remote and local signers should still meet the threshold');
   } finally {
     (globalThis as any).fetch = originalFetch;
+  }
+}
+
+export async function test_failed_signer_does_not_block_threshold_met(): Promise<void> {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.includes('signer-fails')) {
+      throw new Error('signer unavailable');
+    }
+    const pubkey = url.includes('signer-b') ? 'bb'.repeat(32) : 'aa'.repeat(32);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ pubkey, signature: 'cc'.repeat(64) }),
+    } as Response;
+  };
+  try {
+    let calls = 0;
+    const service = makeTestService({
+      threshold: 2,
+      nodes: [
+        { signerUrl: 'http://signer-a.internal:4000' },
+        { signerUrl: 'http://signer-b.internal:4000' },
+        { signerUrl: 'http://signer-fails.internal:4000' },
+      ],
+      fundCrosschain: async () => {
+        calls += 1;
+        return { status: 'pending', hash: 'hash' };
+      },
+    });
+
+    await (service as any).handleEvent(makeTestEvent());
+
+    assertEqual(calls, 1, 'two successful signers should meet threshold despite one failed signer');
+    assertEqual(service.dlq.size(), 0, 'meeting threshold should not dead-letter the event');
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 }
 
@@ -2849,6 +2906,7 @@ export async function runRelayerSelfTests(): Promise<void> {
   await test_signer_url_node_signs_via_remote_call_not_local_key();
   await test_mixed_signer_url_and_private_key_nodes_meet_threshold();
   test_service_persistent_state_survives_reconstruction();
+  await test_failed_signer_does_not_block_threshold_met();
   test_eth_listener_decodes_realistic_abi_log_fixture();
   test_eth_listener_derives_txhash_from_log_not_event_data();
   test_eth_listener_rejects_log_missing_transaction_hash();

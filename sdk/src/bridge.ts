@@ -1612,11 +1612,12 @@ export class OnboardingBridgeSDK {
     const scVal = (result as any).results?.[0]?.retval;
     if (!scVal) return {};
 
-    const native = scValToNative(scVal) as Map<string, bigint>;
+    const native = scValToNative(scVal) as Record<string, bigint> | Map<string, bigint>;
     const out: Record<string, string> = {};
-    native.forEach((value, key) => {
+    const entries = native instanceof Map ? native.entries() : Object.entries(native);
+    for (const [key, value] of entries) {
       out[key] = value.toString();
-    });
+    }
     return out;
   }
 

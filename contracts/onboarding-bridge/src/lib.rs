@@ -4068,7 +4068,8 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
-    /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
+    /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0 or below the configured
+    ///   minimum transfer amount.
     /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode on and `target`
     ///   is not allowlisted.
@@ -4112,7 +4113,7 @@ impl OnboardingBridge {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
-        if amount <= 0 {
+        if amount <= 0 || amount < read_minimum_amount(&env) {
             return Err(BridgeError::InvalidAmount);
         }
         check_access(&env, &target)?;
