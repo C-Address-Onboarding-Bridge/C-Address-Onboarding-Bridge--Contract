@@ -985,6 +985,10 @@ export interface CostEstimate {
    * This is the minimum fee required for the transaction to be included.
    */
   fee: string;
+  /** Inclusion fee selected from current Soroban fee statistics. */
+  inclusionFee: string;
+  /** Inclusion fee plus the simulated Soroban resource fee. */
+  totalFee: string;
   /**
    * Minimum account balance required to submit the transaction, in stroops.
    * Accounts below this balance cannot submit transactions.

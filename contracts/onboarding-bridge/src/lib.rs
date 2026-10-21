@@ -3275,6 +3275,7 @@ impl OnboardingBridge {
             .set(&DataKey::Blocked(address.clone()), &true);
         env.events()
             .publish(("AddressBlocklisted", address), (admin,));
+        extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -3308,6 +3309,7 @@ impl OnboardingBridge {
             .remove(&DataKey::Blocked(address.clone()));
         env.events()
             .publish(("AddressUnblocklisted", address), (admin,));
+        extend_instance_ttl(&env);
 
         Ok(())
     }
@@ -3345,6 +3347,7 @@ impl OnboardingBridge {
             .set(&DataKey::Allowlisted(address.clone()), &true);
         env.events()
             .publish(("AddressAllowlisted", address), (admin,));
+        extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -3381,6 +3384,7 @@ impl OnboardingBridge {
             .remove(&DataKey::Allowlisted(address.clone()));
         env.events()
             .publish(("AddressUnallowlisted", address), (admin,));
+        extend_instance_ttl(&env);
 
         Ok(())
     }
@@ -3419,6 +3423,7 @@ impl OnboardingBridge {
         set_allowlist_mode_flag(&env, enabled);
         env.events()
             .publish(("AllowlistModeChanged", old_enabled, enabled), (admin,));
+        extend_instance_ttl(&env);
         Ok(())
     }
 
