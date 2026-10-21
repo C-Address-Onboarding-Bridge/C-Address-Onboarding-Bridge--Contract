@@ -359,6 +359,10 @@ jobs:
       - name: TypeScript type-check
         run: npx tsc --noEmit
 
+      - name: Check SDK documentation examples
+        working-directory: .
+        run: node scripts/check-migration-sdk-docs.js
+
       - name: Build SDK
         run: npm run build
 

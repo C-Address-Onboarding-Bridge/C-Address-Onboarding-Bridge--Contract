@@ -80,6 +80,40 @@ import {
   TransactionBuilder,
   BASE_FEE,
 } from '@stellar/stellar-sdk';
+import { createHash } from 'crypto';
+
+export interface CommitmentHashOptions {
+  contractId: string;
+  networkPassphrase: string;
+  source: string;
+  target: string;
+  asset: string;
+  amount: string | number | bigint;
+  nonce: string | number | bigint;
+}
+
+export function computeCommitmentHash(options: CommitmentHashOptions): string {
+  const amount = BigInt(options.amount);
+  const nonce = BigInt(options.nonce);
+  if (amount <= 0n || amount > (1n << 127n) - 1n) throw new Error('amount must fit a positive i128');
+  if (nonce < 0n || nonce > (1n << 64n) - 1n) throw new Error('nonce must fit a u64');
+  const amountBytes = Buffer.alloc(16);
+  amountBytes.writeBigUInt64BE(amount >> 64n, 0);
+  amountBytes.writeBigUInt64BE(amount & ((1n << 64n) - 1n), 8);
+  const nonceBytes = Buffer.alloc(8);
+  nonceBytes.writeBigUInt64BE(nonce);
+  const networkId = createHash('sha256').update(options.networkPassphrase).digest();
+  return createHash('sha256').update(Buffer.concat([
+    Buffer.from('onboarding_bridge_commitment_v1'),
+    Buffer.from(options.contractId),
+    networkId,
+    Buffer.from(options.source),
+    Buffer.from(options.target),
+    Buffer.from(options.asset),
+    amountBytes,
+    nonceBytes,
+  ])).digest('hex');
+}
 
 /**
  * TypeScript SDK for the C-Address Onboarding Bridge Soroban contract.
