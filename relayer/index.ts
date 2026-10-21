@@ -1955,16 +1955,37 @@ export function test_signature_from_known_seed_is_deterministic(): void {
 // Startup environment variable validation (Issues 3 & 4)
 // ---------------------------------------------------------------------------
 
+interface ValidatedEthEnv {
+  rpcUrl: string;
+  bridgeContractAddress: string;
+  eventTopic: string;
+  chainId: number;
+  confirmations: number;
+}
+
+interface ValidatedSolanaEnv {
+  wsUrl: string;
+  programId: string;
+  chainId: number;
+  httpUrl: string;
+}
+
+interface ValidatedEnv {
+  contractId: string;
+  rpcUrl: string;
+  networkPassphrase: string;
+  submitterSecretKey: string;
+  threshold: number;
+  relayerPrivateKeys: string[];
+  relayerSignerUrls: string[];
+  healthPort: number;
+  stateDir: string;
+  eth?: ValidatedEthEnv;
+  solana?: ValidatedSolanaEnv;
+}
+
 /**
- * Validate that all required environment variables are present and well-formed.
- * Throws a descriptive Error on the first missing or invalid variable so the
- * process exits with a clear message instead of a cryptic undefined-dereference
- * deep inside an SDK call.
- *
- * Exported so it can be unit-tested independently of process.exit.
- */
-/**
- * Parse a required chain-id environment variable as a positive integer.
+ * Parse a required chain-id environment variable as a non-negative integer.
  * Used for `ETH_CHAIN_ID` / `SOLANA_CHAIN_ID`, which are only required when
  * the corresponding listener is enabled (Issue: chain ids were previously
  * hard-coded to 1 / 101, which silently signs testnet events as mainnet).
@@ -1974,24 +1995,24 @@ export function requireChainId(env: NodeJS.ProcessEnv, name: string): number {
   if (raw === undefined || raw.trim() === '') {
     throw new Error(`${name} is required but was not set`);
   }
-  const chainId = parseInt(raw.trim(), 10);
-  if (!Number.isInteger(chainId) || chainId < 0) {
+  if (!/^\d+$/.test(raw.trim())) {
+    throw new Error(`${name} must be a non-negative integer, got: "${raw}"`);
+  }
+  const chainId = Number(raw.trim());
+  if (!Number.isSafeInteger(chainId)) {
     throw new Error(`${name} must be a non-negative integer, got: "${raw}"`);
   }
   return chainId;
 }
 
-export function validateEnv(env: NodeJS.ProcessEnv = process.env): {
-  contractId: string;
-  rpcUrl: string;
-  networkPassphrase: string;
-  submitterSecretKey: string;
-  threshold: number;
-  relayerPrivateKeys: string[];
-  eth?: ValidatedEthEnv;
-  solana?: ValidatedSolanaEnv;
-}
-
+/**
+ * Validate that all required environment variables are present and well-formed.
+ * Throws a descriptive Error on the first missing or invalid variable so the
+ * process exits with a clear message instead of a cryptic undefined-dereference
+ * deep inside an SDK call.
+ *
+ * Exported so it can be unit-tested independently of process.exit.
+ */
 export function validateEnv(env: NodeJS.ProcessEnv = process.env): ValidatedEnv {
   function requireString(name: string, customMessage?: string): string {
     const value = env[name];
@@ -2001,15 +2022,35 @@ export function validateEnv(env: NodeJS.ProcessEnv = process.env): ValidatedEnv 
     return value.trim();
   }
 
+  function parseNonNegativeInteger(
+    raw: string | undefined,
+    name: string,
+    fallback: number,
+  ): number {
+    if (raw === undefined) return fallback;
+    if (!/^\d+$/.test(raw.trim())) {
+      throw new Error(`${name} must be a non-negative integer, got: "${raw}"`);
+    }
+    const value = Number(raw.trim());
+    if (!Number.isSafeInteger(value)) {
+      throw new Error(`${name} must be a non-negative integer, got: "${raw}"`);
+    }
+    return value;
+  }
+
   const contractId = requireString('CONTRACT_ID');
   const rpcUrl = requireString('STELLAR_RPC_URL');
   const networkPassphrase = requireString('NETWORK_PASSPHRASE');
   const submitterSecretKey = requireString('RELAYER_SECRET_KEY');
 
-  // Issue 4: THRESHOLD must parse to a positive integer.
   const thresholdRaw = env['THRESHOLD'] ?? '1';
-  const threshold = parseInt(thresholdRaw, 10);
-  if (!Number.isInteger(threshold) || threshold < 1) {
+  if (!/^\d+$/.test(thresholdRaw.trim())) {
+    throw new Error(
+      `THRESHOLD must be a positive integer, got: "${thresholdRaw}"`,
+    );
+  }
+  const threshold = Number(thresholdRaw.trim());
+  if (!Number.isSafeInteger(threshold) || threshold < 1) {
     throw new Error(
       `THRESHOLD must be a positive integer, got: "${thresholdRaw}"`,
     );
@@ -2019,10 +2060,21 @@ export function validateEnv(env: NodeJS.ProcessEnv = process.env): ValidatedEnv 
     .split(',')
     .map((pk) => pk.trim())
     .filter(Boolean);
+  const relayerSignerUrls = (env['RELAYER_SIGNER_URLS'] ?? '')
+    .split(',')
+    .map((url) => url.trim())
+    .filter(Boolean);
 
-  if (relayerPrivateKeys.length === 0) {
+  if (relayerPrivateKeys.length === 0 && relayerSignerUrls.length === 0) {
     throw new Error('RELAYER_PRIVATE_KEYS is required and must contain at least one key');
   }
+
+  const stateDir = env['RELAYER_STATE_DIR']?.trim() || '.';
+  const healthPort = parseNonNegativeInteger(
+    env['HEALTH_PORT'],
+    'HEALTH_PORT',
+    3000,
+  );
 
   let eth: ValidatedEthEnv | undefined;
   if (env['ETH_RPC_URL'] && env['ETH_RPC_URL'].trim() !== '') {
@@ -2035,7 +2087,17 @@ export function validateEnv(env: NodeJS.ProcessEnv = process.env): ValidatedEnv 
       'ETH_EVENT_TOPIC',
       'ETH_EVENT_TOPIC is required when ETH_RPC_URL is set',
     );
-    eth = { rpcUrl: ethRpcUrl, bridgeContractAddress, eventTopic };
+    eth = {
+      rpcUrl: ethRpcUrl,
+      bridgeContractAddress,
+      eventTopic,
+      chainId: requireChainId(env, 'ETH_CHAIN_ID'),
+      confirmations: parseNonNegativeInteger(
+        env['ETH_CONFIRMATIONS'],
+        'ETH_CONFIRMATIONS',
+        DEFAULT_ETH_CONFIRMATIONS,
+      ),
+    };
   }
 
   let solana: ValidatedSolanaEnv | undefined;
@@ -2045,7 +2107,16 @@ export function validateEnv(env: NodeJS.ProcessEnv = process.env): ValidatedEnv 
       'SOLANA_PROGRAM_ID',
       'SOLANA_PROGRAM_ID is required when SOLANA_WS_URL is set',
     );
-    solana = { wsUrl, programId };
+    const httpUrl = requireString(
+      'SOLANA_HTTP_URL',
+      'SOLANA_HTTP_URL is required when SOLANA_WS_URL is set',
+    );
+    solana = {
+      wsUrl,
+      programId,
+      chainId: requireChainId(env, 'SOLANA_CHAIN_ID'),
+      httpUrl,
+    };
   }
 
   return {
@@ -2055,6 +2126,9 @@ export function validateEnv(env: NodeJS.ProcessEnv = process.env): ValidatedEnv 
     submitterSecretKey,
     threshold,
     relayerPrivateKeys,
+    relayerSignerUrls,
+    healthPort,
+    stateDir,
     eth,
     solana,
   };
@@ -2101,13 +2175,51 @@ export function test_nan_threshold_is_rejected(): void {
     NETWORK_PASSPHRASE: 'test',
     RELAYER_SECRET_KEY: 'secret',
     RELAYER_PRIVATE_KEYS: '01'.repeat(32),
-    THRESHOLD: 'not-a-number',
+    THRESHOLD: 'abc',
   };
   try {
     validateEnv(env);
     throw new Error('Expected validateEnv to throw but it did not');
   } catch (e: any) {
     assert(e.message.includes('THRESHOLD'), `expected THRESHOLD error, got: ${e.message}`);
+  }
+}
+
+export function test_invalid_eth_confirmations_are_rejected(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test',
+    RELAYER_SECRET_KEY: 'secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32),
+    ETH_RPC_URL: 'http://localhost:8545',
+    ETH_BRIDGE_CONTRACT: '0xbridge',
+    ETH_EVENT_TOPIC: '0xtopic',
+    ETH_CHAIN_ID: '11155111',
+    ETH_CONFIRMATIONS: 'x',
+  };
+  try {
+    validateEnv(env);
+    throw new Error('Expected validateEnv to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('ETH_CONFIRMATIONS'), `expected ETH_CONFIRMATIONS error, got: ${e.message}`);
+  }
+}
+
+export function test_invalid_health_port_is_rejected(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test',
+    RELAYER_SECRET_KEY: 'secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32),
+    HEALTH_PORT: 'abc',
+  };
+  try {
+    validateEnv(env);
+    throw new Error('Expected validateEnv to throw but it did not');
+  } catch (e: any) {
+    assert(e.message.includes('HEALTH_PORT'), `expected HEALTH_PORT error, got: ${e.message}`);
   }
 }
 
@@ -2163,6 +2275,25 @@ export function test_valid_env_parses_correctly(): void {
   assertEqual(result.contractId, 'C_TEST', 'contractId');
   assertEqual(result.threshold, 2, 'threshold');
   assertEqual(result.relayerPrivateKeys.length, 2, 'relayer key count');
+  assertEqual(result.healthPort, 3000, 'default health port');
+}
+
+export function test_solana_env_includes_http_backfill_configuration(): void {
+  const env: NodeJS.ProcessEnv = {
+    CONTRACT_ID: 'C_TEST',
+    STELLAR_RPC_URL: 'http://localhost',
+    NETWORK_PASSPHRASE: 'test network',
+    RELAYER_SECRET_KEY: 'my-secret',
+    RELAYER_PRIVATE_KEYS: '01'.repeat(32),
+    SOLANA_WS_URL: 'ws://localhost',
+    SOLANA_HTTP_URL: 'http://localhost',
+    SOLANA_PROGRAM_ID: 'program',
+    SOLANA_CHAIN_ID: '101',
+    RELAYER_STATE_DIR: '/tmp/relayer-state',
+  };
+  const result = validateEnv(env);
+  assertEqual(result.solana?.httpUrl, 'http://localhost', 'Solana HTTP URL');
+  assertEqual(result.stateDir, '/tmp/relayer-state', 'relayer state directory');
 }
 
 // ---------------------------------------------------------------------------
@@ -2400,7 +2531,10 @@ async function runRelayerSelfTests(): Promise<void> {
   test_missing_rpc_url_throws();
   test_nan_threshold_is_rejected();
   test_zero_threshold_is_rejected();
+  test_invalid_eth_confirmations_are_rejected();
+  test_invalid_health_port_is_rejected();
   test_valid_env_parses_correctly();
+  test_solana_env_includes_http_backfill_configuration();
   // Issue #672: chain ids must come from env, not be hard-coded to 1/101.
   test_missing_chain_id_throws();
   test_non_numeric_chain_id_throws();
@@ -2419,36 +2553,47 @@ if (require.main === module) {
       process.exit(1);
     });
   } else {
+    let env: ValidatedEnv;
+    try {
+      env = validateEnv(process.env);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : err);
+      process.exit(1);
+    }
+
+    fs.mkdirSync(env.stateDir, { recursive: true });
     const service = new RelayerService({
-      contractId: process.env.CONTRACT_ID!,
-      rpcUrl: process.env.STELLAR_RPC_URL!,
-      networkPassphrase: process.env.NETWORK_PASSPHRASE!,
-      submitterSecretKey: process.env.RELAYER_SECRET_KEY!,
-      threshold: parseInt(process.env.THRESHOLD ?? '1', 10),
-      // Prefer independent per-operator signer services (RELAYER_SIGNER_URLS)
-      // over in-process keys (RELAYER_PRIVATE_KEYS, legacy/dev only — see
-      // adr/ADR-007-signer-key-isolation.md).
-      nodes: process.env.RELAYER_SIGNER_URLS
-        ? process.env.RELAYER_SIGNER_URLS.split(',').map((url) => ({ signerUrl: url.trim() }))
-        : (process.env.RELAYER_PRIVATE_KEYS ?? '').split(',').map((pk) => ({ privateKey: pk.trim() })),
+      contractId: env.contractId,
+      rpcUrl: env.rpcUrl,
+      networkPassphrase: env.networkPassphrase,
+      submitterSecretKey: env.submitterSecretKey,
+      threshold: env.threshold,
+      nodes: env.relayerSignerUrls.length > 0
+        ? env.relayerSignerUrls.map((signerUrl) => ({ signerUrl }))
+        : env.relayerPrivateKeys.map((privateKey) => ({ privateKey })),
       listeners: [
-        ...(process.env.ETH_RPC_URL ? [new EthChainListener({
-          rpcUrl: process.env.ETH_RPC_URL,
-          bridgeContractAddress: process.env.ETH_BRIDGE_CONTRACT!,
-          eventTopic: process.env.ETH_EVENT_TOPIC!,
-          chainId: 1,
-          confirmations: process.env.ETH_CONFIRMATIONS ? parseInt(process.env.ETH_CONFIRMATIONS, 10) : undefined,
+        ...(env.eth ? [new EthChainListener({
+          rpcUrl: env.eth.rpcUrl,
+          bridgeContractAddress: env.eth.bridgeContractAddress,
+          eventTopic: env.eth.eventTopic,
+          chainId: env.eth.chainId,
+          confirmations: env.eth.confirmations,
+          blockStorePath: path.join(env.stateDir, `eth-block-${env.eth.chainId}.json`),
         })] : []),
-        ...(process.env.SOLANA_WS_URL ? [new SolanaChainListener({
-          wsUrl: process.env.SOLANA_WS_URL,
-          programId: process.env.SOLANA_PROGRAM_ID!,
-          chainId: requireChainId(process.env, 'SOLANA_CHAIN_ID'),
+        ...(env.solana ? [new SolanaChainListener({
+          wsUrl: env.solana.wsUrl,
+          programId: env.solana.programId,
+          chainId: env.solana.chainId,
+          httpUrl: env.solana.httpUrl,
+          signatureStorePath: path.join(
+            env.stateDir,
+            `solana-signature-${env.solana.chainId}.json`,
+          ),
         })] : []),
       ],
     });
 
-    const healthPort = parseInt(process.env.HEALTH_PORT ?? '3000', 10);
-    const healthServer = startHealthServer(service, healthPort);
+    const healthServer = startHealthServer(service, env.healthPort);
 
     service.start();
 

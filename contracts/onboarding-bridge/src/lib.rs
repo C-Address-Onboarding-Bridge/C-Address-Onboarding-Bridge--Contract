@@ -1309,18 +1309,21 @@ fn read_loyalty_amount_per_fund(env: &Env) -> i128 {
 /// Mints (transfers) the configured loyalty reward to `recipient`, unless the
 /// contract's loyalty-token reserve is insufficient.
 ///
-/// The contract's own loyalty-token balance is checked before attempting the
-/// transfer. If the reserve is depleted, minting is skipped and a
-/// `LoyaltyMintSkipped` event is emitted instead of letting the underlying
-/// token transfer trap — a depleted loyalty reserve must never revert the
-/// funding call that triggered it.
+/// The contract's loyalty-token balance, less any accrued fees and timelocked
+/// deposits for that asset, is checked before attempting the transfer. If the
+/// available reserve is depleted, minting is skipped and a `LoyaltyMintSkipped`
+/// event is emitted instead of letting the underlying token transfer trap.
 fn mint_loyalty_tokens(env: &Env, recipient: &Address) {
     if let Some(loyalty_token) = read_loyalty_token(env) {
         let amount = read_loyalty_amount_per_fund(env);
         if amount > 0 {
             let token_client = token::Client::new(env, &loyalty_token);
             let contract_addr = env.current_contract_address();
-            let reserve = token_client.balance(&contract_addr);
+            let balance = token_client.balance(&contract_addr);
+            let counters = read_asset_counters(env, &loyalty_token);
+            let reserve = balance
+                .saturating_sub(counters.accrued_fees)
+                .saturating_sub(counters.locked_timelock);
             if reserve < amount {
                 env.events()
                     .publish(("LoyaltyMintSkipped", recipient.clone()), (amount, reserve));
