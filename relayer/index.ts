@@ -44,7 +44,7 @@ export interface BridgeEvent {
 /** Pluggable chain event source. Implement for Ethereum, Solana, etc. */
 export interface ChainListener {
   /** Start watching and emit events via the callback. */
-  start(onEvent: (event: BridgeEvent) => void): void;
+  start(onEvent: (event: BridgeEvent) => Promise<void>): void;
   stop(): void;
 }
 
@@ -125,6 +125,38 @@ export interface RelayerServiceConfig {
    * `retryDeadLetters()`). Defaults to 60_000 (1 minute).
    */
   dlqRetryIntervalMs?: number;
+  /** Path for persistent dead-lettered events. Defaults to a JSON file in cwd. */
+  deadLetterQueuePath?: string;
+  /** Path for persistent submitted-event nonces. Defaults to a JSON file in cwd. */
+  nonceStorePath?: string;
+}
+
+function readJsonFile<T>(filePath: string): T | null {
+  let content: string;
+  try {
+    content = fs.readFileSync(filePath, 'utf8');
+  } catch (err: any) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+  return JSON.parse(content) as T;
+}
+
+function writeJsonFileAtomic(filePath: string, value: unknown): void {
+  const json = JSON.stringify(value);
+  if (json === undefined) {
+    throw new TypeError('Value cannot be serialized as JSON');
+  }
+  const dir = path.dirname(filePath);
+  if (dir && dir !== '.') fs.mkdirSync(dir, { recursive: true });
+  const tmp = `${filePath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, json, 'utf8');
+    fs.renameSync(tmp, filePath);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch { /* no temporary file to clean up */ }
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -146,30 +178,9 @@ export interface DeadLetterEntry {
   terminal?: boolean;
 }
 
-function readJsonFile<T>(filePath: string): T | null {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8')) as T;
-  } catch {
-    return null;
-  }
-}
-
-function writeJsonFileAtomic<T>(filePath: string, value: T): void {
-  const json = JSON.stringify(value);
-  if (json === undefined) {
-    throw new TypeError('Value cannot be serialized as JSON');
-  }
-
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmpPath = `${filePath}.tmp`;
-  fs.writeFileSync(tmpPath, json, 'utf8');
-  fs.renameSync(tmpPath, filePath);
-}
-
 /**
- * In-memory dead-letter store for under-threshold events and failed
- * submissions. Replace with a persistent store (e.g. Redis, SQLite) in
- * production.
+ * Stores under-threshold events and failed submissions. Service instances
+ * use an on-disk path by default so advancing a source cursor cannot lose them.
  */
 export class DeadLetterQueue {
   private entries: DeadLetterEntry[] = [];
@@ -370,15 +381,17 @@ export class RelayerService {
   private submitterKeypair: ReturnType<typeof Keypair.fromSecret>;
   private config: RelayerServiceConfig;
   private nonces: NonceStore;
+  private inFlight = new Map<string, Promise<void>>();
   private startedAt = Date.now();
   private lastEventPerChain: Map<number, string> = new Map();
   private dlqRetryTimer: ReturnType<typeof setInterval> | null = null;
   private retrySweepRunning = false;
-  private inFlight = new Set<string>();
-  readonly dlq = new DeadLetterQueue();
+  readonly dlq: DeadLetterQueue;
 
   constructor(config: RelayerServiceConfig) {
     this.config = config;
+    this.nonces = new NonceStore(config.nonceStorePath ?? '.relayer-nonces.json');
+    this.dlq = new DeadLetterQueue(config.deadLetterQueuePath ?? '.relayer-dead-letters.json');
     this.sdk = new OnboardingBridgeSDK({
       contractId: config.contractId,
       rpcUrl: config.rpcUrl,
@@ -464,13 +477,10 @@ export class RelayerService {
 
   private async handleEvent(event: BridgeEvent): Promise<void> {
     const key = `${event.chainId}:${event.txHash}`;
-
     if (this.nonces.has(event.chainId, event.txHash)) {
       console.log(`[relayer] duplicate event ignored: chain=${event.chainId} tx=${event.txHash}`);
       return;
     }
-    if (this.inFlight.has(key)) return;
-
     try {
       validateBridgeEvent(event);
     } catch (error: any) {
@@ -478,38 +488,54 @@ export class RelayerService {
       return;
     }
 
-    console.log(`[relayer] event received: chain=${event.chainId} tx=${event.txHash} target=${event.target} amount=${event.amount}`);
+    const existing = this.inFlight.get(key);
+    if (existing) return existing;
 
-    const payloadHash = computePayloadHash(event);
-
-    // Collect signatures from all configured nodes, then deduplicate by pubkey.
-    // The contract does NOT verify that sigs contains distinct pubkeys — the doc
-    // comment on fund_c_address_crosschain explicitly delegates deduplication to
-    // relayer infrastructure.  A config mistake (two nodes sharing a key) or a
-    // malicious injection must not inflate the effective signature count past
-    // what distinct keys actually authorize.
-    const rawSigs: RelayerSig[] = await Promise.all(
-      this.config.nodes.map((node) => signWithNode(node, payloadHash)),
-    );
-    const seenPubkeys = new Set<string>();
-    const sigs: RelayerSig[] = rawSigs.filter((sig) => {
-      if (seenPubkeys.has(sig.pubkey)) {
-        console.warn(`[relayer] duplicate pubkey detected and removed: ${sig.pubkey}`);
-        return false;
-      }
-      seenPubkeys.add(sig.pubkey);
-      return true;
-    });
-
-    if (sigs.length < this.config.threshold) {
-      console.warn(`[relayer] not enough signers after dedup: have ${sigs.length}, need ${this.config.threshold}`);
-      this.dlq.enqueue(event, sigs.length, this.config.threshold, 'insufficient signers after dedup');
-      return;
+    const processing = this.processEvent(event);
+    this.inFlight.set(key, processing);
+    try {
+      await processing;
+    } finally {
+      if (this.inFlight.get(key) === processing) this.inFlight.delete(key);
     }
-    this.inFlight.add(key);
+  }
+
+  private async processEvent(event: BridgeEvent): Promise<void> {
+    const key = `${event.chainId}:${event.txHash}`;
+    let sigs: RelayerSig[] = [];
 
     try {
-      const result = await this.sdk.fundCrosschain({ ...event, sigs }, this.submitterKeypair);
+      console.log(`[relayer] event received: chain=${event.chainId} tx=${event.txHash} target=${event.target} amount=${event.amount}`);
+      const payloadHash = computePayloadHash(event);
+      const rawSigs: RelayerSig[] = await Promise.all(
+        this.config.nodes.map((node) => signWithNode(node, payloadHash)),
+      );
+      const seenPubkeys = new Set<string>();
+      sigs = rawSigs.filter((sig) => {
+        if (seenPubkeys.has(sig.pubkey)) {
+          console.warn(`[relayer] duplicate pubkey detected and removed: ${sig.pubkey}`);
+          return false;
+        }
+        seenPubkeys.add(sig.pubkey);
+        return true;
+      });
+
+      if (sigs.length < this.config.threshold) {
+        this.dlq.enqueue(event, sigs.length, this.config.threshold, 'insufficient signers after dedup');
+        return;
+      }
+
+      const result = await this.sdk.fundCrosschain(
+        {
+          chainId: event.chainId,
+          txHash: event.txHash,
+          target: event.target,
+          asset: event.asset,
+          amount: event.amount,
+          sigs: sigs.slice(0, this.config.threshold),
+        },
+        this.submitterKeypair,
+      );
 
       if (result.status === 'failed') {
         console.error(`[relayer] fundCrosschain failed: ${result.error}`);
@@ -524,16 +550,13 @@ export class RelayerService {
         return;
       }
 
-      // Mark nonce only after successful submission
       this.nonces.mark(event.chainId, event.txHash);
       this.lastEventPerChain.set(event.chainId, new Date().toISOString());
       this.dlq.remove(event.chainId, event.txHash);
       console.log(`[relayer] submitted tx=${result.hash} for chain=${event.chainId} src-tx=${event.txHash}`);
     } catch (err: any) {
-      console.error(`[relayer] unexpected error: ${err.message}`);
-      this.dlq.enqueue(event, sigs.length, this.config.threshold, `unexpected error: ${err.message}`);
-    } finally {
-      this.inFlight.delete(key);
+      console.error(`[relayer] event processing failed: ${err.message}`);
+      this.dlq.enqueue(event, sigs.length, this.config.threshold, `event processing failed: ${err.message}`);
     }
   }
 }
@@ -630,7 +653,7 @@ export class EthChainListener implements ChainListener {
   private fromBlock: string;
   private config: EthListenerConfig;
   private blockStore: BlockStore;
-  private onEvent: ((event: BridgeEvent) => void) | null = null;
+  private onEvent: ((event: BridgeEvent) => Promise<void>) | null = null;
 
   constructor(config: EthListenerConfig) {
     this.config = config;
@@ -643,10 +666,10 @@ export class EthChainListener implements ChainListener {
     }
   }
 
-  start(onEvent: (event: BridgeEvent) => void): void {
+  start(onEvent: (event: BridgeEvent) => Promise<void>): void {
     this.onEvent = onEvent;
-    this.timer = setInterval(() => this.pollOnce(), this.config.pollIntervalMs ?? 12_000);
-    this.pollOnce(); // immediate first poll
+    this.timer = setInterval(() => { void this.pollOnce(); }, this.config.pollIntervalMs ?? 12_000);
+    void this.pollOnce(); // immediate first poll
   }
 
   stop(): void {
@@ -664,8 +687,8 @@ export class EthChainListener implements ChainListener {
         // and persist it, instead of re-querying a single sliding block on
         // every poll (which misses anything produced between two polls).
         const current = await this.getBlockNumber();
+        this.blockStore.save(current);
         this.fromBlock = current;
-        this.blockStore.save(this.fromBlock);
         console.log(`[eth-listener] resolved initial block to ${this.fromBlock}`);
         return;
       }
@@ -688,7 +711,7 @@ export class EthChainListener implements ChainListener {
           continue;
         }
         const event = this.decode(log);
-        if (event && this.onEvent) this.onEvent(event);
+        if (event && this.onEvent) await this.onEvent(event);
       }
 
       // Always advance fromBlock past the queried range — even when zero
@@ -761,6 +784,7 @@ export class EthChainListener implements ChainListener {
 
     return { logs: Array.isArray(result) ? result : [], queriedToBlock: endBlock };
   }
+
 
   /**
    * Decode a raw eth log into a BridgeEvent.
@@ -937,7 +961,7 @@ export class SolanaSignatureStore {
 /**
  * Listens to Solana program log notifications over WebSocket.
  * Expects the Solana program to emit a structured log line:
- *   "bridge_fund:<signature>:<target>:<asset>:<amount>"
+ *   "bridge_fund:<target>:<asset>:<amount>"
  *
  * `logsSubscribe({ mentions: [programId] })` matches any transaction that
  * touches the program, so a `bridge_fund` line is only accepted when the
@@ -954,11 +978,12 @@ export class SolanaSignatureStore {
 export class SolanaChainListener implements ChainListener {
   private ws: any = null;
   private config: SolanaListenerConfig;
-  private onEvent: ((event: BridgeEvent) => void) | null = null;
+  private onEvent: ((event: BridgeEvent) => Promise<void>) | null = null;
   private stopped = false;
   private reconnectDelay: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private signatureStore: SolanaSignatureStore;
+  private deliveryQueue: Promise<void> = Promise.resolve();
   /** Last transaction signature we know we've processed (persisted). */
   private lastSignature: string | null;
 
@@ -971,7 +996,7 @@ export class SolanaChainListener implements ChainListener {
     this.lastSignature = this.signatureStore.load();
   }
 
-  start(onEvent: (event: BridgeEvent) => void): void {
+  start(onEvent: (event: BridgeEvent) => Promise<void>): void {
     this.onEvent = onEvent;
     this.stopped = false;
     this.connect();
@@ -1001,16 +1026,27 @@ export class SolanaChainListener implements ChainListener {
       // last restart) before resuming live delivery — see issue #668.
       // logsSubscribe only delivers *new* notifications, so without this a
       // reconnect silently drops everything emitted during the downtime.
-      this.backfill().catch((err: any) =>
-        console.error(`[solana-listener] backfill failed: ${err.message ?? err}`),
-      );
+      this.deliveryQueue = Promise.resolve().then(() => this.backfill());
+      this.deliveryQueue.catch((err: any) => {
+        console.error(`[solana-listener] backfill failed: ${err.message ?? err}`);
+        this.ws?.close();
+      });
     };
 
     this.ws.onmessage = (msg: any) => {
+      let data: any;
       try {
-        const data = JSON.parse(typeof msg === 'string' ? msg : msg.data);
-        this.handleNotification(data);
-      } catch { /* ignore malformed messages */ }
+        data = JSON.parse(typeof msg === 'string' ? msg : msg.data);
+      } catch (err: any) {
+        console.error(`[solana-listener] malformed WebSocket message: ${err.message ?? err}`);
+        return;
+      }
+
+      this.deliveryQueue = this.deliveryQueue.then(() => this.processNotification(data));
+      this.deliveryQueue.catch((err: any) => {
+        console.error(`[solana-listener] notification processing failed: ${err.message ?? err}`);
+        this.ws?.close();
+      });
     };
 
     this.ws.onerror = (err: any) => console.error('[solana-listener] ws error:', err.message ?? err);
@@ -1033,58 +1069,7 @@ export class SolanaChainListener implements ChainListener {
     };
   }
 
-  private handleNotification(data: any): void {
-    const value = data?.params?.result?.value;
-    const signature: string | undefined = value?.signature;
-    if (value?.err != null) {
-      console.warn(
-        `[solana-listener] skipping failed transaction ${signature ?? '<unknown>'}: ${JSON.stringify(value.err)}`,
-      );
-      if (signature) this.recordSignature(signature);
-      return;
-    }
-
-    const logs: string[] = value?.logs ?? [];
-    for (const event of this.extractBridgeFundEvents(logs)) {
-      if (this.onEvent) this.onEvent(event);
-    }
-    if (signature) this.recordSignature(signature);
-  }
-
-  private async backfill(): Promise<void> {
-    if (!this.config.httpUrl || !this.lastSignature) return;
-
-    const signatures = await this.rpcCall<Array<{ signature: string }>>(
-      'getSignaturesForAddress',
-      [this.config.programId, { until: this.lastSignature, limit: 1000, commitment: 'finalized' }],
-    );
-
-    for (const item of signatures.reverse()) {
-      const transaction = await this.rpcCall<{
-        meta?: { err?: unknown; logMessages?: string[] | null } | null;
-      } | null>(
-        'getTransaction',
-        [item.signature, { commitment: 'finalized', maxSupportedTransactionVersion: 0 }],
-      );
-      if (!transaction) continue;
-
-      if (transaction.meta?.err != null) {
-        console.warn(
-          `[solana-listener] skipping failed backfill transaction ${item.signature}: ` +
-          JSON.stringify(transaction.meta.err),
-        );
-        this.recordSignature(item.signature);
-        continue;
-      }
-
-      for (const event of this.extractBridgeFundEvents(transaction.meta?.logMessages ?? [])) {
-        if (this.onEvent) this.onEvent(event);
-      }
-      this.recordSignature(item.signature);
-    }
-  }
-
-  private async rpcCall<T>(method: string, params: unknown[]): Promise<T> {
+  private async rpcCall<T = any>(method: string, params: unknown[]): Promise<T> {
     if (!this.config.httpUrl) throw new Error('Solana HTTP RPC URL is not configured');
 
     const response = await fetch(this.config.httpUrl, {
@@ -1106,11 +1091,6 @@ export class SolanaChainListener implements ChainListener {
     return json.result as T;
   }
 
-  private recordSignature(signature: string): void {
-    this.lastSignature = signature;
-    this.signatureStore.save(signature);
-  }
-
   /**
    * `logsSubscribe` with `{ mentions: [programId] }` matches every
    * transaction that *touches* the program, including one where a
@@ -1121,11 +1101,12 @@ export class SolanaChainListener implements ChainListener {
    * only treats a `bridge_fund` line as genuine when the bridge program
    * itself is the currently-executing program (top of the invoke stack).
    */
-  private extractBridgeFundEvents(logs: string[]): BridgeEvent[] {
+  private extractBridgeFundEvents(logs: string[], signature: string): BridgeEvent[] {
     const events: BridgeEvent[] = [];
     const stack: string[] = [];
     const invokeRe = /^Program (\S+) invoke \[\d+\]$/;
     const endRe = /^Program (\S+) (?:success|failed:.*)$/;
+    let bridgeFundLineIndex = 0;
 
     for (const line of logs) {
       const invokeMatch = line.match(invokeRe);
@@ -1140,6 +1121,7 @@ export class SolanaChainListener implements ChainListener {
         continue;
       }
       if (!line.startsWith('Program log: bridge_fund:')) continue;
+      const lineIndex = bridgeFundLineIndex++;
 
       const executingProgram = stack[stack.length - 1];
       if (executingProgram !== this.config.programId) {
@@ -1150,42 +1132,113 @@ export class SolanaChainListener implements ChainListener {
         continue;
       }
 
-      const event = this.decodeLine(line);
+      const event = this.decodeLine(line, signature, lineIndex);
       if (event) events.push(event);
     }
 
     return events;
   }
 
+  private async processNotification(data: any): Promise<void> {
+    const value = data?.params?.result?.value;
+    const signature: string | undefined = value?.signature;
+    if (!signature) return;
+    if (value?.err != null) {
+      console.warn(
+        `[solana-listener] skipping failed transaction ${signature}: ${JSON.stringify(value.err)}`,
+      );
+      this.recordSignature(signature);
+      return;
+    }
+
+    const logs: string[] = Array.isArray(value.logs) ? value.logs : [];
+    for (const event of this.extractBridgeFundEvents(logs, signature)) {
+      if (this.onEvent) await this.onEvent(event);
+    }
+    this.recordSignature(signature);
+  }
+
+  private recordSignature(signature: string): void {
+    this.signatureStore.save(signature);
+    this.lastSignature = signature;
+  }
+
+  private async backfill(): Promise<void> {
+    if (!this.lastSignature || !this.config.httpUrl) return;
+
+    const pending: Array<{ signature: string; err: unknown }> = [];
+    let before: string | undefined;
+    let reachedCheckpoint = false;
+    while (!reachedCheckpoint) {
+      const options: Record<string, unknown> = {
+        limit: 1_000,
+        commitment: 'finalized',
+        until: this.lastSignature,
+      };
+      if (before) options.before = before;
+      const page = await this.rpcCall('getSignaturesForAddress', [this.config.programId, options]);
+      if (!Array.isArray(page)) throw new Error('getSignaturesForAddress returned no signature list');
+      if (page.length === 0) break;
+
+      const checkpointIndex = page.findIndex((entry: any) => entry.signature === this.lastSignature);
+      pending.push(...page.slice(0, checkpointIndex === -1 ? page.length : checkpointIndex));
+      if (checkpointIndex !== -1 || page.length < 1_000) {
+        reachedCheckpoint = true;
+      } else {
+        before = page[page.length - 1].signature;
+      }
+    }
+
+    for (const entry of pending.reverse()) {
+      if (typeof entry.signature !== 'string') {
+        throw new Error('getSignaturesForAddress returned an entry without a signature');
+      }
+      if (!entry.err) {
+        const transaction = await this.rpcCall('getTransaction', [
+          entry.signature,
+          { commitment: 'finalized', encoding: 'json', maxSupportedTransactionVersion: 0 },
+        ]);
+        if (!transaction) throw new Error(`getTransaction returned no transaction for ${entry.signature}`);
+        const logs = transaction.meta?.err ? [] : transaction.meta?.logMessages ?? [];
+        for (const event of this.extractBridgeFundEvents(logs, entry.signature)) {
+          if (this.onEvent) await this.onEvent(event);
+        }
+      }
+      this.recordSignature(entry.signature);
+    }
+  }
+
   /**
-   * Parse: "Program log: bridge_fund:<signature>:<target>:<asset>:<amount>"
+   * Parse: "Program log: bridge_fund:<target>:<asset>:<amount>"
    *
-   * `<signature>` is the base58-encoded 64-byte Solana transaction
-   * signature. The payload hash / contract nonce need a 32-byte `txHash`
-   * (see `computeNonce`), so the signature is base58-decoded, validated to
-   * be exactly 64 bytes, and mapped to 32 bytes via `sha256(signature)`
-   * rather than being used as-is (which would silently truncate/garble a
-   * real signature into an arbitrary buffer).
+   * The replay key comes from the transaction signature supplied by the RPC
+   * notification plus the position of this bridge_fund line, not from data
+   * chosen by the program.
    */
-  private decodeLine(line: string): BridgeEvent | null {
+  private decodeLine(line: string, signature: string, lineIndex: number): BridgeEvent | null {
     try {
       const payload = line.replace('Program log: bridge_fund:', '');
       const parts = payload.split(':');
-      if (parts.length !== 4) return this.rejectLine(line, 'expected 4 fields');
-      const [signature, target, asset, amount] = parts;
-      if (!signature || !target || !asset || !amount) return this.rejectLine(line, 'missing field');
+      if (parts.length !== 3) return this.rejectLine(line, 'expected 3 fields');
+      const [target, asset, amount] = parts;
+      if (!target || !asset || !amount) return this.rejectLine(line, 'missing field');
       if (!/^\d+$/.test(amount)) return this.rejectLine(line, 'amount is not numeric');
 
       let sigBytes: Buffer;
       try {
         sigBytes = base58Decode(signature);
       } catch {
-        return this.rejectLine(line, 'signature is not valid base58');
+        return this.rejectLine(line, 'notification signature is not valid base58');
       }
       if (sigBytes.length !== 64) {
-        return this.rejectLine(line, `signature must decode to 64 bytes, got ${sigBytes.length}`);
+        return this.rejectLine(line, `notification signature must decode to 64 bytes, got ${sigBytes.length}`);
       }
-      const txHash = crypto.createHash('sha256').update(sigBytes).digest('hex');
+      const lineIndexBytes = Buffer.alloc(4);
+      lineIndexBytes.writeUInt32BE(lineIndex);
+      const txHash = crypto.createHash('sha256')
+        .update(sigBytes)
+        .update(lineIndexBytes)
+        .digest('hex');
 
       return { chainId: this.config.chainId, txHash, target, asset, amount };
     } catch {
@@ -1290,7 +1343,7 @@ function makeTestService(params: {
   (service as any).nonces = new NonceStore(); // no filePath: in-memory only for tests
   (service as any).startedAt = Date.now();
   (service as any).lastEventPerChain = new Map();
-  (service as any).inFlight = new Set<string>();
+  (service as any).inFlight = new Map<string, Promise<void>>();
   (service as any).dlq = new DeadLetterQueue(); // no filePath: in-memory only for tests
   return service;
 }
@@ -1731,6 +1784,29 @@ export function test_eth_listener_rejects_malformed_truncated_log_payload(): voi
   assertEqual(event, null, 'truncated ABI log should be rejected');
 }
 
+export function test_eth_listener_rejects_log_missing_transaction_hash(): void {
+  const listener = new EthChainListener({
+    rpcUrl: 'http://localhost',
+    bridgeContractAddress: '0xbridge',
+    eventTopic: '0xtopic',
+    chainId: 1,
+  });
+  const log = makeAbiLog('GDESTINATION', 'CASSET', 100n);
+  delete log.transactionHash;
+  assertEqual((listener as any).decode(log), null, 'log without transaction hash must be rejected');
+}
+
+export function test_block_store_save_and_load(): void {
+  const filePath = tmpBlockStorePath('block-store');
+  try {
+    const store = new BlockStore(filePath);
+    store.save('0x123');
+    assertEqual(store.load(), '0x123', 'BlockStore should persist its cursor');
+  } finally {
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Issue #663: regression tests — fromBlock resolution and advancement
 // ---------------------------------------------------------------------------
@@ -1784,6 +1860,7 @@ export async function test_eth_listener_advances_from_block_even_with_no_logs():
         bridgeContractAddress: '0xbridge',
         eventTopic: '0xtopic',
         chainId: 1,
+        confirmations: 0,
         blockStorePath: tmpBlockStorePath('advance'),
       });
       await (listener as any).pollOnce(); // resolves 'latest' -> 0x65
@@ -1861,6 +1938,50 @@ export async function test_eth_listener_skips_removed_reorged_logs(): Promise<vo
   );
 }
 
+export async function test_pending_submission_does_not_advance_persisted_eth_cursor(): Promise<void> {
+  const filePath = tmpBlockStorePath('pending-submission');
+  const store = new BlockStore(filePath);
+  store.save('0x64');
+
+  let signalStarted!: () => void;
+  const submissionStarted = new Promise<void>((resolve) => { signalStarted = resolve; });
+  let releaseSubmission!: () => void;
+  const submissionGate = new Promise<void>((resolve) => { releaseSubmission = resolve; });
+  const service = makeTestService({
+    fundCrosschain: async () => {
+      signalStarted();
+      await submissionGate;
+      return { status: 'pending', hash: 'stellar-tx' };
+    },
+  });
+  const listener = new EthChainListener({
+    rpcUrl: 'http://localhost',
+    bridgeContractAddress: '0xbridge',
+    eventTopic: '0xtopic',
+    chainId: 1,
+    confirmations: 0,
+    blockStorePath: filePath,
+  });
+  (listener as any).onEvent = (event: BridgeEvent) => (service as any).handleEvent(event);
+
+  try {
+    await withFakeFetch(
+      (method) => method === 'eth_blockNumber' ? '0x64' : [makeAbiLog('GDEST', 'CASSET', 100n)],
+      async () => {
+        const polling = (listener as any).pollOnce() as Promise<void>;
+        await submissionStarted;
+        assertEqual(store.load(), '0x64', 'persisted fromBlock must remain unchanged while fundCrosschain is pending');
+        releaseSubmission();
+        await polling;
+        assertEqual(store.load(), '0x65', 'persisted fromBlock should advance after submission completes');
+      },
+    );
+  } finally {
+    releaseSubmission();
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+  }
+}
+
 export function test_solana_listener_rejects_bad_log_lines(): void {
   const listener = new SolanaChainListener({
     wsUrl: 'ws://localhost',
@@ -1868,20 +1989,44 @@ export function test_solana_listener_rejects_bad_log_lines(): void {
     chainId: 101,
   });
 
-  const decodeLine = (line: string) => (listener as any).decodeLine(line);
-  assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset'), null, 'missing amount should be rejected');
-  assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset:100:extra'), null, 'extra colon should be rejected');
-  assertEqual(decodeLine('Program log: bridge_fund:tx:target:asset:not-a-number'), null, 'non-numeric amount should be rejected');
+  const decodeLine = (line: string, signature = '1'.repeat(64)) =>
+    (listener as any).decodeLine(line, signature, 0);
+  assertEqual(decodeLine('Program log: bridge_fund:target:asset'), null, 'missing amount should be rejected');
+  assertEqual(decodeLine('Program log: bridge_fund:target:asset:100:extra'), null, 'extra colon should be rejected');
+  assertEqual(decodeLine('Program log: bridge_fund:target:asset:not-a-number'), null, 'non-numeric amount should be rejected');
   assertEqual(
-    decodeLine('Program log: bridge_fund:tx:target:asset:100'),
+    decodeLine('Program log: bridge_fund:target:asset:100', 'invalid-signature'),
     null,
-    'a signature that does not base58-decode to 64 bytes should be rejected',
+    'a notification signature that does not base58-decode to 64 bytes should be rejected',
   );
   assertEqual(
-    decodeLine('Program log: bridge_fund:not*base58!:target:asset:100'),
+    decodeLine('Program log: bridge_fund:target:asset:100', 'not*base58!'),
     null,
-    'a signature with characters outside the base58 alphabet should be rejected',
+    'a notification signature with characters outside the base58 alphabet should be rejected',
   );
+}
+
+export function test_solana_replay_key_uses_notification_signature_and_line_index(): void {
+  const listener = new SolanaChainListener({
+    wsUrl: 'ws://localhost',
+    programId: 'bridge-program',
+    chainId: 101,
+  });
+  const log = 'Program log: bridge_fund:GDEST:CASSET:100';
+  const logs = [
+    'Program bridge-program invoke [1]',
+    log,
+    log,
+    'Program bridge-program success',
+  ];
+  const first = (listener as any).extractBridgeFundEvents(logs, '1'.repeat(64)) as BridgeEvent[];
+  const replay = (listener as any).extractBridgeFundEvents(logs, '1'.repeat(64)) as BridgeEvent[];
+  const otherTransaction = (listener as any).extractBridgeFundEvents(logs, '1'.repeat(63) + '2') as BridgeEvent[];
+
+  assertEqual(first.length, 2, 'both bridge_fund lines should be decoded');
+  assertEqual(first[0].txHash, replay[0].txHash, 'replaying the same notification should preserve the replay key');
+  assert(first[0].txHash !== first[1].txHash, 'bridge_fund lines in one transaction need distinct replay keys');
+  assert(first[0].txHash !== otherTransaction[0].txHash, 'identical log text from different transactions needs distinct replay keys');
 }
 
 // ---------------------------------------------------------------------------
@@ -1985,7 +2130,7 @@ export function test_signature_from_known_seed_is_deterministic(): void {
 // Startup environment variable validation (Issues 3 & 4)
 // ---------------------------------------------------------------------------
 
-interface ValidatedEthEnv {
+export interface ValidatedEthEnv {
   rpcUrl: string;
   bridgeContractAddress: string;
   eventTopic: string;
@@ -1993,14 +2138,14 @@ interface ValidatedEthEnv {
   confirmations: number;
 }
 
-interface ValidatedSolanaEnv {
+export interface ValidatedSolanaEnv {
   wsUrl: string;
   programId: string;
   chainId: number;
   httpUrl: string;
 }
 
-interface ValidatedEnv {
+export interface ValidatedEnv {
   contractId: string;
   rpcUrl: string;
   networkPassphrase: string;
@@ -2356,14 +2501,14 @@ export async function test_solana_listener_backfills_missed_events_after_reconne
     (listener as any).rpcCall = async (method: string, _params: unknown[]) => {
       rpcCalls.push(method);
       if (method === 'getSignaturesForAddress') {
-        return [{ signature: 'sig-new', err: null }];
+        return [{ signature: '1'.repeat(64), err: null }];
       }
       if (method === 'getTransaction') {
         return {
           meta: {
             logMessages: [
               'Program program invoke [1]',
-              'Program log: bridge_fund:' + '1'.repeat(64) + ':GDEST:CASSET:100',
+              'Program log: bridge_fund:GDEST:CASSET:100',
               'Program program success',
             ],
           },
@@ -2377,9 +2522,9 @@ export async function test_solana_listener_backfills_missed_events_after_reconne
 
     await (listener as any).backfill();
 
-    assertEqual(rpcCalls, ['getSignaturesForAddress', 'getTransaction'], 'backfill should query signatures then fetch the transaction');
+    assertEqual(rpcCalls.join(','), 'getSignaturesForAddress,getTransaction', 'backfill should query signatures then fetch the transaction');
     assertEqual(events.length, 1, 'backfill should replay the missed bridge_fund event');
-    assertEqual((listener as any).lastSignature, 'sig-new', 'lastSignature should advance to the newest replayed signature');
+    assertEqual((listener as any).lastSignature, '1'.repeat(64), 'lastSignature should advance to the newest replayed signature');
 
     // Simulate a restart: a fresh instance pointed at the same file should
     // resume backfilling from the persisted signature, not from scratch.
@@ -2390,7 +2535,7 @@ export async function test_solana_listener_backfills_missed_events_after_reconne
       httpUrl: 'http://localhost',
       signatureStorePath: filePath,
     });
-    assertEqual((restarted as any).lastSignature, 'sig-new', 'signature persisted before restart must be loaded on construction');
+    assertEqual((restarted as any).lastSignature, '1'.repeat(64), 'signature persisted before restart must be loaded on construction');
   } finally {
     try { fs.unlinkSync(filePath); } catch { /* ignore */ }
   }
@@ -2414,7 +2559,7 @@ export async function test_solana_listener_skips_failed_backfill_transaction(): 
           err: { InstructionError: [0, 'Custom'] },
           logMessages: [
             'Program program invoke [1]',
-            'Program log: bridge_fund:' + '1'.repeat(64) + ':GDEST:CASSET:100',
+            'Program log: bridge_fund:GDEST:CASSET:100',
             'Program program failed: custom program error',
           ],
         },
@@ -2430,7 +2575,7 @@ export async function test_solana_listener_skips_failed_backfill_transaction(): 
   }
 }
 
-export function test_solana_listener_skips_failed_notification(): void {
+export async function test_solana_listener_skips_failed_notification(): Promise<void> {
   const filePath = tempStorePath('solana-failed-notification');
   const listener = new SolanaChainListener({
     wsUrl: 'ws://localhost',
@@ -2442,7 +2587,7 @@ export function test_solana_listener_skips_failed_notification(): void {
     const events: BridgeEvent[] = [];
     (listener as any).onEvent = (event: BridgeEvent) => events.push(event);
 
-    (listener as any).handleNotification({
+    await (listener as any).processNotification({
       params: {
         result: {
           value: {
@@ -2450,7 +2595,7 @@ export function test_solana_listener_skips_failed_notification(): void {
             err: { InstructionError: [0, 'Custom'] },
             logs: [
               'Program program invoke [1]',
-              'Program log: bridge_fund:' + '1'.repeat(64) + ':GDEST:CASSET:100',
+              'Program log: bridge_fund:GDEST:CASSET:100',
               'Program program failed: custom program error',
             ],
           },
@@ -2460,6 +2605,52 @@ export function test_solana_listener_skips_failed_notification(): void {
 
     assertEqual(events.length, 0, 'failed notification logs must not emit bridge_fund events');
   } finally {
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+  }
+}
+
+export async function test_pending_solana_submission_does_not_advance_signature_cursor(): Promise<void> {
+  const filePath = tempStorePath('solana-pending');
+  const signature = '1'.repeat(64);
+  const listener = new SolanaChainListener({
+    wsUrl: 'ws://localhost',
+    programId: 'program',
+    chainId: 101,
+    signatureStorePath: filePath,
+  });
+
+  let signalStarted!: () => void;
+  const submissionStarted = new Promise<void>((resolve) => { signalStarted = resolve; });
+  let releaseSubmission!: () => void;
+  const submissionGate = new Promise<void>((resolve) => { releaseSubmission = resolve; });
+  (listener as any).onEvent = async () => {
+    signalStarted();
+    await submissionGate;
+  };
+
+  try {
+    const processing = (listener as any).processNotification({
+      params: {
+        result: {
+          value: {
+            signature,
+            logs: [
+              'Program program invoke [1]',
+              'Program log: bridge_fund:GDEST:CASSET:100',
+              'Program program success',
+            ],
+          },
+        },
+      },
+    }) as Promise<void>;
+    await submissionStarted;
+    assertEqual((listener as any).lastSignature, null, 'Solana signature cursor must not advance while submission is pending');
+    assertEqual(new SolanaSignatureStore(filePath).load(), null, 'pending Solana signature must not be persisted');
+    releaseSubmission();
+    await processing;
+    assertEqual(new SolanaSignatureStore(filePath).load(), signature, 'Solana signature should persist after event handling completes');
+  } finally {
+    releaseSubmission();
     try { fs.unlinkSync(filePath); } catch { /* ignore */ }
   }
 }
@@ -2519,7 +2710,7 @@ export function test_dead_letter_queue_persists_across_restart(): void {
   }
 }
 
-async function runRelayerSelfTests(): Promise<void> {
+export async function runRelayerSelfTests(): Promise<void> {
   await test_duplicate_event_ignored_via_nonce_store();
   await test_concurrent_duplicate_events_submit_only_once();
   await test_nonce_marked_only_after_successful_submission();
@@ -2542,11 +2733,14 @@ async function runRelayerSelfTests(): Promise<void> {
   await test_eth_listener_advances_from_block_even_with_no_logs();
   await test_eth_listener_withholds_logs_within_confirmation_depth();
   await test_eth_listener_skips_removed_reorged_logs();
+  await test_pending_submission_does_not_advance_persisted_eth_cursor();
   test_solana_listener_rejects_bad_log_lines();
+  test_solana_replay_key_uses_notification_signature_and_line_index();
   test_solana_listener_subscribes_with_finalized_commitment();
-  test_solana_listener_skips_failed_notification();
+  await test_solana_listener_skips_failed_notification();
   await test_solana_listener_backfills_missed_events_after_reconnect();
   await test_solana_listener_skips_failed_backfill_transaction();
+  await test_pending_solana_submission_does_not_advance_signature_cursor();
   await test_solana_listener_skips_backfill_without_persisted_signature();
   test_payload_hash_matches_onchain_algorithm();
   test_amount_encoding_handles_large_decimals();

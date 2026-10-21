@@ -198,8 +198,14 @@ export ETH_RPC_URL="https://eth-mainnet.example.com"
 export ETH_BRIDGE_CONTRACT="0x..."
 export ETH_EVENT_TOPIC="0x..."
 export SOLANA_WS_URL="wss://api.mainnet-beta.solana.com"
+export SOLANA_HTTP_URL="https://api.mainnet-beta.solana.com"
 export SOLANA_PROGRAM_ID="<base58-program-id>"
 ```
+
+The Solana bridge program should emit `Program log: bridge_fund:<target>:<asset>:<amount>`.
+Do not include a transaction signature in the program-controlled log: the relayer
+uses the signature from the RPC notification and the log's position in that
+transaction to derive its replay key.
 
 ### Run the relayer self-tests
 
