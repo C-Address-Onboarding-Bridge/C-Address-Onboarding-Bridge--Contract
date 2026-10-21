@@ -14,6 +14,7 @@ import {
   rpc,
   Contract,
   xdr,
+  Address,
   Keypair,
   nativeToScVal,
   scValToNative,
@@ -263,7 +264,12 @@ class ContractClient {
       .addOperation(
         this.contract.call(
           'fund_c_address',
-          ...toScVals([options.source, options.target, options.asset, options.amount]),
+          ...toScVals([
+            new Address(options.source),
+            new Address(options.target),
+            new Address(options.asset),
+            { value: BigInt(options.amount), type: 'i128' },
+          ]),
         ),
       );
 
@@ -286,13 +292,13 @@ class ContractClient {
         this.contract.call(
           'fund_c_address_with_swap',
           ...toScVals([
-            options.source,
-            options.target,
-            options.sourceAsset,
-            options.targetAsset,
-            options.sourceAmount,
-            options.minTargetAmount,
-            options.swapRoute,
+            new Address(options.source),
+            new Address(options.target),
+            new Address(options.sourceAsset),
+            new Address(options.targetAsset),
+            { value: BigInt(options.sourceAmount), type: 'i128' },
+            { value: BigInt(options.minTargetAmount), type: 'i128' },
+            options.swapRoute.map((address: string) => new Address(address)),
           ]),
         ),
       );
@@ -309,7 +315,10 @@ class ContractClient {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(
-        this.contract.call('withdraw_fees', ...toScVals([options.asset, options.amount]),
+        this.contract.call('withdraw_fees', ...toScVals([
+          new Address(options.asset),
+          { value: BigInt(options.amount), type: 'i128' },
+        ]),
           options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' })),
       );
 
@@ -337,7 +346,7 @@ class ContractClient {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(
-        this.contract.call('set_fee_collector', ...toScVals([newFeeCollector])),
+        this.contract.call('set_fee_collector', ...toScVals([new Address(newFeeCollector)])),
       );
 
     return this.submitMutation('setFeeCollector', tx, adminKeypair);
@@ -351,7 +360,7 @@ class ContractClient {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(
-        this.contract.call('set_admin', ...toScVals([newAdmin])),
+        this.contract.call('set_admin', ...toScVals([new Address(newAdmin)])),
       );
 
     return this.submitMutation('setAdmin', tx, adminKeypair);

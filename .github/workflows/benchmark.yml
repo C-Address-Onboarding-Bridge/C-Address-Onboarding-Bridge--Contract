@@ -58,13 +58,12 @@ jobs:
           cat benchmark_results.json
 
       - name: Download previous benchmark results
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: previous_benchmark.json
-          key: benchmark-results-${{ github.ref_name }}
+          key: benchmark-results-main-${{ github.sha }}
           restore-keys: |
-            benchmark-results-main
-            benchmark-results-
+            benchmark-results-main-
 
       - name: Compare with previous benchmarks
         run: |
@@ -108,6 +107,13 @@ jobs:
       - name: Save benchmark results as baseline
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: cp benchmark_results.json previous_benchmark.json
+
+      - name: Save benchmark baseline cache
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: previous_benchmark.json
+          key: benchmark-results-main-${{ github.sha }}
 
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4

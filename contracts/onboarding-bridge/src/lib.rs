@@ -3936,7 +3936,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotRelayer`] — A signature's pubkey is not a registered relayer.
     /// * [`BridgeError::DuplicateRelayerSignature`] — The same relayer pubkey
     ///   appears more than once in `sigs`.
-    /// * [`BridgeError::BelowThreshold`] — Fewer than `threshold` valid signatures.
+    /// * [`BridgeError::BelowThreshold`] — No active relayers, a zero threshold,
+    ///   or fewer than `threshold` valid signatures.
     /// * [`BridgeError::InvalidAddress`] — A strkey exceeds `MAX_STRKEY_LEN` (64) bytes.
     ///
     /// # Events
@@ -3970,6 +3971,10 @@ impl OnboardingBridge {
         }
         check_access(&env, &target)?;
         check_asset_whitelisted(&env, &asset)?;
+        let threshold = relayer_threshold(&env);
+        if threshold == 0 || relayer_count(&env) == 0 {
+            return Err(BridgeError::BelowThreshold);
+        }
 
         let tx_hash_bytes: soroban_sdk::Bytes = tx_hash.clone().into();
         let mut nonce_pre = soroban_sdk::Bytes::new(&env);
@@ -4021,7 +4026,7 @@ impl OnboardingBridge {
             env.crypto()
                 .ed25519_verify(&sig.pubkey, &payload_hash.clone().into(), &sig.signature);
         }
-        if seen.len() < relayer_threshold(&env) {
+        if seen.len() < threshold {
             return Err(BridgeError::BelowThreshold);
         }
 
@@ -4088,9 +4093,8 @@ impl OnboardingBridge {
 
     /// Removes a relayer from the trusted set.
     ///
-    /// The removal is rejected if it would reduce the active relayer count
-    /// below the current threshold, which would make cross-chain funding
-    /// impossible.
+    /// The removal is rejected if it would remove the last active relayer or
+    /// reduce the relayer count below the current threshold.
     ///
     /// # Arguments
     ///
@@ -4103,14 +4107,17 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    /// * [`BridgeError::BelowThreshold`] — Removing this relayer would drop the
-    ///   count below the required threshold.
+    /// * [`BridgeError::BelowThreshold`] — Removing this relayer would remove
+    ///   the last relayer or drop the count below the required threshold.
     pub fn remove_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
-        if is_relayer(&env, &pubkey) && relayer_count(&env) - 1 < relayer_threshold(&env) {
-            return Err(BridgeError::BelowThreshold);
+        if is_relayer(&env, &pubkey) {
+            let count = relayer_count(&env);
+            if count <= 1 || count.saturating_sub(1) < relayer_threshold(&env) {
+                return Err(BridgeError::BelowThreshold);
+            }
         }
         remove_relayer(&env, &pubkey);
         extend_instance_ttl(&env);
@@ -4122,7 +4129,8 @@ impl OnboardingBridge {
     ///
     /// # Arguments
     ///
-    /// * `threshold` (`u32`) — Must be ≤ the current number of registered relayers.
+    /// * `threshold` (`u32`) — Must be greater than zero and ≤ the current number
+    ///   of registered relayers.
     ///
     /// # Authorization
     ///
@@ -4131,13 +4139,13 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    /// * [`BridgeError::ThresholdExceedsRelayers`] — `threshold` is greater than
-    ///   the number of registered relayers.
+    /// * [`BridgeError::ThresholdExceedsRelayers`] — `threshold` is zero or
+    ///   greater than the number of registered relayers.
     pub fn set_relayer_threshold(env: Env, threshold: u32) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
-        if threshold > relayer_count(&env) {
+        if threshold == 0 || threshold > relayer_count(&env) {
             return Err(BridgeError::ThresholdExceedsRelayers);
         }
         save_relayer_threshold(&env, threshold);

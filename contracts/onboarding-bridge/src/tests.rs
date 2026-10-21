@@ -4194,6 +4194,90 @@ mod crosschain_tests {
 
         assert_eq!(check_balance(&env, &loyalty_token_id, &target), 3i128);
     }
+
+    #[test]
+    fn test_zero_relayer_threshold_is_rejected() {
+        let env = Env::default();
+        let (_bridge_id, _token_id, _admin, bridge) = setup(&env);
+        let relayer = BytesN::from_array(
+            &env,
+            make_signing_key([6u8; 32]).verifying_key().as_bytes(),
+        );
+        bridge.add_relayer(&relayer, &None);
+
+        assert_eq!(
+            bridge.try_set_relayer_threshold(&0u32),
+            Err(Ok(BridgeError::ThresholdExceedsRelayers))
+        );
+        assert_eq!(bridge.query_relayer_threshold(), 1);
+    }
+
+    #[test]
+    fn test_empty_crosschain_signatures_fail_without_relayers() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0x81; 32]);
+        let sigs = Vec::new(&env);
+
+        assert_eq!(
+            bridge.try_fund_c_address_crosschain(
+                &1u32, &tx_hash, &target, &token_id, &100i128, &sigs
+            ),
+            Err(Ok(BridgeError::BelowThreshold))
+        );
+    }
+
+    #[test]
+    fn test_empty_crosschain_signatures_fail_with_active_threshold() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+        let relayer = BytesN::from_array(
+            &env,
+            make_signing_key([7u8; 32]).verifying_key().as_bytes(),
+        );
+        bridge.add_relayer(&relayer, &None);
+        bridge.set_relayer_threshold(&1u32);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0x82; 32]);
+        let sigs = Vec::new(&env);
+        assert_eq!(
+            bridge.try_fund_c_address_crosschain(
+                &1u32, &tx_hash, &target, &token_id, &100i128, &sigs
+            ),
+            Err(Ok(BridgeError::BelowThreshold))
+        );
+    }
+
+    #[test]
+    fn test_zero_threshold_storage_cannot_bypass_relayer_checks() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+        let relayer = BytesN::from_array(
+            &env,
+            make_signing_key([8u8; 32]).verifying_key().as_bytes(),
+        );
+        bridge.add_relayer(&relayer, &None);
+        env.storage()
+            .instance()
+            .set(&DataKey::RelayerThreshold, &0u32);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0x83; 32]);
+        let sigs = Vec::new(&env);
+        assert_eq!(
+            bridge.try_fund_c_address_crosschain(
+                &1u32, &tx_hash, &target, &token_id, &100i128, &sigs
+            ),
+            Err(Ok(BridgeError::BelowThreshold))
+        );
+        assert_eq!(
+            bridge.try_remove_relayer(&relayer),
+            Err(Ok(BridgeError::BelowThreshold))
+        );
+        assert!(bridge.query_is_relayer(&relayer));
+    }
 }
 
 #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]

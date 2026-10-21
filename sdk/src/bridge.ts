@@ -229,10 +229,10 @@ export class OnboardingBridgeSDK {
               this.contract.call(
                 'fund_c_address',
                 ...toScVals([
-                  options.source,
-                  options.target,
-                  options.asset,
-                  options.amount,
+                  new Address(options.source),
+                  new Address(options.target),
+                  new Address(options.asset),
+                  { value: BigInt(options.amount), type: 'i128' },
                 ]),
                 nonceScVal,
                 deadlineScVal,
@@ -303,11 +303,11 @@ export class OnboardingBridgeSDK {
               this.contract.call(
                 'fund_c_address_with_referral',
                 ...toScVals([
-                  options.source,
-                  options.target,
-                  options.asset,
-                  options.amount,
-                  options.referrer,
+                  new Address(options.source),
+                  new Address(options.target),
+                  new Address(options.asset),
+                  { value: BigInt(options.amount), type: 'i128' },
+                  options.referrer ? new Address(options.referrer) : undefined,
                 ]),
               ),
             )
@@ -750,13 +750,13 @@ export class OnboardingBridgeSDK {
               this.contract.call(
                 'fund_c_address_with_swap',
                 ...toScVals([
-                  options.source,
-                  options.target,
-                  options.sourceAsset,
-                  options.targetAsset,
-                  options.sourceAmount,
-                  options.minTargetAmount,
-                  options.swapRoute,
+                  new Address(options.source),
+                  new Address(options.target),
+                  new Address(options.sourceAsset),
+                  new Address(options.targetAsset),
+                  { value: BigInt(options.sourceAmount), type: 'i128' },
+                  { value: BigInt(options.minTargetAmount), type: 'i128' },
+                  options.swapRoute.map((address) => new Address(address)),
                 ]),
                 nonceScVal,
                 deadlineScVal,
@@ -908,10 +908,10 @@ export class OnboardingBridgeSDK {
                 this.contract.call(
                   'batch_fund_c_address',
                   ...toScVals([
-                    options.source,
-                    chunkTargets,
-                    chunkAmounts,
-                    options.asset,
+                    new Address(options.source),
+                    chunkTargets.map((address) => new Address(address)),
+                    chunkAmounts.map((amount) => ({ value: BigInt(amount), type: 'i128' })),
+                    new Address(options.asset),
                   ]),
                   nonceScVal,
                   deadlineScVal,
@@ -1012,7 +1012,10 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'withdraw_fees',
-                ...toScVals([options.asset, options.amount]),
+                ...toScVals([
+                  new Address(options.asset),
+                  { value: BigInt(options.amount), type: 'i128' },
+                ]),
                 options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' }),
               ),
             )
@@ -1096,7 +1099,11 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'reclaim_tokens',
-                ...toScVals([options.asset, options.amount, options.to]),
+                ...toScVals([
+                  new Address(options.asset),
+                  { value: BigInt(options.amount), type: 'i128' },
+                  new Address(options.to),
+                ]),
                 options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' }),
               ),
             )
@@ -3052,10 +3059,10 @@ export class OnboardingBridgeSDK {
         this.contract.call(
           'fund_c_address',
           ...toScVals([
-            options.source,
-            options.target,
-            options.asset,
-            options.amount,
+            new Address(options.source),
+            new Address(options.target),
+            new Address(options.asset),
+            { value: BigInt(options.amount), type: 'i128' },
           ]),
           nonceScVal,
           deadlineScVal,
