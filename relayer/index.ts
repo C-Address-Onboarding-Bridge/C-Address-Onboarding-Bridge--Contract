@@ -996,12 +996,7 @@ export class SolanaChainListener implements ChainListener {
     this.ws.onmessage = (msg: any) => {
       try {
         const data = JSON.parse(typeof msg === 'string' ? msg : msg.data);
-        const signature: string | undefined = data?.params?.result?.value?.signature;
-        const logs: string[] = data?.params?.result?.value?.logs ?? [];
-        for (const event of this.extractBridgeFundEvents(logs)) {
-          if (this.onEvent) this.onEvent(event);
-        }
-        if (signature) this.recordSignature(signature);
+        this.handleNotification(data);
       } catch { /* ignore malformed messages */ }
     };
 
@@ -1023,6 +1018,84 @@ export class SolanaChainListener implements ChainListener {
         this.connect();
       }, delay);
     };
+  }
+
+  private handleNotification(data: any): void {
+    const value = data?.params?.result?.value;
+    const signature: string | undefined = value?.signature;
+    if (value?.err != null) {
+      console.warn(
+        `[solana-listener] skipping failed transaction ${signature ?? '<unknown>'}: ${JSON.stringify(value.err)}`,
+      );
+      if (signature) this.recordSignature(signature);
+      return;
+    }
+
+    const logs: string[] = value?.logs ?? [];
+    for (const event of this.extractBridgeFundEvents(logs)) {
+      if (this.onEvent) this.onEvent(event);
+    }
+    if (signature) this.recordSignature(signature);
+  }
+
+  private async backfill(): Promise<void> {
+    if (!this.config.httpUrl || !this.lastSignature) return;
+
+    const signatures = await this.rpcCall<Array<{ signature: string }>>(
+      'getSignaturesForAddress',
+      [this.config.programId, { until: this.lastSignature, limit: 1000, commitment: 'finalized' }],
+    );
+
+    for (const item of signatures.reverse()) {
+      const transaction = await this.rpcCall<{
+        meta?: { err?: unknown; logMessages?: string[] | null } | null;
+      } | null>(
+        'getTransaction',
+        [item.signature, { commitment: 'finalized', maxSupportedTransactionVersion: 0 }],
+      );
+      if (!transaction) continue;
+
+      if (transaction.meta?.err != null) {
+        console.warn(
+          `[solana-listener] skipping failed backfill transaction ${item.signature}: ` +
+          JSON.stringify(transaction.meta.err),
+        );
+        this.recordSignature(item.signature);
+        continue;
+      }
+
+      for (const event of this.extractBridgeFundEvents(transaction.meta?.logMessages ?? [])) {
+        if (this.onEvent) this.onEvent(event);
+      }
+      this.recordSignature(item.signature);
+    }
+  }
+
+  private async rpcCall<T>(method: string, params: unknown[]): Promise<T> {
+    if (!this.config.httpUrl) throw new Error('Solana HTTP RPC URL is not configured');
+
+    const response = await fetch(this.config.httpUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    });
+    if (!response.ok) {
+      throw new Error(`${method} RPC request failed with HTTP ${response.status}`);
+    }
+
+    const json = await response.json() as { result?: T; error?: unknown };
+    if (json.error != null) {
+      throw new Error(`${method} RPC error: ${JSON.stringify(json.error)}`);
+    }
+    if (!Object.prototype.hasOwnProperty.call(json, 'result')) {
+      throw new Error(`${method} RPC response has no result`);
+    }
+    return json.result as T;
+  }
+
+  private recordSignature(signature: string): void {
+    this.lastSignature = signature;
+    this.signatureStore.save(signature);
   }
 
   /**
@@ -2113,7 +2186,15 @@ export async function test_solana_listener_backfills_missed_events_after_reconne
         return [{ signature: 'sig-new', err: null }];
       }
       if (method === 'getTransaction') {
-        return { meta: { logMessages: ['Program log: bridge_fund:' + 'ab'.repeat(32) + ':GDEST:CASSET:100'] } };
+        return {
+          meta: {
+            logMessages: [
+              'Program program invoke [1]',
+              'Program log: bridge_fund:' + '1'.repeat(64) + ':GDEST:CASSET:100',
+              'Program program success',
+            ],
+          },
+        };
       }
       return null;
     };
@@ -2137,6 +2218,74 @@ export async function test_solana_listener_backfills_missed_events_after_reconne
       signatureStorePath: filePath,
     });
     assertEqual((restarted as any).lastSignature, 'sig-new', 'signature persisted before restart must be loaded on construction');
+  } finally {
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+  }
+}
+
+export async function test_solana_listener_skips_failed_backfill_transaction(): Promise<void> {
+  const filePath = tempStorePath('solana-failed-sig');
+  const listener = new SolanaChainListener({
+    wsUrl: 'ws://localhost',
+    programId: 'program',
+    chainId: 101,
+    httpUrl: 'http://localhost',
+    signatureStorePath: filePath,
+  });
+  try {
+    (listener as any).lastSignature = 'sig-before-restart';
+    (listener as any).rpcCall = async (method: string) => method === 'getSignaturesForAddress'
+      ? [{ signature: 'sig-failed' }]
+      : {
+        meta: {
+          err: { InstructionError: [0, 'Custom'] },
+          logMessages: [
+            'Program program invoke [1]',
+            'Program log: bridge_fund:' + '1'.repeat(64) + ':GDEST:CASSET:100',
+            'Program program failed: custom program error',
+          ],
+        },
+      };
+
+    const events: BridgeEvent[] = [];
+    (listener as any).onEvent = (event: BridgeEvent) => events.push(event);
+    await (listener as any).backfill();
+
+    assertEqual(events.length, 0, 'failed backfill transactions must not emit bridge_fund events');
+  } finally {
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+  }
+}
+
+export function test_solana_listener_skips_failed_notification(): void {
+  const filePath = tempStorePath('solana-failed-notification');
+  const listener = new SolanaChainListener({
+    wsUrl: 'ws://localhost',
+    programId: 'program',
+    chainId: 101,
+    signatureStorePath: filePath,
+  });
+  try {
+    const events: BridgeEvent[] = [];
+    (listener as any).onEvent = (event: BridgeEvent) => events.push(event);
+
+    (listener as any).handleNotification({
+      params: {
+        result: {
+          value: {
+            signature: 'sig-failed',
+            err: { InstructionError: [0, 'Custom'] },
+            logs: [
+              'Program program invoke [1]',
+              'Program log: bridge_fund:' + '1'.repeat(64) + ':GDEST:CASSET:100',
+              'Program program failed: custom program error',
+            ],
+          },
+        },
+      },
+    });
+
+    assertEqual(events.length, 0, 'failed notification logs must not emit bridge_fund events');
   } finally {
     try { fs.unlinkSync(filePath); } catch { /* ignore */ }
   }
@@ -2221,7 +2370,9 @@ async function runRelayerSelfTests(): Promise<void> {
   await test_eth_listener_skips_removed_reorged_logs();
   test_solana_listener_rejects_bad_log_lines();
   test_solana_listener_subscribes_with_finalized_commitment();
+  test_solana_listener_skips_failed_notification();
   await test_solana_listener_backfills_missed_events_after_reconnect();
+  await test_solana_listener_skips_failed_backfill_transaction();
   await test_solana_listener_skips_backfill_without_persisted_signature();
   test_payload_hash_matches_onchain_algorithm();
   test_amount_encoding_handles_large_decimals();

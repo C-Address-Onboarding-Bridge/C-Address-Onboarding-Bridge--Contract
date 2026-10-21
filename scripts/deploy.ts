@@ -265,6 +265,133 @@ async function deployContract(
   const createResult = await submitAndConfirm(provider, cfg, admin, (account) =>
     new TransactionBuilder(account, {
       fee: BASE_FEE,
-      netw
+      networkPassphrase: cfg.networkPassphrase,
+    })
+      .addOperation(
+        Operation.createCustomContract({
+          address: Address.fromString(admin.publicKey()),
+          wasmHash,
+          salt,
+          constructorArgs,
+        }),
+      )
+      .setTimeout(30)
+      .build(),
+  );
 
-/* … truncated 1649 chars — edit only what you need near the top … */
+  const contractId = extractContractId(createResult);
+  if (!contractId) {
+    throw new Error('Contract deployment succeeded but returned no contractId');
+  }
+  console.log(`  Contract ID: ${contractId} ✓`);
+  return contractId;
+}
+
+/**
+ * Extract the created contract ID from a createCustomContract result.
+ * The contract address is returned as the operation's return value.
+ */
+function extractContractId(result: SorobanRpc.Api.GetTransactionResponse): string | undefined {
+  if (result.status !== 'SUCCESS') return undefined;
+  const meta = result.resultMetaXdr;
+  if (!meta) return undefined;
+  const txMeta = xdr.TransactionMeta.fromXDR(meta, 'base64');
+  const sorobanMeta = txMeta.v3().sorobanMeta();
+  if (!sorobanMeta) return undefined;
+  const returnValue = sorobanMeta.returnValue();
+  if (!returnValue) return undefined;
+  return Address.fromScVal(returnValue).toString();
+}
+
+async function initialize(
+  provider: SorobanRpc.Server,
+  cfg: DeployConfig,
+  admin: Keypair,
+  contractId: string,
+  wasmHash: Buffer,
+): Promise<void> {
+  console.log(`Initializing contract ${contractId}…`);
+  const contract = new Contract(contractId);
+  const account = await provider.getAccount(admin.publicKey());
+
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: cfg.networkPassphrase,
+  })
+    .addOperation(
+      contract.call(
+        'initialize',
+        Address.fromString(admin.publicKey()).toScVal(),
+        Address.fromString(cfg.feeCollectorPublicKey).toScVal(),
+        nativeToScVal(cfg.feeBps, { type: 'u32' }),
+        nativeToScVal(null),
+        nativeToScVal(wasmHash, { type: 'bytes' }),
+      ),
+    )
+    .setTimeout(30)
+    .build();
+
+  const prepared = await provider.prepareTransaction(tx);
+  prepared.sign(admin);
+  const resp = await provider.sendTransaction(prepared);
+  console.log(`  Init tx: ${resp.hash}`);
+  await poll(provider, resp.hash);
+  console.log('  Initialized successfully ✓');
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+async function main(): Promise<void> {
+  const filteredArgv = process.argv.slice(2).filter((_, i, arr) => {
+    if (arr[i - 1] === '--network' || arr[i] === '--network') return false;
+    if (arr[i - 1] === '--salt' || arr[i] === '--salt') return false;
+    return true;
+  });
+
+  const [command, customId] = filteredArgv;
+  const network = parseNetworkArg();
+  const cfg = loadConfig(network);
+
+  if (!cfg.adminSecretKey || cfg.adminSecretKey.startsWith('S...')) {
+    console.error('adminSecretKey is not set in your deploy-config file. Aborting.');
+    process.exit(1);
+  }
+
+  const admin = Keypair.fromSecret(cfg.adminSecretKey);
+  const provider = new SorobanRpc.Server(cfg.rpcUrl, { allowHttp: cfg.network === 'dev' });
+
+  console.log(`\n=== C-Address Onboarding Bridge Deployment ===`);
+  console.log(`Network:  ${cfg.network}`);
+  console.log(`RPC:      ${cfg.rpcUrl}`);
+  console.log(`Admin:    ${admin.publicKey()}`);
+  console.log(`FeeBps:   ${cfg.feeBps}\n`);
+
+  if (command === 'deploy' || command === 'all') {
+    const wasmHash = createHash('sha256').update(fs.readFileSync(cfg.wasmPath)).digest();
+    const contractId = await deployContract(provider, cfg, admin, wasmHash);
+    console.log(`\nDeployment complete. CONTRACT_ID=${contractId}`);
+    return;
+  }
+
+  if (command === 'init') {
+    if (!customId) {
+      console.error('Usage: npx ts-node scripts/deploy.ts init <contract_id> [--network <network>]');
+      process.exit(1);
+    }
+    const wasmHash = createHash('sha256').update(fs.readFileSync(cfg.wasmPath)).digest();
+    await initialize(provider, cfg, admin, customId, wasmHash);
+    return;
+  }
+
+  console.error(`Unknown command "${command}". Valid commands: all, deploy, init`);
+  process.exit(1);
+}
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

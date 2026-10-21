@@ -658,8 +658,7 @@ fn bench_execute_meta_fund() {
     let signing_key = SigningKey::from_bytes(&secret);
     let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
     bridge.register_meta_signer(&source, &pubkey);
-    let network_id = BytesN::from_array(&env, &[9u8; 32]);
-    bridge.set_meta_tx_network_id(&network_id);
+    let network_id = env.ledger().network_id();
 
     // Build the canonical meta-fund payload and sign it.
     use soroban_sdk::Bytes;

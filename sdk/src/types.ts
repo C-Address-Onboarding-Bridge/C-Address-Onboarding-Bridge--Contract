@@ -437,6 +437,11 @@ export interface PendingUpgrade {
 }
 
 export interface MetaFundParams {
+  /**
+   * 32-byte hex-encoded SHA-256 hash of the Stellar network passphrase.
+   * This must match `env.ledger().network_id()` on the deployed contract.
+   */
+  networkId: string;
   source: string;
   target: string;
   asset: string;
