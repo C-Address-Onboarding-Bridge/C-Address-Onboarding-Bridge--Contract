@@ -82,8 +82,9 @@ export function startSignerService(privateKeyHex: string, port: number, authToke
     });
   });
 
-  server.listen(port, () => {
-    console.log(`[signer-service] listening on :${port} (holds one signing key only)`);
+  const host = process.env.SIGNER_HOST ?? '127.0.0.1';
+  server.listen(port, host, () => {
+    console.log(`[signer-service] listening on ${host}:${port} (holds one signing key only)`);
   });
 
   return server;

@@ -1526,16 +1526,19 @@ export class OnboardingBridgeSDK {
     adminKeypair: Keypair,
     nonce?: string | number | bigint,
   ): Promise<TransactionResult> {
-    if (newFeeBps < 0 || newFeeBps > 1000) {
-      throw new Error('Fee basis points must be between 0 and 1000');
-    }
-
     return withTransactionHooks(
       this.hooks,
       'setFee',
       { newFeeBps, nonce },
       async () => {
         try {
+          if (newFeeBps < 0 || newFeeBps > 1000) {
+            return {
+              hash: '',
+              status: 'failed',
+              error: 'Fee basis points must be between 0 and 1000',
+            };
+          }
           const adminAccount = await withRpcHook(
             this.hooks,
             'getAccount',
