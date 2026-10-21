@@ -230,14 +230,14 @@ class ContractClient {
     preparedTx.sign(signer);
     const response = await this.provider.sendTransaction(preparedTx);
 
-    if (response.status !== 'ERROR') {
+    if (response.status === 'PENDING') {
       await Promise.all(CACHE_KEYS.map((key) => this.cache.delete(key)));
       void this.invalidateAfterConfirmation(response.hash);
     }
 
     return {
       hash: response.hash,
-      status: response.status === 'ERROR' ? 'failed' : 'pending',
+      status: response.status === 'PENDING' ? 'pending' : 'failed',
     };
   }
 

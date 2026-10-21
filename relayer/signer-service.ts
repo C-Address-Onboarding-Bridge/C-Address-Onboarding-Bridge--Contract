@@ -11,9 +11,8 @@
  * instance's URL. See `adr/ADR-007-signer-key-isolation.md` for the trust
  * model this establishes and what is intentionally left as follow-up.
  *
- * This is deliberately minimal (stdlib + @stellar/stellar-sdk only, no TLS
- * termination, no auth). Deploy it behind mTLS or a private network — see the
- * ADR's "Remaining follow-up" section.
+ * This is deliberately minimal (stdlib + @stellar/stellar-sdk only). Deploy it
+ * behind TLS in addition to the mandatory bearer-token authentication.
  */
 
 import * as http from 'http';
@@ -50,11 +49,17 @@ export function signHex(privateKeyHex: string, payloadHashHex: string): SignResp
  * Start the signer HTTP server. `privateKeyHex` is held only in this
  * process's memory — it is never logged or echoed back in any response.
  */
-export function startSignerService(privateKeyHex: string, port: number): http.Server {
+export function startSignerService(privateKeyHex: string, port: number, authToken: string): http.Server {
+  if (!authToken) throw new Error('SIGNER_AUTH_TOKEN is required');
   const server = http.createServer((req, res) => {
     if (req.method !== 'POST' || req.url !== '/sign') {
       res.writeHead(404);
       res.end('Not Found');
+      return;
+    }
+    if (req.headers.authorization !== `Bearer ${authToken}`) {
+      res.writeHead(401);
+      res.end('Unauthorized');
       return;
     }
 
@@ -131,6 +136,11 @@ if (require.main === module) {
       process.exit(1);
     }
     const port = parseInt(process.env.SIGNER_PORT ?? '4000', 10);
-    startSignerService(privateKeyHex, port);
+    const authToken = process.env.SIGNER_AUTH_TOKEN;
+    if (!authToken) {
+      console.error('SIGNER_AUTH_TOKEN is required');
+      process.exit(1);
+    }
+    startSignerService(privateKeyHex, port, authToken);
   }
 }
