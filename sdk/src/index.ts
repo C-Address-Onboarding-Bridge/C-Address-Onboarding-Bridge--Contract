@@ -33,7 +33,7 @@
  * | `assertAccountAddress` | Validates a G-address; throws on invalid input |
  * | `assertContractAddress` | Validates a C-address; throws on invalid input |
  * | `withRetry` | Low-level retry wrapper for arbitrary async functions |
- * | `withRpcRetry` | Wraps a `SorobanRpc.Server` with automatic retries |
+ * | `withRpcRetry` | Wraps an `rpc.Server` with automatic retries |
  * | `isRetryableRpcError` | Classifies an error as transient (worth retrying) |
  * | `computeBackoffDelay` | Computes exponential backoff delay with optional jitter |
  * | `VIEW_RETRY_POLICY` | Default retry policy for idempotent read calls |

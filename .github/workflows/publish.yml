@@ -19,17 +19,10 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.84.0
-          targets: wasm32v1-none
+          targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
-
-      # The upgrade tests in src/tests.rs `include_bytes!` the release wasm, so
-      # the wasm has to exist BEFORE anything compiles the test target. Building
-      # it first keeps `cargo test` from failing on a clean runner (same
-      # ordering fix as the Soroban Contract job in ci.yml).
-      - name: Build WASM (release)
-        run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
 
       - name: Run contract tests
         run: cargo test -p onboarding-bridge --features testutils

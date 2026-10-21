@@ -143,6 +143,26 @@ export interface DeadLetterEntry {
   reason: string;
 }
 
+function readJsonFile<T>(filePath: string): T | null {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8')) as T;
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonFileAtomic<T>(filePath: string, value: T): void {
+  const json = JSON.stringify(value);
+  if (json === undefined) {
+    throw new TypeError('Value cannot be serialized as JSON');
+  }
+
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmpPath = `${filePath}.tmp`;
+  fs.writeFileSync(tmpPath, json, 'utf8');
+  fs.renameSync(tmpPath, filePath);
+}
+
 /**
  * In-memory dead-letter store for under-threshold events and failed
  * submissions. Replace with a persistent store (e.g. Redis, SQLite) in
@@ -517,33 +537,13 @@ export class BlockStore {
    * that callers can fall back to `'latest'` on a fresh install.
    */
   load(): string | null {
-    try {
-      const raw = fs.readFileSync(this.filePath, 'utf8');
-      const parsed = JSON.parse(raw) as unknown;
-      if (
-        parsed !== null &&
-        typeof parsed === 'object' &&
-        'fromBlock' in (parsed as object) &&
-        typeof (parsed as { fromBlock: unknown }).fromBlock === 'string'
-      ) {
-        return (parsed as { fromBlock: string }).fromBlock;
-      }
-      return null;
-    } catch {
-      // File missing or unreadable — treat as first run
-      return null;
-    }
+    const parsed = readJsonFile<{ fromBlock?: unknown }>(this.filePath);
+    return parsed && typeof parsed.fromBlock === 'string' ? parsed.fromBlock : null;
   }
 
   /** Atomically persist the current fromBlock value. */
   save(fromBlock: string): void {
-    const dir = path.dirname(this.filePath);
-    if (dir && dir !== '.') {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    const tmp = this.filePath + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify({ fromBlock }), 'utf8');
-    fs.renameSync(tmp, this.filePath);
+    writeJsonFileAtomic(this.filePath, { fromBlock });
   }
 }
 
@@ -2334,7 +2334,7 @@ export function test_dead_letter_queue_persists_across_restart(): void {
   const filePath = tempStorePath('dlq');
   try {
     const before = new DeadLetterQueue(filePath);
-    before.enqueue(makeTestEvent(), 1, 2);
+    before.enqueue(makeTestEvent(), 1, 2, 'threshold not met');
     assertEqual(before.size(), 1, 'entry should be enqueued');
 
     // Simulate a restart: construct a brand-new instance pointed at the same file.
@@ -2380,6 +2380,8 @@ async function runRelayerSelfTests(): Promise<void> {
   test_signature_from_known_seed_is_deterministic();
   // Issue #657: BlockStore persistence
   test_block_store_save_and_load();
+  test_nonce_store_persists_across_restart();
+  test_dead_letter_queue_persists_across_restart();
   // Issue 3 & 4: env var and threshold validation
   test_missing_contract_id_throws();
   test_missing_rpc_url_throws();

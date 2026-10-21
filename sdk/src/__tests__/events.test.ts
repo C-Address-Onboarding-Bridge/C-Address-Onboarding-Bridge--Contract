@@ -8,7 +8,7 @@ const mockGetEvents = jest.fn();
 const mockGetLatestLedger = jest.fn();
 
 jest.mock('@stellar/stellar-sdk', () => ({
-  SorobanRpc: {
+  rpc: {
     Server: jest.fn().mockImplementation(() => ({
       getEvents: mockGetEvents,
       getLatestLedger: mockGetLatestLedger,

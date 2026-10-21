@@ -10,14 +10,15 @@ Local development environment for the C-Address Onboarding Bridge — Soroban sm
 |---|---|---|
 | Docker + Docker Compose | 24+ | [docs.docker.com](https://docs.docker.com/get-docker/) |
 | Node.js | 20 LTS | [nodejs.org](https://nodejs.org) or `nvm install 20` |
-| Rust + wasm32 target | stable | `curl https://sh.rustup.rs -sSf \| sh` |
+| Rust + wasm32 targets | 1.84.0 (pinned by `rust-toolchain.toml`) | `curl https://sh.rustup.rs -sSf \| sh` |
 | Stellar CLI | latest | `cargo install --locked stellar-cli` |
 | Git | any | — |
 
-Add the wasm32 target after installing Rust:
+The repository's `rust-toolchain.toml` pins Rust 1.84.0 and configures both
+WASM targets. If you install them manually, target the pinned toolchain:
 
 ```bash
-rustup target add wasm32-unknown-unknown
+rustup target add --toolchain 1.84.0 wasm32-unknown-unknown wasm32v1-none
 ```
 
 ---

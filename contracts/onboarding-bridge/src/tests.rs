@@ -718,15 +718,11 @@ fn test_fund_works_after_unpause() {
     assert_eq!(check_balance(&env, &token_id, &target), 495i128);
 }
 
-// The soroban-sdk ships a known-good compiled wasm fixture used for doc/unit
-// tests. We reuse it here as our "v2" wasm to get a real BytesN<32> hash that
-// the host accepts, so we can exercise the full auth → wasm-swap → event path.
-const V2_WASM: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/wasm32-unknown-unknown/release/onboarding_bridge.wasm"
-));
+// Soroban SDK 22.0.1's small doctest fixture is a valid uploadable contract
+// WASM. Keeping it here makes upgrade tests independent of prior builds and
+// the caller's CARGO_TARGET_DIR.
+const V2_WASM: &[u8] = include_bytes!("../test_fixtures/contract.wasm");
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_upgrade_admin_only_and_event() {
     let env = Env::default();
@@ -775,7 +771,6 @@ fn test_upgrade_non_admin_rejected() {
 
 /********** Timelocked upgrade tests (execute_upgrade) **********/
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_execute_upgrade_succeeds_at_timelock_boundary_and_clears_pending() {
     let env = Env::default();

@@ -17,10 +17,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.84.0
           components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -29,13 +30,6 @@ jobs:
       # pre-commit hook only covers fmt and `--no-verify` skips it entirely.
       - name: Check formatting
         run: cargo fmt --all -- --check
-
-      # `--all-targets` compiles the test target, and the upgrade tests in
-      # src/tests.rs `include_bytes!` the release wasm -- so on a clean runner
-      # clippy fails with "couldn't read ...onboarding_bridge.wasm" unless the
-      # wasm is built first (same ordering fix as the Soroban Contract job).
-      - name: Build WASM fixture for the test target
-        run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -47,7 +41,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.84.0
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -88,18 +84,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.84.0
           targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      # The wasm has to exist BEFORE anything compiles the test target: the
-      # upgrade tests in src/tests.rs `include_bytes!` it, so `cargo check
-      # --all-targets` fails outright on a clean checkout if the build runs
-      # after it. This ordering bug is why the job never reached the suite.
-      - name: Build WASM (release)
+      # Build the legacy WASM artifact used by the hash check and upload step.
+      - name: Build WASM (wasm32-unknown-unknown)
         run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
 
       # Fast fail on type errors (including the test target) before paying for
@@ -117,12 +111,8 @@ jobs:
       - name: Build WASM (wasm32v1-none)
         run: cargo build -p onboarding-bridge --release --target wasm32v1-none
 
-      # TODO(next-bounty): advisory only. wasm_hash.txt does not match a build of
-      # this source on any current stable toolchain -- rustc codegen changes
-      # between releases, and this job pins `dtolnay/rust-toolchain@stable`,
-      # which moves. A meaningful artifact hash needs a pinned toolchain and a
-      # reproducible build (e.g. `stellar contract build` in a pinned image).
-      # Until then this reports the drift instead of failing every run.
+      # TODO(next-bounty): advisory only until wasm_hash.txt is refreshed from
+      # the pinned toolchain's reproducible build.
       - name: Verify WASM Hash
         continue-on-error: true
         run: |
@@ -285,9 +275,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
-          targets: wasm32-unknown-unknown
+          toolchain: 1.84.0
+          targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Pin Soroban SDK major version
         run: |
@@ -303,10 +294,6 @@ jobs:
       - name: Build contract
         run: cargo build -p onboarding-bridge --release
 
-      # The upgrade tests include_bytes! the compiled wasm; build it first.
-      - name: Build WASM fixture for tests
-        run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
-
       - name: Run contract tests
         run: cargo test -p onboarding-bridge --features testutils
 
@@ -320,9 +307,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.84.0
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
