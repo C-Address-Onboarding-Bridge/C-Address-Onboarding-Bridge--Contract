@@ -1164,7 +1164,11 @@ export class SolanaChainListener implements ChainListener {
   }
 
   private async backfill(): Promise<void> {
-    if (!this.lastSignature || !this.config.httpUrl) return;
+    if (!this.lastSignature) return;
+    if (!this.config.httpUrl) {
+      console.warn('[solana-listener] backfill skipped: HTTP RPC URL is not configured');
+      return;
+    }
 
     const pending: Array<{ signature: string; err: unknown }> = [];
     let before: string | undefined;
@@ -2498,9 +2502,11 @@ export async function test_solana_listener_backfills_missed_events_after_reconne
     (listener as any).lastSignature = 'sig-before-restart';
 
     const rpcCalls: string[] = [];
-    (listener as any).rpcCall = async (method: string, _params: unknown[]) => {
+    let signatureParams: unknown[] = [];
+    (listener as any).rpcCall = async (method: string, params: unknown[]) => {
       rpcCalls.push(method);
       if (method === 'getSignaturesForAddress') {
+        signatureParams = params;
         return [{ signature: '1'.repeat(64), err: null }];
       }
       if (method === 'getTransaction') {
@@ -2523,6 +2529,11 @@ export async function test_solana_listener_backfills_missed_events_after_reconne
     await (listener as any).backfill();
 
     assertEqual(rpcCalls.join(','), 'getSignaturesForAddress,getTransaction', 'backfill should query signatures then fetch the transaction');
+    assertEqual(signatureParams[0], 'program', 'backfill should query the configured program');
+    const signatureOptions = signatureParams[1] as { commitment?: string; limit?: number; until?: string };
+    assertEqual(signatureOptions.commitment, 'finalized', 'signature query should use finalized commitment');
+    assertEqual(signatureOptions.limit, 1000, 'signature query should request a full page');
+    assertEqual(signatureOptions.until, 'sig-before-restart', 'signature query should page back to the last processed signature');
     assertEqual(events.length, 1, 'backfill should replay the missed bridge_fund event');
     assertEqual((listener as any).lastSignature, '1'.repeat(64), 'lastSignature should advance to the newest replayed signature');
 
@@ -2671,6 +2682,72 @@ export async function test_solana_listener_skips_backfill_without_persisted_sign
   assert(!called, 'a fresh listener with no persisted signature has nothing to backfill from and should not call the RPC');
 }
 
+export async function test_solana_listener_skips_failed_transactions_during_backfill(): Promise<void> {
+  const filePath = tempStorePath('solana-sig-failed');
+  try {
+    const listener = new SolanaChainListener({
+      wsUrl: 'ws://localhost',
+      programId: 'program',
+      chainId: 101,
+      httpUrl: 'http://localhost',
+      signatureStorePath: filePath,
+    });
+    (listener as any).lastSignature = 'sig-before-restart';
+    const fetchedTransactions: string[] = [];
+    (listener as any).rpcCall = async (method: string, params: unknown[]) => {
+      if (method === 'getSignaturesForAddress') {
+        return [
+          { signature: 'sig-new', err: null },
+          { signature: 'sig-failed', err: { InstructionError: [0, 'failed'] } },
+        ];
+      }
+      if (method === 'getTransaction') {
+        fetchedTransactions.push(params[0] as string);
+        return { meta: { logMessages: [] } };
+      }
+      return null;
+    };
+
+    await (listener as any).backfill();
+    assertEqual(
+      fetchedTransactions.join(','),
+      'sig-new',
+      'failed finalized transactions must not be fetched or replayed',
+    );
+    assertEqual((listener as any).lastSignature, 'sig-new', 'backfill should persist its newest processed signature');
+  } finally {
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+  }
+}
+
+export async function test_solana_listener_skips_backfill_without_http_url(): Promise<void> {
+  const filePath = tempStorePath('solana-sig-no-http');
+  const listener = new SolanaChainListener({
+    wsUrl: 'ws://localhost',
+    programId: 'program',
+    chainId: 101,
+    signatureStorePath: filePath,
+  });
+  (listener as any).lastSignature = 'sig-before-restart';
+  let called = false;
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (message?: unknown) => { warnings.push(String(message)); };
+  (listener as any).rpcCall = async () => { called = true; return []; };
+
+  try {
+    await (listener as any).backfill();
+    assert(!called, 'backfill without an HTTP URL must not call RPC');
+    assert(
+      warnings.some((message) => message.includes('backfill skipped')),
+      'backfill without an HTTP URL should log a warning',
+    );
+  } finally {
+    console.warn = originalWarn;
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Issue #670: regression tests — submission state survives a process restart
 // ---------------------------------------------------------------------------
@@ -2774,6 +2851,8 @@ export async function runRelayerSelfTests(): Promise<void> {
   await test_solana_listener_skips_failed_backfill_transaction();
   await test_pending_solana_submission_does_not_advance_signature_cursor();
   await test_solana_listener_skips_backfill_without_persisted_signature();
+  await test_solana_listener_skips_failed_transactions_during_backfill();
+  await test_solana_listener_skips_backfill_without_http_url();
   test_payload_hash_matches_onchain_algorithm();
   test_amount_encoding_handles_large_decimals();
   test_signature_passes_ed25519_verify();

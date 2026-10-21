@@ -187,7 +187,9 @@ pub enum BridgeError {
     MetaTxPubkeySourceMismatch = 49,
     /// `tiers.len()` exceeds `MAX_FEE_TIERS`.
     TooManyFeeTiers = 51,
-    // Next free discriminant: 51. Always take the next unused value here and
+    /// Cross-chain payouts exceed the admin-funded liquidity reserve.
+    InsufficientCrossChainReserve = 52,
+    // Next free discriminant: 53. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
 
@@ -259,6 +261,7 @@ pub enum DataKey {
     AssetWhitelistEntry(Address),
     PoolWhitelistEntry(Address),
     RelayerSet,
+    CrossChainReserve(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +349,7 @@ pub struct MigrationAssetState {
     pub asset: Address,
     pub counters: AssetCounters,
     pub fee_cap_bps: u32,
+    pub crosschain_reserve: i128,
 }
 
 /// A volume-based fee tier.
@@ -858,6 +862,45 @@ fn save_asset_counters(env: &Env, asset: &Address, counters: &AssetCounters) {
 
 fn read_accrued_fees(env: &Env, asset: &Address) -> i128 {
     read_asset_counters(env, asset).accrued_fees
+}
+
+fn read_crosschain_reserve(env: &Env, asset: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CrossChainReserve(asset.clone()))
+        .unwrap_or(0)
+}
+
+fn write_crosschain_reserve(env: &Env, asset: &Address, amount: i128) {
+    let key = DataKey::CrossChainReserve(asset.clone());
+    env.storage().persistent().set(&key, &amount);
+    let max_ttl = read_max_persistent_ttl(env);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, max_ttl / 4, max_ttl);
+}
+
+fn increment_crosschain_reserve(
+    env: &Env,
+    asset: &Address,
+    amount: i128,
+) -> Result<(), BridgeError> {
+    let reserve = safe_math::safe_add(read_crosschain_reserve(env, asset), amount)?;
+    write_crosschain_reserve(env, asset, reserve);
+    Ok(())
+}
+
+fn decrement_crosschain_reserve(
+    env: &Env,
+    asset: &Address,
+    amount: i128,
+) -> Result<(), BridgeError> {
+    let reserve = read_crosschain_reserve(env, asset);
+    if amount > reserve {
+        return Err(BridgeError::InsufficientCrossChainReserve);
+    }
+    write_crosschain_reserve(env, asset, safe_math::safe_sub(reserve, amount)?);
+    Ok(())
 }
 
 fn increment_accrued_fees(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
@@ -2664,9 +2707,9 @@ impl OnboardingBridge {
 
     /// Returns the contract's total token balance for `asset`.
     ///
-    /// This includes both accrued fees and any tokens held for other purposes
-    /// (e.g. timelocked funds). Use `query_accrued_fees` to isolate the fee
-    /// portion.
+    /// This includes accrued fees, timelocked funds, and cross-chain liquidity.
+    /// Use `query_accrued_fees` and `query_crosschain_reserve` to inspect those
+    /// reserved portions separately.
     ///
     /// # Errors
     ///
@@ -2675,6 +2718,12 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         let token_client = token::Client::new(&env, &asset);
         Ok(token_client.balance(&env.current_contract_address()))
+    }
+
+    /// Returns the amount of `asset` reserved for cross-chain payouts.
+    pub fn query_crosschain_reserve(env: Env, asset: Address) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_crosschain_reserve(&env, &asset))
     }
 
     /// Deprecated compatibility alias for [`query_contract_balance`].
@@ -3208,6 +3257,7 @@ impl OnboardingBridge {
                         asset: asset.clone(),
                         counters: read_asset_counters(&env, &asset),
                         fee_cap_bps: read_asset_fee_cap(&env, &asset),
+                        crosschain_reserve: read_crosschain_reserve(&env, &asset),
                     });
                 }
             }
@@ -3451,9 +3501,9 @@ impl OnboardingBridge {
     /// contract and are not owed as fees.
     ///
     /// While active, the reclaimable amount is
-    /// `contract_token_balance − accrued_fees − locked_timelock`. After an
-    /// emergency migration deactivates the contract, the full remaining
-    /// balance is reclaimable so the old contract cannot strand funds.
+    /// `contract_token_balance − accrued_fees − locked_timelock − crosschain_reserve`.
+    /// After an emergency migration deactivates the contract, the full
+    /// remaining balance is reclaimable so the old contract cannot strand funds.
     ///
     /// # Arguments
     ///
@@ -3470,8 +3520,8 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
-    /// * [`BridgeError::InsufficientReclaimable`] — `amount` exceeds
-    ///   `contract_balance − accrued_fees`.
+    /// * [`BridgeError::InsufficientReclaimable`] — `amount` exceeds the
+    ///   unreserved contract balance.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     ///
     /// # Events
@@ -3481,8 +3531,9 @@ impl OnboardingBridge {
     /// # Security Considerations
     ///
     /// While active, the check
-    /// `reclaimable = balance − accrued_fees − locked_timelock` ensures that
-    /// fee reserves and unclaimed `TimelockEntry` deposits are ring-fenced.
+    /// `reclaimable = balance − accrued_fees − locked_timelock − crosschain_reserve`
+    /// ensures that fee reserves, unclaimed `TimelockEntry` deposits, and
+    /// cross-chain liquidity are ring-fenced.
     /// After `emergency_migrate`, recovery intentionally takes precedence over
     /// those reservations because the old contract is permanently disabled.
     /// Unrevealed `CommitmentEntry` records never hold contract balance in the
@@ -3508,8 +3559,11 @@ impl OnboardingBridge {
         let contract_balance = token_client.balance(&env.current_contract_address());
         let counters = read_asset_counters(&env, &asset);
         let reclaimable = safe_math::safe_sub(
-            safe_math::safe_sub(contract_balance, counters.accrued_fees)?,
-            counters.locked_timelock,
+            safe_math::safe_sub(
+                safe_math::safe_sub(contract_balance, counters.accrued_fees)?,
+                counters.locked_timelock,
+            )?,
+            read_crosschain_reserve(&env, &asset),
         )?;
 
         if reclaimable < amount {
@@ -3906,12 +3960,80 @@ impl OnboardingBridge {
     // Cross-chain onboarding
     // -----------------------------------------------------------------------
 
+    /// Adds admin-funded tokens to the liquidity reserve used by
+    /// `fund_c_address_crosschain`.
+    ///
+    /// The asset must be whitelisted. The admin authorizes both this call and
+    /// the token transfer from their account into the bridge. Reserve deposits
+    /// are not accrued fees.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
+    /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
+    pub fn fund_crosschain_reserve(
+        env: Env,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        check_asset_whitelisted(&env, &asset)?;
+
+        let admin = read_admin(&env);
+        admin.require_auth();
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&admin, &env.current_contract_address(), &amount);
+        increment_crosschain_reserve(&env, &asset, amount)?;
+        extend_instance_ttl(&env);
+
+        env.events()
+            .publish(("CrossChainReserveFunded", asset), (admin, amount));
+        Ok(())
+    }
+
+    /// Withdraws unused cross-chain liquidity from the reserve to the admin.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
+    /// * [`BridgeError::InsufficientCrossChainReserve`] — `amount` exceeds the
+    ///   reserve balance.
+    pub fn withdraw_crosschain_reserve(
+        env: Env,
+        asset: Address,
+        amount: i128,
+    ) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        if amount <= 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+
+        let admin = read_admin(&env);
+        admin.require_auth();
+        decrement_crosschain_reserve(&env, &asset, amount)?;
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&env.current_contract_address(), &admin, &amount);
+        extend_instance_ttl(&env);
+
+        env.events()
+            .publish(("CrossChainReserveWithdrawn", asset), (admin, amount));
+        Ok(())
+    }
+
     /// Credits a C-address from a cross-chain event, verified by M-of-N relayer signatures.
     ///
     /// This function allows off-chain relayers to bridge tokens that arrived
     /// on another chain (e.g. Ethereum, Solana) to a Soroban C-address.
-    /// The contract must already hold a sufficient balance of `asset` to pay
-    /// out `net_amount` to the target.
+    /// The admin must first deposit sufficient `asset` liquidity through
+    /// `fund_crosschain_reserve`. Payouts debit this reserve, not accrued fees
+    /// or timelocked funds.
     ///
     /// ## Payload Construction
     ///
@@ -3960,6 +4082,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::BelowThreshold`] — No active relayers, a zero threshold,
     ///   or fewer than `threshold` valid signatures.
     /// * [`BridgeError::InvalidAddress`] — A strkey exceeds `MAX_STRKEY_LEN` (64) bytes.
+    /// * [`BridgeError::InsufficientCrossChainReserve`] — The reserve cannot
+    ///   cover `net_amount`.
     ///
     /// # Events
     ///
@@ -3968,7 +4092,9 @@ impl OnboardingBridge {
     /// # Security Considerations
     ///
     /// The nonce is derived deterministically from `(chain_id, tx_hash)` and
-    /// marked used before the token transfer, preventing replay attacks. An
+    /// marked used before the token transfer, preventing replay attacks.
+    /// Cross-chain payouts do not accrue fees: they spend pre-funded reserve
+    /// liquidity rather than depositing tokens in this call. An
     /// invalid Ed25519 signature causes a host-level trap (panic) rather than
     /// returning an error code, so callers should pre-validate signatures
     /// off-chain. The contract verifies that `sigs` contains distinct
@@ -4051,18 +4177,18 @@ impl OnboardingBridge {
             return Err(BridgeError::BelowThreshold);
         }
 
-        mark_nonce_used(&env, &nonce);
-
         let global_fee_bps = read_fee_bps(&env);
         let effective_fee_bps = get_effective_fee_bps(&env, &asset, global_fee_bps);
         let fee = calculate_fee(amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(amount, fee)?;
+        decrement_crosschain_reserve(&env, &asset, net_amount)?;
+        mark_nonce_used(&env, &nonce);
 
         if net_amount > 0 {
             let token_client = token::Client::new(&env, &asset);
             token_client.transfer(&env.current_contract_address(), &target, &net_amount);
         }
-        update_asset_counters(&env, &asset, fee, net_amount)?;
+        update_asset_counters_split(&env, &asset, 0, 0, net_amount)?;
         mint_loyalty_tokens(&env, &target);
         extend_instance_ttl(&env);
 
@@ -4439,7 +4565,8 @@ impl OnboardingBridge {
         Ok(())
     }
 
-    /// Extends the persistent-storage TTL for `AssetStats(key_asset)`.
+    /// Extends the persistent-storage TTL for the per-asset counters and
+    /// cross-chain reserve entry associated with `key_asset`.
     ///
     /// Only keys that already exist in storage are extended; missing keys are
     /// silently skipped.
@@ -4477,6 +4604,12 @@ impl OnboardingBridge {
             env.storage()
                 .persistent()
                 .extend_ttl(&key, threshold, max_ttl);
+        }
+        let reserve_key = DataKey::CrossChainReserve(key_asset.clone());
+        if env.storage().persistent().has(&reserve_key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&reserve_key, threshold, max_ttl);
         }
         env.events()
             .publish(("PersistentTtlExtended",), (admin, key_asset, max_ttl));

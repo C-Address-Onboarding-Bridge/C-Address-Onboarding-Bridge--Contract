@@ -1498,6 +1498,29 @@ describe("OnboardingBridgeSDK", () => {
     });
   });
 
+  describe("read query address arguments", () => {
+    it("wraps every address parameter in Address before building the simulation", async () => {
+      await sdk.getCAddressBalance(MOCK_ASSET, MOCK_ASSET);
+      await sdk.getFeeBalance(MOCK_ASSET);
+      await sdk.getContractBalance(MOCK_ASSET);
+      await sdk.getAllBalances([MOCK_ASSET, MOCK_ASSET]);
+      await sdk.queryCurrentTier(MOCK_ADDRESS);
+      await sdk.isBlocked(MOCK_ADDRESS);
+      await sdk.isAllowlisted(MOCK_ASSET);
+
+      expect(Address).toHaveBeenNthCalledWith(1, MOCK_ASSET);
+      expect(Address).toHaveBeenNthCalledWith(2, MOCK_ASSET);
+      expect(Address).toHaveBeenNthCalledWith(3, MOCK_ASSET);
+      expect(Address).toHaveBeenNthCalledWith(4, MOCK_ASSET);
+      expect(Address).toHaveBeenNthCalledWith(5, MOCK_ASSET);
+      expect(Address).toHaveBeenNthCalledWith(6, MOCK_ASSET);
+      expect(Address).toHaveBeenNthCalledWith(7, MOCK_ADDRESS);
+      expect(Address).toHaveBeenNthCalledWith(8, MOCK_ADDRESS);
+      expect(Address).toHaveBeenNthCalledWith(9, MOCK_ASSET);
+      expect(Address).toHaveBeenCalledTimes(9);
+    });
+  });
+
   // ---------------------------------------------------------------------------
   // Cross-chain tests
   // ---------------------------------------------------------------------------
@@ -1838,6 +1861,13 @@ describe("OnboardingBridgeSDK", () => {
         "Failed to query blocklist status",
       );
     });
+
+    it("rejects an invalid address before simulation", async () => {
+      await expect(sdk.isBlocked("not-an-address")).rejects.toThrow(
+        'Invalid address for "address"',
+      );
+      expect(mockProvider.simulateTransaction).not.toHaveBeenCalled();
+    });
   });
 
   describe("isAllowlisted", () => {
@@ -1868,6 +1898,13 @@ describe("OnboardingBridgeSDK", () => {
       await expect(sdk.isAllowlisted(MOCK_ADDRESS)).rejects.toThrow(
         "Failed to query allowlist status",
       );
+    });
+
+    it("rejects an invalid address before simulation", async () => {
+      await expect(sdk.isAllowlisted("not-an-address")).rejects.toThrow(
+        'Invalid address for "address"',
+      );
+      expect(mockProvider.simulateTransaction).not.toHaveBeenCalled();
     });
   });
 

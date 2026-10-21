@@ -38,6 +38,22 @@ export function assertAccountAddress(address: string, field: string): void {
 }
 
 /**
+ * Assert that `address` is a valid Stellar account or contract address.
+ *
+ * Throws a descriptive error when `address` is not a valid StrKey address.
+ */
+export function assertAddress(address: string, field: string): void {
+  if (
+    !StrKey.isValidEd25519PublicKey(address) &&
+    !StrKey.isValidContract(address)
+  ) {
+    throw new Error(
+      `Invalid address for "${field}": expected a G-address or C-address, got "${address}"`,
+    );
+  }
+}
+
+/**
  * Assert that `address` is a valid Stellar contract address (C-address,
  * starts with the letter `C`).
  *

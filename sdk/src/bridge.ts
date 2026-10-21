@@ -66,7 +66,7 @@ export const BATCH_TX_LIMIT = 100;
  * `BridgeConfig.baseReserveStroops` if the network uses a different value.
  */
 export const BASE_RESERVE_STROOPS = 5_000_000;
-import { assertAccountAddress, assertContractAddress, assertRelayerPubkey } from './validate';
+import { assertAccountAddress, assertAddress, assertContractAddress, assertRelayerPubkey } from './validate';
 import { withRpcRetry } from './retry';
 import { toScVals, buildSimulationTx as buildSharedSimTx } from './encoding';
 import {
@@ -1352,7 +1352,7 @@ export class OnboardingBridgeSDK {
       this.hooks,
       'simulateTransaction',
       { contractMethod: 'query_balance' },
-      () => this.provider.simulateTransaction(this.buildSimulationTx('query_balance', [cAddress, asset])),
+      () => this.provider.simulateTransaction(this.buildSimulationTx('query_balance', [new Address(cAddress), new Address(asset)])),
     );
 
     if ('error' in result && result.error) {
@@ -1460,7 +1460,7 @@ export class OnboardingBridgeSDK {
       'simulateTransaction',
       { contractMethod: 'query_accrued_fees' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_accrued_fees', [asset]),
+        this.buildSimulationTx('query_accrued_fees', [new Address(asset)]),
       ),
     );
 
@@ -1485,7 +1485,7 @@ export class OnboardingBridgeSDK {
       'simulateTransaction',
       { contractMethod: 'query_contract_balance' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_contract_balance', [asset]),
+        this.buildSimulationTx('query_contract_balance', [new Address(asset)]),
       ),
     );
 
@@ -1523,7 +1523,7 @@ export class OnboardingBridgeSDK {
       'simulateTransaction',
       { contractMethod: 'query_all_balances' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_all_balances', [assets]),
+        this.buildSimulationTx('query_all_balances', [assets.map((asset) => new Address(asset))]),
       ),
     );
 
@@ -3055,12 +3055,13 @@ export class OnboardingBridgeSDK {
    * @throws {Error} On RPC failure.
    */
   async isBlocked(address: string): Promise<boolean> {
+    assertAddress(address, 'address');
     const result = await withRpcHook(
       this.hooks,
       'simulateTransaction',
       { contractMethod: 'query_is_blocked' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_is_blocked', [address]),
+        this.buildSimulationTx('query_is_blocked', [new Address(address)]),
       ),
     );
     if ('error' in result && result.error) {
@@ -3090,12 +3091,13 @@ export class OnboardingBridgeSDK {
    * @throws {Error} On RPC failure.
    */
   async isAllowlisted(address: string): Promise<boolean> {
+    assertAddress(address, 'address');
     const result = await withRpcHook(
       this.hooks,
       'simulateTransaction',
       { contractMethod: 'query_is_allowlisted' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_is_allowlisted', [address]),
+        this.buildSimulationTx('query_is_allowlisted', [new Address(address)]),
       ),
     );
     if ('error' in result && result.error) {

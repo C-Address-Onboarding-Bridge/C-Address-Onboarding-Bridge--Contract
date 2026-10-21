@@ -31,6 +31,7 @@
  * | {@link OnboardingBridgeSDK} | Main SDK class — wraps all contract calls |
  * | {@link OffRampIntegration} | Moonpay / Transak / Ramp / Banxa URL builder + CEX memo helpers |
  * | `assertAccountAddress` | Validates a G-address; throws on invalid input |
+ * | `assertAddress` | Validates a G-address or C-address; throws on invalid input |
  * | `assertContractAddress` | Validates a C-address; throws on invalid input |
  * | `withRetry` | Low-level retry wrapper for arbitrary async functions |
  * | `withRpcRetry` | Wraps an `rpc.Server` with automatic retries |
@@ -54,7 +55,7 @@
 export { OnboardingBridgeSDK, BATCH_TX_LIMIT, BASE_RESERVE_STROOPS, computeCommitmentHash } from './bridge';
 export type { CommitmentHashOptions } from './bridge';
 export { OffRampIntegration } from './offramp';
-export { assertAccountAddress, assertContractAddress } from './validate';
+export { assertAccountAddress, assertAddress, assertContractAddress } from './validate';
 export { CachedContractClient } from './cachedBridge';
 export type { CacheOptions, CacheKey } from './cachedBridge';
 export { InMemoryCache } from './cache';
