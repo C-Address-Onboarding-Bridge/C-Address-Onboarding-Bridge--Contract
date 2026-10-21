@@ -42,6 +42,7 @@ services:
   # Indexer API — Rust event indexer and webhook delivery worker
   # -------------------------------------------------------------------
   indexer:
+    restart: on-failure
     image: rust:1-bookworm
     working_dir: /app
     ports:

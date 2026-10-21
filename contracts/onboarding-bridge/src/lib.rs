@@ -15,10 +15,9 @@
 //!   blocklist/allowlist management, etc.) calls the private `extend_instance_ttl` helper
 //!   before returning, so instance storage — including the `Admin` entry — cannot expire
 //!   as long as the contract keeps receiving any mutating call.
-//! - **Persistent storage** — per-address or per-asset data (balances, nonces, daily
-//!   usage, timelock entries). Extended explicitly via `extend_persistent_ttl`, which
-//!   covers per-asset counters, `AssetStats`, `Timelock`, `Commitment`, and `Relayer`
-//!   entries for a given key (see `extend_persistent_ttl` for the full key list).
+//! - **Persistent storage** — per-address or per-asset data. `extend_persistent_ttl`
+//!   covers `AssetStats(asset)`; timelocks, commitments, relayers, and source-scoped
+//!   entries use their dedicated public TTL extenders.
 //!
 //! ## Fee Model
 //!
@@ -4430,8 +4429,7 @@ impl OnboardingBridge {
         Ok(())
     }
 
-    /// Extends the persistent-storage TTL for the three per-asset counter keys
-    /// (`AccruedFees`, `TotalBridged`, `TotalFeesCollected`) of `key_asset`.
+    /// Extends the persistent-storage TTL for `AssetStats(key_asset)`.
     ///
     /// Only keys that already exist in storage are extended; missing keys are
     /// silently skipped.

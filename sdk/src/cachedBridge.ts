@@ -148,7 +148,8 @@ class ContractClient {
     }
 
     const scVal = (result as any).results?.[0]?.retval;
-    const fee = scVal ? Number(scValToNative(scVal)) : 0;
+    if (!scVal) throw new Error('query_fee_bps returned no value');
+    const fee = Number(scValToNative(scVal));
     await this.cache.set(cacheKey, fee, this.ttls[cacheKey]);
     return fee;
   }
@@ -168,7 +169,8 @@ class ContractClient {
     }
 
     const scVal = (result as any).results?.[0]?.retval;
-    const feeCollector = scVal ? scValToNative(scVal).toString() : '';
+    if (!scVal) throw new Error('query_fee_collector returned no value');
+    const feeCollector = scValToNative(scVal).toString();
     await this.cache.set(cacheKey, feeCollector, this.ttls[cacheKey]);
     return feeCollector;
   }
@@ -188,7 +190,8 @@ class ContractClient {
     }
 
     const scVal = (result as any).results?.[0]?.retval;
-    const admin = scVal ? scValToNative(scVal).toString() : '';
+    if (!scVal) throw new Error('query_admin returned no value');
+    const admin = scValToNative(scVal).toString();
     await this.cache.set(cacheKey, admin, this.ttls[cacheKey]);
     return admin;
   }
@@ -208,7 +211,8 @@ class ContractClient {
     }
 
     const scVal = (result as any).results?.[0]?.retval;
-    const initialized = scVal ? Boolean(scValToNative(scVal)) : false;
+    if (!scVal) throw new Error('query_is_initialized returned no value');
+    const initialized = Boolean(scValToNative(scVal));
     await this.cache.set(cacheKey, initialized, this.ttls[cacheKey]);
     return initialized;
   }
