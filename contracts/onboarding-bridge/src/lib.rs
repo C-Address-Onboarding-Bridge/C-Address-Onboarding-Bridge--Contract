@@ -3817,6 +3817,7 @@ impl OnboardingBridge {
         env: Env,
         token: Address,
         amount_per_fund: i128,
+        nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         if amount_per_fund < 0 {
@@ -3824,6 +3825,7 @@ impl OnboardingBridge {
         }
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         save_loyalty_token(&env, &token);
         save_loyalty_amount_per_fund(&env, &amount_per_fund);
         extend_instance_ttl(&env);
@@ -3887,7 +3889,11 @@ impl OnboardingBridge {
     /// # Events
     ///
     /// * `("FeeTiersSet", admin)` — data: `(tiers.len(),)`
-    pub fn set_fee_tiers(env: Env, tiers: Vec<FeeTier>) -> Result<(), BridgeError> {
+    pub fn set_fee_tiers(
+        env: Env,
+        tiers: Vec<FeeTier>,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         check_not_paused(&env)?;
         if tiers.len() > MAX_FEE_TIERS {
@@ -3908,6 +3914,7 @@ impl OnboardingBridge {
         }
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         save_fee_tiers(&env, &tiers);
         extend_instance_ttl(&env);
         env.events().publish(("FeeTiersSet", admin), (tiers.len(),));
@@ -4268,10 +4275,15 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::BelowThreshold`] — Removing this relayer would remove
     ///   the last relayer or drop the count below the required threshold.
-    pub fn remove_relayer(env: Env, pubkey: BytesN<32>) -> Result<(), BridgeError> {
+    pub fn remove_relayer(
+        env: Env,
+        pubkey: BytesN<32>,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         if is_relayer(&env, &pubkey) {
             let count = relayer_count(&env);
             if count <= 1 || count.saturating_sub(1) < relayer_threshold(&env) {
@@ -4301,10 +4313,15 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ThresholdExceedsRelayers`] — `threshold` is zero or
     ///   greater than the number of registered relayers.
-    pub fn set_relayer_threshold(env: Env, threshold: u32) -> Result<(), BridgeError> {
+    pub fn set_relayer_threshold(
+        env: Env,
+        threshold: u32,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         if threshold == 0 || threshold > relayer_count(&env) {
             return Err(BridgeError::ThresholdExceedsRelayers);
         }
@@ -4575,10 +4592,15 @@ impl OnboardingBridge {
     /// # Events
     ///
     /// * `("InstanceTtlExtended",)` — data: `(admin, actual_ttl)`
-    pub fn extend_instance_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
+    pub fn extend_instance_ttl(
+        env: Env,
+        ttl: u32,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_instance_ttl(&env))?;
         env.storage().instance().extend_ttl(threshold, max_ttl);
         env.events()
@@ -4615,10 +4637,12 @@ impl OnboardingBridge {
         env: Env,
         key_asset: Address,
         ttl: u32,
+        nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
         let key = DataKey::AssetStats(key_asset.clone());
         if env.storage().persistent().has(&key) {
@@ -4789,10 +4813,12 @@ impl OnboardingBridge {
         source: Address,
         asset: Address,
         ttl: u32,
+        nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
         for key in [
             DataKey::SourceDailyLimit(source.clone(), asset.clone()),
@@ -4839,10 +4865,15 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::InvalidTtl`] — `ttl` is below `MIN_ALLOWED_TTL`.
-    pub fn set_max_instance_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
+    pub fn set_max_instance_ttl(
+        env: Env,
+        ttl: u32,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         if ttl < MIN_ALLOWED_TTL {
             return Err(BridgeError::InvalidTtl);
         }
@@ -4879,7 +4910,11 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::InvalidTtl`] — `ttl` is below `MIN_ALLOWED_TTL`.
-    pub fn set_max_persistent_ttl(env: Env, ttl: u32) -> Result<(), BridgeError> {
+    pub fn set_max_persistent_ttl(
+        env: Env,
+        ttl: u32,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
 
         if ttl < MIN_ALLOWED_TTL {
@@ -4888,6 +4923,7 @@ impl OnboardingBridge {
 
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
 
         let capped = ttl.min(MAX_ALLOWED_TTL);
         let old_ttl = read_max_persistent_ttl(&env);

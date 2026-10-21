@@ -54,6 +54,31 @@ This document provides a comprehensive API reference for all exported classes, i
 
 Main entry point for interacting with the deployed Onboarding Bridge Soroban contract.
 
+Admin-authorized state-changing contract methods accept an optional final
+`nonce: Option<u64>` ABI argument. Pass `undefined` in SDK methods that expose
+the nonce to send `void` and use Stellar transaction replay protection; pass a
+sequential value to enforce per-admin ordering. For direct Soroban calls, append
+this argument to each of these methods:
+
+| Contract method | Arguments before nonce |
+|---|---|
+| `set_loyalty_token` | `token, amount_per_fund` |
+| `set_fee_tiers` | `tiers` |
+| `remove_relayer` | `pubkey` |
+| `set_relayer_threshold` | `threshold` |
+| `extend_instance_ttl` | `ttl` |
+| `extend_persistent_ttl` | `key_asset, ttl` |
+| `extend_source_persistent_ttl` | `source, asset, ttl` |
+| `set_max_instance_ttl` | `ttl` |
+| `set_max_persistent_ttl` | `ttl` |
+| `set_meta_tx_network_id` | `network_id` |
+
+The SDK exposes nonce parameters on `setLoyaltyToken`, `setFeeTiers`,
+`removeRelayer` (in `RelayerManagementOptions`), and `setRelayerThreshold`.
+The six TTL and network-ID methods in the table do not have SDK convenience
+wrappers; call them through the contract client with the listed arguments
+followed by the optional nonce.
+
 #### Constructor
 
 ```ts
@@ -400,7 +425,8 @@ async removeRelayer(
   adminKeypair: Keypair
 ): Promise<TransactionResult>
 ```
-Removes a registered relayer public key (admin only).
+Removes a registered relayer public key (admin only). Pass `nonce` in
+`options` to enforce sequential admin ordering.
 - **Parameters**:
   - `options`: `RelayerManagementOptions`
   - `adminKeypair`: `Keypair`
@@ -410,13 +436,16 @@ Removes a registered relayer public key (admin only).
 ```ts
 async setRelayerThreshold(
   threshold: number,
-  adminKeypair: Keypair
+  adminKeypair: Keypair,
+  nonce?: string | number | bigint
 ): Promise<TransactionResult>
 ```
-Configures the required threshold of relayer signatures (admin only).
+Configures the required threshold of relayer signatures (admin only). The
+optional nonce enforces sequential admin ordering.
 - **Parameters**:
   - `threshold`: `number`
   - `adminKeypair`: `Keypair`
+  - `nonce`: optional sequential admin nonce (`string | number | bigint`)
 - **Returns**: `Promise<TransactionResult>`
 
 ##### `queryRelayerThreshold`

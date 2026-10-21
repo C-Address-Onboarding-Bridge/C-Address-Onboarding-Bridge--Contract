@@ -440,7 +440,7 @@ fn bench_fund_c_address_crosschain() {
     let relayer_signing_key = SigningKey::from_bytes(&relayer_secret);
     let relayer_pubkey = BytesN::from_array(&env, relayer_signing_key.verifying_key().as_bytes());
     bridge.add_relayer(&relayer_pubkey, &None);
-    bridge.set_relayer_threshold(&1u32);
+    bridge.set_relayer_threshold(&1u32, &None);
 
     // Seed the dedicated reserve through the admin deposit path.
     mint(&env, &token_id, &admin, 10_000i128);
@@ -734,7 +734,7 @@ fn bench_tiered_fee_lookup() {
             },
         ],
     );
-    bridge.set_fee_tiers(&tiers);
+    bridge.set_fee_tiers(&tiers, &None);
     mint(&env, &token_id, &user, 1_000_000i128 * 2);
 
     // Fund once to build volume so the tiered lookup activates.
