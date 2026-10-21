@@ -22,6 +22,7 @@ This document provides a comprehensive API reference for all exported classes, i
    - [WithdrawFeesOptions](#withdrawfeesoptions)
    - [OffRampConfig](#offrampconfig)
    - [TransactionResult](#transactionresult)
+   - [ConfirmedTransactionResult](#confirmedtransactionresult)
    - [FundCAddressWithSwapOptions](#fundcaddresswithswapoptions)
    - [CrossChainFundOptions](#crosschainfundoptions)
    - [CreateCOptions](#createcoptions)
@@ -115,6 +116,38 @@ const results = await sdk.batchFundCAddresses(
   (completed, total, txHash) => console.log(`${completed}/${total}`, txHash),
 );
 ```
+
+##### `commitFundAndWait`
+```ts
+async commitFundAndWait(
+  options: CommitFundOptions,
+  sourceKeypair: Keypair
+): Promise<ConfirmedTransactionResult<{ commitmentId: bigint }>>
+```
+Submits a commit-reveal funding commitment and waits for the transaction to
+reach `SUCCESS` or `FAILED`. On success, `commitmentId` is decoded from the
+contract return value and can be passed to `revealFund` or `cancelCommitment`.
+
+##### `fundCAddressTimelockedAndWait`
+```ts
+async fundCAddressTimelockedAndWait(
+  options: FundCTimelockedOptions,
+  sourceKeypair: Keypair
+): Promise<ConfirmedTransactionResult<{ timelockId: bigint }>>
+```
+Submits a timelocked funding operation and waits for confirmation. On success,
+`timelockId` is decoded from the contract return value and can be passed to
+`claimTimelocked`.
+
+##### `scheduleUpgradeAndWait`
+```ts
+async scheduleUpgradeAndWait(
+  options: ScheduleUpgradeOptions,
+  adminKeypair: Keypair
+): Promise<ConfirmedTransactionResult<{ executableAfterLedger: number }>>
+```
+Schedules an upgrade and waits for confirmation. On success,
+`executableAfterLedger` is decoded from the contract return value.
 
 ##### `withdrawFees`
 ```ts
@@ -946,13 +979,27 @@ Static key definitions for off-ramp integrations.
 ---
 
 ### `TransactionResult`
-The result of an on-chain transaction submission.
+The result of submitting a transaction without waiting for ledger confirmation.
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `hash` | `string` | On-chain transaction hash. |
-| `status` | `'success' \| 'pending' \| 'failed'` | Execution status. |
+| `status` | `'pending' \| 'failed'` | Submission status. |
 | `error` | `string` | *Optional*. Error description if `status` is `'failed'`. |
+
+---
+
+### `ConfirmedTransactionResult<T>`
+The result of a transaction that has been polled until it reaches a terminal
+on-chain status.
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `hash` | `string` | On-chain transaction hash. |
+| `status` | `'success' \| 'failed'` | Final transaction status. |
+| `error` | `string` | *Optional*. Error description if `status` is `'failed'`. |
+
+On success, the result also contains the decoded return-value fields in `T`.
 
 ---
 
