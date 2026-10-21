@@ -1471,11 +1471,17 @@ export class OnboardingBridgeSDK {
     );
 
     if ('error' in result && result.error) {
+      if (/Error\(Contract,\s*#?14\)/.test(result.error)) {
+        return null;
+      }
       throw new Error(`Failed to get loyalty token: ${result.error}`);
     }
 
     const scVal = (result as any).results?.[0]?.retval;
-    return scVal ? scValToNative(scVal) as LoyaltyToken : null;
+    if (!scVal) return null;
+
+    const [token, amount] = scValToNative(scVal) as [string, bigint | number | string];
+    return { token, amount_per_fund: amount.toString() };
   }
 
   async queryFeeTiers(): Promise<FeeTier[]> {

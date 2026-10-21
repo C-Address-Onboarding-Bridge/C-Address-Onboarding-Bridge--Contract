@@ -320,7 +320,7 @@ async function initialize(
   })
     .addOperation(
       contract.call(
-        'initialize',
+        'initialize_with_wasm_hash',
         Address.fromString(admin.publicKey()).toScVal(),
         Address.fromString(cfg.feeCollectorPublicKey).toScVal(),
         nativeToScVal(cfg.feeBps, { type: 'u32' }),

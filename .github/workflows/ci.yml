@@ -452,6 +452,8 @@ jobs:
 
       - name: Run deployment script tests
         run: npm run test:scripts
+      - name: Type-check deployment script
+        run: npx tsc --noEmit --skipLibCheck --target ES2022 --module commonjs --esModuleInterop scripts/deploy.ts
 
       - name: Build SDK
         run: npm run build --workspace=sdk
