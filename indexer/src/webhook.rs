@@ -178,6 +178,21 @@ pub struct Subscription {
     pub target_filter: Option<String>,
     pub active: bool,
     /// Secret used to sign webhook payloads. Returned only at creation.
+    #[serde(skip_serializing)]
+    pub secret: String,
+    pub created_at: String,
+}
+
+/// Subscription response returned only on creation, including the secret.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatedSubscription {
+    pub id: String,
+    pub url: String,
+    pub event_type: Option<String>,
+    pub asset_filter: Option<String>,
+    pub source_filter: Option<String>,
+    pub target_filter: Option<String>,
+    pub active: bool,
     pub secret: String,
     pub created_at: String,
 }

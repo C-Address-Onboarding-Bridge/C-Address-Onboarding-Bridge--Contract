@@ -70,19 +70,14 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
 }
 
 pub fn build_app(state: Arc<AppState>) -> Router {
-    // SECURITY TODO(next-bounty): protected routes were meant to
-    // sit behind a `require_api_key` middleware that was never written.
-    let protected = protected_routes();
-    // .route_layer(middleware::from_fn_with_state(
-    //     Arc::clone(&state),
-    //     require_api_key,
-    // ));
+    let protected = protected_routes().route_layer(middleware::from_fn_with_state(
+        Arc::clone(&state),
+        require_api_key,
+    ));
 
-    // TODO(next-bounty): `build_cors_layer()` was never written either; tower-http
-    // is still a dependency, so add the helper and restore this layer.
     public_routes()
         .merge(protected)
-        // .layer(build_cors_layer())
+        .layer(build_cors_layer())
         .with_state(state)
 }
 
@@ -156,28 +151,7 @@ async fn main() {
         webhook::run_delivery_worker(webhook_state, webhook_token).await;
     });
 
-    // Public read-only routes — no auth required.
-    let public_routes = Router::new()
-        .route("/api/events", get(list_events))
-        .route("/api/events/:event_type", get(list_events_by_type))
-        .route("/api/subscriptions", get(list_subscriptions))
-        .route("/api/stats", get(get_stats))
-        .route("/health", get(health));
-
-    // Mutating routes require an API key; read-only routes remain public.
-    let protected_routes = Router::new()
-        .route("/api/subscriptions", post(create_subscription))
-        .route("/api/subscriptions/:id", delete(delete_subscription))
-        .route("/api/replay", post(replay_events))
-        .route_layer(middleware::from_fn_with_state(
-            Arc::clone(&state),
-            require_api_key,
-        ));
-
-    let app = public_routes
-        .merge(protected_routes)
-        .layer(build_cors_layer())
-        .with_state(state);
+    let app = build_app(state);
 
     tracing::info!("Indexer listening on {}", listen_addr);
     let listener = tokio::net::TcpListener::bind(&listen_addr).await.unwrap();
@@ -305,7 +279,7 @@ async fn list_events_by_type(
 async fn create_subscription(
     State(state): State<Arc<AppState>>,
     Json(req): Json<webhook::CreateSubscription>,
-) -> Result<(StatusCode, Json<webhook::Subscription>), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(StatusCode, Json<webhook::CreatedSubscription>), (StatusCode, Json<serde_json::Value>)> {
     // Validate the URL before persisting to prevent SSRF via webhook delivery.
     if let Err(e) = webhook::validate_webhook_url(&req.url).await {
         return Err((
@@ -318,7 +292,22 @@ async fn create_subscription(
         .db
         .create_subscription(req)
         .await
-        .map(|s| (StatusCode::CREATED, Json(s)))
+        .map(|s| {
+            (
+                StatusCode::CREATED,
+                Json(webhook::CreatedSubscription {
+                    id: s.id,
+                    url: s.url,
+                    event_type: s.event_type,
+                    asset_filter: s.asset_filter,
+                    source_filter: s.source_filter,
+                    target_filter: s.target_filter,
+                    active: s.active,
+                    secret: s.secret,
+                    created_at: s.created_at,
+                }),
+            )
+        })
         .map_err(|_| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -428,8 +417,8 @@ mod auth_tests {
     };
     use tower::ServiceExt; // for `oneshot`
 
-    /// Build a minimal app wired with the same auth middleware used in main(),
-    /// backed by an in-memory SQLite database so no file system state is needed.
+    /// Build a minimal app wired with build_app(), backed by an in-memory
+    /// SQLite database so no file system state is needed.
     async fn test_app(api_key: &str) -> Router {
         let database = db::Database::new("sqlite::memory:").await;
         database.migrate().await;
@@ -444,24 +433,7 @@ mod auth_tests {
             lookback_ledgers: poller::DEFAULT_LOOKBACK_LEDGERS,
         });
 
-        let public_routes = Router::new().route("/health", get(health));
-
-        let protected_routes = Router::new()
-            .route(
-                "/api/subscriptions",
-                get(list_subscriptions).post(create_subscription),
-            )
-            .route("/api/subscriptions/:id", delete(delete_subscription))
-            .route("/api/replay", post(replay_events))
-            .route_layer(middleware::from_fn_with_state(
-                Arc::clone(&state),
-                require_api_key,
-            ));
-
-        public_routes
-            .merge(protected_routes)
-            .layer(build_cors_layer())
-            .with_state(state)
+        build_app(state)
     }
 
     #[tokio::test]
@@ -682,6 +654,7 @@ mod route_tests {
             contract_id: "C_TEST".to_string(),
             rpc_client: reqwest::Client::new(),
             webhook_client: reqwest::Client::new(),
+            api_key_hash: sha256_hex("test"),
             lookback_ledgers: 0,
         })
     }
