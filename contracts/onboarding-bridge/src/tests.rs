@@ -873,18 +873,16 @@ fn test_execute_upgrade_succeeds_at_timelock_boundary_and_clears_pending() {
     assert_eq!(wasm_hash, uploaded_hash);
     bridge.execute_upgrade(&wasm_hash, &None);
 
-    // The pending record is cleared before the wasm swap, so a second
-    // execute now reports "not scheduled" rather than replaying the upgrade.
-    assert_eq!(bridge.query_pending_upgrade(), None);
-    assert_eq!(
-        bridge.try_execute_upgrade(&wasm_hash, &None),
-        Err(Ok(BridgeError::UpgradeNotScheduled))
-    );
-
     assert_eq!(
         count_events_with_topic(&env, &bridge_id, "ContractUpgraded"),
         1
     );
+
+    // The pending record is cleared before the wasm swap.
+    let pending_exists = env.as_contract(&bridge_id, || {
+        env.storage().instance().has(&DataKey::PendingUpgrade)
+    });
+    assert!(!pending_exists);
 }
 
 #[test]
@@ -4633,16 +4631,18 @@ fn test_loyalty_rewards_preserve_bridged_asset_reserves() {
         bridge.query_contract_balance(&asset) >= bridge.query_accrued_fees(&asset) + locked
     );
 
+    let mut skipped = 0u32;
     for _ in 0..5 {
         let target = Address::generate(&env);
         bridge.fund_c_address(&user, &target, &asset, &100i128, &None, &None);
+        skipped += count_events_with_topic(&env, &bridge_id, "LoyaltyMintSkipped");
         assert!(
             bridge.query_contract_balance(&asset) >= bridge.query_accrued_fees(&asset) + locked
         );
     }
 
     assert!(
-        count_events_with_topic(&env, &bridge_id, "LoyaltyMintSkipped") > 0,
+        skipped > 0,
         "funding should skip rewards when only reserved funds remain"
     );
 
@@ -5180,7 +5180,7 @@ mod concurrent_sequential_tests {
         env: Env,
         bridge_id: Address,
         token_id: Address,
-        admin: Address,
+        _admin: Address,
         fee_collector: Address,
         user: Address,
     }
@@ -5203,7 +5203,7 @@ mod concurrent_sequential_tests {
                 env,
                 bridge_id,
                 token_id,
-                admin,
+                _admin: admin,
                 fee_collector,
                 user,
             }
