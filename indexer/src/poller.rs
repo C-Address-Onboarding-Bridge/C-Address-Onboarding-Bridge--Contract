@@ -133,7 +133,7 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
         });
 
         let response = state
-            .webhook_client
+            .rpc_client
             .post(&state.rpc_url)
             .json(&request)
             .send()
@@ -919,6 +919,7 @@ mod tests {
             // the loop reaches the cancellable sleep quickly.
             rpc_url: "http://127.0.0.1:1".to_string(),
             contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
             webhook_client: reqwest::Client::new(),
             lookback_ledgers: 720,
         });
@@ -933,5 +934,62 @@ mod tests {
             .await
             .expect("worker must return promptly after cancellation")
             .expect("worker task must not panic");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #854 — RPC calls must use the timeout-configured `rpc_client`
+    // -----------------------------------------------------------------------
+
+    /// `fetch_latest_ledger` must honor the configured request timeout
+    /// instead of hanging forever when the RPC node accepts a connection but
+    /// never responds. This guards against #854's regression, where
+    /// `AppState` had no `rpc_client` field and RPC calls fell back to an
+    /// un-timed-out `reqwest::Client::new()`.
+    #[tokio::test]
+    async fn test_fetch_latest_ledger_times_out_on_unresponsive_rpc() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("must bind a local test listener");
+        let addr = listener.local_addr().unwrap();
+
+        // Accept the connection and then never write a response, simulating
+        // a hung RPC node.
+        tokio::spawn(async move {
+            if let Ok((socket, _)) = listener.accept().await {
+                // Hold the connection open without responding.
+                let _ = socket;
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+
+        let rpc_client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_millis(200))
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .expect("failed to build timed-out RPC client");
+
+        let db = crate::db::Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        let state = crate::AppState {
+            db,
+            rpc_url: format!("http://{}", addr),
+            contract_id: "C_TEST".to_string(),
+            rpc_client,
+            webhook_client: reqwest::Client::new(),
+            api_key_hash: String::new(),
+            lookback_ledgers: 720,
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            fetch_latest_ledger(&state),
+        )
+        .await
+        .expect("fetch_latest_ledger must return within the test's outer timeout window");
+
+        assert!(
+            result.is_err(),
+            "an unresponsive RPC must surface a timeout error, not hang or succeed"
+        );
     }
 }
