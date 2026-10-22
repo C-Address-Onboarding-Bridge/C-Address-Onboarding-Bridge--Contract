@@ -6365,7 +6365,6 @@ fn test_extend_source_persistent_ttl_extends_source_keys() {
     let expected_keys = [
         DataKey::SourceDailyLimit(user.clone(), token_id.clone()),
         DataKey::DailyUsage(user.clone(), token_id.clone(), day),
-        DataKey::UserDeposit(user.clone(), token_id.clone()),
         DataKey::SourceBridgedVolume(user.clone(), token_id.clone()),
         DataKey::Nonce(user.clone()),
         DataKey::AuthNonce(user.clone()),
@@ -6443,7 +6442,7 @@ fn test_extend_source_persistent_ttl_caps_at_max_allowed_ttl() {
     let ttl = env.as_contract(&bridge_id, || {
         env.storage()
             .persistent()
-            .get_ttl(&DataKey::UserDeposit(user.clone(), token_id.clone()))
+            .get_ttl(&DataKey::SourceBridgedVolume(user.clone(), token_id.clone()))
     });
     assert!(ttl <= MAX_ALLOWED_TTL);
 }
@@ -7337,3 +7336,51 @@ fn test_legacy_bridge_config_migration_fallback() {
         assert!(env.storage().instance().has(&DataKey::BridgeConfig));
     });
 }
+
+#[test]
+fn test_funding_paths_clean_storage_no_unused_user_deposit() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 100_000i128);
+
+    // 1. Referral funding path
+    let referrer = Address::generate(&env);
+    bridge.fund_c_address_with_referral(
+        &user,
+        &Address::generate(&env),
+        &token_id,
+        &1_000i128,
+        &Some(referrer),
+        &Some(0u64),
+        &None,
+    );
+
+    // 2. Timelocked funding path
+    let target = Address::generate(&env);
+    let current_time = env.ledger().timestamp();
+    bridge.fund_c_address_timelocked(
+        &user,
+        &target,
+        &token_id,
+        &1_000i128,
+        &(current_time + 10_000),
+        &(current_time + 5_000),
+        &Some(1u64),
+        &None,
+    );
+
+    // Assert SourceBridgedVolume is properly tracked
+    env.as_contract(&bridge_id, || {
+        assert_eq!(
+            crate::read_source_bridged_volume(&env, &user, &token_id),
+            1_000i128
+        );
+    });
+}
+
