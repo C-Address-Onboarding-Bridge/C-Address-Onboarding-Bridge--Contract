@@ -854,7 +854,7 @@ fn test_execute_upgrade_succeeds_at_timelock_boundary_and_clears_pending() {
     // budget allows; lift the limit so the test exercises logic, not gas.
     env.cost_estimate().budget().reset_unlimited();
     let wasm_bytes = Bytes::from_slice(&env, V2_WASM);
-    let wasm_hash: BytesN<32> = env.deployer().upload_contract_wasm(wasm_bytes);
+    let wasm_hash: BytesN<32> = env.crypto().sha256(&wasm_bytes).into();
 
     let executable_after_ledger = bridge.schedule_upgrade(&wasm_hash, &None);
     assert_eq!(
@@ -869,6 +869,8 @@ fn test_execute_upgrade_succeeds_at_timelock_boundary_and_clears_pending() {
     // Exactly at the boundary: docs specify `sequence >= scheduled + timelock`,
     // so landing exactly on `executable_after_ledger` must already succeed.
     advance_ledger_sequence(&env, executable_after_ledger);
+    let uploaded_hash = env.deployer().upload_contract_wasm(wasm_bytes);
+    assert_eq!(wasm_hash, uploaded_hash);
     bridge.execute_upgrade(&wasm_hash, &None);
 
     // The pending record is cleared before the wasm swap, so a second
