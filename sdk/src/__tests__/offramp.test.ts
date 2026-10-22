@@ -520,6 +520,37 @@ describe('OffRampIntegration', () => {
       })).toThrow(/Invalid contract address for "cAddress"/);
     });
 
+    // Issue #855: examples/README previously called getOnRampUrl with
+    // `cAddress` while the implementation validated `params.gAddress`,
+    // throwing at step 6 of both full-integration examples. These two cases
+    // replay the exact param shapes from examples/typescript/full-integration.ts
+    // (lines 205-222) and examples/javascript/full-integration.js (lines
+    // 143-150) so a future drift between the examples and the SDK's
+    // `cAddress` contract fails here instead of only at example run time.
+    it('accepts the moonpay on-ramp params used in full-integration.ts/js', () => {
+      const offramp = new OffRampIntegration({ moonpayApiKey: 'pk_test_demo', testMode: true });
+
+      expect(() => offramp.getOnRampUrl({
+        provider: 'moonpay',
+        amount: '50',
+        fiatCurrency: 'USD',
+        asset: 'XLM',
+        cAddress: TARGET_C_ADDRESS,
+      })).not.toThrow();
+    });
+
+    it('accepts the transak on-ramp params used in full-integration.ts/js', () => {
+      const offramp = new OffRampIntegration({ transakApiKey: 'demo-key', testMode: true });
+
+      expect(() => offramp.getOnRampUrl({
+        provider: 'transak',
+        amount: '100',
+        fiatCurrency: 'EUR',
+        asset: 'USDC',
+        cAddress: TARGET_C_ADDRESS,
+      })).not.toThrow();
+    });
+
     it('getOffRampUrl rejects invalid gAddress format', () => {
       const offramp = new OffRampIntegration({ moonpayApiKey: 'test', testMode: false });
 
