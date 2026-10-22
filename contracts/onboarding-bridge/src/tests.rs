@@ -1872,6 +1872,28 @@ impl TestToken {
             .persistent()
             .set(&(TDataKey::Balance, to), &(to_bal + amount));
     }
+
+    pub fn approve(_e: Env, _from: Address, _spender: Address, _amount: i128, _live_until_ledger: u32) {
+        // mock approve
+    }
+
+    pub fn transfer_from(e: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        spender.require_auth();
+        if from == to {
+            return;
+        }
+        let from_bal = Self::balance(e.clone(), from.clone());
+        if from_bal < amount {
+            panic!("insufficient balance");
+        }
+        let to_bal = Self::balance(e.clone(), to.clone());
+        e.storage()
+            .persistent()
+            .set(&(TDataKey::Balance, from), &(from_bal - amount));
+        e.storage()
+            .persistent()
+            .set(&(TDataKey::Balance, to), &(to_bal + amount));
+    }
 }
 
 pub(crate) mod swap_pool_contract {
@@ -2774,17 +2796,25 @@ fn setup_batch(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, Addres
 
 /// Helper: count events from bridge with a given topic string prefix.
 fn count_events_with_topic(env: &Env, bridge_id: &Address, topic: &str) -> u32 {
-    use soroban_sdk::{IntoVal, String as SStr, TryFromVal, Val};
+    use soroban_sdk::{IntoVal, String as SStr, Symbol, TryFromVal, Val};
+    let topic_sym = Symbol::new(env, topic);
     let topic_val: Val = topic.into_val(env);
-    let topic_str: SStr = SStr::try_from_val(env, &topic_val).unwrap();
     let mut count = 0u32;
     for event in env.events().all().iter() {
         let (cid, topics, _) = event;
         if cid == *bridge_id && !topics.is_empty() {
             if let Some(t) = topics.get(0) {
-                if let Ok(s) = SStr::try_from_val(env, &t) {
-                    if s == topic_str {
+                if let Ok(sym) = Symbol::try_from_val(env, &t) {
+                    if sym == topic_sym {
                         count += 1;
+                        continue;
+                    }
+                }
+                if let Ok(topic_str) = SStr::try_from_val(env, &topic_val) {
+                    if let Ok(s) = SStr::try_from_val(env, &t) {
+                        if s == topic_str {
+                            count += 1;
+                        }
                     }
                 }
             }
@@ -4109,7 +4139,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([7u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x77; 32]);
@@ -4364,7 +4394,7 @@ mod crosschain_tests {
         bridge.add_relayer(&relayer, &None);
 
         assert_eq!(
-            bridge.try_set_relayer_threshold(&0u32),
+            bridge.try_set_relayer_threshold(&0u32, &None),
             Err(Ok(BridgeError::ThresholdExceedsRelayers))
         );
         assert_eq!(bridge.query_relayer_threshold(), 1);
@@ -4395,7 +4425,7 @@ mod crosschain_tests {
             make_signing_key([7u8; 32]).verifying_key().as_bytes(),
         );
         bridge.add_relayer(&relayer, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x82; 32]);
@@ -4411,15 +4441,17 @@ mod crosschain_tests {
     #[test]
     fn test_zero_threshold_storage_cannot_bypass_relayer_checks() {
         let env = Env::default();
-        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+        let (bridge_id, token_id, _admin, bridge) = setup(&env);
         let relayer = BytesN::from_array(
             &env,
             make_signing_key([8u8; 32]).verifying_key().as_bytes(),
         );
         bridge.add_relayer(&relayer, &None);
-        env.storage()
-            .instance()
-            .set(&DataKey::RelayerThreshold, &0u32);
+        env.as_contract(&bridge_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::RelayerThreshold, &0u32);
+        });
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x83; 32]);
@@ -4431,7 +4463,7 @@ mod crosschain_tests {
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert_eq!(
-            bridge.try_remove_relayer(&relayer),
+            bridge.try_remove_relayer(&relayer, &None),
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert!(bridge.query_is_relayer(&relayer));
@@ -4469,7 +4501,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([8u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         for (chain_id, hash_byte) in [(1u32, 0x31u8), (2u32, 0x32u8)] {
             let target = soroban_sdk::Address::generate(&env);
@@ -4512,23 +4544,28 @@ mod crosschain_tests {
                 &3_000i128,
                 &insufficient_sigs,
             ),
-            Err(Ok(crate::BridgeError::InsufficientCrossChainReserve))
+            Err(Ok(crate::BridgeError::InsufficientReclaimable))
         );
 
         let token = TestTokenClient::new(&env, &token_id);
         let contract_balance = token.balance(&bridge_id);
-        let locked = crate::read_asset_counters(&env, &token_id).locked_timelock;
+        let locked = env.as_contract(&bridge_id, || {
+            crate::read_asset_counters(&env, &token_id).locked_timelock
+        });
         assert!(bridge.query_accrued_fees(&token_id) + locked <= contract_balance);
 
         advance_ledger_time(&env, 1_100);
         bridge.claim_timelocked(&timelock_id);
         assert_eq!(token.balance(&timelock_target), 495i128);
         assert_eq!(bridge.query_accrued_fees(&token_id), 5i128);
-        assert_eq!(crate::read_asset_counters(&env, &token_id).locked_timelock, 0i128);
+        let locked_after = env.as_contract(&bridge_id, || {
+            crate::read_asset_counters(&env, &token_id).locked_timelock
+        });
+        assert_eq!(locked_after, 0i128);
         assert_eq!(bridge.query_contract_balance(&token_id), 2_085i128);
         assert!(
             bridge.query_accrued_fees(&token_id)
-                + crate::read_asset_counters(&env, &token_id).locked_timelock
+                + locked_after
                 <= bridge.query_contract_balance(&token_id)
         );
 
@@ -4575,7 +4612,7 @@ fn test_loyalty_rewards_preserve_bridged_asset_reserves() {
     let target = Address::generate(&env);
 
     bridge.set_fee_bps(&1_000u32, &None);
-    bridge.set_loyalty_token(&asset, &200i128);
+    bridge.set_loyalty_token(&asset, &200i128, &None);
     mint_tokens(&env, &asset, &bridge_id, 300i128);
 
     bridge.fund_c_address_timelocked(
@@ -7117,14 +7154,57 @@ fn test_verify_auth_entry_success() {
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
 
     let seq = env.ledger().sequence();
+    // Nonce starts at 0, not yet consumed
+    assert_eq!(bridge.query_auth_nonce(&user), 0u64);
+    assert!(!bridge.query_auth_nonce_used(&user, &0u64));
+
     // Should succeed: nonce 0 is fresh, ledger is within the window
     bridge.verify_auth_entry(&user, &0u64, &0u32, &(seq + 100));
 
-    // The nonce must now be marked used; replaying it must fail
+    // The counter must now be 1, nonce 0 marked used, nonce 1 unused
+    assert_eq!(bridge.query_auth_nonce(&user), 1u64);
+    assert!(bridge.query_auth_nonce_used(&user, &0u64));
+    assert!(!bridge.query_auth_nonce_used(&user, &1u64));
+
+    // Persistent storage must only write AuthNonce counter, never redundant UsedAuthNonce
+    let used_nonce_persisted = env.as_contract(&bridge_id, || {
+        env.storage()
+            .persistent()
+            .has(&DataKey::UsedAuthNonce(user.clone(), 0u64))
+    });
+    assert!(!used_nonce_persisted);
+
+    let auth_nonce_persisted = env.as_contract(&bridge_id, || {
+        env.storage()
+            .persistent()
+            .has(&DataKey::AuthNonce(user.clone()))
+    });
+    assert!(auth_nonce_persisted);
+
+    // The nonce must now be marked used; replaying it must fail with AuthNonceAlreadyUsed
     assert_eq!(
         bridge.try_verify_auth_entry(&user, &0u64, &0u32, &(seq + 100)),
+        Err(Ok(BridgeError::AuthNonceAlreadyUsed))
+    );
+
+    // Supplying an out-of-order future nonce must fail with DuplicateNonce
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &2u64, &0u32, &(seq + 100)),
         Err(Ok(BridgeError::DuplicateNonce))
     );
+
+    // Next sequential nonce 1 succeeds
+    bridge.verify_auth_entry(&user, &1u64, &0u32, &(seq + 100));
+    assert_eq!(bridge.query_auth_nonce(&user), 2u64);
+    assert!(bridge.query_auth_nonce_used(&user, &1u64));
+    assert!(!bridge.query_auth_nonce_used(&user, &2u64));
+
+    let used_nonce_1_persisted = env.as_contract(&bridge_id, || {
+        env.storage()
+            .persistent()
+            .has(&DataKey::UsedAuthNonce(user.clone(), 1u64))
+    });
+    assert!(!used_nonce_1_persisted);
 }
 
 #[test]

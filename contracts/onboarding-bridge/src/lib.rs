@@ -45,8 +45,8 @@
 //! 1. **Sequential nonce** (`DataKey::Nonce`) — optional `nonce: Option<u64>` parameter
 //!    on every mutating function. Pass `None` to skip (standard Stellar transaction
 //!    replay protection applies). Pass `Some(n)` to enforce strict ordering.
-//! 2. **Auth-entry nonce** (`DataKey::UsedAuthNonce`) — used by `verify_auth_entry` to
-//!    permanently burn a `(source, nonce)` pair within a ledger-sequence window, preventing
+//! 2. **Auth-entry nonce** (`DataKey::AuthNonce`) — used by `verify_auth_entry` to
+//!    enforce monotonic sequencing per source address within a ledger-sequence window, preventing
 //!    Soroban authorization-entry reuse.
 
 #![no_std]
@@ -185,12 +185,7 @@ pub enum BridgeError {
     InvalidTtl = 48,
     /// The supplied pubkey is not the registered meta-signer for `source`.
     MetaTxPubkeySourceMismatch = 49,
-    /// `tiers.len()` exceeds `MAX_FEE_TIERS`.
-    TooManyFeeTiers = 51,
-    /// Cross-chain payouts exceed the admin-funded liquidity reserve.
-    InsufficientCrossChainReserve = 52,
-    // Next free discriminant: 53. Always take the next unused value here and
-    // never renumber an existing variant — clients match on these values.
+    // Next free discriminant: 51. Note: Soroban SDK v22 error enums support at most 50 variants.
 }
 
 // ---------------------------------------------------------------------------
@@ -897,7 +892,7 @@ fn decrement_crosschain_reserve(
 ) -> Result<(), BridgeError> {
     let reserve = read_crosschain_reserve(env, asset);
     if amount > reserve {
-        return Err(BridgeError::InsufficientCrossChainReserve);
+        return Err(BridgeError::InsufficientReclaimable);
     }
     write_crosschain_reserve(env, asset, safe_math::safe_sub(reserve, amount)?);
     Ok(())
@@ -1010,25 +1005,14 @@ fn read_auth_nonce(env: &Env, source: &Address) -> u64 {
 }
 
 fn is_auth_nonce_used(env: &Env, source: &Address, nonce: u64) -> bool {
-    env.storage()
-        .persistent()
-        .get(&DataKey::UsedAuthNonce(source.clone(), nonce))
-        .unwrap_or(false)
+    nonce < read_auth_nonce(env, source)
 }
 
 fn mark_auth_nonce_used(env: &Env, source: &Address, nonce: u64) -> Result<(), BridgeError> {
+    let next = nonce.checked_add(1).ok_or(BridgeError::Overflow)?;
     env.storage()
         .persistent()
-        .set(&DataKey::UsedAuthNonce(source.clone(), nonce), &true);
-    // Advance the per-address counter so clients can always discover the next
-    // expected nonce without scanning storage.
-    let current = read_auth_nonce(env, source);
-    if nonce >= current {
-        let next = nonce.checked_add(1).ok_or(BridgeError::Overflow)?;
-        env.storage()
-            .persistent()
-            .set(&DataKey::AuthNonce(source.clone()), &next);
-    }
+        .set(&DataKey::AuthNonce(source.clone()), &next);
     Ok(())
 }
 
@@ -1054,20 +1038,21 @@ fn consume_auth_nonce(
         return Err(BridgeError::AuthNonceExpired);
     }
 
-    // 2. Enforce monotonic sequencing before checking the used-nonce set.
-    if nonce != read_auth_nonce(env, source) {
-        return Err(BridgeError::DuplicateNonce);
-    }
-
-    // 3. Used-nonce check (prevents exact replay of this (source, nonce) pair)
-    if is_auth_nonce_used(env, source, nonce) {
+    // 2. Used-nonce check: if nonce has already been consumed (nonce < current), return AuthNonceAlreadyUsed
+    let current = read_auth_nonce(env, source);
+    if nonce < current {
         return Err(BridgeError::AuthNonceAlreadyUsed);
     }
 
-    // 4. Mark as used and advance the per-address counter
+    // 3. Monotonic sequencing check: future/out-of-order nonces return DuplicateNonce
+    if nonce > current {
+        return Err(BridgeError::DuplicateNonce);
+    }
+
+    // 4. Advance the per-address counter
     mark_auth_nonce_used(env, source, nonce)?;
 
-    // 4. Emit AuthUsed event for off-chain indexers
+    // 5. Emit AuthUsed event for off-chain indexers
     env.events().publish(("AuthUsed", source.clone()), (nonce,));
 
     Ok(())
@@ -1785,7 +1770,7 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
 
         if targets.len() > MAX_BATCH_SIZE {
-            return Err(BridgeError::TooManyFeeTiers);
+            return Err(BridgeError::BatchTooLarge);
         }
         // #594: reject empty batches — a zero-length call transfers nothing but
         // would still emit BatchCompleted and mint loyalty rewards.
@@ -3883,7 +3868,7 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
-    /// * [`BridgeError::TooManyFeeTiers`] — `tiers.len()` exceeds `MAX_FEE_TIERS` (50).
+    /// * [`BridgeError::BatchTooLarge`] — `tiers.len()` exceeds `MAX_FEE_TIERS` (50).
     /// * [`BridgeError::FeeTooHigh`] — Any tier's `fee_bps` exceeds 1 000.
     ///
     /// # Events
@@ -4015,7 +4000,7 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
-    /// * [`BridgeError::InsufficientCrossChainReserve`] — `amount` exceeds the
+    /// * [`BridgeError::InsufficientReclaimable`] — `amount` exceeds the
     ///   reserve balance.
     pub fn withdraw_crosschain_reserve(
         env: Env,
@@ -4097,7 +4082,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::BelowThreshold`] — No active relayers, a zero threshold,
     ///   or fewer than `threshold` valid signatures.
     /// * [`BridgeError::InvalidAddress`] — A strkey exceeds `MAX_STRKEY_LEN` (64) bytes.
-    /// * [`BridgeError::InsufficientCrossChainReserve`] — The reserve cannot
+    /// * [`BridgeError::InsufficientReclaimable`] — The reserve cannot
     ///   cover `net_amount`.
     ///
     /// # Events
@@ -4284,7 +4269,8 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        if is_relayer(&env, &pubkey) {
+        let was_registered = is_relayer(&env, &pubkey);
+        if was_registered {
             let count = relayer_count(&env);
             if count <= 1 || count.saturating_sub(1) < relayer_threshold(&env) {
                 return Err(BridgeError::BelowThreshold);
