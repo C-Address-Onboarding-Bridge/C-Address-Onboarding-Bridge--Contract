@@ -769,4 +769,126 @@ mod tests {
             "Foreign key constraint violation must return error"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Issue #861 - subscriptions.secret column
+    // -----------------------------------------------------------------------
+
+    /// The `secret` column must exist in the schema (added by migration 0002)
+    /// and the secret handed out at creation time must survive a round-trip
+    /// through `list_subscriptions`.
+    #[tokio::test]
+    async fn test_subscription_secret_round_trips() {
+        let db = setup_db().await;
+
+        let created = db
+            .create_subscription(CreateSubscription {
+                url: "http://example.com/hook".to_string(),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .expect("create subscription");
+
+        assert!(
+            !created.secret.is_empty(),
+            "a new subscription must be given a signing secret"
+        );
+
+        let listed = db.list_subscriptions().await.expect("list subscriptions");
+        assert_eq!(listed.len(), 1, "exactly one subscription must be listed");
+        assert_eq!(listed[0].id, created.id, "subscription id must round-trip");
+        assert_eq!(
+            listed[0].secret, created.secret,
+            "subscription secret must round-trip through list_subscriptions"
+        );
+    }
+
+    /// Subscriptions that already existed before migration 0002 must be
+    /// backfilled with a random secret instead of keeping the empty default.
+    #[tokio::test]
+    async fn test_migration_0002_backfills_secret_for_existing_rows() {
+        let db = Database::new("sqlite::memory:").await;
+        let mut conn = db.pool.acquire().await.expect("acquire connection");
+
+        // Apply the pre-0002 schema and insert a row the way 0001 allowed.
+        sqlx::raw_sql(include_str!("../migrations/0001_initial_schema.sql"))
+            .execute(&mut *conn)
+            .await
+            .expect("apply initial schema");
+        sqlx::query(
+            "INSERT INTO subscriptions (id, url, active, created_at)
+             VALUES ('sub-legacy', 'http://example.com/hook', 1, '2024-01-01T00:00:00Z')",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("insert legacy subscription");
+
+        // Apply migration 0002 exactly the way the migrator would.
+        sqlx::raw_sql(include_str!("../migrations/0002_subscription_secret.sql"))
+            .execute(&mut *conn)
+            .await
+            .expect("apply subscription secret migration");
+
+        let secret: (String,) =
+            sqlx::query_as("SELECT secret FROM subscriptions WHERE id = 'sub-legacy'")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("read backfilled secret");
+
+        assert!(
+            !secret.0.is_empty(),
+            "a subscription created before migration 0002 must be backfilled with a secret"
+        );
+    }
+
+    /// A database that already applied migration 0001 must be able to run the
+    /// migrator again: 0002 is applied on top of it (no checksum mismatch,
+    /// because 0001 is left untouched) and the `secret` column becomes usable.
+    #[tokio::test]
+    async fn test_migration_0002_upgrades_database_that_already_applied_0001() {
+        use sqlx::migrate::Migrate;
+
+        let db = Database::new("sqlite::memory:").await;
+        let migrator = sqlx::migrate!("./migrations");
+
+        // Apply 0001 only, the way a database created before this fix looks.
+        let mut conn = db.pool.acquire().await.expect("acquire connection");
+        Migrate::ensure_migrations_table(&mut *conn)
+            .await
+            .expect("create migrations table");
+        let first = migrator.iter().next().expect("migration 0001");
+        assert_eq!(first.version, 1);
+        Migrate::apply(&mut *conn, first)
+            .await
+            .expect("apply migration 0001");
+
+        sqlx::query(
+            "INSERT INTO subscriptions (id, url, active, created_at)
+             VALUES ('sub-old', 'http://example.com/hook', 1, '2024-01-01T00:00:00Z')",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("insert legacy subscription");
+
+        // The migrator must now apply 0002 without complaining about a
+        // changed checksum for the already-applied 0001.
+        migrator
+            .run_direct(&mut *conn)
+            .await
+            .expect("apply migration 0002");
+
+        let secret: (String,) =
+            sqlx::query_as("SELECT secret FROM subscriptions WHERE id = 'sub-old'")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("read backfilled secret");
+
+        assert!(
+            !secret.0.is_empty(),
+            "a subscription created before migration 0002 must be backfilled with a secret"
+        );
+    }
 }
