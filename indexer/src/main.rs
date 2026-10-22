@@ -22,6 +22,10 @@ pub struct AppState {
     pub db: db::Database,
     pub rpc_url: String,
     pub contract_id: String,
+    /// HTTP client used for Soroban RPC calls, built with the timeouts
+    /// configured below so a hung RPC node cannot stall the poll loop
+    /// indefinitely (#638).
+    pub rpc_client: reqwest::Client,
     pub webhook_client: reqwest::Client,
     pub api_key_hash: String,
     /// Number of ledgers to look back from the RPC tip on first run (no
@@ -129,6 +133,7 @@ async fn main() {
         db: database,
         rpc_url,
         contract_id,
+        rpc_client,
         webhook_client: reqwest::Client::new(),
         api_key_hash,
         lookback_ledgers,
@@ -433,6 +438,7 @@ mod auth_tests {
             db: database,
             rpc_url: "http://localhost".to_string(),
             contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
             webhook_client: reqwest::Client::new(),
             api_key_hash: sha256_hex(api_key),
             lookback_ledgers: poller::DEFAULT_LOOKBACK_LEDGERS,
@@ -674,6 +680,7 @@ mod route_tests {
             db: database,
             rpc_url: "http://localhost".to_string(),
             contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
             webhook_client: reqwest::Client::new(),
             lookback_ledgers: 0,
         })

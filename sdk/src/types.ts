@@ -646,6 +646,15 @@ export interface OnRampUrlParams {
   /**
    * Target C-address that will receive the purchased crypto.
    * The provider will route funds to this address on Stellar.
+   *
+   * This must stay a C-address (validated by `getOnRampUrl` via
+   * `assertContractAddress`, see offramp.ts). Issue #855 reported this
+   * field drifting out of sync with a since-reverted `gAddress` rename;
+   * the examples and README (examples/typescript/full-integration.ts:210,
+   * examples/javascript/full-integration.js:144, README.md:395) and the
+   * "getOnRampUrl rejects G-address as cAddress" test in
+   * sdk/src/__tests__/offramp.test.ts all now agree on `cAddress` — keep
+   * them in sync if this field is ever renamed again.
    */
   cAddress: string;
 
