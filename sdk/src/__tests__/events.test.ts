@@ -5,11 +5,13 @@ import { EventSubscriber } from '../events';
 import type { CAddressFundedEvent, BridgeEventPayload } from '../events';
 
 const mockGetEvents = jest.fn();
+const mockGetLatestLedger = jest.fn();
 
 jest.mock('@stellar/stellar-sdk', () => ({
   SorobanRpc: {
     Server: jest.fn().mockImplementation(() => ({
       getEvents: mockGetEvents,
+      getLatestLedger: mockGetLatestLedger,
     })),
   },
   // The subscriber converts topics/values with scValToNative; the mock passes
@@ -47,6 +49,8 @@ describe('EventSubscriber', () => {
     jest.useFakeTimers();
     mockGetEvents.mockReset();
     mockGetEvents.mockResolvedValue({ events: [] });
+    mockGetLatestLedger.mockReset();
+    mockGetLatestLedger.mockResolvedValue({ sequence: 999 });
     subscriber = makeSubscriber();
   });
 
@@ -145,6 +149,17 @@ describe('EventSubscriber', () => {
 
       const lastCall = mockGetEvents.mock.calls.at(-1)![0];
       expect(lastCall.cursor).toBe('tok-42');
+    });
+
+    it('resolves startLedger from getLatestLedger on the first poll when configured with the default "now"', async () => {
+      subscriber.on('*', jest.fn());
+
+      await subscriber.poll();
+
+      expect(mockGetLatestLedger).toHaveBeenCalledTimes(1);
+      const firstCall = mockGetEvents.mock.calls[0][0];
+      expect(firstCall.startLedger).toBe(999);
+      expect(firstCall.cursor).toBeUndefined();
     });
 
     it('isolates a throwing listener from other listeners', async () => {

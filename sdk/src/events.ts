@@ -375,12 +375,20 @@ export class EventSubscriber {
     };
 
     // Attach cursor: either startLedger (number) or pagingToken (string).
+    //
+    // Soroban RPC's getEvents requires startLedger when no cursor is given
+    // and rejects the request otherwise — it does NOT default to "current
+    // ledger" when both are omitted. So on the very first poll while cursor
+    // is still the 'now' sentinel, resolve the current ledger via
+    // getLatestLedger() and use its sequence as startLedger.
     if (typeof this.cursor === 'number') {
       params.startLedger = this.cursor;
     } else if (typeof this.cursor === 'string' && this.cursor !== 'now') {
       params.cursor = this.cursor;
+    } else {
+      const latest = await this.server.getLatestLedger();
+      params.startLedger = latest.sequence;
     }
-    // When cursor === 'now', omit both — the RPC defaults to current ledger
 
     const response = await this.server.getEvents(params);
 
