@@ -302,5 +302,34 @@ describe('EventSubscriber', () => {
       expect(received).toHaveLength(1);
       expect(received[0].name).toBe('CAddressFunded');
     });
+
+    it('dispatches events with other topic counts (2 and 3) in the same batch', async () => {
+      // FeesWithdrawn has 2 topics and AdminProposed has 3 (lib.rs); both
+      // would have been excluded by the old single-segment `[['*']]` filter
+      // just like the 4-topic CAddressFunded case above.
+      mockGetEvents.mockResolvedValue({
+        events: [
+          {
+            topic: ['FeesWithdrawn', 'GCOLLECTOR'],
+            value: [500],
+            ledger: 43,
+            pagingToken: 'tok-2',
+          },
+          {
+            topic: ['AdminProposed', 'GADMIN', 'GNEWADMIN'],
+            value: [],
+            ledger: 44,
+            pagingToken: 'tok-3',
+          },
+        ],
+      });
+      const received: BridgeEventPayload[] = [];
+      subscriber.on('*', (e) => received.push(e));
+
+      await subscriber.poll();
+
+      expect(received).toHaveLength(2);
+      expect(received.map((e) => e.name)).toEqual(['FeesWithdrawn', 'AdminProposed']);
+    });
   });
 });

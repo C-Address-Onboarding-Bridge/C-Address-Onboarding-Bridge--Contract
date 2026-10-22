@@ -393,7 +393,12 @@ export class EventSubscriber {
         {
           type: 'contract',
           contractIds: [this.contractId],
-          topics: [['*']],
+          // No topic filter: a single-segment wildcard (`[['*']]`) only
+          // matches events with exactly one topic. Soroban RPC requires an
+          // exact topic-count match unless the filter ends with `**`, so a
+          // single `'*'` segment silently drops every multi-topic bridge
+          // event (e.g. CAddressFunded has 4 topics, AdminProposed has 3).
+          // Filtering by contractIds alone is sufficient here.
         },
       ],
       limit: this.limit,
