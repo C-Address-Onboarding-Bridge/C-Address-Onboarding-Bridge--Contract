@@ -202,8 +202,11 @@ export class EventSubscriber {
   /** Registry of active listeners keyed by event name (including '*'). */
   private listeners: Map<string, Set<BridgeEventCallback<any>>>;
 
-  /** NodeJS/browser interval handle. */
-  private intervalHandle: ReturnType<typeof setInterval> | null = null;
+  /** NodeJS/browser timeout handle for the self-scheduling poll loop. */
+  private intervalHandle: ReturnType<typeof setTimeout> | null = null;
+
+  /** Whether a fetch is currently in flight (guards against overlap). */
+  private polling = false;
 
   /** Whether destroy() has been called. */
   private destroyed = false;
@@ -315,23 +318,51 @@ export class EventSubscriber {
 
   private startPolling(): void {
     if (this.intervalHandle !== null) return;
-    this.intervalHandle = setInterval(() => {
-      this.fetchAndDispatch().catch((err) => {
-        // Emit to error listeners so consumers can detect persistently-down
-        // RPC endpoints and react (e.g. circuit break, alert, reconnect).
-        this.dispatchError(err instanceof Error ? err : new Error(String(err)));
-      });
-    }, this.pollingIntervalMs);
+    this.intervalHandle = setTimeout(() => this.runPollTick(), this.pollingIntervalMs);
   }
 
   private stopPolling(): void {
     if (this.intervalHandle !== null) {
-      clearInterval(this.intervalHandle);
+      clearTimeout(this.intervalHandle);
       this.intervalHandle = null;
     }
   }
 
+  /**
+   * Self-scheduling poll tick: runs one fetch, then arms the next tick only
+   * after this one settles. Combined with the `polling` in-flight guard,
+   * this ensures a slow RPC call can never overlap with the next poll, even
+   * if `poll()` is also called manually while a scheduled tick is running.
+   */
+  private runPollTick(): void {
+    this.fetchAndDispatch()
+      .catch((err) => {
+        // Emit to error listeners so consumers can detect persistently-down
+        // RPC endpoints and react (e.g. circuit break, alert, reconnect).
+        this.dispatchError(err instanceof Error ? err : new Error(String(err)));
+      })
+      .finally(() => {
+        // Only re-arm if stopPolling()/destroy() wasn't called while we awaited.
+        if (!this.destroyed && this.intervalHandle !== null) {
+          this.intervalHandle = setTimeout(() => this.runPollTick(), this.pollingIntervalMs);
+        }
+      });
+  }
+
   private async fetchAndDispatch(): Promise<void> {
+    // In-flight guard: if a previous fetch (manual poll() or scheduled tick)
+    // is still running, skip this call rather than racing cursor updates,
+    // which would otherwise let overlapping polls dispatch duplicate events.
+    if (this.polling) return;
+    this.polling = true;
+    try {
+      await this.doFetchAndDispatch();
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  private async doFetchAndDispatch(): Promise<void> {
     const params: SorobanRpc.Server.GetEventsRequest = {
       filters: [
         {
