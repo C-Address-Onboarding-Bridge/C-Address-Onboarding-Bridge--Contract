@@ -7253,3 +7253,87 @@ fn test_verify_auth_entry_expired_window_fails() {
         Err(Ok(BridgeError::AuthNonceExpired))
     );
 }
+
+#[test]
+fn test_bridge_config_single_source_of_truth_on_init_and_handover() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // Legacy keys are NOT written on initialize
+    env.as_contract(&bridge_id, || {
+        assert!(!env.storage().instance().has(&DataKey::Admin));
+        assert!(!env.storage().instance().has(&DataKey::FeeCollector));
+        assert!(!env.storage().instance().has(&DataKey::FeeBps));
+        assert!(env.storage().instance().has(&DataKey::BridgeConfig));
+    });
+
+    assert_eq!(bridge.query_admin(), admin);
+    assert_eq!(bridge.query_fee_collector(), fee_collector);
+    assert_eq!(bridge.query_fee_bps(), 50u32);
+
+    // Updating fee bps updates BridgeConfig and all representations agree
+    bridge.set_fee_bps(&250u32, &None);
+    assert_eq!(bridge.query_fee_bps(), 250u32);
+    env.as_contract(&bridge_id, || {
+        assert_eq!(crate::read_bridge_config(&env).fee_bps, 250u32);
+        assert!(!env.storage().instance().has(&DataKey::FeeBps));
+    });
+
+    // Direct admin change updates BridgeConfig without touching legacy Admin key
+    let new_admin = Address::generate(&env);
+    bridge.set_admin(&new_admin, &None);
+    assert_eq!(bridge.query_admin(), new_admin);
+    env.as_contract(&bridge_id, || {
+        assert!(!env.storage().instance().has(&DataKey::Admin));
+    });
+
+    // Direct fee_collector change updates BridgeConfig without touching legacy FeeCollector key
+    let new_collector = Address::generate(&env);
+    bridge.set_fee_collector(&new_collector, &None);
+    assert_eq!(bridge.query_fee_collector(), new_collector);
+    env.as_contract(&bridge_id, || {
+        assert!(!env.storage().instance().has(&DataKey::FeeCollector));
+    });
+
+    // Two-step admin handover
+    let handover_admin = Address::generate(&env);
+    bridge.propose_new_admin(&handover_admin, &None);
+    bridge.accept_admin();
+    assert_eq!(bridge.query_admin(), handover_admin);
+
+    // Two-step fee collector handover
+    let handover_collector = Address::generate(&env);
+    bridge.propose_new_fee_collector(&handover_collector, &None);
+    bridge.accept_fee_collector();
+    assert_eq!(bridge.query_fee_collector(), handover_collector);
+}
+
+#[test]
+fn test_legacy_bridge_config_migration_fallback() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+
+    // Simulate a legacy deployed contract that only has legacy instance keys:
+    env.as_contract(&bridge_id, || {
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::FeeCollector, &fee_collector);
+        env.storage().instance().set(&DataKey::FeeBps, &75u32);
+        assert!(!env.storage().instance().has(&DataKey::BridgeConfig));
+
+        // Reading bridge config executes the one-time migration and saves BridgeConfig:
+        let cfg = crate::read_bridge_config(&env);
+        assert_eq!(cfg.admin, admin);
+        assert_eq!(cfg.fee_collector, fee_collector);
+        assert_eq!(cfg.fee_bps, 75u32);
+        assert!(!cfg.paused);
+        assert!(!cfg.allowlist_mode);
+
+        // Subsequent reads find BridgeConfig in storage:
+        assert!(env.storage().instance().has(&DataKey::BridgeConfig));
+    });
+}

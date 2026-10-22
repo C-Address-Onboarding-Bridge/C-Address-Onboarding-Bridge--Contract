@@ -491,24 +491,35 @@ fn read_max_withdraw_per_tx(env: &Env) -> i128 {
 }
 
 fn read_bridge_config(env: &Env) -> BridgeConfigData {
-    env.storage()
+    if let Some(config) = env
+        .storage()
         .instance()
-        .get(&DataKey::BridgeConfig)
-        .unwrap_or_else(|| BridgeConfigData {
-            admin: env
-                .storage()
-                .instance()
-                .get(&DataKey::Admin)
-                .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized)),
-            fee_collector: env
-                .storage()
-                .instance()
-                .get(&DataKey::FeeCollector)
-                .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized)),
-            fee_bps: env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0),
-            paused: false,
-            allowlist_mode: false,
-        })
+        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
+    {
+        return config;
+    }
+
+    // One-time fallback migration path for contracts deployed with legacy keys only:
+    let admin = env
+        .storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized));
+    let fee_collector = env
+        .storage()
+        .instance()
+        .get(&DataKey::FeeCollector)
+        .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized));
+    let fee_bps = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+    let config = BridgeConfigData {
+        admin,
+        fee_collector,
+        fee_bps,
+        paused: false,
+        allowlist_mode: false,
+    };
+    save_bridge_config(env, &config);
+    config
 }
 
 fn save_bridge_config(env: &Env, cfg: &BridgeConfigData) {
@@ -580,48 +591,26 @@ fn increment_user_deposit(
 
 #[inline(never)]
 fn save_admin(env: &Env, admin: &Address) {
-    env.storage().instance().set(&DataKey::Admin, admin);
-    if let Some(mut config) = env
-        .storage()
-        .instance()
-        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
-    {
-        config.admin = admin.clone();
-        save_bridge_config(env, &config);
-    }
+    let mut config = read_bridge_config(env);
+    config.admin = admin.clone();
+    save_bridge_config(env, &config);
 }
 
 #[inline(never)]
 fn read_admin(env: &Env) -> Address {
-    env.storage()
-        .instance()
-        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
-        .map(|config| config.admin)
-        .or_else(|| env.storage().instance().get(&DataKey::Admin))
-        .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized))
+    read_bridge_config(env).admin
 }
 
 #[inline(never)]
 fn save_fee_collector(env: &Env, addr: &Address) {
-    env.storage().instance().set(&DataKey::FeeCollector, addr);
-    if let Some(mut config) = env
-        .storage()
-        .instance()
-        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
-    {
-        config.fee_collector = addr.clone();
-        save_bridge_config(env, &config);
-    }
+    let mut config = read_bridge_config(env);
+    config.fee_collector = addr.clone();
+    save_bridge_config(env, &config);
 }
 
 #[inline(never)]
 fn read_fee_collector(env: &Env) -> Address {
-    env.storage()
-        .instance()
-        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
-        .map(|config| config.fee_collector)
-        .or_else(|| env.storage().instance().get(&DataKey::FeeCollector))
-        .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized))
+    read_bridge_config(env).fee_collector
 }
 
 fn read_config(env: &Env) -> BridgeConfig {
@@ -1526,11 +1515,6 @@ impl OnboardingBridge {
                 allowlist_mode: false,
             },
         );
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeCollector, &fee_collector);
-        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         save_current_wasm_hash(&env, &wasm_hash);
         mark_initialized(&env);
         extend_instance_ttl(&env);
@@ -2083,9 +2067,6 @@ impl OnboardingBridge {
         extend_instance_ttl(&env);
         let old_collector = read_fee_collector(&env);
         save_fee_collector(&env, &new_fee_collector);
-        let mut config = read_bridge_config(&env);
-        config.fee_collector = new_fee_collector.clone();
-        save_bridge_config(&env, &config);
         env.events().publish(
             ("FeeCollectorChanged", old_collector, new_fee_collector),
             (admin,),
@@ -2126,9 +2107,6 @@ impl OnboardingBridge {
         extend_instance_ttl(&env);
         let old_collector = read_fee_collector(&env);
         save_fee_collector(&env, &pending);
-        let mut config = read_bridge_config(&env);
-        config.fee_collector = pending.clone();
-        save_bridge_config(&env, &config);
         remove_pending_fee_collector(&env);
         env.events()
             .publish(("FeeCollectorTransferred", old_collector, pending), ());
@@ -2148,9 +2126,6 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         save_admin(&env, &new_admin);
-        let mut config = read_bridge_config(&env);
-        config.admin = new_admin.clone();
-        save_bridge_config(&env, &config);
         env.events().publish(("AdminChanged", admin, new_admin), ());
         Ok(())
     }
@@ -2187,9 +2162,6 @@ impl OnboardingBridge {
         extend_instance_ttl(&env);
         let old_admin = read_admin(&env);
         save_admin(&env, &pending);
-        let mut config = read_bridge_config(&env);
-        config.admin = pending.clone();
-        save_bridge_config(&env, &config);
         remove_pending_admin(&env);
         env.events()
             .publish(("AdminTransferred", old_admin, pending), ());
