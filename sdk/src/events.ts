@@ -104,34 +104,6 @@ export interface FeeCollectorTransferredEvent {
   pagingToken: string;
 }
 
-/**
- * Emitted when a new fee collector is proposed (contract
- * `FeeCollectorProposed`).
- */
-export interface FeeCollectorProposedEvent {
-  name: 'FeeCollectorProposed';
-  /** Current fee collector proposing the change */
-  feeCollector: string;
-  /** Proposed new fee collector address */
-  proposedFeeCollector: string;
-  ledger: number;
-  pagingToken: string;
-}
-
-/**
- * Emitted when a proposed fee collector accepts and the fee collector address
- * changes (contract `FeeCollectorTransferred`).
- */
-export interface FeeCollectorTransferredEvent {
-  name: 'FeeCollectorTransferred';
-  /** Previous fee collector address */
-  oldFeeCollector: string;
-  /** New fee collector address */
-  newFeeCollector: string;
-  ledger: number;
-  pagingToken: string;
-}
-
 /** Emitted when a meta-transaction fund is executed (issue #35). */
 export interface MetaFundExecutedEvent {
   name: 'MetaFundExecuted';
@@ -273,7 +245,7 @@ export class EventSubscriber {
   private listeners: Map<string, Set<BridgeEventCallback<any>>>;
 
   /** NodeJS/browser timeout handle for the self-scheduling poll loop. */
-  private intervalHandle: ReturnType<typeof setTimeout> | null = null;
+  private intervalHandle: ReturnType<typeof setInterval> | null = null;
 
   /** Whether a fetch is currently in flight (guards against overlap). */
   private polling = false;
@@ -327,7 +299,23 @@ export class EventSubscriber {
           this.listeners.delete(eventName);
         }
       }
-      // Stop polling when no listeners remain (preserve 'error' lis
+      // Stop polling when no listeners remain (preserve 'error' listeners
+      // so the error callback keeps working even with no other subscribers).
+      if (this.listenerCount() === 0) {
+        this.stopPolling();
+      }
+    };
+  }
+
+  /**
+   * Remove all listeners for a specific event name.
+   */
+  off(eventName: BridgeEventName): void {
+    this.listeners.delete(eventName);
+    if (this.listenerCount() === 0) {
+      this.stopPolling();
+    }
+  }
 
   /**
    * Total number of registered callbacks across all event names.
@@ -372,11 +360,17 @@ export class EventSubscriber {
   private startPolling(): void {
     if (this.intervalHandle !== null) return;
     this.intervalHandle = setInterval(() => {
-      this.fetchAndDispatch().catch((err) => {
-        // Emit to error listeners so consumers can detect persistently-down
-        // RPC endpoints and react (e.g. circuit break, alert, reconnect).
-        this.dispatchError(err instanceof Error ? err : new Error(String(err)));
-      });
+      if (this.polling) return; // skip if a fetch is already in flight
+      this.polling = true;
+      this.fetchAndDispatch()
+        .catch((err) => {
+          // Emit to error listeners so consumers can detect persistently-down
+          // RPC endpoints and react (e.g. circuit break, alert, reconnect).
+          this.dispatchError(err instanceof Error ? err : new Error(String(err)));
+        })
+        .finally(() => {
+          this.polling = false;
+        });
     }, this.pollingIntervalMs);
   }
 
@@ -385,6 +379,7 @@ export class EventSubscriber {
       clearInterval(this.intervalHandle);
       this.intervalHandle = null;
     }
+    this.polling = false;
   }
 
   private async fetchAndDispatch(): Promise<void> {
