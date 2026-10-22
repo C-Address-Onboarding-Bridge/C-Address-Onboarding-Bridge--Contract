@@ -7171,3 +7171,18 @@ fn test_verify_auth_entry_expired_window_fails() {
         Err(Ok(BridgeError::AuthNonceExpired))
     );
 }
+
+#[test]
+fn test_set_max_withdraw_per_tx_paused() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+    assert_eq!(
+        bridge.try_set_max_withdraw_per_tx(&1000i128, &None),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}

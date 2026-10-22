@@ -50,6 +50,10 @@ const CONFIG = {
 
 const MOCK_ADDRESS = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
 
+// Physical cache key written by `CachedContractClient`/`ContractClient`
+// (see cacheKeyPrefix in cachedBridge.ts).
+const KEY = (k: string) => `${CONFIG.networkPassphrase}:${CONFIG.contractId}:${k}`;
+
 describe('CachedContractClient', () => {
   let mockProvider: any;
   let mockKeypair: any;
@@ -134,14 +138,14 @@ describe('CachedContractClient', () => {
     await wrapper.getFee();
     await wrapper.client.setAdmin(MOCK_ADDRESS, { publicKey: () => MOCK_ADDRESS, sign: jest.fn() });
     await wrapper.getFee();
-    expect(await cache.get('getFee')).toBe(50);
+    expect(await cache.get(KEY('getFee'))).toBe(50);
 
     confirm();
     await confirmation;
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(await cache.get('getFee')).toBeUndefined();
+    expect(await cache.get(KEY('getFee'))).toBeUndefined();
     await expect(wrapper.getFee()).resolves.toBe(60);
   });
 
@@ -150,10 +154,10 @@ describe('CachedContractClient', () => {
     mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
 
     await wrapper.getFee();
-    expect(await cache.get('getFee')).toBe(50);
+    expect(await cache.get(KEY('getFee'))).toBe(50);
 
     await wrapper.invalidateCache('getFee');
-    expect(await cache.get('getFee')).toBeUndefined();
+    expect(await cache.get(KEY('getFee'))).toBeUndefined();
   });
 
   it('forwards the configured timeout to transaction builders', async () => {
@@ -327,32 +331,70 @@ describe('CachedContractClient', () => {
     nowSpy.mockRestore();
   });
 
-  it('clears all cached entries when invalidateCache is called with no arguments', async () => {
-    await cache.set('getFee', 100);
-    await cache.set('getFeeCollector', 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF');
-    await cache.set('getAdmin', 'GAHJZ6Y2Z5AM6ZAUOVGQ3XK6YKP6SAJSE3ZGJHNUZFXZMNZ5NRX5NHJY3');
-    await cache.set('isInitialized', true);
+  it('clears only its own cached entries when invalidateCache is called with no arguments', async () => {
+    await cache.set(KEY('getFee'), 100);
+    await cache.set(KEY('getFeeCollector'), 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF');
+    await cache.set(KEY('getAdmin'), 'GAHJZ6Y2Z5AM6ZAUOVGQ3XK6YKP6SAJSE3ZGJHNUZFXZMNZ5NRX5NHJY3');
+    await cache.set(KEY('isInitialized'), true);
+
+    // Foreign entries owned by a different contract using the same provider.
+    const foreignPrefix = `${CONFIG.networkPassphrase}:${CONFIG.contractId.replace(/A/g, 'B')}:`;
+    await cache.set(`${foreignPrefix}getFee`, 999);
+    await cache.set(`${foreignPrefix}getAdmin`, 'GFOREIGN');
 
     await wrapper.invalidateCache();
 
-    expect(await cache.get('getFee')).toBeUndefined();
-    expect(await cache.get('getFeeCollector')).toBeUndefined();
-    expect(await cache.get('getAdmin')).toBeUndefined();
-    expect(await cache.get('isInitialized')).toBeUndefined();
+    expect(await cache.get(KEY('getFee'))).toBeUndefined();
+    expect(await cache.get(KEY('getFeeCollector'))).toBeUndefined();
+    expect(await cache.get(KEY('getAdmin'))).toBeUndefined();
+    expect(await cache.get(KEY('isInitialized'))).toBeUndefined();
+
+    // Foreign entries must survive.
+    expect(await cache.get(`${foreignPrefix}getFee`)).toBe(999);
+    expect(await cache.get(`${foreignPrefix}getAdmin`)).toBe('GFOREIGN');
   });
 
   it('deletes only the specified keys when invalidateCache is called with an array', async () => {
-    await cache.set('getFee', 100);
-    await cache.set('getFeeCollector', 'GCCD6AJOYZCUAQLXX32ZJF2NKFFAU6TYPVWLZSE3GGSOOD5GVPJGZZ5B');
-    await cache.set('getAdmin', 'GAHJZ6Y2Z5AM6ZAUOVGQ3XK6YKP6SAJSE3ZGJHNUZFXZMNZ5NRX5NHJY3');
-    await cache.set('isInitialized', true);
+    await cache.set(KEY('getFee'), 100);
+    await cache.set(KEY('getFeeCollector'), 'GCCD6AJOYZCUAQLXX32ZJF2NKFFAU6TYPVWLZSE3GGSOOD5GVPJGZZ5B');
+    await cache.set(KEY('getAdmin'), 'GAHJZ6Y2Z5AM6ZAUOVGQ3XK6YKP6SAJSE3ZGJHNUZFXZMNZ5NRX5NHJY3');
+    await cache.set(KEY('isInitialized'), true);
 
     await wrapper.invalidateCache(['getFee', 'getFeeCollector']);
 
-    expect(await cache.get('getFee')).toBeUndefined();
-    expect(await cache.get('getFeeCollector')).toBeUndefined();
+    expect(await cache.get(KEY('getFee'))).toBeUndefined();
+    expect(await cache.get(KEY('getFeeCollector'))).toBeUndefined();
     // Untouched keys remain
-    expect(await cache.get('getAdmin')).toBe('GAHJZ6Y2Z5AM6ZAUOVGQ3XK6YKP6SAJSE3ZGJHNUZFXZMNZ5NRX5NHJY3');
-    expect(await cache.get('isInitialized')).toBe(true);
+    expect(await cache.get(KEY('getAdmin'))).toBe('GAHJZ6Y2Z5AM6ZAUOVGQ3XK6YKP6SAJSE3ZGJHNUZFXZMNZ5NRX5NHJY3');
+    expect(await cache.get(KEY('isInitialized'))).toBe(true);
+  });
+
+  it('two clients sharing one InMemoryCache with different contract ids do not collide', async () => {
+    const otherConfig = { ...CONFIG, contractId: CONFIG.contractId.replace(/A/g, 'B') };
+    const otherWrapper = new CachedContractClient(otherConfig, { provider: cache });
+    const otherKey = (k: string) =>
+      `${otherConfig.networkPassphrase}:${otherConfig.contractId}:${k}`;
+
+    (scValToNative as jest.Mock)
+      .mockReturnValueOnce(50) // wrapper.getFee
+      .mockReturnValueOnce(75); // otherWrapper.getFee
+    mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+    expect(await wrapper.getFee()).toBe(50);
+    expect(await otherWrapper.getFee()).toBe(75);
+    expect(mockProvider.simulateTransaction).toHaveBeenCalledTimes(2);
+
+    // Each client sees only its own cached value.
+    expect(await cache.get(KEY('getFee'))).toBe(50);
+    expect(await cache.get(otherKey('getFee'))).toBe(75);
+
+    // Invalidating one client must not disturb the other's cache.
+    await wrapper.invalidateCache();
+    expect(await cache.get(KEY('getFee'))).toBeUndefined();
+    expect(await cache.get(otherKey('getFee'))).toBe(75);
+
+    // The other client still serves its cached value without a new RPC call.
+    expect(await otherWrapper.getFee()).toBe(75);
+    expect(mockProvider.simulateTransaction).toHaveBeenCalledTimes(2);
   });
 });

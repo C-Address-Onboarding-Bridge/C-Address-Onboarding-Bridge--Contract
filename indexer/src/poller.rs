@@ -10,8 +10,8 @@ const POLL_INTERVAL_MS: u64 = 5000;
 const MAX_EVENTS_PER_POLL: usize = 100;
 /// Default number of ledgers to look back on first run when no persisted
 /// `last_ledger` exists.  Real Soroban RPC servers enforce a retention window
-/// (typically 17280 ledgers ≈ 24 hours on mainnet); requesting from ledger 0
-/// would be rejected.  This default is conservative (≈ 1 hour of ledgers at
+/// (typically 17280 ledgers ~= 24 hours on mainnet); requesting from ledger 0
+/// would be rejected.  This default is conservative (~= 1 hour of ledgers at
 /// ~5 s per ledger) and can be overridden via the `LOOKBACK_LEDGERS` env var.
 pub const DEFAULT_LOOKBACK_LEDGERS: i64 = 720;
 
@@ -63,7 +63,7 @@ async fn fetch_latest_ledger(state: &AppState) -> Result<i64, Box<dyn std::error
 
     let body: serde_json::Value = response.json().await?;
 
-    // #637 — surface JSON-RPC errors instead of silently treating them as
+    // #637 - surface JSON-RPC errors instead of silently treating them as
     // missing fields.
     if let Some(err) = body.get("error") {
         return Err(format!("getLatestLedger RPC error: {}", err).into());
@@ -78,11 +78,23 @@ async fn fetch_latest_ledger(state: &AppState) -> Result<i64, Box<dyn std::error
     Ok(seq)
 }
 
+/// Send one `getEvents` request and persist every event it returns.
+///
+/// Pagination contract (`getEvents`):
+/// - The first request uses `startLedger`; subsequent requests use the opaque
+///   `cursor` from the previous response. `startLedger` and `cursor` are
+///   mutually exclusive per the Soroban RPC spec, so the request body only
+///   carries the one that applies.
+/// - `result.events` holds the page. `result.cursor` points at the next page.
+///   `result.latestLedger` is the RPC node's tip - used for logging.
+/// - The ledger cursor is persisted **after** the whole page is stored, so a
+///   crash mid-page causes the next poll to replay that page (safe: inserts
+///   are `INSERT OR IGNORE`).
 async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
     let start_ledger = match state.db.get_last_ledger().await? {
         Some(last) => last + 1,
         None => {
-            // First run — no persisted cursor.  Requesting from ledger 0 would
+            // First run - no persisted cursor.  Requesting from ledger 0 would
             // be rejected by any real (non-quickstart) Soroban RPC endpoint
             // because it falls outside the node's retention window.
             // Instead, fetch the current tip and subtract a configurable
@@ -92,7 +104,7 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
             let lookback = state.lookback_ledgers;
             let fallback = (latest - lookback).max(0);
             tracing::info!(
-                "No persisted ledger cursor — starting from ledger {} \
+                "No persisted ledger cursor - starting from ledger {} \
                  (latest={} minus lookback={}). \
                  Set LOOKBACK_LEDGERS=0 to start from the current tip, \
                  or use POST /api/replay to backfill older history.",
@@ -104,51 +116,67 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // #635 — page through all results using the RPC cursor so that more than
+    // #635 - page through all results using the RPC cursor so that more than
     // MAX_EVENTS_PER_POLL events in a single poll window are never silently
-    // dropped.  We persist the cursor (encoded as a string) rather than a
-    // plain ledger number so the next poll resumes exactly where we left off.
-    let mut pagination_cursor: Option<String> = None;
+    // dropped.  We persist the ledger position after each page completes so
+    // the next poll resumes exactly where we left off.
+    let mut cursor: Option<String> = None;
     let mut max_ledger = start_ledger;
-    let mut any_events = false;
 
     loop {
-        let mut pagination = serde_json::json!({ "limit": MAX_EVENTS_PER_POLL });
-        if let Some(ref c) = pagination_cursor {
-            pagination["cursor"] = serde_json::Value::String(c.clone());
-        }
-
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getEvents",
-            "params": {
+        let params = match cursor {
+            Some(ref c) => serde_json::json!({
+                "filters": [{
+                    "type": "contract",
+                    "contractIds": [state.contract_id],
+                }],
+                "pagination": {
+                    "cursor": c,
+                    "limit": MAX_EVENTS_PER_POLL,
+                },
+            }),
+            None => serde_json::json!({
                 "startLedger": start_ledger,
                 "filters": [{
                     "type": "contract",
                     "contractIds": [state.contract_id],
                 }],
-                "pagination": pagination,
-            }
+                "pagination": {
+                    "limit": MAX_EVENTS_PER_POLL,
+                },
+            }),
+        };
+
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getEvents",
+            "params": params,
         });
 
+        // #635/#850 - exactly one request per page (the pre-merge code sent it
+        // twice and never parsed the body).
         let response = state
             .rpc_client
             .post(&state.rpc_url)
             .json(&request)
             .send()
             .await?;
-
         let body: serde_json::Value = response.json().await?;
 
-        // #637 — if the RPC returned an error object, propagate it so
-        // run_poller logs it rather than silently treating it as no events.
+        // #637 - surface JSON-RPC errors instead of treating them as no events.
         if let Some(err) = body.get("error") {
             let message = err.to_string();
 
-            // #636 — detect "start ledger out of range" and recover to the
-            // oldest available ledger rather than getting stuck forever.
-            if message.contains("startLedger") || message.contains("out of range") || message.contains("beforeOldestLedger") {
+            // #636 - recover to the latest ledger tip when the requested
+            // start ledger is outside the RPC's retention window.  Only the
+            // very first request (startLedger-based) can hit this; cursor
+            // requests past page 1 don't reference a ledger.
+            if cursor.is_none()
+                && (message.contains("startLedger")
+                    || message.contains("out of range")
+                    || message.contains("beforeOldestLedger"))
+            {
                 tracing::warn!(
                     "Cursor ledger {} is outside RPC retention window ({}). \
                      Recovering to latest ledger tip.",
@@ -163,17 +191,27 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("getEvents RPC error: {}", message).into());
         }
 
-    let response = state
-        .rpc_client
-        .post(&state.rpc_url)
-        .json(&request)
-        .send()
-        .await?;
+        let result = body
+            .get("result")
+            .ok_or("getEvents: missing result")?;
 
-        any_events = true;
+        let events: Vec<serde_json::Value> = result
+            .get("events")
+            .and_then(|e| e.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let next_cursor: Option<String> = result
+            .get("cursor")
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+
+        let latest_ledger_from_rpc = result
+            .get("latestLedger")
+            .and_then(|l| l.as_i64())
+            .unwrap_or(0);
 
         let mut events_seen_per_tx: HashMap<&str, usize> = HashMap::new();
-
         for raw_event in &events {
             let ledger = raw_event
                 .get("ledger")
@@ -192,10 +230,10 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
             *counter += 1;
 
             if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id, event_index) {
-                // Only fan out webhooks for events we have not indexed before;
-                // otherwise a re-poll would re-deliver every event in the range.
-                if state.db.insert_event(&indexed).await? {
-                    state.db.queue_webhook_deliveries(&indexed).await?;
+                // Insert the event and queue its webhook deliveries atomically
+                // (one SQLite transaction) so a crash between the two can never
+                // leave an indexed event with no deliveries queued. See #647.
+                if state.db.insert_event_and_queue_deliveries(&indexed).await? {
                     tracing::info!(
                         "Indexed event: {} at ledger {}",
                         indexed.event_type,
@@ -207,38 +245,37 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let tx_hash = raw_event
-            .get("txHash")
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
-        let counter = events_seen_per_tx.entry(tx_hash).or_insert(0);
-        let event_index = *counter;
-        *counter += 1;
+        // #850 - persist the ledger cursor only after the whole page is
+        // stored.  Advancing past the page mid-loop would lose events on a
+        // crash.  `INSERT OR IGNORE` makes the worst case (full replay of the
+        // page after a crash) safe and idempotent.
+        if !events.is_empty() || max_ledger > start_ledger {
+            state.db.set_last_ledger(max_ledger).await?;
+        }
 
-        if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id, event_index) {
-            // Insert the event and queue its webhook deliveries atomically
-            // (one SQLite transaction) so a crash between the two can never
-            // leave an indexed event with no deliveries queued. See #647.
-            // Only fan out webhooks for events we have not indexed before;
-            // otherwise a re-poll would re-deliver every event in the range.
-            if state.db.insert_event_and_queue_deliveries(&indexed).await? {
-                tracing::info!(
-                    "Indexed event: {} at ledger {}",
-                    indexed.event_type,
-                    indexed.ledger_sequence
+        // #850 - break when the page wasn't full (no more events to page
+        // through) or when the RPC didn't provide a cursor for the next page.
+        if events.len() < MAX_EVENTS_PER_POLL {
+            if max_ledger > start_ledger {
+                tracing::debug!(
+                    "Poller advanced to ledger {} (rpc latest={})",
+                    max_ledger,
+                    latest_ledger_from_rpc
                 );
-            } else {
-                tracing::debug!("Skipping already-indexed event {}", indexed.id);
+            }
+            break;
+        }
+
+        match next_cursor {
+            Some(c) => cursor = Some(c),
+            None => {
+                tracing::warn!(
+                    "Full page of {} events but no cursor returned; stopping pagination",
+                    events.len()
+                );
+                break;
             }
         }
-        pagination_cursor = next_cursor;
-    }
-
-    // Always advance the persisted cursor so quiet periods don't stall us.
-    // (#636: also covers the no-events case above via max_ledger update.)
-    if any_events || max_ledger > start_ledger {
-        state.db.set_last_ledger(max_ledger).await?;
-        tracing::debug!("Poller advanced to ledger {}", max_ledger);
     }
 
     Ok(())
@@ -288,11 +325,24 @@ fn parse_contract_event(
     }
 
     // Topic position of the asset/source/target/referrer party fields varies
-    // by event: most events publish (name, source, target), but some funding
-    // paths interleave an asset (or two, for swaps) before the parties. Map
-    // each event type to its actual topic layout so `data` gets correctly
-    // labelled fields instead of a generic, sometimes-wrong source/target.
-    // See #642.
+    // by event: most events publish (name, source, target), but funding
+    // paths sometimes interleave an asset (or two, for swaps) before the
+    // parties. Map each event type to its actual topic layout so `data` gets
+    // correctly labelled fields instead of a generic, sometimes-wrong
+    // source/target. See #642 / #850.
+    //
+    // Layouts (as published by the contract, and exercised by this module's
+    // tests):
+    //   SwapAndFunded              -> (source_asset, target_asset, source, target)
+    //   CAddressFunded             -> (asset, source, target)
+    //   CommitRevealFunded         -> (asset, source, target)
+    //   MetaFundExecuted           -> (asset, source, target)
+    //   ReferralPaid               -> (source, referrer)
+    //   FeesWithdrawn              -> (fee_collector)
+    //   AdminProposed/Transferred  -> (from, to)
+    //   FeeCollector*Proposed/...  -> (from, to)
+    //   CommitFund / BatchTransferFailed / remaining admin/config events
+    //                              -> (source, target)
     match &event_type {
         BridgeEventType::SwapAndFunded => {
             insert_topic_str(&mut data, &decoded_topics, 1, "source_asset");
@@ -300,7 +350,9 @@ fn parse_contract_event(
             insert_topic_str(&mut data, &decoded_topics, 3, "source");
             insert_topic_str(&mut data, &decoded_topics, 4, "target");
         }
-        BridgeEventType::CommitRevealFunded | BridgeEventType::MetaFundExecuted => {
+        BridgeEventType::CAddressFunded
+        | BridgeEventType::CommitRevealFunded
+        | BridgeEventType::MetaFundExecuted => {
             insert_topic_str(&mut data, &decoded_topics, 1, "asset");
             insert_topic_str(&mut data, &decoded_topics, 2, "source");
             insert_topic_str(&mut data, &decoded_topics, 3, "target");
@@ -309,41 +361,50 @@ fn parse_contract_event(
             insert_topic_str(&mut data, &decoded_topics, 1, "source");
             insert_topic_str(&mut data, &decoded_topics, 2, "referrer");
         }
-        _ => {
-            // CAddressFunded, CommitFund, BatchTransferFailed, and the
-            // remaining admin/config events all publish (name, source, target).
-            insert_topic_str(&mut data, &decoded_topics, 1, "source");
-            insert_topic_str(&mut data, &decoded_topics, 2, "target");
-        }
-        // ("FeesWithdrawn", fee_collector) — asset carried in value, not topics
+        // ("FeesWithdrawn", fee_collector) - asset carried in value, not topics
         BridgeEventType::FeesWithdrawn => {
             if let Some(collector) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert("fee_collector".to_string(), serde_json::Value::String(collector.to_string()));
+                data.insert(
+                    "fee_collector".to_string(),
+                    serde_json::Value::String(collector.to_string()),
+                );
             }
         }
         // ("AdminProposed", admin, new_admin) / ("AdminTransferred", old_admin, pending)
         BridgeEventType::AdminProposed | BridgeEventType::AdminTransferred => {
             if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert("from".to_string(), serde_json::Value::String(from.to_string()));
+                data.insert(
+                    "from".to_string(),
+                    serde_json::Value::String(from.to_string()),
+                );
             }
             if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
                 data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
             }
         }
-        // ("FeeCollectorTransferProposed", admin, new_collector) / ("FeeCollectorTransferred", old, pending)
-        BridgeEventType::FeeCollectorTransferProposed | BridgeEventType::FeeCollectorTransferred => {
+        // ("FeeCollectorTransferProposed", admin, new_collector) /
+        // ("FeeCollectorTransferred", old, pending)
+        BridgeEventType::FeeCollectorTransferProposed
+        | BridgeEventType::FeeCollectorTransferred => {
             if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert("from".to_string(), serde_json::Value::String(from.to_string()));
+                data.insert(
+                    "from".to_string(),
+                    serde_json::Value::String(from.to_string()),
+                );
             }
             if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
                 data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
             }
         }
-        // All other event types: no well-known topic fields beyond the event name.
-        _ => {}
+        _ => {
+            // CommitFund, BatchTransferFailed, and the remaining admin/config
+            // events all publish (name, source, target).
+            insert_topic_str(&mut data, &decoded_topics, 1, "source");
+            insert_topic_str(&mut data, &decoded_topics, 2, "target");
+        }
     }
 
-    // #634 — Deterministic ID: sha256(ledger || tx_hash || event_type ||
+    // #634 - Deterministic ID: sha256(ledger || tx_hash || event_type ||
     // first_topic || event_index) encoded as a 64-char hex string.
     //
     // Using SHA-256 (rather than std::hash::DefaultHasher, whose output is
@@ -516,7 +577,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Issue 4 — edge cases in parse_contract_event / BridgeEventType
+    // Issue 4 - edge cases in parse_contract_event / BridgeEventType
     // -----------------------------------------------------------------------
 
     /// An empty topic array must return None (no event type to determine).
@@ -581,12 +642,12 @@ mod tests {
         );
     }
 
-    /// topics[1] is extracted into `data["source"]`.
+    /// #639/#850: CAddressFunded layout is ("CAddressFunded", asset, source, target).
     #[test]
     fn test_parse_extracts_source_from_topics_index_1() {
-        // NOTE: this test uses the OLD (pre-#639) assumed layout and is kept
-        // only to document the former behaviour.  The corrected layout is
-        // tested by test_c_address_funded_topic_mapping below.
+        // NOTE: this test previously documented the pre-#639 layout. The
+        // corrected layout is (name, asset, source, target), so the fields
+        // land at the positions asserted below.
         let raw = raw_event(serde_json::json!([
             "CAddressFunded",
             "GASSETADDR",
@@ -594,13 +655,13 @@ mod tests {
             "CTARGETADDR"
         ]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
-        // asset is now at topics[1]
+        // asset is at topics[1]
         assert_eq!(
             event.data["asset"].as_str(),
             Some("GASSETADDR"),
             "topics[1] must be stored as data.asset for CAddressFunded"
         );
-        // source is now at topics[2]
+        // source is at topics[2]
         assert_eq!(
             event.data["source"].as_str(),
             Some("GSOURCEADDR"),
@@ -608,7 +669,7 @@ mod tests {
         );
     }
 
-    /// topics[2] is extracted into `data["target"]`.
+    /// topics[3] is extracted into `data["target"]` for CAddressFunded.
     #[test]
     fn test_parse_extracts_target_from_topics_index_2() {
         let raw = raw_event(serde_json::json!(["CAddressFunded", "GASSET", "GSOURCE", "CTARGET"]));
@@ -653,9 +714,10 @@ mod tests {
     #[test]
     fn test_c_address_funded_populates_asset_field() {
         let raw = raw_event(serde_json::json!([
-            "AAAADwAAAA5DQWRkcmVzc0Z1bmRlZAAA",
-            "AAAADwAAAAtHU09VUkNFQUREUgA=",
-            "AAAADwAAAAtDVEFSR0VUQUREUgA="
+            "CAddressFunded",
+            "CASSETADDR",
+            "GSOURCEADDR",
+            "CTARGETADDR"
         ]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert!(
@@ -665,7 +727,7 @@ mod tests {
     }
 
     /// #639/#640: FeesWithdrawn layout is ("FeesWithdrawn", fee_collector).
-    /// No asset in topics — verify fee_collector is stored correctly.
+    /// No asset in topics - verify fee_collector is stored correctly.
     #[test]
     fn test_fees_withdrawn_topic_mapping() {
         let raw = raw_event(serde_json::json!(["FeesWithdrawn", "GCOLLECTOR"]));
@@ -677,7 +739,7 @@ mod tests {
         );
         assert!(
             event.data.get("asset").is_none(),
-            "FeesWithdrawn has no asset topic — data['asset'] must be absent"
+            "FeesWithdrawn has no asset topic - data['asset'] must be absent"
         );
     }
 
@@ -730,17 +792,17 @@ mod tests {
         let raw_fc = raw_event(serde_json::json!(["FeeCollectorChanged", "GCOL", "GNEWCOL"]));
         assert!(
             parse_contract_event(&raw_admin, "C1", 0).is_none(),
-            "'AdminChanged' must yield None — contract never emits this"
+            "'AdminChanged' must yield None - contract never emits this"
         );
         assert!(
             parse_contract_event(&raw_fc, "C1", 0).is_none(),
-            "'FeeCollectorChanged' must yield None — contract never emits this"
+            "'FeeCollectorChanged' must yield None - contract never emits this"
         );
     }
 
     #[test]
     fn test_parse_decodes_rpc_scval_topics_and_value() {
-        // #639: CAddressFunded is ("CAddressFunded", asset, source, target) — 4 topics.
+        // #639: CAddressFunded is ("CAddressFunded", asset, source, target) - 4 topics.
         // Base64-encoded XDR ScSymbol values for each field:
         //   "CAddressFunded" -> AAAADwAAAA5DQWRkcmVzc0Z1bmRlZAAA
         //   "CASSETADDR"     -> AAAADwAAAApDQVNTRVRBRERSAAA=
@@ -782,7 +844,7 @@ mod tests {
         );
     }
 
-    /// Deterministic ID: same raw input → same id on repeated calls.
+    /// Deterministic ID: same raw input -> same id on repeated calls.
     #[test]
     fn test_parse_deterministic_id_same_input_same_id() {
         let raw = raw_event(serde_json::json!(["CAddressFunded", "GSRC", "CTGT"]));
@@ -792,7 +854,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Issue #642 — funding-path events (commit-reveal, swap, meta-tx, referral)
+    // Issue #642 - funding-path events (commit-reveal, swap, meta-tx, referral)
     // -----------------------------------------------------------------------
 
     /// `CommitFund` uses the generic (name, source, target) layout.
@@ -805,7 +867,7 @@ mod tests {
         assert_eq!(event.data["target"].as_str(), Some("CTGT"));
     }
 
-    /// `CommitRevealFunded` publishes (name, asset, source, target) — the
+    /// `CommitRevealFunded` publishes (name, asset, source, target) - the
     /// asset must not be mislabelled as the source.
     #[test]
     fn test_parse_commit_reveal_funded_extracts_asset_source_target() {
@@ -839,7 +901,7 @@ mod tests {
     }
 
     /// `SwapAndFunded` publishes (name, source_asset, target_asset, source,
-    /// target) — five topics in total.
+    /// target) - five topics in total.
     #[test]
     fn test_parse_swap_and_funded_extracts_all_parties() {
         let raw = raw_event(serde_json::json!([
@@ -857,7 +919,7 @@ mod tests {
         assert_eq!(event.data["target"].as_str(), Some("CTGT"));
     }
 
-    /// `ReferralPaid` publishes (name, source, referrer) — the second party
+    /// `ReferralPaid` publishes (name, source, referrer) - the second party
     /// is a referrer, not a funding target.
     #[test]
     fn test_parse_referral_paid_extracts_source_and_referrer() {
@@ -883,7 +945,7 @@ mod tests {
         assert_eq!(event.data["target"].as_str(), Some("CTGT"));
     }
 
-    /// Deterministic ID: different tx_hash → different id.
+    /// Deterministic ID: different tx_hash -> different id.
     #[test]
     fn test_parse_deterministic_id_different_tx_hash_different_id() {
         let raw1 = serde_json::json!({
@@ -904,7 +966,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Issue #646 — cooperative shutdown
+    // Issue #646 - cooperative shutdown
     // -----------------------------------------------------------------------
 
     /// Cancelling the token must make `run_poller` return instead of looping
@@ -921,6 +983,7 @@ mod tests {
             contract_id: "C_TEST".to_string(),
             rpc_client: reqwest::Client::new(),
             webhook_client: reqwest::Client::new(),
+            api_key_hash: String::new(),
             lookback_ledgers: 720,
         });
         let token = CancellationToken::new();
@@ -937,7 +1000,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Issue #854 — RPC calls must use the timeout-configured `rpc_client`
+    // Issue #854 - RPC calls must use the timeout-configured `rpc_client`
     // -----------------------------------------------------------------------
 
     /// `fetch_latest_ledger` must honor the configured request timeout
@@ -990,6 +1053,134 @@ mod tests {
         assert!(
             result.is_err(),
             "an unresponsive RPC must surface a timeout error, not hang or succeed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #850 - poll_once pagination
+    // -----------------------------------------------------------------------
+
+    /// Mock `getEvents` that returns two pages of events, then (defensively)
+    /// an empty page. The test asserts that:
+    ///   - exactly two RPC requests were made (one per page),
+    ///   - all 150 events across both pages are stored,
+    ///   - the persisted cursor advanced to the last event's ledger.
+    #[tokio::test]
+    async fn test_poll_once_pages_two_pages_and_terminates() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        fn make_event_json(ledger: i64, tx_hash: &str) -> serde_json::Value {
+            serde_json::json!({
+                "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
+                "ledger": ledger,
+                "txHash": tx_hash,
+                "createdAt": "2024-06-01T12:00:00Z",
+                "value": null,
+            })
+        }
+
+        // Page 1: MAX_EVENTS_PER_POLL events (full page).
+        let page1_events: Vec<_> = (0..MAX_EVENTS_PER_POLL)
+            .map(|i| make_event_json(100 + i as i64, &format!("tx-p1-{}", i)))
+            .collect();
+        // Page 2: 50 events (partial page -> must break).
+        let page2_events: Vec<_> = (0..50)
+            .map(|i| make_event_json(200 + i as i64, &format!("tx-p2-{}", i)))
+            .collect();
+
+        let page1_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": page1_events,
+                "cursor": "cursor-page-2",
+                "latestLedger": 300,
+            }
+        });
+        let page2_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": page2_events,
+                "cursor": "cursor-page-3",
+                "latestLedger": 300,
+            }
+        });
+        let empty_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": [],
+                "cursor": "cursor-unused",
+                "latestLedger": 300,
+            }
+        });
+
+        let request_count = Arc::new(AtomicU32::new(0));
+        let request_count_clone = Arc::clone(&request_count);
+
+        let mock_router = axum::Router::new().route(
+            "/",
+            post(move || {
+                let count = request_count_clone.fetch_add(1, Ordering::SeqCst);
+                let response = match count {
+                    0 => page1_response.clone(),
+                    1 => page2_response.clone(),
+                    _ => empty_response.clone(),
+                };
+                async move { axum::Json(response) }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.unwrap();
+        });
+
+        let db = crate::db::Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        // Seed a cursor so poll_once does NOT call fetch_latest_ledger.
+        db.set_last_ledger(99).await.unwrap();
+
+        let state = crate::AppState {
+            db: db.clone(),
+            rpc_url: format!("http://{}", addr),
+            contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::new(),
+            api_key_hash: String::new(),
+            lookback_ledgers: 720,
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            poll_once(&state),
+        )
+        .await
+        .expect("poll_once must terminate (no infinite loop)");
+
+        result.expect("poll_once must succeed");
+
+        let count = request_count.load(Ordering::SeqCst);
+        assert_eq!(
+            count, 2,
+            "exactly two getEvents calls must be made (one per page)"
+        );
+
+        let events = db.list_events(1000, 0).await.expect("list events");
+        assert_eq!(
+            events.len(),
+            150,
+            "all 150 events across both pages must be stored"
+        );
+
+        let last_ledger = db.get_last_ledger().await.expect("get_last_ledger");
+        assert_eq!(
+            last_ledger,
+            Some(249),
+            "cursor must advance to the last event's ledger (200 + 49)"
         );
     }
 }

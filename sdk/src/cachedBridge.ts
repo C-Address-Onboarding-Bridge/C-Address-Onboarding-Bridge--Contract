@@ -50,6 +50,21 @@ const CACHE_KEYS: CacheKey[] = [
 ];
 
 /**
+ * Build the per-client cache namespace so two clients sharing one
+ * {@link ICacheProvider} (e.g. a single Redis instance backing both a
+ * testnet and a mainnet deployment) cannot read or overwrite each other's
+ * entries.
+ *
+ * The prefix is derived from the wire identity of the deployment: the
+ * network passphrase plus the contract id. Two clients that target the
+ * same network + contract legitimately share a cache; any other
+ * combination is isolated.
+ */
+function cacheKeyPrefix(config: BridgeConfig): string {
+  return `${config.networkPassphrase}:${config.contractId}:`;
+}
+
+/**
  * CachedContractClient caches a small set of view methods while delegating
  * all transaction logic to the underlying OnboardingBridge SDK implementation.
  */
@@ -57,10 +72,12 @@ export class CachedContractClient {
   private sdk: any;
   private cache: ICacheProvider;
   private ttls: Record<CacheKey, number>;
+  private cachePrefix: string;
 
   constructor(config: BridgeConfig, options: CacheOptions = {}) {
     this.cache = options.provider ?? new InMemoryCache();
     this.ttls = { ...DEFAULT_TTL_MS, ...(options.ttlMs ?? {}) };
+    this.cachePrefix = cacheKeyPrefix(config);
 
     this.sdk = new ContractClient(config, this.cache, this.ttls);
   }
@@ -98,16 +115,23 @@ export class CachedContractClient {
   }
 
   /**
-   * Invalidate cached values by key or clear the entire cache.
+   * Invalidate cached values by key.
+   *
+   * Deletes only the entries owned by this client (i.e. those written under
+   * this deployment's `${networkPassphrase}:${contractId}` prefix). It never
+   * calls `provider.clear()`, so an `invalidateCache()` on a shared backend
+   * cannot wipe another client's entries.
    */
   async invalidateCache(keys?: CacheKey | CacheKey[]): Promise<void> {
-    if (!keys) {
-      await this.cache.clear();
-      return;
-    }
+    const keysToDelete: CacheKey[] = keys
+      ? Array.isArray(keys)
+        ? keys
+        : [keys]
+      : [...CACHE_KEYS];
 
-    const keysToDelete = Array.isArray(keys) ? keys : [keys];
-    await Promise.all(keysToDelete.map((key) => this.cache.delete(key)));
+    await Promise.all(
+      keysToDelete.map((key) => this.cache.delete(`${this.cachePrefix}${key}`)),
+    );
   }
 }
 
@@ -119,6 +143,7 @@ class ContractClient {
   private contract: Contract;
   private provider: rpc.Server;
   private networkPassphrase: string;
+  private cachePrefix: string;
 
   constructor(config: BridgeConfig, cache: ICacheProvider, ttls: Record<CacheKey, number>) {
     assertContractAddress(config.contractId, 'contractId');
@@ -131,11 +156,18 @@ class ContractClient {
       config.retry,
     );
     this.networkPassphrase = config.networkPassphrase;
+    this.cachePrefix = cacheKeyPrefix(config);
+  }
+
+  /** Return the physical cache key for a logical cache slot. */
+  private scopeKey(key: CacheKey): string {
+    return `${this.cachePrefix}${key}`;
   }
 
   async getFee(): Promise<number> {
     const cacheKey: CacheKey = 'getFee';
-    const cached = await this.cache.get<number>(cacheKey);
+    const storageKey = this.scopeKey(cacheKey);
+    const cached = await this.cache.get<number>(storageKey);
     if (cached !== undefined) {
       return cached;
     }
@@ -150,13 +182,14 @@ class ContractClient {
     const scVal = (result as any).results?.[0]?.retval;
     if (!scVal) throw new Error('query_fee_bps returned no value');
     const fee = Number(scValToNative(scVal));
-    await this.cache.set(cacheKey, fee, this.ttls[cacheKey]);
+    await this.cache.set(storageKey, fee, this.ttls[cacheKey]);
     return fee;
   }
 
   async getFeeCollector(): Promise<string> {
     const cacheKey: CacheKey = 'getFeeCollector';
-    const cached = await this.cache.get<string>(cacheKey);
+    const storageKey = this.scopeKey(cacheKey);
+    const cached = await this.cache.get<string>(storageKey);
     if (cached !== undefined) {
       return cached;
     }
@@ -171,13 +204,14 @@ class ContractClient {
     const scVal = (result as any).results?.[0]?.retval;
     if (!scVal) throw new Error('query_fee_collector returned no value');
     const feeCollector = scValToNative(scVal).toString();
-    await this.cache.set(cacheKey, feeCollector, this.ttls[cacheKey]);
+    await this.cache.set(storageKey, feeCollector, this.ttls[cacheKey]);
     return feeCollector;
   }
 
   async getAdmin(): Promise<string> {
     const cacheKey: CacheKey = 'getAdmin';
-    const cached = await this.cache.get<string>(cacheKey);
+    const storageKey = this.scopeKey(cacheKey);
+    const cached = await this.cache.get<string>(storageKey);
     if (cached !== undefined) {
       return cached;
     }
@@ -192,13 +226,14 @@ class ContractClient {
     const scVal = (result as any).results?.[0]?.retval;
     if (!scVal) throw new Error('query_admin returned no value');
     const admin = scValToNative(scVal).toString();
-    await this.cache.set(cacheKey, admin, this.ttls[cacheKey]);
+    await this.cache.set(storageKey, admin, this.ttls[cacheKey]);
     return admin;
   }
 
   async isInitialized(): Promise<boolean> {
     const cacheKey: CacheKey = 'isInitialized';
-    const cached = await this.cache.get<boolean>(cacheKey);
+    const storageKey = this.scopeKey(cacheKey);
+    const cached = await this.cache.get<boolean>(storageKey);
     if (cached !== undefined) {
       return cached;
     }
@@ -213,7 +248,7 @@ class ContractClient {
     const scVal = (result as any).results?.[0]?.retval;
     if (!scVal) throw new Error('query_is_initialized returned no value');
     const initialized = Boolean(scValToNative(scVal));
-    await this.cache.set(cacheKey, initialized, this.ttls[cacheKey]);
+    await this.cache.set(storageKey, initialized, this.ttls[cacheKey]);
     return initialized;
   }
 
@@ -231,7 +266,7 @@ class ContractClient {
     const response = await this.provider.sendTransaction(preparedTx);
 
     if (response.status === 'PENDING') {
-      await Promise.all(CACHE_KEYS.map((key) => this.cache.delete(key)));
+      await Promise.all(CACHE_KEYS.map((key) => this.cache.delete(this.scopeKey(key))));
       void this.invalidateAfterConfirmation(response.hash);
     }
 
@@ -255,7 +290,7 @@ class ContractClient {
         result = await this.provider.getTransaction(hash);
       }
       if (result.status === 'NOT_FOUND') return;
-      await Promise.all(CACHE_KEYS.map((key) => this.cache.delete(key)));
+      await Promise.all(CACHE_KEYS.map((key) => this.cache.delete(this.scopeKey(key))));
     } catch {
       // Cache was already invalidated on submission; confirmation invalidation
       // is best-effort and must not surface as an unhandled background error.
