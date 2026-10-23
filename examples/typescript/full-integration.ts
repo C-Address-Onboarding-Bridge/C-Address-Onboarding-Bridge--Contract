@@ -1,5 +1,5 @@
 /**
- * Full integration example — TypeScript
+ * Full integration example - TypeScript
  *
  * Demonstrates every major SDK operation against the testnet:
  *   1. Setting up the SDK
@@ -22,10 +22,10 @@
  *   npx ts-node examples/typescript/full-integration.ts
  *
  * Environment variables (or edit the CONFIG block below):
- *   SOURCE_SECRET       — secret key of the source/admin account
- *   FEE_COLLECTOR_SECRET — secret key of the fee collector account
- *   CONTRACT_ID         — C-address of the deployed bridge contract
- *   USDC_ASSET          — C-address of the USDC token contract on testnet
+ *   SOURCE_SECRET        - secret key of the source/admin account
+ *   FEE_COLLECTOR_SECRET - secret key of the fee collector account
+ *   CONTRACT_ID          - C-address of the deployed bridge contract
+ *   USDC_ASSET           - C-address of the USDC token contract on testnet
  */
 
 import {
@@ -36,7 +36,7 @@ import {
 import { Keypair, Networks, SorobanRpc } from '@stellar/stellar-sdk';
 
 // ---------------------------------------------------------------------------
-// Configuration — replace with real values or set environment variables
+// Configuration - replace with real values or set environment variables
 // ---------------------------------------------------------------------------
 const CONFIG = {
   contractId:  process.env.CONTRACT_ID         ?? 'CA_REPLACE_WITH_CONTRACT_ID',
@@ -58,15 +58,15 @@ async function waitForConfirmation(
   hash: string,
   label: string,
 ): Promise<void> {
-  process.stdout.write(`  Waiting for ${label} (${hash.slice(0, 8)}…)`);
+  process.stdout.write(`  Waiting for ${label} (${hash.slice(0, 8)}...`);
   for (let i = 0; i < 30; i++) {
     const tx = await server.getTransaction(hash);
     if (tx.status === 'SUCCESS') {
-      console.log(' ✓');
+      console.log(' OK)');
       return;
     }
     if (tx.status === 'FAILED') {
-      console.log(' ✗');
+      console.log(' FAILED)');
       throw new Error(`Transaction ${hash} failed`);
     }
     process.stdout.write('.');
@@ -82,9 +82,30 @@ async function submitAndConfirm(
   label: string,
 ): Promise<void> {
   if (result.status === 'failed') {
-    throw new Error(`${label} submission failed: ${result.error}`);
+    throw new Error(`${label} submission failed: ${result.error ?? 'unknown error'}`);
   }
   await waitForConfirmation(server, result.hash, label);
+}
+
+/**
+ * Assert every TransactionResult in a batch succeeded and wait for confirmation
+ * on each submitted transaction.
+ *
+ * `batchFundCAddresses` auto-splits large batches across multiple transactions
+ * (one per chunk) and returns one `TransactionResult` per submitted
+ * transaction, so a single `submitAndConfirm(result)` is not sufficient.
+ */
+async function submitBatchAndConfirm(
+  server: SorobanRpc.Server,
+  results: TransactionResult[],
+  label: string,
+): Promise<void> {
+  if (results.length === 0) {
+    throw new Error(`${label} returned no transactions`);
+  }
+  for (let i = 0; i < results.length; i++) {
+    await submitAndConfirm(server, results[i], `${label}[${i + 1}/${results.length}]`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +113,7 @@ async function submitAndConfirm(
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  console.log('=== C-Address Onboarding Bridge — TypeScript Integration Example ===\n');
+  console.log('=== C-Address Onboarding Bridge - TypeScript Integration Example ===\n');
 
   const sourceKeypair       = Keypair.fromSecret(CONFIG.sourceSecret);
   const feeCollectorKeypair = Keypair.fromSecret(CONFIG.feeCollectorSecret);
@@ -101,7 +122,7 @@ async function main(): Promise<void> {
   // -------------------------------------------------------------------------
   // 1. Set up the SDK
   // -------------------------------------------------------------------------
-  console.log('1. Setting up SDK…');
+  console.log('1. Setting up SDK...');
   const sdk = new OnboardingBridgeSDK({
     contractId:        CONFIG.contractId,
     rpcUrl:            CONFIG.rpcUrl,
@@ -114,7 +135,7 @@ async function main(): Promise<void> {
   // -------------------------------------------------------------------------
   // 2. Verify contract is initialized
   // -------------------------------------------------------------------------
-  console.log('2. Verifying contract state…');
+  console.log('2. Verifying contract state...');
   const initialized = await sdk.isInitialized();
   if (!initialized) {
     throw new Error(
@@ -124,7 +145,7 @@ async function main(): Promise<void> {
   const feeBps       = await sdk.getFee();
   const admin        = await sdk.getAdmin();
   const feeCollector = await sdk.getFeeCollector();
-  console.log(`   Initialized: ✓`);
+  console.log(`   Initialized: OK`);
   console.log(`   Fee:         ${feeBps} bps (${feeBps / 100}%)`);
   console.log(`   Admin:       ${admin}`);
   console.log(`   FeeCollector: ${feeCollector}\n`);
@@ -132,7 +153,7 @@ async function main(): Promise<void> {
   // -------------------------------------------------------------------------
   // 3. Fund a single C-address
   // -------------------------------------------------------------------------
-  console.log('3. Funding a single C-address…');
+  console.log('3. Funding a single C-address...');
   // In a real scenario this would be a deployed smart account C-address.
   // For this example we derive a deterministic placeholder from a known seed.
   const TARGET_C_ADDRESS = CONFIG.contractId; // reuse contract address as a demo target
@@ -156,9 +177,9 @@ async function main(): Promise<void> {
   // -------------------------------------------------------------------------
   // 4. Batch fund multiple C-addresses
   // -------------------------------------------------------------------------
-  console.log('4. Batch funding multiple C-addresses…');
+  console.log('4. Batch funding multiple C-addresses...');
   // Using the same target three times as a demonstration.
-  const batchResult = await sdk.batchFundCAddresses(
+  const batchResults = await sdk.batchFundCAddresses(
     {
       source:  sourceKeypair.publicKey(),
       targets: [TARGET_C_ADDRESS, TARGET_C_ADDRESS, TARGET_C_ADDRESS],
@@ -168,13 +189,14 @@ async function main(): Promise<void> {
     sourceKeypair,
   );
 
-  await submitAndConfirm(server, batchResult, 'batchFundCAddresses');
-  console.log('   Batch fund complete ✓\n');
+  // batchFundCAddresses returns one TransactionResult per chunk.
+  await submitBatchAndConfirm(server, batchResults, 'batchFundCAddresses');
+  console.log(`   Batch fund complete (${batchResults.length} transaction(s)) OK\n`);
 
   // -------------------------------------------------------------------------
   // 5. Withdraw accumulated fees
   // -------------------------------------------------------------------------
-  console.log('5. Withdrawing accumulated fees…');
+  console.log('5. Withdrawing accumulated fees...');
   const feeBalance = await sdk.getFeeBalance(CONFIG.usdcAsset);
   console.log(`   Accrued fees: ${feeBalance}`);
 
@@ -184,16 +206,16 @@ async function main(): Promise<void> {
       feeCollectorKeypair,
     );
     await submitAndConfirm(server, withdrawResult, 'withdrawFees');
-    console.log('   Fees withdrawn ✓');
+    console.log('   Fees withdrawn OK');
   } else {
     console.log('   No fees to withdraw.');
   }
   console.log();
 
   // -------------------------------------------------------------------------
-  // 6. Off-ramp integrations — URL generation (no network calls)
+  // 6. Off-ramp integrations - URL generation (no network calls)
   // -------------------------------------------------------------------------
-  console.log('6. Generating off-ramp / on-ramp URLs…');
+  console.log('6. Generating off-ramp / on-ramp URLs...');
 
   const offramp = new OffRampIntegration({
     moonpayApiKey: process.env.MOONPAY_KEY ?? 'pk_test_demo',
@@ -212,7 +234,7 @@ async function main(): Promise<void> {
   console.log('   MoonPay on-ramp URL:');
   console.log(`     ${moonpayUrl}\n`);
 
-  // Transak on-ramp: user pays €100 EUR, receives USDC at their C-address
+  // Transak on-ramp: user pays 100 EUR, receives USDC at their C-address
   const transakUrl = offramp.getOnRampUrl({
     provider:     'transak',
     amount:       '100',
@@ -223,9 +245,9 @@ async function main(): Promise<void> {
   console.log('   Transak on-ramp URL:');
   console.log(`     ${transakUrl}\n`);
 
-  // Provider comparison for $100 USD → XLM
+  // Provider comparison for $100 USD -> XLM
   const comparison = offramp.compareProviders('100', 'XLM', 'USD');
-  console.log('   Provider fee comparison for $100 → XLM:');
+  console.log('   Provider fee comparison for $100 -> XLM:');
   for (const [provider, info] of Object.entries(comparison)) {
     console.log(`     ${provider}: fee=$${info.feeAmount} net=$${info.netAmount} (~${info.settlementTime}h)`);
   }
@@ -234,7 +256,7 @@ async function main(): Promise<void> {
   // -------------------------------------------------------------------------
   // 7. CEX deposit memo helpers
   // -------------------------------------------------------------------------
-  console.log('7. CEX deposit memo helpers…');
+  console.log('7. CEX deposit memo helpers...');
   const memo = offramp.generateCEXDepositMemo(TARGET_C_ADDRESS);
   console.log(`   Generated memo: "${memo}"`);
 
@@ -247,15 +269,15 @@ async function main(): Promise<void> {
   // -------------------------------------------------------------------------
   // 8. Error handling patterns
   // -------------------------------------------------------------------------
-  console.log('8. Demonstrating error handling…');
+  console.log('8. Demonstrating error handling...');
 
-  // Mutating methods never throw — check status
+  // Mutating methods never throw - check status
   const badResult = await sdk.fundCAddress(
     {
       source: sourceKeypair.publicKey(),
       target: TARGET_C_ADDRESS,
       asset:  CONFIG.usdcAsset,
-      amount: '0', // zero amount → contract returns InvalidAmount
+      amount: '0', // zero amount -> contract returns InvalidAmount
     },
     sourceKeypair,
   );
@@ -264,7 +286,7 @@ async function main(): Promise<void> {
     console.log(`   Expected failure caught: ${badResult.error}`);
   }
 
-  // Read-only methods throw on error — use try/catch
+  // Read-only methods throw on error - use try/catch
   try {
     await sdk.getCAddressBalance('INVALID_ADDRESS', CONFIG.usdcAsset);
   } catch (err: any) {

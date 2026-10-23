@@ -107,7 +107,7 @@ jobs:
 
       # Fast fail on type errors (including the test target) before paying for
       # a full release build. A red main here is exactly what this job exists
-      # to catch — see the "Soroban Contract" checklist in the CI issue.
+      # to catch -- see the "Soroban Contract" checklist in the CI issue.
       - name: cargo check
         run: cargo check -p onboarding-bridge --all-targets --features testutils
 
@@ -149,7 +149,7 @@ jobs:
         run: |
           COUNT_LINE=$(grep -E "^test result:" contract_test_output.txt | tail -n1)
           if [ -z "$COUNT_LINE" ]; then
-            echo "::error::No 'test result:' line found in contract test output — the suite may not have run at all."
+            echo "::error::No 'test result:' line found in contract test output -- the suite may not have run at all."
             exit 1
           fi
           if [[ "$COUNT_LINE" == "test result: FAILED"* ]]; then
@@ -165,7 +165,7 @@ jobs:
 
       # The indexer is its own Cargo workspace root (see indexer/Cargo.toml),
       # so its test target rots silently unless something explicitly builds
-      # and runs it too — same rationale as the contract test step above.
+      # and runs it too -- same rationale as the contract test step above.
       - name: Run indexer tests
         working-directory: indexer
         run: set -o pipefail; cargo test 2>&1 | tee ../indexer_test_output.txt
@@ -174,7 +174,7 @@ jobs:
         run: |
           COUNT_LINE=$(grep -E "^test result:" indexer_test_output.txt | tail -n1)
           if [ -z "$COUNT_LINE" ]; then
-            echo "::error::No 'test result:' line found in indexer test output — the suite may not have run at all."
+            echo "::error::No 'test result:' line found in indexer test output -- the suite may not have run at all."
             exit 1
           fi
           if [[ "$COUNT_LINE" == "test result: FAILED"* ]]; then
@@ -260,7 +260,7 @@ jobs:
               print("No gas regressions detected.")
           EOF
           else
-            echo "No baseline file found — saving current results as baseline."
+            echo "No baseline file found -- saving current results as baseline."
             cp bench_results.txt bench_baseline.txt
           fi
 
@@ -379,6 +379,43 @@ jobs:
 
       - name: Build SDK
         run: npm run build
+
+  # Type-check the example programs against the built SDK so API drift (e.g.
+  # batchFundCAddresses returning TransactionResult[] instead of a single
+  # TransactionResult) fails CI instead of shipping a broken example. See #851.
+  examples:
+    name: Examples (type-check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      # Root install creates the workspace symlink for the SDK and makes the
+      # SDK's own dependencies (e.g. @stellar/stellar-sdk) resolvable from
+      # examples/ via standard node_modules lookup.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build SDK
+        run: npm run build --workspace=sdk
+
+      - name: Type-check TypeScript example
+        run: npm run check:examples
+
+      - name: Syntax-check JavaScript example
+        run: node --check examples/javascript/full-integration.js
 
   sdk-matrix:
     name: SDK Compatibility Matrix

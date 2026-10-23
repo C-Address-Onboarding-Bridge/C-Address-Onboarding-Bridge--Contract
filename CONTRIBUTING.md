@@ -117,6 +117,9 @@ npm run build
 npm test
 cd ..
 
+# Examples (type-check only - no build)
+tsc -p examples/typescript --noEmit
+
 # Relayer
 cd relayer
 npm install
