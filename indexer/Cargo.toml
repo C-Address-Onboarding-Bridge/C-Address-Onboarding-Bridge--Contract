@@ -28,6 +28,7 @@ hex = "0.4"
 url = "2"
 futures = "0.3"
 hmac = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
