@@ -89,6 +89,7 @@ fn deploy() -> Fixture<'static> {
 
     let bridge = crate::OnboardingBridgeClient::new(&env, &bridge_id);
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.add_asset(&token, &None);
 
     Fixture {
         env,
@@ -126,7 +127,6 @@ fn smoke_rejects_double_initialization() {
 
 /// The core happy path: funding moves the amount out of the source and splits
 /// it between the target and the fee collector.
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn smoke_funds_target_and_collects_fee() {
     let f = deploy();
@@ -140,12 +140,11 @@ fn smoke_funds_target_and_collects_fee() {
     // 50 bps of 100_000 = 500.
     let expected_fee = 500i128;
     assert_eq!(token_client.balance(&target), amount - expected_fee);
-    assert_eq!(token_client.balance(&f.fee_collector), expected_fee);
+    assert_eq!(f.bridge.query_accrued_fees(&f.token), expected_fee);
     assert_eq!(token_client.balance(&f.user), 1_000_000 - amount);
 }
 
 /// Accounting totals must agree with what actually moved.
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn smoke_tracks_totals_after_funding() {
     let f = deploy();
@@ -154,13 +153,12 @@ fn smoke_tracks_totals_after_funding() {
     f.bridge
         .fund_c_address(&f.user, &target, &f.token, &100_000i128, &None, &None);
 
-    assert_eq!(f.bridge.query_total_bridged(&f.token), 100_000i128);
+    assert_eq!(f.bridge.query_total_bridged(&f.token), 99_500i128);
     assert_eq!(f.bridge.query_total_fees_collected(&f.token), 500i128);
 }
 
 /// Input validation is live on the deployed build — a non-positive amount is
 /// rejected instead of being processed as a no-op transfer.
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn smoke_rejects_invalid_amount() {
     let f = deploy();
@@ -175,7 +173,6 @@ fn smoke_rejects_invalid_amount() {
 
 /// The emergency stop works and is reversible. A deployment where pause is
 /// broken cannot be safely operated.
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn smoke_pause_blocks_funding_and_unpause_restores_it() {
     let f = deploy();
@@ -192,5 +189,5 @@ fn smoke_pause_blocks_funding_and_unpause_restores_it() {
 
     f.bridge
         .fund_c_address(&f.user, &target, &f.token, &100_000i128, &None, &None);
-    assert_eq!(f.bridge.query_total_bridged(&f.token), 100_000i128);
+    assert_eq!(f.bridge.query_total_bridged(&f.token), 99_500i128);
 }

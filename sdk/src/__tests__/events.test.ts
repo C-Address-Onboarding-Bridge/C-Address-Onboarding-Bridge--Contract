@@ -210,6 +210,17 @@ describe('EventSubscriber', () => {
       expect(lastCall.cursor).toBe('tok-42');
     });
 
+    it('resolves startLedger from getLatestLedger on the first poll when configured with the default "now"', async () => {
+      subscriber.on('*', jest.fn());
+
+      await subscriber.poll();
+
+      expect(mockGetLatestLedger).toHaveBeenCalledTimes(1);
+      const firstCall = mockGetEvents.mock.calls[0][0];
+      expect(firstCall.startLedger).toBe(999);
+      expect(firstCall.cursor).toBeUndefined();
+    });
+
     it('isolates a throwing listener from other listeners', async () => {
       mockGetEvents.mockResolvedValue(fundedEventResponse());
       const healthy = jest.fn();
