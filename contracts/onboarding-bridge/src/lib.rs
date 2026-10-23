@@ -221,7 +221,6 @@ pub enum DataKey {
     LoyaltyAmountPerFund,
     TimelockId,
     Timelock(u64),
-    UserDeposit(Address, Address),
     MaxInstanceTtl,
     MaxPersistentTtl,
     BridgeConfig,
@@ -580,18 +579,6 @@ fn read_timelock_entry(env: &Env, id: u64) -> Option<TimelockEntry> {
     env.storage().persistent().get(&DataKey::Timelock(id))
 }
 
-fn increment_user_deposit(
-    env: &Env,
-    source: &Address,
-    asset: &Address,
-    amount: i128,
-) -> Result<(), BridgeError> {
-    let key = DataKey::UserDeposit(source.clone(), asset.clone());
-    let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-    let updated = safe_math::safe_add(current, amount)?;
-    env.storage().persistent().set(&key, &updated);
-    Ok(())
-}
 
 #[inline(never)]
 fn save_admin(env: &Env, admin: &Address) {
@@ -2607,8 +2594,6 @@ impl OnboardingBridge {
                 );
             }
         }
-
-        increment_user_deposit(&env, &source, &asset, amount)?;
         update_asset_counters_split(&env, &asset, protocol_fee, fee, net_amount)?;
         increment_source_bridged_volume(&env, &source, &asset, amount)?;
 
@@ -4466,7 +4451,6 @@ impl OnboardingBridge {
             },
         );
         increment_locked_timelock(&env, &asset, amount)?;
-        increment_user_deposit(&env, &source, &asset, amount)?;
         mint_loyalty_tokens(&env, &source);
         extend_instance_ttl(&env);
 
@@ -4779,7 +4763,7 @@ impl OnboardingBridge {
 
     /// Extends the persistent-storage TTL for all per-`(source, asset)` and
     /// per-`source` keys used by the core funding paths: `SourceDailyLimit`,
-    /// the current day's `DailyUsage`, `UserDeposit`, `SourceBridgedVolume`,
+    /// the current day's `DailyUsage`, `SourceBridgedVolume`,
     /// the sequential `Nonce`, and the auth-entry `AuthNonce` counter.
     ///
     /// Only keys that already exist in storage are extended; missing keys are
@@ -4818,7 +4802,6 @@ impl OnboardingBridge {
         for key in [
             DataKey::SourceDailyLimit(source.clone(), asset.clone()),
             DataKey::DailyUsage(source.clone(), asset.clone(), current_day(&env)),
-            DataKey::UserDeposit(source.clone(), asset.clone()),
             DataKey::SourceBridgedVolume(source.clone(), asset.clone()),
             DataKey::Nonce(source.clone()),
             DataKey::AuthNonce(source.clone()),
@@ -5779,8 +5762,6 @@ impl OnboardingBridge {
         if net_amount > 0 {
             token_client.transfer(&contract_addr, &params.target, &net_amount);
         }
-
-        increment_user_deposit(&env, &params.source, &params.asset, params.amount)?;
         update_asset_counters(&env, &params.asset, fee, net_amount)?;
         increment_source_bridged_volume(&env, &params.source, &params.asset, params.amount)?;
 
