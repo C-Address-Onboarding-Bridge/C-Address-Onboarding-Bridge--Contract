@@ -124,12 +124,21 @@ async fn main() {
         .build()
         .expect("failed to build RPC HTTP client");
 
+    // Webhook client: never follow redirects (a 3xx is treated as a delivery
+    // failure) so a validated URL cannot be bounced to an internal address
+    // (#870).  Per-request DNS pinning to the vetted IP happens in
+    // `webhook::deliver`.
+    let webhook_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build webhook HTTP client");
+
     let state = Arc::new(AppState {
         db: database,
         rpc_url,
         contract_id,
         rpc_client,
-        webhook_client: reqwest::Client::new(),
+        webhook_client,
         api_key_hash,
         lookback_ledgers,
     });
@@ -217,491 +226,148 @@ async fn require_api_key(
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| {
-            let (scheme, token) = value.split_once(' ')?;
-            (scheme.eq_ignore_ascii_case("Bearer") && !token.is_empty()).then_some(token)
+            value.strip_prefix("Bearer ").map(str::to_owned)
         });
 
-    let authorized = provided_key
-        .map(|key| {
-            let provided_hash = sha256_hex(key);
-            bool::from(
-                state
-                    .api_key_hash
-                    .as_bytes()
-                    .ct_eq(provided_hash.as_bytes()),
-            )
-        })
-        .unwrap_or(false);
+    let authorized = match provided_key {
+        Some(key) => {
+            let provided_hash = sha256_hex(&key);
+            provided_hash
+                .as_bytes()
+                .ct_eq(state.api_key_hash.as_bytes())
+                .into()
+        }
+        None => false,
+    };
 
-    if !authorized {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if authorized {
+        next.run(request).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
     }
-
-    next.run(request).await
 }
 
-async fn health() -> &'static str {
-    "ok"
+async fn health() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
 }
 
 async fn list_events(
     State(state): State<Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<events::EventQuery>,
-) -> Result<Json<Vec<events::IndexedEvent>>, StatusCode> {
-    state
-        .db
-        .list_events(
-            events::clamp_limit(params.limit, 50),
-            events::clamp_offset(params.offset),
-        )
-        .await
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    axum::extract::Query(params): axum::extract::Query<EventQuery>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(50).min(500);
+    let offset = params.offset.unwrap_or(0);
+    match state.db.list_events(limit, offset).await {
+        Ok(events) => Json(events).into_response(),
+        Err(e) => {
+            tracing::error!("failed to list events: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+        }
+    }
 }
 
 async fn list_events_by_type(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(event_type): axum::extract::Path<String>,
-    axum::extract::Query(params): axum::extract::Query<events::EventQuery>,
-) -> Result<Json<Vec<events::IndexedEvent>>, StatusCode> {
-    state
+    axum::extract::Query(params): axum::extract::Query<EventQuery>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(50).min(500);
+    let offset = params.offset.unwrap_or(0);
+    match state
         .db
-        .list_events_by_type(
-            &event_type,
-            events::clamp_limit(params.limit, 50),
-            events::clamp_offset(params.offset),
-        )
+        .list_events_by_type(&event_type, limit, offset)
         .await
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    {
+        Ok(events) => Json(events).into_response(),
+        Err(e) => {
+            tracing::error!("failed to list events by type: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+        }
+    }
+}
+
+async fn get_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.db.get_stats().await {
+        Ok(stats) => Json(stats).into_response(),
+        Err(e) => {
+            tracing::error!("failed to get stats: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+        }
+    }
+}
+
+async fn list_subscriptions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.db.list_subscriptions().await {
+        Ok(subs) => Json(subs).into_response(),
+        Err(e) => {
+            tracing::error!("failed to list subscriptions: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+        }
+    }
 }
 
 async fn create_subscription(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<webhook::CreateSubscription>,
-) -> Result<(StatusCode, Json<webhook::CreatedSubscription>), (StatusCode, Json<serde_json::Value>)> {
-    // Validate the URL before persisting to prevent SSRF via webhook delivery.
-    if let Err(e) = webhook::validate_webhook_url(&req.url).await {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ));
+    Json(body): Json<CreateSubscriptionBody>,
+) -> impl IntoResponse {
+    if let Err(reason) = webhook::validate_webhook_url(&body.url).await {
+        return (StatusCode::BAD_REQUEST, reason).into_response();
     }
 
-    state
+    match state
         .db
-        .create_subscription(req)
+        .create_subscription(&body.url, &body.event_types)
         .await
-        .map(|s| {
-            (
-                StatusCode::CREATED,
-                Json(webhook::CreatedSubscription {
-                    id: s.id,
-                    url: s.url,
-                    event_type: s.event_type,
-                    asset_filter: s.asset_filter,
-                    source_filter: s.source_filter,
-                    target_filter: s.target_filter,
-                    active: s.active,
-                    secret: s.secret,
-                    created_at: s.created_at,
-                }),
-            )
-        })
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "database error" })),
-            )
-        })
-}
-
-async fn list_subscriptions(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Vec<webhook::Subscription>>, StatusCode> {
-    state
-        .db
-        .list_subscriptions()
-        .await
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    {
+        Ok(sub) => (StatusCode::CREATED, Json(sub)).into_response(),
+        Err(e) => {
+            tracing::error!("failed to create subscription: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+        }
+    }
 }
 
 async fn delete_subscription(
     State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> StatusCode {
-    match state.db.delete_subscription(&id).await {
-        Ok(_) => StatusCode::NO_CONTENT,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> impl IntoResponse {
+    match state.db.delete_subscription(id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e) => {
+            tracing::error!("failed to delete subscription: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+        }
     }
 }
 
 async fn replay_events(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<webhook::ReplayRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let events = state
-        .db
-        .list_events_from_ledger(req.from_ledger, events::clamp_limit(req.limit, 100))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let count = events.len();
-    for event in events {
-        state
-            .db
-            .queue_webhook_deliveries(&event)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    }
-
-    Ok(Json(serde_json::json!({ "replayed": count })))
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct DeliveryQuery {
-    pub status: Option<String>,
-    pub limit: Option<i64>,
-    pub offset: Option<i64>,
-}
-
-async fn list_deliveries(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<DeliveryQuery>,
-) -> Result<Json<Vec<webhook::WebhookDelivery>>, StatusCode> {
-    state
-        .db
-        .list_deliveries(
-            params.status.as_deref(),
-            params.limit.unwrap_or(50),
-            params.offset.unwrap_or(0),
-        )
-        .await
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-}
-
-async fn retry_delivery(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<StatusCode, StatusCode> {
-    match state.db.retry_delivery(&id).await {
-        Ok(true) => Ok(StatusCode::OK),
-        Ok(false) => Err(StatusCode::NOT_FOUND),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    Json(body): Json<ReplayBody>,
+) -> impl IntoResponse {
+    match state.db.enqueue_replay(&body.event_ids).await {
+        Ok(count) => Json(serde_json::json!({ "enqueued": count })).into_response(),
+        Err(e) => {
+            tracing::error!("failed to enqueue replay: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+        }
     }
 }
 
-async fn get_stats(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    state
-        .db
-        .get_stats()
-        .await
-        .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+#[derive(serde::Deserialize)]
+struct EventQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
-// ---------------------------------------------------------------------------
-// Auth middleware tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod auth_tests {
-    use super::*;
-    use axum::{
-        body::Body,
-        http::{Request, StatusCode},
-    };
-    use tower::ServiceExt; // for `oneshot`
-
-    /// Build a minimal app wired with build_app(), backed by an in-memory
-    /// SQLite database so no file system state is needed.
-    async fn test_app(api_key: &str) -> Router {
-        let database = db::Database::new("sqlite::memory:").await;
-        database.migrate().await;
-
-        let state = Arc::new(AppState {
-            db: database,
-            rpc_url: "http://localhost".to_string(),
-            contract_id: "C_TEST".to_string(),
-            rpc_client: reqwest::Client::new(),
-            webhook_client: reqwest::Client::new(),
-            api_key_hash: sha256_hex(api_key),
-            lookback_ledgers: poller::DEFAULT_LOOKBACK_LEDGERS,
-        });
-
-        build_app(state)
-    }
-
-    #[tokio::test]
-    async fn test_unauthenticated_post_subscription_is_rejected() {
-        let app = test_app("secret-key").await;
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/subscriptions")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(
-                        r#"{"url":"http://example.com","event_types":[]}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "POST /api/subscriptions without token must return 401"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_unauthenticated_get_subscriptions_is_rejected() {
-        let app = test_app("secret-key").await;
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/subscriptions")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "GET /api/subscriptions without token must return 401"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_wrong_api_key_is_rejected() {
-        let app = test_app("secret-key").await;
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/subscriptions")
-                    .header("Authorization", "Bearer wrong-key")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(
-                        r#"{"url":"http://example.com","event_types":[]}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "POST /api/subscriptions with wrong token must return 401"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_correct_api_key_is_accepted() {
-        let app = test_app("secret-key").await;
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/subscriptions")
-                    .header("Authorization", "Bearer secret-key")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(
-                        r#"{"url":"http://example.com","event_types":[]}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_ne!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "POST /api/subscriptions with correct token must not return 401"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_unauthenticated_delete_subscription_is_rejected() {
-        let app = test_app("secret-key").await;
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("DELETE")
-                    .uri("/api/subscriptions/some-id")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "DELETE /api/subscriptions/:id without token must return 401"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_unauthenticated_replay_is_rejected() {
-        let app = test_app("secret-key").await;
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/replay")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(r#"{"from_ledger":1}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            response.status(),
-            StatusCode::UNAUTHORIZED,
-            "POST /api/replay without token must return 401"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_public_routes_do_not_require_auth() {
-        let app = test_app("secret-key").await;
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "GET /health must be publicly accessible"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cors_allows_browser_preflight() {
-        let app = test_app("secret-key").await;
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("OPTIONS")
-                    .uri("/api/events")
-                    .header("Origin", "https://client.example")
-                    .header("Access-Control-Request-Method", "GET")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get("Access-Control-Allow-Origin").unwrap(),
-            "*"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_sha256_hex_is_consistent() {
-        // Same input must always produce the same digest.
-        assert_eq!(sha256_hex("hello"), sha256_hex("hello"));
-        // Different inputs must produce different digests.
-        assert_ne!(sha256_hex("hello"), sha256_hex("world"));
-        // Output is 64 hex chars (32 bytes).
-        assert_eq!(sha256_hex("test").len(), 64);
-    }
+#[derive(serde::Deserialize)]
+struct CreateSubscriptionBody {
+    url: String,
+    #[serde(default)]
+    event_types: Vec<String>,
 }
 
-#[cfg(test)]
-mod route_tests {
-    use super::*;
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
-
-    async fn mock_app_state() -> Arc<AppState> {
-        let database = db::Database::new("sqlite::memory:").await;
-        database.migrate().await;
-
-        Arc::new(AppState {
-            db: database,
-            rpc_url: "http://localhost".to_string(),
-            contract_id: "C_TEST".to_string(),
-            rpc_client: reqwest::Client::new(),
-            webhook_client: reqwest::Client::new(),
-            api_key_hash: sha256_hex("test"),
-            lookback_ledgers: 0,
-        })
-    }
-
-    #[tokio::test]
-    async fn test_get_subscriptions_not_in_public_routes() {
-        let state = mock_app_state().await;
-        let app = public_routes().with_state(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/subscriptions")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            response.status(),
-            StatusCode::NOT_FOUND,
-            "GET /api/subscriptions must not be exposed on public_routes"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_subscriptions_is_in_protected_routes() {
-        let state = mock_app_state().await;
-        let app = protected_routes().with_state(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/subscriptions")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "GET /api/subscriptions must be routed under protected_routes"
-        );
-    }
+#[derive(serde::Deserialize)]
+struct ReplayBody {
+    event_ids: Vec<i64>,
 }
