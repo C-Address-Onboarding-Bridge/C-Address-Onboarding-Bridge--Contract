@@ -896,3 +896,6 @@ MIT
 
 <!-- handsoff-issue-682 -->
 - #682: sdk: add register_meta_signer and a helper that builds the exact meta-tx payload the contract verifies
+
+<!-- handsoff-issue-876 -->
+- #876: indexer: delivery worker skips ahead after an HTTP failure, breaking its per-subscriber FIFO guarantee
