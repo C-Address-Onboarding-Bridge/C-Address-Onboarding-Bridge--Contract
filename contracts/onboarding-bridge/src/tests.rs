@@ -7070,10 +7070,42 @@ fn test_verify_auth_entry_success() {
     // Should succeed: nonce 0 is fresh, ledger is within the window
     bridge.verify_auth_entry(&user, &0u64, &0u32, &(seq + 100));
 
-    // The nonce must now be marked used; replaying it must fail
+    // Next expected nonce is now 1
+    assert_eq!(bridge.query_auth_nonce(&user), 1u64);
+    assert!(bridge.query_auth_nonce_used(&user, &0u64));
+    assert!(!bridge.query_auth_nonce_used(&user, &1u64));
+
+    // The nonce must now be marked used; replaying it must fail with AuthNonceAlreadyUsed
     assert_eq!(
         bridge.try_verify_auth_entry(&user, &0u64, &0u32, &(seq + 100)),
+        Err(Ok(BridgeError::AuthNonceAlreadyUsed))
+    );
+
+    // A future / gap nonce must fail with DuplicateNonce (monotonic sequencing enforced)
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &5u64, &0u32, &(seq + 100)),
         Err(Ok(BridgeError::DuplicateNonce))
+    );
+
+    // Only the monotonic AuthNonce counter entry is written to persistent storage,
+    // avoiding redundant persistent storage bloat from UsedAuthNonce.
+    env.as_contract(&bridge_id, || {
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&DataKey::UsedAuthNonce(user.clone(), 0)));
+        assert!(env
+            .storage()
+            .persistent()
+            .has(&DataKey::AuthNonce(user.clone())));
+    });
+
+    // Valid continuation with next sequential nonce 1 succeeds
+    bridge.verify_auth_entry(&user, &1u64, &0u32, &(seq + 100));
+    assert_eq!(bridge.query_auth_nonce(&user), 2u64);
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &1u64, &0u32, &(seq + 100)),
+        Err(Ok(BridgeError::AuthNonceAlreadyUsed))
     );
 }
 

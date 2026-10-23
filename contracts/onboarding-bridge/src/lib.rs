@@ -1004,25 +1004,16 @@ fn read_auth_nonce(env: &Env, source: &Address) -> u64 {
 }
 
 fn is_auth_nonce_used(env: &Env, source: &Address, nonce: u64) -> bool {
-    env.storage()
-        .persistent()
-        .get(&DataKey::UsedAuthNonce(source.clone(), nonce))
-        .unwrap_or(false)
+    nonce < read_auth_nonce(env, source)
 }
 
 fn mark_auth_nonce_used(env: &Env, source: &Address, nonce: u64) -> Result<(), BridgeError> {
+    // Advance the per-address monotonic counter so clients can discover the next
+    // expected nonce without scanning storage. No redundant UsedAuthNonce entry is written.
+    let next = nonce.checked_add(1).ok_or(BridgeError::Overflow)?;
     env.storage()
         .persistent()
-        .set(&DataKey::UsedAuthNonce(source.clone(), nonce), &true);
-    // Advance the per-address counter so clients can always discover the next
-    // expected nonce without scanning storage.
-    let current = read_auth_nonce(env, source);
-    if nonce >= current {
-        let next = nonce.checked_add(1).ok_or(BridgeError::Overflow)?;
-        env.storage()
-            .persistent()
-            .set(&DataKey::AuthNonce(source.clone()), &next);
-    }
+        .set(&DataKey::AuthNonce(source.clone()), &next);
     Ok(())
 }
 
@@ -1048,20 +1039,21 @@ fn consume_auth_nonce(
         return Err(BridgeError::AuthNonceExpired);
     }
 
-    // 2. Enforce monotonic sequencing before checking the used-nonce set.
-    if nonce != read_auth_nonce(env, source) {
-        return Err(BridgeError::DuplicateNonce);
+    let current = read_auth_nonce(env, source);
+    // 2. Used-nonce check: any nonce below the current monotonic counter has already been consumed
+    if nonce < current {
+        return Err(BridgeError::AuthNonceAlreadyUsed);
     }
 
-    // 3. Used-nonce check (prevents exact replay of this (source, nonce) pair)
-    if is_auth_nonce_used(env, source, nonce) {
-        return Err(BridgeError::AuthNonceAlreadyUsed);
+    // 3. Monotonic sequencing check: future or gap nonces are rejected
+    if nonce > current {
+        return Err(BridgeError::DuplicateNonce);
     }
 
     // 4. Mark as used and advance the per-address counter
     mark_auth_nonce_used(env, source, nonce)?;
 
-    // 4. Emit AuthUsed event for off-chain indexers
+    // 5. Emit AuthUsed event for off-chain indexers
     env.events().publish(("AuthUsed", source.clone()), (nonce,));
 
     Ok(())
