@@ -5108,7 +5108,7 @@ mod concurrent_sequential_tests {
         env: Env,
         bridge_id: Address,
         token_id: Address,
-        admin: Address,
+        _admin: Address,
         fee_collector: Address,
         user: Address,
     }
@@ -5131,7 +5131,7 @@ mod concurrent_sequential_tests {
                 env,
                 bridge_id,
                 token_id,
-                admin,
+                _admin: admin,
                 fee_collector,
                 user,
             }
