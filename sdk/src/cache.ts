@@ -40,7 +40,7 @@ export interface InMemoryCacheOptions {
  * evicted lazily on read, swept periodically on write, and the total number of
  * entries can be bounded via `maxEntries` using LRU eviction.
  */
-export class InMemoryCache implements ICacheProvider {
+export class InMemoryCache<K = string, V = unknown> implements ICacheProvider {
   private store = new Map<string, CacheEntry<unknown>>();
   private readonly maxEntries?: number;
   private readonly sweepIntervalMs: number;
@@ -49,6 +49,13 @@ export class InMemoryCache implements ICacheProvider {
   constructor(options: InMemoryCacheOptions = {}) {
     this.maxEntries = options.maxEntries;
     this.sweepIntervalMs = options.sweepIntervalMs ?? 1000;
+  }
+
+  /**
+   * Total number of items currently in the cache.
+   */
+  get size(): number {
+    return this.store.size;
   }
 
   async get<T>(key: string): Promise<T | undefined> {

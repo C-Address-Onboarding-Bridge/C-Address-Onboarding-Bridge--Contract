@@ -1,4 +1,4 @@
-import { nativeToScVal, Address, xdr } from '@stellar/stellar-sdk';
+import { nativeToScVal, Address, xdr, MuxedAccount } from '@stellar/stellar-sdk';
 import { toSingleScVal } from '../encoding';
 
 describe('toSingleScVal', () => {
@@ -16,7 +16,7 @@ describe('toSingleScVal', () => {
   });
 
   it('encodes an address argument when the ABI type is address', () => {
-    const address = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF5';
+    const address = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
     const result = toSingleScVal(address, { type: 'address' });
     expect(result).toEqual(new Address(address).toScVal());
     expect(result.switch().name).toBe('scvAddress');
@@ -37,7 +37,8 @@ describe('toSingleScVal', () => {
   it('encodes a muxed M... address when the ABI type is address', () => {
     const muxed = 'MA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVAAAAAAAAAAAAAJLK';
     const result = toSingleScVal(muxed, { type: 'address' });
-    expect(result).toEqual(new Address(muxed).toScVal());
+    const expectedBase = MuxedAccount.fromAddress(muxed, '0').baseAccount().accountId();
+    expect(result).toEqual(new Address(expectedBase).toScVal());
     expect(result.switch().name).toBe('scvAddress');
   });
 
@@ -97,13 +98,13 @@ describe('toSingleScVal', () => {
 
   it('encodes a timepoint argument explicitly by its ABI type', () => {
     const result = toSingleScVal('1700000000', { type: 'timepoint' });
-    expect(result).toEqual(nativeToScVal(BigInt('1700000000'), { type: 'timepoint' }));
+    expect(result).toEqual(xdr.ScVal.scvTimepoint(xdr.Uint64.fromString('1700000000')));
     expect(result.switch().name).toBe('scvTimepoint');
   });
 
   it('encodes a duration argument explicitly by its ABI type', () => {
     const result = toSingleScVal('3600', { type: 'duration' });
-    expect(result).toEqual(nativeToScVal(BigInt('3600'), { type: 'duration' }));
+    expect(result).toEqual(xdr.ScVal.scvDuration(xdr.Uint64.fromString('3600')));
     expect(result.switch().name).toBe('scvDuration');
   });
 
@@ -128,5 +129,11 @@ describe('toSingleScVal', () => {
     const result = toSingleScVal(null, { type: 'option', elementType: { type: 'u32' } });
     expect(result).toEqual(xdr.ScVal.scvVoid());
     expect(result.switch().name).toBe('scvVoid');
+  });
+
+  it('supports single-argument TypedArg { value, type } object', () => {
+    const result = toSingleScVal({ value: '42', type: 'u32' });
+    expect(result).toEqual(nativeToScVal(42, { type: 'u32' }));
+    expect(result.switch().name).toBe('scvU32');
   });
 });
