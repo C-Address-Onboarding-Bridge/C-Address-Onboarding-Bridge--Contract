@@ -153,7 +153,7 @@ impl Database {
             "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, secret, created_at
              FROM subscriptions WHERE active = 1",
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await?;
 
         let now = chrono::Utc::now().to_rfc3339();
@@ -186,7 +186,7 @@ impl Database {
             .bind(&sub_id)
             .bind(&event.id)
             .bind(&now)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
         Ok(())

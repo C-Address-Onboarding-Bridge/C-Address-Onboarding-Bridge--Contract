@@ -370,8 +370,17 @@ fn parse_contract_event(
                 );
             }
         }
-        // ("AdminProposed", admin, new_admin) / ("AdminTransferred", old_admin, pending)
-        BridgeEventType::AdminProposed | BridgeEventType::AdminTransferred => {
+        // ("AdminProposed", admin, new_admin) / ("AdminTransferred", old_admin, pending) /
+        // ("AdminChanged", admin, new_admin) /
+        // ("FeeCollectorTransferProposed", admin, new_collector) /
+        // ("FeeCollectorTransferred", old, pending) /
+        // ("FeeCollectorChanged", old_collector, new_fee_collector)
+        BridgeEventType::AdminProposed
+        | BridgeEventType::AdminTransferred
+        | BridgeEventType::AdminChanged
+        | BridgeEventType::FeeCollectorTransferProposed
+        | BridgeEventType::FeeCollectorTransferred
+        | BridgeEventType::FeeCollectorChanged => {
             if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
                 data.insert(
                     "from".to_string(),
@@ -382,19 +391,11 @@ fn parse_contract_event(
                 data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
             }
         }
-        // ("FeeCollectorTransferProposed", admin, new_collector) /
-        // ("FeeCollectorTransferred", old, pending)
-        BridgeEventType::FeeCollectorTransferProposed
-        | BridgeEventType::FeeCollectorTransferred => {
-            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert(
-                    "from".to_string(),
-                    serde_json::Value::String(from.to_string()),
-                );
-            }
-            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
-                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
-            }
+        BridgeEventType::MetaSignerRegistered | BridgeEventType::MetaSignerUnregistered => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "source");
+        }
+        BridgeEventType::FeeTiersSet | BridgeEventType::LoyaltyTokenSet => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "admin");
         }
         _ => {
             // CommitFund, BatchTransferFailed, and the remaining admin/config
@@ -784,20 +785,77 @@ mod tests {
         );
     }
 
-    /// #641: The old incorrect topic strings AdminChanged / FeeCollectorChanged
-    /// must NOT produce indexed events (contract never emits them).
+    /// #888: AdminChanged and FeeCollectorChanged are direct setter topics emitted
+    /// by the contract and must be recognised with (from, to) mapping.
     #[test]
-    fn test_old_incorrect_role_change_topics_produce_no_event() {
+    fn test_direct_setter_role_change_topics_produce_indexed_events() {
         let raw_admin = raw_event(serde_json::json!(["AdminChanged", "GADMIN", "GNEWADMIN"]));
+        let event_admin = parse_contract_event(&raw_admin, "C1", 0).expect("AdminChanged must parse");
+        assert_eq!(event_admin.event_type, "AdminChanged");
+        assert_eq!(event_admin.data["from"].as_str(), Some("GADMIN"));
+        assert_eq!(event_admin.data["to"].as_str(), Some("GNEWADMIN"));
+
         let raw_fc = raw_event(serde_json::json!(["FeeCollectorChanged", "GCOL", "GNEWCOL"]));
-        assert!(
-            parse_contract_event(&raw_admin, "C1", 0).is_none(),
-            "'AdminChanged' must yield None - contract never emits this"
-        );
-        assert!(
-            parse_contract_event(&raw_fc, "C1", 0).is_none(),
-            "'FeeCollectorChanged' must yield None - contract never emits this"
-        );
+        let event_fc = parse_contract_event(&raw_fc, "C1", 0).expect("FeeCollectorChanged must parse");
+        assert_eq!(event_fc.event_type, "FeeCollectorChanged");
+        assert_eq!(event_fc.data["from"].as_str(), Some("GCOL"));
+        assert_eq!(event_fc.data["to"].as_str(), Some("GNEWCOL"));
+    }
+
+    /// #888: AdminTransferCancelled and FeeCollectorTransferCancelled are recognized.
+    #[test]
+    fn test_transfer_cancelled_topics_produce_indexed_events() {
+        let raw_admin = raw_event(serde_json::json!(["AdminTransferCancelled"]));
+        let event_admin = parse_contract_event(&raw_admin, "C1", 0).expect("AdminTransferCancelled must parse");
+        assert_eq!(event_admin.event_type, "AdminTransferCancelled");
+
+        let raw_fc = raw_event(serde_json::json!(["FeeCollectorTransferCancelled"]));
+        let event_fc = parse_contract_event(&raw_fc, "C1", 0).expect("FeeCollectorTransferCancelled must parse");
+        assert_eq!(event_fc.event_type, "FeeCollectorTransferCancelled");
+    }
+
+    /// #888: RelayerAdded is recognized.
+    #[test]
+    fn test_relayer_added_produces_indexed_event() {
+        let raw = raw_event(serde_json::json!(["RelayerAdded"]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("RelayerAdded must parse");
+        assert_eq!(event.event_type, "RelayerAdded");
+    }
+
+    /// #888: MetaSignerRegistered and MetaSignerUnregistered map source to data["source"].
+    #[test]
+    fn test_meta_signer_topics_produce_indexed_events() {
+        let raw_reg = raw_event(serde_json::json!(["MetaSignerRegistered", "GSOURCE"]));
+        let event_reg = parse_contract_event(&raw_reg, "C1", 0).expect("MetaSignerRegistered must parse");
+        assert_eq!(event_reg.event_type, "MetaSignerRegistered");
+        assert_eq!(event_reg.data["source"].as_str(), Some("GSOURCE"));
+
+        let raw_unreg = raw_event(serde_json::json!(["MetaSignerUnregistered", "GSOURCE"]));
+        let event_unreg = parse_contract_event(&raw_unreg, "C1", 0).expect("MetaSignerUnregistered must parse");
+        assert_eq!(event_unreg.event_type, "MetaSignerUnregistered");
+        assert_eq!(event_unreg.data["source"].as_str(), Some("GSOURCE"));
+    }
+
+    /// #888: FeeTiersSet and LoyaltyTokenSet map admin to data["admin"].
+    #[test]
+    fn test_fee_tiers_and_loyalty_set_topics_produce_indexed_events() {
+        let raw_tiers = raw_event(serde_json::json!(["FeeTiersSet", "GADMIN"]));
+        let event_tiers = parse_contract_event(&raw_tiers, "C1", 0).expect("FeeTiersSet must parse");
+        assert_eq!(event_tiers.event_type, "FeeTiersSet");
+        assert_eq!(event_tiers.data["admin"].as_str(), Some("GADMIN"));
+
+        let raw_loyalty = raw_event(serde_json::json!(["LoyaltyTokenSet", "GADMIN"]));
+        let event_loyalty = parse_contract_event(&raw_loyalty, "C1", 0).expect("LoyaltyTokenSet must parse");
+        assert_eq!(event_loyalty.event_type, "LoyaltyTokenSet");
+        assert_eq!(event_loyalty.data["admin"].as_str(), Some("GADMIN"));
+    }
+
+    /// #888: CommitmentCancelled is recognized.
+    #[test]
+    fn test_commitment_cancelled_produces_indexed_event() {
+        let raw = raw_event(serde_json::json!(["CommitmentCancelled"]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("CommitmentCancelled must parse");
+        assert_eq!(event.event_type, "CommitmentCancelled");
     }
 
     #[test]
