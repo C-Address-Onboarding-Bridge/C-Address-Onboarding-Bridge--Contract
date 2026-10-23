@@ -6,7 +6,6 @@
 //! that the auth chain is correct and token balance changes are real.
 //!
 //! Balance assertions always use the real token contract's balance() function.
-
 #![cfg(test)]
 
 use crate::OnboardingBridge;
@@ -78,7 +77,6 @@ impl Setup {
 
 // ── Test 1: token transfer from user → bridge, then bridge → C-address ────────
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn integration_fund_transfers_tokens_to_target() {
     let s = Setup::new();
@@ -126,7 +124,6 @@ fn integration_fund_transfers_tokens_to_target() {
 
 // ── Test 2: fee accumulation across multiple fund calls ────────────────────────
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn integration_fee_accumulates_in_bridge() {
     let s = Setup::new();
@@ -171,7 +168,6 @@ fn integration_fee_accumulates_in_bridge() {
 
 // ── Test 3: fee withdrawal from bridge to fee_collector ───────────────────────
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn integration_withdraw_fees_to_fee_collector() {
     let s = Setup::new();
@@ -237,7 +233,6 @@ fn integration_withdraw_fees_to_fee_collector() {
 
 // ── Test 4: multiple tokens accumulate and withdraw independently ─────────────
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn integration_multiple_tokens_simultaneously() {
     let env = Env::default();

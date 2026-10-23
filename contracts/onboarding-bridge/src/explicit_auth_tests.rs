@@ -8,7 +8,6 @@
 //!
 //! Each test uses explicit authentication with mock_auths() instead of
 //! mock_all_auths(), and uses a real Soroban token contract instead of TestToken.
-
 #![cfg(test)]
 
 use soroban_sdk::{
@@ -16,7 +15,7 @@ use soroban_sdk::{
     Address, Env, IntoVal,
 };
 
-use crate::OnboardingBridge;
+use crate::{BridgeError, OnboardingBridge};
 
 // Test initialization with explicit auth
 #[test]
@@ -104,7 +103,6 @@ fn test_non_admin_cannot_set_fee_bps() {
 }
 
 // Test admin-only operations with wrong auth
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 #[should_panic(expected = "Auth")]
 fn test_non_admin_cannot_set_admin() {
@@ -152,7 +150,6 @@ fn test_non_admin_cannot_set_admin() {
 }
 
 // Test that operations fail without proper auth
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 #[should_panic(expected = "Auth")]
 fn test_fund_without_auth_fails() {
@@ -208,7 +205,6 @@ fn test_fund_without_auth_fails() {
 }
 
 // Test correct admin operations succeed
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_admin_operations_succeed() {
     let env = Env::default();
@@ -273,7 +269,6 @@ fn test_admin_operations_succeed() {
 }
 
 // Test with real token contract integration
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_real_token_integration() {
     let env = Env::default();
@@ -325,7 +320,6 @@ fn test_real_token_integration() {
 }
 
 // Test fee_collector-specific operations
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_fee_collector_operations() {
     let env = Env::default();
@@ -452,13 +446,10 @@ fn test_fee_collector_withdraw_fees() {
 
     // Withdraw should fail due to insufficient balance, not due to auth
     // The important part is that fee_collector auth is accepted
-    assert!(result.is_err());
-    // We don't check the specific error because it's about insufficient balance
-    // The key is that it didn't fail with Auth error
+    assert_eq!(result, Err(Ok(BridgeError::InsufficientReclaimable)));
 }
 
 // Test comprehensive authorization failures (no mint required)
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 #[should_panic(expected = "Auth")]
 fn test_authorization_failures() {
