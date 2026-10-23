@@ -153,7 +153,7 @@ impl Database {
             "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, secret, created_at
              FROM subscriptions WHERE active = 1",
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await?;
 
         let now = chrono::Utc::now().to_rfc3339();
@@ -180,13 +180,16 @@ impl Database {
             let delivery_id = uuid::Uuid::new_v4().to_string();
             sqlx::query(
                 "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
-                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)",
+                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)
+                 ON CONFLICT(subscription_id, event_id) DO UPDATE SET
+                     status = 'pending',
+                     next_retry_at = excluded.next_retry_at",
             )
             .bind(&delivery_id)
             .bind(&sub_id)
             .bind(&event.id)
             .bind(&now)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
         Ok(())
@@ -364,7 +367,10 @@ impl Database {
             let delivery_id = uuid::Uuid::new_v4().to_string();
             sqlx::query(
                 "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
-                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)",
+                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)
+                 ON CONFLICT(subscription_id, event_id) DO UPDATE SET
+                     status = 'pending',
+                     next_retry_at = excluded.next_retry_at",
             )
             .bind(&delivery_id)
             .bind(&sub.id)
@@ -891,4 +897,82 @@ mod tests {
             "a subscription created before migration 0002 must be backfilled with a secret"
         );
     }
+
+    /// Replaying the same event range twice must deduplicate webhook deliveries:
+    /// exactly one delivery row exists per (subscription, event), keeping the
+    /// original stable delivery_id and re-arming status to 'pending'.
+    #[tokio::test]
+    async fn test_replaying_event_deduplicates_webhook_deliveries() {
+        let db = setup_db().await;
+        let event = make_event("evt-replay-001");
+
+        let sub = db
+            .create_subscription(CreateSubscription {
+                url: "http://example.com/webhook".to_string(),
+                event_type: Some("CAddressFunded".to_string()),
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .expect("create subscription");
+
+        db.insert_event(&event).await.expect("insert event");
+        db.queue_webhook_deliveries(&event).await.expect("queue initial delivery");
+
+        let deliveries = db.list_deliveries(None, 10, 0).await.expect("list deliveries");
+        assert_eq!(deliveries.len(), 1);
+        let original_id = deliveries[0].id.clone();
+        assert_eq!(deliveries[0].status, "pending");
+        assert_eq!(deliveries[0].subscription_id, sub.id);
+        assert_eq!(deliveries[0].event_id, "evt-replay-001");
+
+        db.mark_delivery_success(&original_id).await.expect("mark delivered");
+        let after_delivery = db.list_deliveries(None, 10, 0).await.expect("list deliveries");
+        assert_eq!(after_delivery[0].status, "delivered");
+
+        // Replay: calling queue_webhook_deliveries again for the same event
+        db.queue_webhook_deliveries(&event).await.expect("replay event deliveries");
+
+        let after_replay = db.list_deliveries(None, 10, 0).await.expect("list deliveries after replay");
+        assert_eq!(after_replay.len(), 1, "replaying must not create a duplicate delivery row");
+        assert_eq!(after_replay[0].id, original_id, "delivery_id must remain stable for receiver dedup");
+        assert_eq!(after_replay[0].status, "pending", "replaying must re-arm delivery status to pending");
+    }
+
+    /// Migration 0003 must enforce unique constraint on (subscription_id, event_id)
+    /// and create the foreign key lookup indexes.
+    #[tokio::test]
+    async fn test_migration_0003_enforces_unique_constraint_and_indexes() {
+        let db = Database::new("sqlite::memory:").await;
+        let migrator = sqlx::migrate!("./migrations");
+
+        let mut conn = db.pool.acquire().await.expect("acquire connection");
+        migrator.run_direct(&mut *conn).await.expect("run all migrations");
+
+        let unique_idx: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_webhook_deliveries_sub_event'",
+        )
+        .fetch_optional(&mut *conn)
+        .await
+        .expect("query unique index");
+        assert!(unique_idx.is_some(), "idx_webhook_deliveries_sub_event must exist");
+
+        let sub_idx: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_webhook_deliveries_subscription_id'",
+        )
+        .fetch_optional(&mut *conn)
+        .await
+        .expect("query subscription index");
+        assert!(sub_idx.is_some(), "idx_webhook_deliveries_subscription_id must exist");
+
+        let event_idx: Option<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_webhook_deliveries_event_id'",
+        )
+        .fetch_optional(&mut *conn)
+        .await
+        .expect("query event index");
+        assert!(event_idx.is_some(), "idx_webhook_deliveries_event_id must exist");
+    }
 }
+
