@@ -38,6 +38,8 @@ import {
   PaginationOptions,
   CostEstimate,
   TimelockEntry,
+  CalculatedFee,
+  EffectiveFee,
 } from './types';
 import {
   type ObservabilityHooks,
@@ -1554,6 +1556,238 @@ export class OnboardingBridgeSDK {
 
     const scVal = (result as any).results?.[0]?.retval;
     return scVal ? scValToNative(scVal).toString() : '0';
+  }
+
+  /**
+   * Get the current nonce for a caller address.
+   *
+   * Every write method accepts an optional `nonce` that must match the stored nonce
+   * for the caller. This method enables callers to retrieve their expected nonce.
+   *
+   * @param caller - Account address to query the stored nonce for.
+   * @returns The caller's nonce as a bigint.
+   *
+   * @throws {Error} If `caller` is not a valid account address or on RPC simulation failure.
+   *
+   * @example
+   * ```ts
+   * const nonce = await sdk.getNonce('GABC...123');
+   * console.log('Current caller nonce:', nonce);
+   * ```
+   */
+  async getNonce(caller: string): Promise<bigint> {
+    assertAccountAddress(caller, 'caller');
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_nonce' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_nonce', [new Address(caller)]),
+      ),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get nonce: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? BigInt(scValToNative(scVal).toString()) : 0n;
+  }
+
+  /**
+   * Calculate standard fee and net amount for a gross amount before tiers or overrides.
+   *
+   * Calls the on-chain `query_calculate_fee` function and decodes the `(i128, i128)` tuple.
+   *
+   * @param grossAmount - Gross amount in the token's smallest unit.
+   * @returns An object with `fee` and `netAmount`.
+   *
+   * @throws {Error} On RPC simulation failure or if grossAmount is invalid.
+   *
+   * @example
+   * ```ts
+   * const { fee, netAmount } = await sdk.calculateFee(10000000n);
+   * console.log('Fee:', fee, 'Net amount:', netAmount);
+   * ```
+   */
+  async calculateFee(grossAmount: bigint | string | number): Promise<CalculatedFee> {
+    const amountVal = BigInt(grossAmount);
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_calculate_fee' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_calculate_fee', [{ value: amountVal, type: 'i128' }]),
+      ),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to calculate fee: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    if (!scVal) {
+      throw new Error('No return value from query_calculate_fee simulation');
+    }
+    const native = scValToNative(scVal);
+    return {
+      fee: BigInt(native[0].toString()),
+      netAmount: BigInt(native[1].toString()),
+    };
+  }
+
+  /**
+   * Calculate effective fee for a specific source account, asset, and transfer amount,
+   * accounting for loyalty tiers, VIP status, and per-asset caps.
+   *
+   * Calls the on-chain `query_effective_fee` function and decodes the `(u32, i128, i128)` tuple.
+   *
+   * @param source - Source address initiating the transfer.
+   * @param asset - Token contract address.
+   * @param amount - Gross transfer amount.
+   * @returns An object with `feeBps`, `fee`, and `netAmount`.
+   *
+   * @throws {Error} If addresses are invalid or on RPC simulation failure.
+   *
+   * @example
+   * ```ts
+   * const { feeBps, fee, netAmount } = await sdk.getEffectiveFee('GABC...', 'CD...usdc', 10000000n);
+   * console.log(`Fee rate: ${feeBps} bps, fee: ${fee}, net: ${netAmount}`);
+   * ```
+   */
+  async getEffectiveFee(
+    source: string,
+    asset: string,
+    amount: bigint | string | number,
+  ): Promise<EffectiveFee> {
+    assertAccountAddress(source, 'source');
+    assertContractAddress(asset, 'asset');
+    const amountVal = BigInt(amount);
+
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_effective_fee' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_effective_fee', [
+          new Address(source),
+          new Address(asset),
+          { value: amountVal, type: 'i128' },
+        ]),
+      ),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get effective fee: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    if (!scVal) {
+      throw new Error('No return value from query_effective_fee simulation');
+    }
+    const native = scValToNative(scVal);
+    return {
+      feeBps: Number(native[0]),
+      fee: BigInt(native[1].toString()),
+      netAmount: BigInt(native[2].toString()),
+    };
+  }
+
+  /**
+   * Get total amount bridged for an asset.
+   *
+   * @param asset - Token contract address.
+   * @returns Total bridged volume as a bigint.
+   *
+   * @throws {Error} If `asset` is not a valid contract address or on RPC failure.
+   *
+   * @example
+   * ```ts
+   * const total = await sdk.getTotalBridged('CD...usdc');
+   * console.log('Total bridged USDC:', total);
+   * ```
+   */
+  async getTotalBridged(asset: string): Promise<bigint> {
+    assertContractAddress(asset, 'asset');
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_total_bridged' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_total_bridged', [new Address(asset)]),
+      ),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get total bridged: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? BigInt(scValToNative(scVal).toString()) : 0n;
+  }
+
+  /**
+   * Get total fees collected for an asset.
+   *
+   * @param asset - Token contract address.
+   * @returns Total fees collected as a bigint.
+   *
+   * @throws {Error} If `asset` is not a valid contract address or on RPC failure.
+   *
+   * @example
+   * ```ts
+   * const totalFees = await sdk.getTotalFeesCollected('CD...usdc');
+   * console.log('Total fees collected:', totalFees);
+   * ```
+   */
+  async getTotalFeesCollected(asset: string): Promise<bigint> {
+    assertContractAddress(asset, 'asset');
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_total_fees_collected' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_total_fees_collected', [new Address(asset)]),
+      ),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get total fees collected: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? BigInt(scValToNative(scVal).toString()) : 0n;
+  }
+
+  /**
+   * Get the global minimum transfer amount required by the bridge.
+   *
+   * @returns Minimum transfer amount as a bigint.
+   *
+   * @throws {Error} On RPC simulation failure.
+   *
+   * @example
+   * ```ts
+   * const minAmount = await sdk.getMinimumAmount();
+   * console.log('Minimum transfer amount:', minAmount);
+   * ```
+   */
+  async getMinimumAmount(): Promise<bigint> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_minimum_amount' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_minimum_amount', []),
+      ),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get minimum amount: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? BigInt(scValToNative(scVal).toString()) : 0n;
   }
 
   /**
