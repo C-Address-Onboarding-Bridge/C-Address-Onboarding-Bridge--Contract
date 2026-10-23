@@ -896,3 +896,6 @@ MIT
 
 <!-- handsoff-issue-682 -->
 - #682: sdk: add register_meta_signer and a helper that builds the exact meta-tx payload the contract verifies
+
+<!-- handsoff-issue-873 -->
+- #873: security: SSRF filter misses NAT64, 6to4, IPv4-compatible and site-local IPv6 ranges
