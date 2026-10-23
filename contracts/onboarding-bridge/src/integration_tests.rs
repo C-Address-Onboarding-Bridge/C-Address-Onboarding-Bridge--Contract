@@ -6,9 +6,6 @@
 //! that the auth chain is correct and token balance changes are real.
 //!
 //! Balance assertions always use the real token contract's balance() function.
-
-#![cfg(test)]
-
 use crate::OnboardingBridge;
 
 use soroban_sdk::{
