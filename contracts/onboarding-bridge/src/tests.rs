@@ -2342,7 +2342,6 @@ fn test_swap_deadline_in_future_passes() {
     assert_eq!(check_balance(&env, &target_token_id, &target), 500i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_swap_slippage_exceeded_fails() {
     let env = Env::default();
@@ -4087,7 +4086,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([7u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x77; 32]);
@@ -4336,7 +4335,7 @@ mod crosschain_tests {
         bridge.add_relayer(&relayer, &None);
 
         assert_eq!(
-            bridge.try_set_relayer_threshold(&0u32),
+            bridge.try_set_relayer_threshold(&0u32, &None),
             Err(Ok(BridgeError::ThresholdExceedsRelayers))
         );
         assert_eq!(bridge.query_relayer_threshold(), 1);
@@ -4367,7 +4366,7 @@ mod crosschain_tests {
             make_signing_key([7u8; 32]).verifying_key().as_bytes(),
         );
         bridge.add_relayer(&relayer, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x82; 32]);
@@ -4403,7 +4402,7 @@ mod crosschain_tests {
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert_eq!(
-            bridge.try_remove_relayer(&relayer),
+            bridge.try_remove_relayer(&relayer, &None),
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert!(bridge.query_is_relayer(&relayer));
@@ -4441,7 +4440,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([8u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         for (chain_id, hash_byte) in [(1u32, 0x31u8), (2u32, 0x32u8)] {
             let target = soroban_sdk::Address::generate(&env);
@@ -4484,7 +4483,7 @@ mod crosschain_tests {
                 &3_000i128,
                 &insufficient_sigs,
             ),
-            Err(Ok(crate::BridgeError::InsufficientCrossChainReserve))
+            Err(Ok(crate::BridgeError::InsufficientReclaimable))
         );
 
         let token = TestTokenClient::new(&env, &token_id);
@@ -4546,7 +4545,7 @@ fn test_loyalty_rewards_preserve_bridged_asset_reserves() {
     let target = Address::generate(&env);
 
     bridge.set_fee_bps(&1_000u32, &None);
-    bridge.set_loyalty_token(&asset, &200i128);
+    bridge.set_loyalty_token(&asset, &200i128, &None);
     mint_tokens(&env, &asset, &bridge_id, 300i128);
 
     bridge.fund_c_address_timelocked(
@@ -7071,10 +7070,42 @@ fn test_verify_auth_entry_success() {
     // Should succeed: nonce 0 is fresh, ledger is within the window
     bridge.verify_auth_entry(&user, &0u64, &0u32, &(seq + 100));
 
-    // The nonce must now be marked used; replaying it must fail
+    // Next expected nonce is now 1
+    assert_eq!(bridge.query_auth_nonce(&user), 1u64);
+    assert!(bridge.query_auth_nonce_used(&user, &0u64));
+    assert!(!bridge.query_auth_nonce_used(&user, &1u64));
+
+    // The nonce must now be marked used; replaying it must fail with AuthNonceAlreadyUsed
     assert_eq!(
         bridge.try_verify_auth_entry(&user, &0u64, &0u32, &(seq + 100)),
+        Err(Ok(BridgeError::AuthNonceAlreadyUsed))
+    );
+
+    // A future / gap nonce must fail with DuplicateNonce (monotonic sequencing enforced)
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &5u64, &0u32, &(seq + 100)),
         Err(Ok(BridgeError::DuplicateNonce))
+    );
+
+    // Only the monotonic AuthNonce counter entry is written to persistent storage,
+    // avoiding redundant persistent storage bloat from UsedAuthNonce.
+    env.as_contract(&bridge_id, || {
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&DataKey::UsedAuthNonce(user.clone(), 0)));
+        assert!(env
+            .storage()
+            .persistent()
+            .has(&DataKey::AuthNonce(user.clone())));
+    });
+
+    // Valid continuation with next sequential nonce 1 succeeds
+    bridge.verify_auth_entry(&user, &1u64, &0u32, &(seq + 100));
+    assert_eq!(bridge.query_auth_nonce(&user), 2u64);
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &1u64, &0u32, &(seq + 100)),
+        Err(Ok(BridgeError::AuthNonceAlreadyUsed))
     );
 }
 
