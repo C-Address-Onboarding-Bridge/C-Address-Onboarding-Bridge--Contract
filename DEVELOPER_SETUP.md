@@ -1,5 +1,8 @@
 # Developer Setup Guide
 
+The checked-in `.env.example` uses `API_KEY=dev-only-change-me` so the local
+indexer starts successfully. Replace it with a strong secret outside local development.
+
 Local development environment for the C-Address Onboarding Bridge — Soroban smart contract, TypeScript SDK, and off-chain relayer service.
 
 ---
@@ -10,14 +13,15 @@ Local development environment for the C-Address Onboarding Bridge — Soroban sm
 |---|---|---|
 | Docker + Docker Compose | 24+ | [docs.docker.com](https://docs.docker.com/get-docker/) |
 | Node.js | 20 LTS | [nodejs.org](https://nodejs.org) or `nvm install 20` |
-| Rust + wasm32 target | stable | `curl https://sh.rustup.rs -sSf \| sh` |
+| Rust + wasm32 targets | 1.84.0 (pinned by `rust-toolchain.toml`) | `curl https://sh.rustup.rs -sSf \| sh` |
 | Stellar CLI | latest | `cargo install --locked stellar-cli` |
 | Git | any | — |
 
-Add the wasm32 target after installing Rust:
+The repository's `rust-toolchain.toml` pins Rust 1.84.0 and configures both
+WASM targets. If you install them manually, target the pinned toolchain:
 
 ```bash
-rustup target add wasm32-unknown-unknown
+rustup target add --toolchain 1.84.0 wasm32-unknown-unknown wasm32v1-none
 ```
 
 ---
@@ -194,8 +198,14 @@ export ETH_RPC_URL="https://eth-mainnet.example.com"
 export ETH_BRIDGE_CONTRACT="0x..."
 export ETH_EVENT_TOPIC="0x..."
 export SOLANA_WS_URL="wss://api.mainnet-beta.solana.com"
+export SOLANA_HTTP_URL="https://api.mainnet-beta.solana.com"
 export SOLANA_PROGRAM_ID="<base58-program-id>"
 ```
+
+The Solana bridge program should emit `Program log: bridge_fund:<target>:<asset>:<amount>`.
+Do not include a transaction signature in the program-controlled log: the relayer
+uses the signature from the RPC notification and the log's position in that
+transaction to derive its replay key.
 
 ### Run the relayer self-tests
 
@@ -283,7 +293,7 @@ Workspace settings (`.vscode/settings.json`) are already configured for:
 | `ETH_EVENT_TOPIC` | optional | keccak256 of the BridgeFund event signature |
 | `SOLANA_WS_URL` | optional | Solana WebSocket endpoint |
 | `SOLANA_PROGRAM_ID` | optional | Solana bridge program id |
-| `MOONPAY_API_KEY` | optional | Moonpay on-ramp API key |
+| `MOONPAY_KEY` | optional | Moonpay on-ramp API key |
 | `TRANSAK_API_KEY` | optional | Transak on-ramp API key |
 
 ---

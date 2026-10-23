@@ -66,7 +66,7 @@ import { Keypair } from '@stellar/stellar-sdk';
 
 const sdk = new OnboardingBridgeSDK({
   contractId: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4',
-  rpcUrl: 'https://soroban-mainnet.stellar.org',
+  rpcUrl: 'https://mainnet.sorobanrpc.com',
   networkPassphrase: 'Public Global Stellar Network ; September 2015',
 });
 
@@ -105,12 +105,10 @@ curl -X POST https://soroban-testnet.stellar.org -d '
 #### Step 5: Verify with Smoke Tests
 
 ```bash
-# Run smoke test suite
-npm run test:smoke
-
-# Manual verification
-npm run dev  # Start local testnet instance
-npm test     # Run integration tests
+# Validate migration examples and run each workspace's checks
+npm run lint:docs:migration-sdk
+npm --workspace sdk test
+npm --workspace relayer run self-test
 ```
 
 ## Breaking Changes
@@ -232,14 +230,9 @@ npm run init:testnet
 ### Step 2: Run Test Scenarios
 
 ```bash
-# Run full test suite
-npm test
-
-# Run integration tests specifically
-npm run test:integration
-
-# Run smoke tests
-npm run test:smoke
+# Run the checks exposed by the workspaces
+npm --workspace sdk test
+npm --workspace relayer run self-test
 ```
 
 ### Step 3: Test Upgrade Path
@@ -280,8 +273,7 @@ assert.equal(fundTx.status, 'pending');
 ### Step 4: Stress Test
 
 ```bash
-// Run under load to find any issues
-npm run test:load
+// Use your deployment's load harness; this repository has no test:load script.
 
 // Monitor:
 // - Transaction success rate

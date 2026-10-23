@@ -196,8 +196,8 @@ export interface FundCAddressWithReferralOptions extends FundCOptions {
   referrer?: string;
 }
 
-export interface CommitFundOptions extends FundCOptions {
-  /** 32-byte sha256(amount_be16 || nonce_be8) commitment hash as hex. */
+export interface CommitFundOptions extends Omit<FundCOptions, 'amount'> {
+  /** Domain-separated commitment produced by `computeCommitmentHash`. */
   amountHash: string;
 
   /** Unix timestamp deadline for revealing the commitment. */
@@ -437,6 +437,11 @@ export interface PendingUpgrade {
 }
 
 export interface MetaFundParams {
+  /**
+   * 32-byte hex-encoded SHA-256 hash of the Stellar network passphrase.
+   * This must match `env.ledger().network_id()` on the deployed contract.
+   */
+  networkId: string;
   source: string;
   target: string;
   asset: string;
@@ -641,8 +646,20 @@ export interface OnRampUrlParams {
   /**
    * Target C-address that will receive the purchased crypto.
    * The provider will route funds to this address on Stellar.
+   *
+   * This must stay a C-address (validated by `getOnRampUrl` via
+   * `assertContractAddress`, see offramp.ts). Issue #855 reported this
+   * field drifting out of sync with a since-reverted `gAddress` rename;
+   * the examples and README (examples/typescript/full-integration.ts:210,
+   * examples/javascript/full-integration.js:144, README.md:395) and the
+   * "getOnRampUrl rejects G-address as cAddress" test in
+   * sdk/src/__tests__/offramp.test.ts all now agree on `cAddress` — keep
+   * them in sync if this field is ever renamed again.
    */
   cAddress: string;
+
+  /** Optional callback for signing the generated URL server-side. */
+  signer?: (url: string) => string;
 }
 
 /**
@@ -724,6 +741,15 @@ export interface TransactionResult {
    */
   error?: string;
 }
+
+/**
+ * Result returned by an SDK method that waits for transaction finality.
+ *
+ * A failed transaction has no decoded contract return value.
+ */
+export type ConfirmedTransactionResult<T> =
+  | ({ hash: string; status: 'success' } & T)
+  | { hash: string; status: 'failed'; error?: string };
 
 // ---------------------------------------------------------------------------
 // Cross-chain types
@@ -891,6 +917,20 @@ export interface FundCAddressWithSwapOptions {
    * Each pool must implement `swap(min_amount_out: i128, to: Address) → i128`.
    */
   swapRoute: string[];
+
+  /**
+   * Optional sequential nonce for replay protection.
+   * Pass `undefined` to skip nonce enforcement (standard Stellar tx
+   * replay protection via sequence number applies).
+   */
+  nonce?: string | number | bigint;
+
+  /**
+   * Optional Unix timestamp (seconds) deadline.
+   * If provided and the ledger timestamp exceeds this value, the
+   * contract will reject the transaction.
+   */
+  deadline?: string | number | bigint;
 }
 
 // ---------------------------------------------------------------------------
@@ -899,11 +939,10 @@ export interface FundCAddressWithSwapOptions {
 
 /**
  * A single page of results returned by list-querying SDK methods such as
- * {@link OnboardingBridgeSDK.getWhitelistedAssets},
- * {@link OnboardingBridgeSDK.getBlocklistedAddresses}, etc.
+ * {@link OnboardingBridgeSDK.getWhitelistedAssets}.
  *
- * Because Soroban contracts return full vectors, pagination is performed
- * client-side. The `cursor` is an opaque base64-encoded offset token.
+ * Pagination is performed on-chain: the `cursor` is an opaque base64-encoded
+ * offset token that the contract call resumes from.
  *
  * @typeParam T — the element type for items in this page.
  *
@@ -967,6 +1006,10 @@ export interface CostEstimate {
    * This is the minimum fee required for the transaction to be included.
    */
   fee: string;
+  /** Inclusion fee selected from current Soroban fee statistics. */
+  inclusionFee: string;
+  /** Inclusion fee plus the simulated Soroban resource fee. */
+  totalFee: string;
   /**
    * Minimum account balance required to submit the transaction, in stroops.
    * Accounts below this balance cannot submit transactions.

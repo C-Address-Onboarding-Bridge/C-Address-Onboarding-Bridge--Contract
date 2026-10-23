@@ -11,6 +11,7 @@
  *
  * Options:
  *   --network <mainnet|testnet|dev>   Select deployment environment (default: testnet)
+ *   --salt <hex>                      Override the 32-byte contract salt (64 hex chars)
  *
  * Config files (checked in order, first found wins):
  *   deploy-config.<network>.json     e.g. deploy-config.testnet.json
@@ -24,15 +25,17 @@ import {
   SorobanRpc,
   Contract,
   TransactionBuilder,
+  Operation,
   BASE_FEE,
   nativeToScVal,
   Keypair,
   Address,
   Networks,
+  xdr,
 } from '@stellar/stellar-sdk';
 import * as fs from 'fs';
 import * as path from 'path';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -99,6 +102,26 @@ function parseNetworkArg(): NetworkName {
 }
 
 /**
+ * Parse the optional --salt flag from argv.
+ *
+ * Returns a 32-byte Buffer.  When --salt is provided it must be a 64-character
+ * hex string (32 bytes); otherwise a cryptographically random salt is generated
+ * so that repeated deployments from the same admin account do not collide.
+ */
+export function parseSaltArg(): Buffer {
+  const idx = process.argv.indexOf('--salt');
+  if (idx !== -1 && process.argv[idx + 1]) {
+    const hex = process.argv[idx + 1];
+    if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+      console.error('Invalid --salt: expected 64 hex characters (32 bytes).');
+      process.exit(1);
+    }
+    return Buffer.from(hex, 'hex');
+  }
+  return randomBytes(32);
+}
+
+/**
  * Load and return the DeployConfig for the given network.
  *
  * Lookup order:
@@ -158,17 +181,52 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function poll(
+/**
+ * Poll the RPC node until the transaction is no longer NOT_FOUND.
+ *
+ * Throws when the transaction has FAILED (including the result XDR) so callers
+ * never mistake a failed transaction for a confirmed one.
+ */
+export async function poll(
   provider: SorobanRpc.Server,
   hash: string,
   retries = 20,
 ): Promise<SorobanRpc.Api.GetTransactionResponse> {
   for (let i = 0; i < retries; i++) {
     const r = await provider.getTransaction(hash);
+    if (r.status === 'FAILED') {
+      const resultXdr = (r as SorobanRpc.Api.GetFailedTransactionResponse).resultXdr;
+      throw new Error(
+        `Transaction ${hash} failed: ${resultXdr ? resultXdr.toXDR('base64') : 'no result XDR'}`,
+      );
+    }
     if (r.status !== 'NOT_FOUND') return r;
     await sleep(2000);
   }
   throw new Error(`Transaction ${hash} was not confirmed after ${retries * 2}s`);
+}
+
+/**
+ * Build, prepare, sign, and submit a transaction, then poll until confirmed.
+ * Returns the confirmed transaction response.
+ */
+async function submitAndConfirm(
+  provider: SorobanRpc.Server,
+  cfg: DeployConfig,
+  admin: Keypair,
+  build: (account: SorobanRpc.Api.AccountResponse) => ReturnType<TransactionBuilder['build']>,
+): Promise<SorobanRpc.Api.GetTransactionResponse> {
+  const account = await provider.getAccount(admin.publicKey());
+  const tx = build(account);
+  const prepared = await provider.prepareTransaction(tx);
+  prepared.sign(admin);
+  const send = await provider.sendTransaction(prepared);
+  console.log(`  Tx: ${send.hash}`);
+  const result = await poll(provider, send.hash);
+  if (result.status === 'FAILED') {
+    throw new Error(`Transaction ${send.hash} failed: ${JSON.stringify(result)}`);
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -184,15 +242,19 @@ async function deployContract(
   const wasm = fs.readFileSync(cfg.wasmPath);
 
   console.log('Installing WASM…');
-  const installResp = await provider.installContractCode(wasm);
-  const installTx = TransactionBuilder.fromXdr(installResp, cfg.networkPassphrase);
-  installTx.sign(admin);
-  const installSend = await provider.sendTransaction(installTx);
-  console.log(`  Install tx: ${installSend.hash}`);
-  await poll(provider, installSend.hash);
+  const installResult = await submitAndConfirm(provider, cfg, admin, (account) =>
+    new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: cfg.networkPassphrase,
+    })
+      .addOperation(Operation.uploadContractWasm({ wasm }))
+      .setTimeout(30)
+      .build(),
+  );
   console.log('  WASM installed ✓');
 
   console.log('Creating contract instance…');
+  const salt = parseSaltArg();
   const constructorArgs = [
     Address.fromString(admin.publicKey()).toScVal(),
     Address.fromString(cfg.feeCollectorPublicKey).toScVal(),
@@ -200,23 +262,45 @@ async function deployContract(
     nativeToScVal(null),
     nativeToScVal(wasmHash, { type: 'bytes' }),
   ];
-  const createResp = await provider.createContract(
-    wasm,
-    admin.publicKey(),
-    '0'.repeat(64),
-    constructorArgs,
+  const createResult = await submitAndConfirm(provider, cfg, admin, (account) =>
+    new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: cfg.networkPassphrase,
+    })
+      .addOperation(
+        Operation.createCustomContract({
+          address: Address.fromString(admin.publicKey()),
+          wasmHash,
+          salt,
+          constructorArgs,
+        }),
+      )
+      .setTimeout(30)
+      .build(),
   );
-  const createTx = TransactionBuilder.fromXdr(createResp, cfg.networkPassphrase);
-  createTx.sign(admin);
-  const createSend = await provider.sendTransaction(createTx);
-  console.log(`  Create tx: ${createSend.hash}`);
-  const createResult = await poll(provider, createSend.hash);
 
-  if (!createResult.contractId) {
+  const contractId = extractContractId(createResult);
+  if (!contractId) {
     throw new Error('Contract deployment succeeded but returned no contractId');
   }
-  console.log(`  Contract ID: ${createResult.contractId} ✓`);
-  return createResult.contractId;
+  console.log(`  Contract ID: ${contractId} ✓`);
+  return contractId;
+}
+
+/**
+ * Extract the created contract ID from a createCustomContract result.
+ * The contract address is returned as the operation's return value.
+ */
+function extractContractId(result: SorobanRpc.Api.GetTransactionResponse): string | undefined {
+  if (result.status !== 'SUCCESS') return undefined;
+  const meta = result.resultMetaXdr;
+  if (!meta) return undefined;
+  const txMeta = xdr.TransactionMeta.fromXDR(meta, 'base64');
+  const sorobanMeta = txMeta.v3().sorobanMeta();
+  if (!sorobanMeta) return undefined;
+  const returnValue = sorobanMeta.returnValue();
+  if (!returnValue) return undefined;
+  return Address.fromScVal(returnValue).toString();
 }
 
 async function initialize(
@@ -236,7 +320,7 @@ async function initialize(
   })
     .addOperation(
       contract.call(
-        'initialize',
+        'initialize_with_wasm_hash',
         Address.fromString(admin.publicKey()).toScVal(),
         Address.fromString(cfg.feeCollectorPublicKey).toScVal(),
         nativeToScVal(cfg.feeBps, { type: 'u32' }),
@@ -260,11 +344,9 @@ async function initialize(
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  // Strip --network and its value from argv so we can parse positional args cleanly.
-  const networkIdx = process.argv.indexOf('--network');
   const filteredArgv = process.argv.slice(2).filter((_, i, arr) => {
-    if (arr[i - 1] === '--network') return false;
-    if (arr[i] === '--network') return false;
+    if (arr[i - 1] === '--network' || arr[i] === '--network') return false;
+    if (arr[i - 1] === '--salt' || arr[i] === '--salt') return false;
     return true;
   });
 
@@ -289,11 +371,7 @@ async function main(): Promise<void> {
   if (command === 'deploy' || command === 'all') {
     const wasmHash = createHash('sha256').update(fs.readFileSync(cfg.wasmPath)).digest();
     const contractId = await deployContract(provider, cfg, admin, wasmHash);
-    if (command === 'all') {
-      console.log(`\nDeployment complete. CONTRACT_ID=${contractId}`);
-    } else {
-      console.log(`\nDeployment complete. CONTRACT_ID=${contractId}`);
-    }
+    console.log(`\nDeployment complete. CONTRACT_ID=${contractId}`);
     return;
   }
 
@@ -311,7 +389,9 @@ async function main(): Promise<void> {
   process.exit(1);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

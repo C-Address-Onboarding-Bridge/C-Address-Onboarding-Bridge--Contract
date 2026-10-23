@@ -8,7 +8,7 @@
  *  - {@link STATE_CHANGING_RETRY_POLICY} for write calls, which carry a
  *    double-submission risk and are therefore retried conservatively.
  *
- * The {@link withRpcRetry} helper wraps a `SorobanRpc.Server` so every RPC
+ * The {@link withRpcRetry} helper wraps an `rpc.Server` so every RPC
  * method is automatically retried with the policy appropriate to it.
  */
 

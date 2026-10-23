@@ -17,10 +17,11 @@ Three upgrade strategies were considered:
 
 Use a **timelock upgrade** pattern for production deployments:
 
-- `schedule_upgrade(new_wasm_hash, delay_seconds)` (admin only): stores the pending hash and `release_time = now + delay` under `DataKey::PendingUpgrade`.
-- `execute_upgrade(expected_hash)` (admin only): callable only after `release_time`; verifies the hash matches to prevent bait-and-switch; calls `update_current_contract_wasm`.
-- `cancel_upgrade()` (admin only): removes the pending upgrade if the admin changes their mind.
-- Minimum enforced delay: **24 hours** (configurable upward; cannot be lowered below the minimum by admin).
+- `schedule_upgrade(new_wasm_hash, nonce)` (admin only): stores the pending hash and returns the `u32` ledger sequence after which execution is allowed.
+- `execute_upgrade(expected_hash, nonce)` (admin only): callable after that ledger; verifies the hash and calls `update_current_contract_wasm`.
+- `cancel_upgrade(nonce)` (admin only): removes the pending upgrade if the admin changes their mind.
+- The delay is fixed at **17,280 ledgers** (about 24 hours at five seconds per ledger). It is not caller-configurable.
+- Once executable, an upgrade remains valid for another 17,280 ledgers. After that window it expires and must be scheduled again.
 - The `expected_hash` parameter in `execute_upgrade` is a safety check: if the admin's key was compromised and the attacker scheduled a different WASM, the legitimate admin (who stored the expected hash off-chain at schedule time) can detect the mismatch.
 
 Deploy-new-instance was rejected because it changes the contract ID, breaking all integrations.

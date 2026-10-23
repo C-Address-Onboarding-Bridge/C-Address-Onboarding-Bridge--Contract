@@ -14,6 +14,7 @@
   "scripts": {
     "prepare": "husky install || true",
     "lint:docs:migration-sdk": "node scripts/check-migration-sdk-docs.js",
+    "test:scripts": "TS_NODE_TRANSPILE_ONLY=1 TS_NODE_COMPILER_OPTIONS='{\"module\":\"CommonJS\",\"moduleResolution\":\"node\"}' node -r ts-node/register --test scripts/deploy.test.ts",
     "estimate-deploy-cost": "ts-node scripts/estimate-deploy-cost.ts",
     "estimate:mainnet": "npm run estimate-deploy-cost -- --network mainnet",
     "estimate:testnet": "npm run estimate-deploy-cost -- --network testnet",
@@ -30,71 +31,5 @@
     "semantic-release": "^23.0.0",
     "ts-node": "^10.0.0",
     "typescript": "^5.0.0"
-  },
-  "release": {
-    "branches": [
-      "main"
-    ],
-    "plugins": [
-      "@semantic-release/commit-analyzer",
-      "@semantic-release/release-notes-generator",
-      [
-        "@semantic-release/changelog",
-        {
-          "changelogFile": "CHANGELOG.md",
-          "changelogTitle": "# Changelog"
-        }
-      ],
-      "@semantic-release/npm",
-      [
-        "@semantic-release/git",
-        {
-          "assets": [
-            "CHANGELOG.md",
-            "package.json",
-            "package-lock.json",
-            "sdk/package.json",
-            "sdk/package-lock.json"
-          ],
-          "message": "chore(release): ${nextRelease.version}\n\n${nextRelease.notes}"
-        }
-      ],
-      "@semantic-release/github"
-    ]
-  },
-  "commitlint": {
-    "extends": [
-      "@commitlint/config-conventional"
-    ],
-    "rules": {
-      "type-enum": [
-        2,
-        "always",
-        [
-          "feat",
-          "fix",
-          "docs",
-          "style",
-          "refactor",
-          "perf",
-          "test",
-          "chore",
-          "ci",
-          "revert"
-        ]
-      ],
-      "subject-case": [
-        2,
-        "never",
-        [
-          "upper-case"
-        ]
-      ],
-      "type-case": [
-        2,
-        "always",
-        "lower-case"
-      ]
-    }
   }
 }

@@ -30,6 +30,7 @@ import {
   MetaFundParams,
   ReclaimTokensOptions,
   TransactionResult,
+  ConfirmedTransactionResult,
   CrossChainFundOptions,
   RelayerManagementOptions,
   FundCAddressWithSwapOptions,
@@ -65,11 +66,11 @@ export const BATCH_TX_LIMIT = 100;
  * `BridgeConfig.baseReserveStroops` if the network uses a different value.
  */
 export const BASE_RESERVE_STROOPS = 5_000_000;
-import { assertAccountAddress, assertContractAddress, assertRelayerPubkey } from './validate';
+import { assertAccountAddress, assertAddress, assertContractAddress, assertRelayerPubkey } from './validate';
 import { withRpcRetry } from './retry';
 import { toScVals, buildSimulationTx as buildSharedSimTx } from './encoding';
 import {
-  SorobanRpc,
+  rpc,
   Contract,
   xdr,
   Address,
@@ -80,6 +81,40 @@ import {
   TransactionBuilder,
   BASE_FEE,
 } from '@stellar/stellar-sdk';
+import { createHash } from 'crypto';
+
+export interface CommitmentHashOptions {
+  contractId: string;
+  networkPassphrase: string;
+  source: string;
+  target: string;
+  asset: string;
+  amount: string | number | bigint;
+  nonce: string | number | bigint;
+}
+
+export function computeCommitmentHash(options: CommitmentHashOptions): string {
+  const amount = BigInt(options.amount);
+  const nonce = BigInt(options.nonce);
+  if (amount <= 0n || amount > (1n << 127n) - 1n) throw new Error('amount must fit a positive i128');
+  if (nonce < 0n || nonce > (1n << 64n) - 1n) throw new Error('nonce must fit a u64');
+  const amountBytes = Buffer.alloc(16);
+  amountBytes.writeBigUInt64BE(amount >> 64n, 0);
+  amountBytes.writeBigUInt64BE(amount & ((1n << 64n) - 1n), 8);
+  const nonceBytes = Buffer.alloc(8);
+  nonceBytes.writeBigUInt64BE(nonce);
+  const networkId = createHash('sha256').update(options.networkPassphrase).digest();
+  return createHash('sha256').update(Buffer.concat([
+    Buffer.from('onboarding_bridge_commitment_v1'),
+    Buffer.from(options.contractId),
+    networkId,
+    Buffer.from(options.source),
+    Buffer.from(options.target),
+    Buffer.from(options.asset),
+    amountBytes,
+    nonceBytes,
+  ])).digest('hex');
+}
 
 /**
  * TypeScript SDK for the C-Address Onboarding Bridge Soroban contract.
@@ -115,7 +150,7 @@ import {
 export class OnboardingBridgeSDK {
   private config: BridgeConfig;
   private contract: Contract;
-  private provider: SorobanRpc.Server;
+  private provider: rpc.Server;
   private networkPassphrase: string;
   private hooks: ObservabilityHooks | undefined;
 
@@ -148,7 +183,7 @@ export class OnboardingBridgeSDK {
     // failures (network/timeout/rate-limit) with exponential backoff + jitter.
     // Reads use an aggressive policy; writes use a conservative one (see retry.ts).
     this.provider = withRpcRetry(
-      new SorobanRpc.Server(config.rpcUrl),
+      new rpc.Server(config.rpcUrl),
       config.retry,
     );
     this.networkPassphrase = config.networkPassphrase;
@@ -170,7 +205,7 @@ export class OnboardingBridgeSDK {
    *
    * @returns A {@link TransactionResult} with `status: 'pending'` on successful
    *          submission, or `status: 'failed'` with an `error` message.
-   *          Poll `SorobanRpc.Server.getTransaction(result.hash)` to confirm
+   *          Poll `rpc.Server.getTransaction(result.hash)` to confirm
    *          finality before showing success to the user.
    *
    * @throws Never — errors are returned as `status: 'failed'`.
@@ -229,10 +264,10 @@ export class OnboardingBridgeSDK {
               this.contract.call(
                 'fund_c_address',
                 ...toScVals([
-                  options.source,
-                  options.target,
-                  options.asset,
-                  options.amount,
+                  new Address(options.source),
+                  new Address(options.target),
+                  new Address(options.asset),
+                  { value: BigInt(options.amount), type: 'i128' },
                 ]),
                 nonceScVal,
                 deadlineScVal,
@@ -258,7 +293,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -278,7 +313,15 @@ export class OnboardingBridgeSDK {
     return withTransactionHooks(
       this.hooks,
       'fundCAddressWithReferral',
-      { source: options.source, target: options.target, asset: options.asset, amount: options.amount, referrer: options.referrer },
+      {
+        source: options.source,
+        target: options.target,
+        asset: options.asset,
+        amount: options.amount,
+        referrer: options.referrer,
+        nonce: options.nonce,
+        deadline: options.deadline,
+      },
       async () => {
         try {
           assertAccountAddress(options.source, 'source');
@@ -295,6 +338,16 @@ export class OnboardingBridgeSDK {
             () => this.provider.getAccount(options.source),
           );
 
+          const referrerScVal = options.referrer === undefined
+            ? xdr.ScVal.scvVoid()
+            : new Address(options.referrer).toScVal();
+          const nonceScVal = options.nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+          const deadlineScVal = options.deadline === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
+
           const tx = new TransactionBuilder(sourceAccount, {
             fee: BASE_FEE,
             networkPassphrase: this.networkPassphrase,
@@ -303,12 +356,14 @@ export class OnboardingBridgeSDK {
               this.contract.call(
                 'fund_c_address_with_referral',
                 ...toScVals([
-                  options.source,
-                  options.target,
-                  options.asset,
-                  options.amount,
-                  options.referrer,
+                  new Address(options.source),
+                  new Address(options.target),
+                  new Address(options.asset),
+                  { value: BigInt(options.amount), type: 'i128' },
                 ]),
+                referrerScVal,
+                nonceScVal,
+                deadlineScVal,
               ),
             )
             .setTimeout(this.config.timeout ?? 30)
@@ -331,7 +386,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -399,7 +454,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -410,6 +465,22 @@ export class OnboardingBridgeSDK {
         }
       },
     );
+  }
+
+  /**
+   * Submit a commitment and wait until the network confirms it.
+   *
+   * Unlike {@link commitFund}, this method returns the commitment ID decoded
+   * from the confirmed transaction's return value.
+   */
+  async commitFundAndWait(
+    options: CommitFundOptions,
+    sourceKeypair: Keypair,
+  ): Promise<ConfirmedTransactionResult<{ commitmentId: bigint }>> {
+    const result = await this.commitFund(options, sourceKeypair);
+    return this.waitForContractReturnValue(result, 'commitFund', (returnValue) => ({
+      commitmentId: this.decodeU64ReturnValue(returnValue),
+    }));
   }
 
   async revealFund(
@@ -468,7 +539,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -502,6 +573,8 @@ export class OnboardingBridgeSDK {
         amount: options.amount,
         releaseTime: options.releaseTime,
         cliffTime: options.cliffTime ?? 0,
+        nonce: options.nonce,
+        deadline: options.deadline,
       },
       async () => {
         try {
@@ -516,6 +589,13 @@ export class OnboardingBridgeSDK {
             () => this.provider.getAccount(options.source),
           );
 
+          const nonceScVal = options.nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+          const deadlineScVal = options.deadline === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
+
           const tx = new TransactionBuilder(sourceAccount, {
             fee: BASE_FEE,
             networkPassphrase: this.networkPassphrase,
@@ -529,6 +609,8 @@ export class OnboardingBridgeSDK {
                 nativeToScVal(BigInt(options.amount), { type: 'i128' }),
                 nativeToScVal(BigInt(options.releaseTime), { type: 'u64' }),
                 nativeToScVal(BigInt(options.cliffTime ?? 0), { type: 'u64' }),
+                nonceScVal,
+                deadlineScVal,
               ),
             )
             .setTimeout(this.config.timeout ?? 30)
@@ -551,7 +633,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -565,11 +647,30 @@ export class OnboardingBridgeSDK {
   }
 
   /**
+   * Submit timelocked funding and wait for confirmation.
+   *
+   * Unlike {@link fundCAddressTimelocked}, this method returns the timelock ID
+   * decoded from the confirmed transaction's return value.
+   */
+  async fundCAddressTimelockedAndWait(
+    options: FundCTimelockedOptions,
+    sourceKeypair: Keypair,
+  ): Promise<ConfirmedTransactionResult<{ timelockId: bigint }>> {
+    const result = await this.fundCAddressTimelocked(options, sourceKeypair);
+    return this.waitForContractReturnValue(result, 'fundCAddressTimelocked', (returnValue) => ({
+      timelockId: this.decodeU64ReturnValue(returnValue),
+    }));
+  }
+
+  /**
    * Claim a matured timelocked funding entry.
+   * Smart-contract targets must provide `authorizeTarget`, which signs the
+   * Soroban authorization entries added during transaction preparation.
    */
   async claimTimelocked(
-    id: number,
-    targetKeypair: Keypair,
+    id: string | number | bigint,
+    transactionSourceKeypair: Keypair,
+    authorizeTarget?: (preparedTransaction: any) => Promise<void>,
   ): Promise<TransactionResult> {
     return withTransactionHooks(
       this.hooks,
@@ -580,8 +681,8 @@ export class OnboardingBridgeSDK {
           const targetAccount = await withRpcHook(
             this.hooks,
             'getAccount',
-            { address: targetKeypair.publicKey() },
-            () => this.provider.getAccount(targetKeypair.publicKey()),
+            { address: transactionSourceKeypair.publicKey() },
+            () => this.provider.getAccount(transactionSourceKeypair.publicKey()),
           );
 
           const tx = new TransactionBuilder(targetAccount, {
@@ -603,7 +704,11 @@ export class OnboardingBridgeSDK {
             { contractMethod: 'claim_timelocked' },
             () => this.provider.prepareTransaction(tx),
           );
-          preparedTx.sign(targetKeypair);
+          if (!authorizeTarget) {
+            throw new Error('authorizeTarget is required for the C-address timelock target');
+          }
+          await authorizeTarget(preparedTx);
+          preparedTx.sign(transactionSourceKeypair);
 
           const response = await withRpcHook(
             this.hooks,
@@ -614,7 +719,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -706,6 +811,8 @@ export class OnboardingBridgeSDK {
         targetAsset: options.targetAsset,
         sourceAmount: options.sourceAmount,
         minTargetAmount: options.minTargetAmount,
+        nonce: options.nonce,
+        deadline: options.deadline,
       },
       async () => {
         try {
@@ -722,6 +829,13 @@ export class OnboardingBridgeSDK {
             () => this.provider.getAccount(options.source),
           );
 
+          const nonceScVal = options.nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+          const deadlineScVal = options.deadline === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
+
           const tx = new TransactionBuilder(sourceAccount, {
             fee: BASE_FEE,
             networkPassphrase: this.networkPassphrase,
@@ -730,14 +844,16 @@ export class OnboardingBridgeSDK {
               this.contract.call(
                 'fund_c_address_with_swap',
                 ...toScVals([
-                  options.source,
-                  options.target,
-                  options.sourceAsset,
-                  options.targetAsset,
-                  options.sourceAmount,
-                  options.minTargetAmount,
-                  options.swapRoute,
+                  new Address(options.source),
+                  new Address(options.target),
+                  new Address(options.sourceAsset),
+                  new Address(options.targetAsset),
+                  { value: BigInt(options.sourceAmount), type: 'i128' },
+                  { value: BigInt(options.minTargetAmount), type: 'i128' },
+                  options.swapRoute.map((address) => new Address(address)),
                 ]),
+                nonceScVal,
+                deadlineScVal,
               ),
             )
             .setTimeout(this.config.timeout ?? 30)
@@ -760,7 +876,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -857,9 +973,7 @@ export class OnboardingBridgeSDK {
         const results: TransactionResult[] = [];
         let completed = 0;
 
-        const nonceScVal = options.nonce === undefined
-          ? xdr.ScVal.scvVoid()
-          : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+        const baseNonce = options.nonce === undefined ? undefined : BigInt(options.nonce);
         const deadlineScVal = options.deadline === undefined
           ? xdr.ScVal.scvVoid()
           : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
@@ -868,6 +982,12 @@ export class OnboardingBridgeSDK {
         for (let offset = 0; offset < total; offset += BATCH_TX_LIMIT) {
           const chunkTargets = options.targets.slice(offset, offset + BATCH_TX_LIMIT);
           const chunkAmounts = options.amounts.slice(offset, offset + BATCH_TX_LIMIT);
+          const nonceScVal = baseNonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(
+                baseNonce + BigInt(offset / BATCH_TX_LIMIT),
+                { type: 'u64' },
+              );
 
           let result: TransactionResult;
           try {
@@ -886,10 +1006,10 @@ export class OnboardingBridgeSDK {
                 this.contract.call(
                   'batch_fund_c_address',
                   ...toScVals([
-                    options.source,
-                    chunkTargets,
-                    chunkAmounts,
-                    options.asset,
+                    new Address(options.source),
+                    chunkTargets.map((address) => new Address(address)),
+                    chunkAmounts.map((amount) => ({ value: BigInt(amount), type: 'i128' })),
+                    new Address(options.asset),
                   ]),
                   nonceScVal,
                   deadlineScVal,
@@ -915,7 +1035,7 @@ export class OnboardingBridgeSDK {
 
             result = {
               hash: response.hash,
-              status: response.status === 'ERROR' ? 'failed' : 'pending',
+              status: response.status === 'PENDING' ? 'pending' : 'failed',
             };
           } catch (error: any) {
             result = {
@@ -934,6 +1054,60 @@ export class OnboardingBridgeSDK {
               total,
               result.hash || undefined,
             );
+          }
+
+          if (baseNonce !== undefined && offset + BATCH_TX_LIMIT < total) {
+            if (result.status === 'failed') {
+              results.push(...Array.from(
+                { length: Math.ceil((total - offset - chunkTargets.length) / BATCH_TX_LIMIT) },
+                (): TransactionResult => ({
+                  hash: '',
+                  status: 'failed',
+                  error: 'Not submitted because an earlier nonce transaction failed',
+                }),
+              ));
+              return results;
+            }
+
+            try {
+              let confirmation = await this.provider.getTransaction(result.hash);
+              while (confirmation.status === 'NOT_FOUND') {
+                await new Promise((resolve) => setTimeout(resolve, 1_000));
+                confirmation = await this.provider.getTransaction(result.hash);
+              }
+
+              if (confirmation.status === 'FAILED') {
+                results[results.length - 1] = {
+                  ...result,
+                  status: 'failed',
+                  error: 'Transaction failed on-chain',
+                };
+                results.push(...Array.from(
+                  { length: Math.ceil((total - offset - chunkTargets.length) / BATCH_TX_LIMIT) },
+                  (): TransactionResult => ({
+                    hash: '',
+                    status: 'failed',
+                    error: 'Not submitted because an earlier nonce transaction failed',
+                  }),
+                ));
+                return results;
+              }
+            } catch (error: any) {
+              results[results.length - 1] = {
+                ...result,
+                status: 'failed',
+                error: error.message || 'Unable to confirm nonce transaction',
+              };
+              results.push(...Array.from(
+                { length: Math.ceil((total - offset - chunkTargets.length) / BATCH_TX_LIMIT) },
+                (): TransactionResult => ({
+                  hash: '',
+                  status: 'failed',
+                  error: 'Not submitted because an earlier nonce transaction could not be confirmed',
+                }),
+              ));
+              return results;
+            }
           }
         }
 
@@ -990,7 +1164,10 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'withdraw_fees',
-                ...toScVals([options.asset, options.amount]),
+                ...toScVals([
+                  new Address(options.asset),
+                  { value: BigInt(options.amount), type: 'i128' },
+                ]),
                 options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' }),
               ),
             )
@@ -1014,7 +1191,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -1074,7 +1251,11 @@ export class OnboardingBridgeSDK {
             .addOperation(
               this.contract.call(
                 'reclaim_tokens',
-                ...toScVals([options.asset, options.amount, options.to]),
+                ...toScVals([
+                  new Address(options.asset),
+                  { value: BigInt(options.amount), type: 'i128' },
+                  new Address(options.to),
+                ]),
                 options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' }),
               ),
             )
@@ -1098,7 +1279,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -1249,7 +1430,7 @@ export class OnboardingBridgeSDK {
       this.hooks,
       'simulateTransaction',
       { contractMethod: 'query_balance' },
-      () => this.provider.simulateTransaction(this.buildSimulationTx('query_balance', [cAddress, asset])),
+      () => this.provider.simulateTransaction(this.buildSimulationTx('query_balance', [new Address(cAddress), new Address(asset)])),
     );
 
     if ('error' in result && result.error) {
@@ -1290,11 +1471,17 @@ export class OnboardingBridgeSDK {
     );
 
     if ('error' in result && result.error) {
+      if (/Error\(Contract,\s*#?14\)/.test(result.error)) {
+        return null;
+      }
       throw new Error(`Failed to get loyalty token: ${result.error}`);
     }
 
     const scVal = (result as any).results?.[0]?.retval;
-    return scVal ? scValToNative(scVal) as LoyaltyToken : null;
+    if (!scVal) return null;
+
+    const [token, amount] = scValToNative(scVal) as [string, bigint | number | string];
+    return { token, amount_per_fund: amount.toString() };
   }
 
   async queryFeeTiers(): Promise<FeeTier[]> {
@@ -1313,13 +1500,16 @@ export class OnboardingBridgeSDK {
     return scVal ? scValToNative(scVal) as FeeTier[] : [];
   }
 
-  async queryCurrentTier(source: string): Promise<FeeTier | null> {
+  async queryCurrentTier(source: string, asset: string): Promise<FeeTier | null> {
     assertAccountAddress(source, 'source');
+    assertContractAddress(asset, 'asset');
     const result = await withRpcHook(
       this.hooks,
       'simulateTransaction',
       { contractMethod: 'query_current_tier' },
-      () => this.provider.simulateTransaction(this.buildSimulationTx('query_current_tier', [source])),
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_current_tier', [new Address(source), new Address(asset)]),
+      ),
     );
 
     if ('error' in result && result.error) {
@@ -1354,7 +1544,7 @@ export class OnboardingBridgeSDK {
       'simulateTransaction',
       { contractMethod: 'query_accrued_fees' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_accrued_fees', [asset]),
+        this.buildSimulationTx('query_accrued_fees', [new Address(asset)]),
       ),
     );
 
@@ -1379,7 +1569,7 @@ export class OnboardingBridgeSDK {
       'simulateTransaction',
       { contractMethod: 'query_contract_balance' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_contract_balance', [asset]),
+        this.buildSimulationTx('query_contract_balance', [new Address(asset)]),
       ),
     );
 
@@ -1417,7 +1607,7 @@ export class OnboardingBridgeSDK {
       'simulateTransaction',
       { contractMethod: 'query_all_balances' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_all_balances', [assets]),
+        this.buildSimulationTx('query_all_balances', [assets.map((asset) => new Address(asset))]),
       ),
     );
 
@@ -1428,11 +1618,12 @@ export class OnboardingBridgeSDK {
     const scVal = (result as any).results?.[0]?.retval;
     if (!scVal) return {};
 
-    const native = scValToNative(scVal) as Map<string, bigint>;
+    const native = scValToNative(scVal) as Record<string, bigint> | Map<string, bigint>;
     const out: Record<string, string> = {};
-    native.forEach((value, key) => {
+    const entries = native instanceof Map ? native.entries() : Object.entries(native);
+    for (const [key, value] of entries) {
       out[key] = value.toString();
-    });
+    }
     return out;
   }
 
@@ -1494,16 +1685,19 @@ export class OnboardingBridgeSDK {
     adminKeypair: Keypair,
     nonce?: string | number | bigint,
   ): Promise<TransactionResult> {
-    if (newFeeBps < 0 || newFeeBps > 1000) {
-      throw new Error('Fee basis points must be between 0 and 1000');
-    }
-
     return withTransactionHooks(
       this.hooks,
       'setFee',
       { newFeeBps, nonce },
       async () => {
         try {
+          if (newFeeBps < 0 || newFeeBps > 1000) {
+            return {
+              hash: '',
+              status: 'failed',
+              error: 'Fee basis points must be between 0 and 1000',
+            };
+          }
           const adminAccount = await withRpcHook(
             this.hooks,
             'getAccount',
@@ -1546,7 +1740,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -1608,7 +1802,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -1625,11 +1819,12 @@ export class OnboardingBridgeSDK {
     token: string,
     amountPerFund: string | number | bigint,
     adminKeypair: Keypair,
+    nonce?: string | number | bigint,
   ): Promise<TransactionResult> {
     return withTransactionHooks(
       this.hooks,
       'setLoyaltyToken',
-      { token, amountPerFund },
+      { token, amountPerFund, nonce },
       async () => {
         try {
           assertContractAddress(token, 'token');
@@ -1649,6 +1844,7 @@ export class OnboardingBridgeSDK {
                 'set_loyalty_token',
                 new Address(token).toScVal(),
                 nativeToScVal(BigInt(amountPerFund), { type: 'i128' }),
+                this.optionalNonceToScVal(nonce),
               ),
             )
             .setTimeout(this.config.timeout ?? 30)
@@ -1671,7 +1867,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -1687,11 +1883,12 @@ export class OnboardingBridgeSDK {
   async setFeeTiers(
     tiers: FeeTier[],
     adminKeypair: Keypair,
+    nonce?: string | number | bigint,
   ): Promise<TransactionResult> {
     return withTransactionHooks(
       this.hooks,
       'setFeeTiers',
-      { tierCount: tiers.length },
+      { tierCount: tiers.length, nonce },
       async () => {
         try {
           const adminAccount = await withRpcHook(
@@ -1709,6 +1906,7 @@ export class OnboardingBridgeSDK {
               this.contract.call(
                 'set_fee_tiers',
                 xdr.ScVal.scvVec(tiers.map((tier) => this.feeTierToScVal(tier))),
+                this.optionalNonceToScVal(nonce),
               ),
             )
             .setTimeout(this.config.timeout ?? 30)
@@ -1731,7 +1929,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -1816,7 +2014,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -1902,7 +2100,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -1913,6 +2111,376 @@ export class OnboardingBridgeSDK {
         }
       },
     );
+  }
+
+  /**
+   * Propose an admin handover to a new G-address (admin only).
+   *
+   * This two-step path is preferred over `setAdmin` for normal operations
+   * because it proves the proposed admin controls the key (via
+   * {@link acceptAdmin}) before the role is moved — `setAdmin` transfers
+   * control immediately and unrecoverably if the new key is unusable.
+   *
+   * @param newAdmin     - G-address of the proposed admin.
+   * @param adminKeypair - Keypair of the current admin account.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * await sdk.proposeNewAdmin('G...newAdmin', adminKeypair);
+   * // newAdmin then calls:
+   * await sdk.acceptAdmin(newAdminKeypair);
+   * ```
+   */
+  async proposeNewAdmin(
+    newAdmin: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'proposeNewAdmin',
+      { newAdmin, nonce },
+      async () => {
+        try {
+          assertAccountAddress(newAdmin, 'newAdmin');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const nonceScVal = nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(nonce), { type: 'u64' });
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'propose_new_admin',
+                new Address(newAdmin).toScVal(),
+                nonceScVal,
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'propose_new_admin' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'propose_new_admin' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Accept a pending admin handover (must be signed by the proposed admin).
+   *
+   * Completes the handover started by {@link proposeNewAdmin}. Fails if there
+   * is no pending admin, or if `pendingAdminKeypair` does not match the
+   * address that was proposed.
+   *
+   * @param pendingAdminKeypair - Keypair of the proposed (pending) admin.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * await sdk.acceptAdmin(newAdminKeypair);
+   * ```
+   */
+  async acceptAdmin(pendingAdminKeypair: Keypair): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'acceptAdmin',
+      {},
+      async () => {
+        try {
+          const pendingAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: pendingAdminKeypair.publicKey() },
+            () => this.provider.getAccount(pendingAdminKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(pendingAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(this.contract.call('accept_admin'))
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'accept_admin' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(pendingAdminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'accept_admin' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Get the pending admin G-address, if an admin handover is in progress.
+   *
+   * @returns The pending admin's G-address, or `null` if there is no pending
+   *          handover.
+   *
+   * @throws {Error} On RPC failure.
+   */
+  async getPendingAdmin(): Promise<string | null> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_pending_admin' },
+      () => this.provider.simulateTransaction(this.buildSimulationTx('query_pending_admin', [])),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get pending admin: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    if (!scVal) return null;
+    const native = scValToNative(scVal);
+    return native ? native.toString() : null;
+  }
+
+  /**
+   * Propose a fee-collector handover to a new G-address (admin only).
+   *
+   * This two-step path is preferred over `setFeeCollector` for normal
+   * operations because it proves the proposed collector controls the key
+   * (via {@link acceptFeeCollector}) before the role is moved.
+   *
+   * @param newCollector - G-address of the proposed fee collector.
+   * @param adminKeypair - Keypair of the admin account.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * await sdk.proposeNewFeeCollector('G...newCollector', adminKeypair);
+   * // newCollector then calls:
+   * await sdk.acceptFeeCollector(newCollectorKeypair);
+   * ```
+   */
+  async proposeNewFeeCollector(
+    newCollector: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'proposeNewFeeCollector',
+      { newCollector, nonce },
+      async () => {
+        try {
+          assertAccountAddress(newCollector, 'newCollector');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const nonceScVal = nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(nonce), { type: 'u64' });
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'propose_new_fee_collector',
+                new Address(newCollector).toScVal(),
+                nonceScVal,
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'propose_new_fee_collector' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'propose_new_fee_collector' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Accept a pending fee-collector handover (must be signed by the proposed
+   * fee collector).
+   *
+   * Completes the handover started by {@link proposeNewFeeCollector}. Fails
+   * if there is no pending fee collector, or if `pendingCollectorKeypair`
+   * does not match the address that was proposed.
+   *
+   * @param pendingCollectorKeypair - Keypair of the proposed (pending) fee collector.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   *
+   * @example
+   * ```ts
+   * await sdk.acceptFeeCollector(newCollectorKeypair);
+   * ```
+   */
+  async acceptFeeCollector(pendingCollectorKeypair: Keypair): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'acceptFeeCollector',
+      {},
+      async () => {
+        try {
+          const pendingAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: pendingCollectorKeypair.publicKey() },
+            () => this.provider.getAccount(pendingCollectorKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(pendingAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(this.contract.call('accept_fee_collector'))
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'accept_fee_collector' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(pendingCollectorKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'accept_fee_collector' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Get the pending fee-collector G-address, if a handover is in progress.
+   *
+   * @returns The pending fee collector's G-address, or `null` if there is no
+   *          pending handover.
+   *
+   * @throws {Error} On RPC failure.
+   */
+  async getPendingFeeCollector(): Promise<string | null> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_pending_fee_collector' },
+      () => this.provider.simulateTransaction(this.buildSimulationTx('query_pending_fee_collector', [])),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get pending fee collector: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    if (!scVal) return null;
+    const native = scValToNative(scVal);
+    return native ? native.toString() : null;
   }
 
   /**
@@ -1974,7 +2542,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -1998,6 +2566,22 @@ export class OnboardingBridgeSDK {
       adminKeypair,
       options.nonce,
     );
+  }
+
+  /**
+   * Schedule an upgrade and wait for confirmation.
+   *
+   * Unlike {@link scheduleUpgrade}, this method returns the executable ledger
+   * decoded from the confirmed transaction's return value.
+   */
+  async scheduleUpgradeAndWait(
+    options: ScheduleUpgradeOptions,
+    adminKeypair: Keypair,
+  ): Promise<ConfirmedTransactionResult<{ executableAfterLedger: number }>> {
+    const result = await this.scheduleUpgrade(options, adminKeypair);
+    return this.waitForContractReturnValue(result, 'scheduleUpgrade', (returnValue) => ({
+      executableAfterLedger: this.decodeU32ReturnValue(returnValue),
+    }));
   }
 
   async executeUpgrade(
@@ -2040,7 +2624,7 @@ export class OnboardingBridgeSDK {
                 this.optionalNonceToScVal(options.nonce),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -2060,7 +2644,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -2132,7 +2716,7 @@ export class OnboardingBridgeSDK {
                 this.hexBytesToScVal(options.signature, 64, 'signature'),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -2152,7 +2736,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -2243,7 +2827,7 @@ export class OnboardingBridgeSDK {
             () => this.provider.sendTransaction(preparedTx),
           );
 
-          return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+          return { hash: response.hash, status: response.status === 'PENDING' ? 'pending' : 'failed' };
         } catch (error: any) {
           return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
         }
@@ -2300,7 +2884,7 @@ export class OnboardingBridgeSDK {
             { contractMethod: 'add_relayer' },
             () => this.provider.sendTransaction(preparedTx),
           );
-          return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+          return { hash: response.hash, status: response.status === 'PENDING' ? 'pending' : 'failed' };
         } catch (error: any) {
           return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
         }
@@ -2337,7 +2921,11 @@ export class OnboardingBridgeSDK {
             () => this.provider.getAccount(adminKeypair.publicKey()),
           );
           const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
-            .addOperation(this.contract.call('remove_relayer', xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex'))))
+            .addOperation(this.contract.call(
+              'remove_relayer',
+              xdr.ScVal.scvBytes(Buffer.from(options.pubkey, 'hex')),
+              this.optionalNonceToScVal(options.nonce),
+            ))
             .setTimeout(this.config.timeout ?? 30)
             .build();
           const preparedTx = await withRpcHook(
@@ -2353,7 +2941,7 @@ export class OnboardingBridgeSDK {
             { contractMethod: 'remove_relayer' },
             () => this.provider.sendTransaction(preparedTx),
           );
-          return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+          return { hash: response.hash, status: response.status === 'PENDING' ? 'pending' : 'failed' };
         } catch (error: any) {
           return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
         }
@@ -2380,11 +2968,15 @@ export class OnboardingBridgeSDK {
    * await sdk.setRelayerThreshold(2, adminKeypair);
    * ```
    */
-  async setRelayerThreshold(threshold: number, adminKeypair: Keypair): Promise<TransactionResult> {
+  async setRelayerThreshold(
+    threshold: number,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
     return withTransactionHooks(
       this.hooks,
       'setRelayerThreshold',
-      { threshold },
+      { threshold, nonce },
       async () => {
         try {
           const adminAccount = await withRpcHook(
@@ -2394,7 +2986,11 @@ export class OnboardingBridgeSDK {
             () => this.provider.getAccount(adminKeypair.publicKey()),
           );
           const tx = new TransactionBuilder(adminAccount, { fee: BASE_FEE, networkPassphrase: this.networkPassphrase })
-            .addOperation(this.contract.call('set_relayer_threshold', nativeToScVal(threshold, { type: 'u32' })))
+            .addOperation(this.contract.call(
+              'set_relayer_threshold',
+              nativeToScVal(threshold, { type: 'u32' }),
+              this.optionalNonceToScVal(nonce),
+            ))
             .setTimeout(this.config.timeout ?? 30)
             .build();
           const preparedTx = await withRpcHook(
@@ -2410,7 +3006,7 @@ export class OnboardingBridgeSDK {
             { contractMethod: 'set_relayer_threshold' },
             () => this.provider.sendTransaction(preparedTx),
           );
-          return { hash: response.hash, status: response.status === 'ERROR' ? 'failed' : 'pending' };
+          return { hash: response.hash, status: response.status === 'PENDING' ? 'pending' : 'failed' };
         } catch (error: any) {
           return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
         }
@@ -2490,25 +3086,11 @@ export class OnboardingBridgeSDK {
   }
 
   /**
-   * Slice a full list into a paginated page.
-   * @internal
-   */
-  private paginate<T>(items: T[], offset: number, limit: number): PaginatedResult<T> {
-    const page = items.slice(offset, offset + limit);
-    const nextOffset = offset + page.length;
-    const hasMore = nextOffset < items.length;
-    return {
-      items: page,
-      cursor: hasMore ? this.encodeCursor(nextOffset) : undefined,
-      hasMore,
-    };
-  }
-
-  /**
    * Return a paginated list of whitelisted asset contract addresses.
    *
    * Only whitelisted assets can be used in `fundCAddress` and batch calls.
-   * The full list is fetched from the contract and paginated client-side.
+   * Pagination happens on-chain: the cursor encodes the offset, and the
+   * contract only returns up to `limit` entries starting at that offset.
    *
    * @param cursor - Opaque cursor from a previous call.  Omit to start from page 1.
    * @param limit  - Maximum items per page.  Defaults to 20.
@@ -2529,129 +3111,103 @@ export class OnboardingBridgeSDK {
     cursor?: string,
     limit = 20,
   ): Promise<PaginatedResult<string>> {
+    if (!Number.isInteger(limit) || limit < 1) throw new RangeError('limit must be a positive integer');
+    const effectiveLimit = Math.min(limit, 100);
+    const offset = this.decodeCursor(cursor);
     const result = await withRpcHook(
       this.hooks,
       'simulateTransaction',
       { contractMethod: 'query_whitelisted_assets' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_whitelisted_assets', []),
+        this.buildSimulationTx('query_whitelisted_assets', [
+          nativeToScVal(offset, { type: 'u32' }),
+          nativeToScVal(effectiveLimit, { type: 'u32' }),
+        ]),
       ),
     );
     if ('error' in result && result.error) {
       throw new Error(`Failed to query whitelisted assets: ${result.error}`);
     }
     const scVal = (result as any).results?.[0]?.retval;
-    const all: string[] = scVal
+    const page: string[] = scVal
       ? (scValToNative(scVal) as Address[]).map((a) => a.toString())
       : [];
-    return this.paginate(all, this.decodeCursor(cursor), limit);
+    const nextOffset = offset + page.length;
+    return {
+      items: page,
+      cursor: page.length === effectiveLimit ? this.encodeCursor(nextOffset) : undefined,
+      hasMore: page.length === effectiveLimit,
+    };
   }
 
   /**
-   * Return a paginated list of fee-exempt addresses.
-   *
-   * Fee-exempt addresses pay zero protocol fee on every transfer regardless of
-   * the configured `fee_bps`.  The full list is fetched from the contract and
-   * paginated client-side.
-   *
-   * @param cursor - Opaque cursor from a previous call.  Omit to start from page 1.
-   * @param limit  - Maximum items per page.  Defaults to 20.
-   *
-   * @returns A {@link PaginatedResult} of address strings.
-   *
-   * @throws {Error} On RPC failure.
-   */
-  async getFeeExemptAddresses(
-    cursor?: string,
-    limit = 20,
-  ): Promise<PaginatedResult<string>> {
-    const result = await withRpcHook(
-      this.hooks,
-      'simulateTransaction',
-      { contractMethod: 'query_fee_exempt_addresses' },
-      () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_fee_exempt_addresses', []),
-      ),
-    );
-    if ('error' in result && result.error) {
-      throw new Error(`Failed to query fee-exempt addresses: ${result.error}`);
-    }
-    const scVal = (result as any).results?.[0]?.retval;
-    const all: string[] = scVal
-      ? (scValToNative(scVal) as Address[]).map((a) => a.toString())
-      : [];
-    return this.paginate(all, this.decodeCursor(cursor), limit);
-  }
-
-  /**
-   * Return a paginated list of addresses on the blocklist.
+   * Check whether an address is on the blocklist.
    *
    * Blocklisted addresses cannot receive funds via `fundCAddress` or batch calls.
    * Transfers to them are silently skipped (in batch) or rejected (single).
    *
-   * @param cursor - Opaque cursor from a previous call.  Omit to start from page 1.
-   * @param limit  - Maximum items per page.  Defaults to 20.
+   * There is no contract call that lists the full blocklist — only a
+   * per-address membership check (`query_is_blocked`) — so this replaces the
+   * previous (non-functional) `getBlocklistedAddresses` listing method. Build
+   * a full listing from indexer events instead, once blocklist events exist.
    *
-   * @returns A {@link PaginatedResult} of address strings.
+   * @param address - The address to check.
+   *
+   * @returns `true` if `address` is blocklisted.
    *
    * @throws {Error} On RPC failure.
    */
-  async getBlocklistedAddresses(
-    cursor?: string,
-    limit = 20,
-  ): Promise<PaginatedResult<string>> {
+  async isBlocked(address: string): Promise<boolean> {
+    assertAddress(address, 'address');
     const result = await withRpcHook(
       this.hooks,
       'simulateTransaction',
-      { contractMethod: 'query_blocklist' },
+      { contractMethod: 'query_is_blocked' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_blocklist', []),
+        this.buildSimulationTx('query_is_blocked', [new Address(address)]),
       ),
     );
     if ('error' in result && result.error) {
-      throw new Error(`Failed to query blocklist: ${result.error}`);
+      throw new Error(`Failed to query blocklist status: ${result.error}`);
     }
     const scVal = (result as any).results?.[0]?.retval;
-    const all: string[] = scVal
-      ? (scValToNative(scVal) as Address[]).map((a) => a.toString())
-      : [];
-    return this.paginate(all, this.decodeCursor(cursor), limit);
+    return scVal ? Boolean(scValToNative(scVal)) : false;
   }
 
   /**
-   * Return a paginated list of addresses on the allowlist.
+   * Check whether an address is on the allowlist.
    *
    * When the contract is in allowlist mode, only allowlisted addresses can
    * receive funds.  Non-allowlisted targets in batch calls are skipped and
    * their amounts refunded to the source.
    *
-   * @param cursor - Opaque cursor from a previous call.  Omit to start from page 1.
-   * @param limit  - Maximum items per page.  Defaults to 20.
+   * There is no contract call that lists the full allowlist — only a
+   * per-address membership check (`query_is_allowlisted`) — so this replaces
+   * the previous (non-functional) `getAllowlistedAddresses` listing method.
+   * Build a full listing from indexer events instead, once allowlist events
+   * exist.
    *
-   * @returns A {@link PaginatedResult} of address strings.
+   * @param address - The address to check.
+   *
+   * @returns `true` if `address` is allowlisted.
    *
    * @throws {Error} On RPC failure.
    */
-  async getAllowlistedAddresses(
-    cursor?: string,
-    limit = 20,
-  ): Promise<PaginatedResult<string>> {
+  async isAllowlisted(address: string): Promise<boolean> {
+    assertAddress(address, 'address');
     const result = await withRpcHook(
       this.hooks,
       'simulateTransaction',
-      { contractMethod: 'query_allowlist' },
+      { contractMethod: 'query_is_allowlisted' },
       () => this.provider.simulateTransaction(
-        this.buildSimulationTx('query_allowlist', []),
+        this.buildSimulationTx('query_is_allowlisted', [new Address(address)]),
       ),
     );
     if ('error' in result && result.error) {
-      throw new Error(`Failed to query allowlist: ${result.error}`);
+      throw new Error(`Failed to query allowlist status: ${result.error}`);
     }
     const scVal = (result as any).results?.[0]?.retval;
-    const all: string[] = scVal
-      ? (scValToNative(scVal) as Address[]).map((a) => a.toString())
-      : [];
-    return this.paginate(all, this.decodeCursor(cursor), limit);
+    return scVal ? Boolean(scValToNative(scVal)) : false;
   }
 
   /**
@@ -2689,6 +3245,13 @@ export class OnboardingBridgeSDK {
     const dummySource = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
     const dummyAccount = new Account(dummySource, '0');
 
+    const nonceScVal = options.nonce === undefined
+      ? xdr.ScVal.scvVoid()
+      : nativeToScVal(BigInt(options.nonce), { type: 'u64' });
+    const deadlineScVal = options.deadline === undefined
+      ? xdr.ScVal.scvVoid()
+      : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
+
     const tx = new TransactionBuilder(dummyAccount, {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
@@ -2697,11 +3260,13 @@ export class OnboardingBridgeSDK {
         this.contract.call(
           'fund_c_address',
           ...toScVals([
-            options.source,
-            options.target,
-            options.asset,
-            options.amount,
+            new Address(options.source),
+            new Address(options.target),
+            new Address(options.asset),
+            { value: BigInt(options.amount), type: 'i128' },
           ]),
+          nonceScVal,
+          deadlineScVal,
         ),
       )
       .setTimeout(this.config.timeout ?? 30)
@@ -2710,7 +3275,7 @@ export class OnboardingBridgeSDK {
     const result = await withRpcHook(
       this.hooks,
       'simulateTransaction',
-      { contractMethod: 'estimate_cost' },
+      { contractMethod: 'fund_c_address' },
       () => this.provider.simulateTransaction(tx),
     );
     const executionTimeMs = Date.now() - start;
@@ -2720,7 +3285,7 @@ export class OnboardingBridgeSDK {
     }
 
     // Extract fees from simulation result
-    // SorobanRpc.Api.SimulateTransactionSuccessResponse shape:
+    // rpc.Api.SimulateTransactionSuccessResponse shape:
     //   minResourceFee: string   (resource fee in stroops)
     //   cost: { cpuInsns, memBytes }
     const simResult = result as any;
@@ -2730,10 +3295,8 @@ export class OnboardingBridgeSDK {
         ? String(simResult.minResourceFee)
         : '0';
 
-    // The inclusion (base) fee is BASE_FEE plus any surge pricing
-    const inclusionFee = simResult.cost?.feeCharged != null
-      ? String(simResult.cost.feeCharged)
-      : BASE_FEE;
+    const feeStats = await this.provider.getFeeStats();
+    const inclusionFee = String(feeStats.sorobanInclusionFee?.p50 ?? BASE_FEE);
 
     // Total fee = inclusion + resource
     const totalFee = String(
@@ -2748,7 +3311,9 @@ export class OnboardingBridgeSDK {
     const minBalance = String(BigInt(2 + subentryCount) * baseReserve);
 
     return {
-      fee: totalFee,
+      fee: inclusionFee,
+      inclusionFee,
+      totalFee,
       minBalance,
       resourceFee,
       executionTimeMs,
@@ -2802,6 +3367,76 @@ export class OnboardingBridgeSDK {
       .build();
   }
 
+  private async waitForContractReturnValue<T>(
+    submitted: TransactionResult,
+    method: string,
+    decode: (returnValue: xdr.ScVal) => T,
+  ): Promise<ConfirmedTransactionResult<T>> {
+    if (submitted.status === 'failed') {
+      return { hash: submitted.hash, status: 'failed', error: submitted.error };
+    }
+
+    try {
+      const getTransaction = () =>
+        withRpcHook(
+          this.hooks,
+          'getTransaction',
+          { hash: submitted.hash, contractMethod: method },
+          () => this.provider.getTransaction(submitted.hash),
+        );
+      let response = await getTransaction();
+
+      while (response.status === 'NOT_FOUND') {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        response = await getTransaction();
+      }
+
+      if (response.status === 'FAILED') {
+        return {
+          hash: submitted.hash,
+          status: 'failed',
+          error: `Transaction ${submitted.hash} failed on chain`,
+        };
+      }
+
+      if (!response.returnValue) {
+        throw new Error(`Confirmed ${method} transaction did not include a return value`);
+      }
+
+      return {
+        hash: submitted.hash,
+        status: 'success',
+        ...decode(response.returnValue),
+      };
+    } catch (error: any) {
+      return {
+        hash: submitted.hash,
+        status: 'failed',
+        error: error.message || 'Failed while waiting for transaction confirmation',
+      };
+    }
+  }
+
+  private decodeU64ReturnValue(returnValue: xdr.ScVal): bigint {
+    const value = scValToNative(returnValue);
+    if (typeof value !== 'bigint' && typeof value !== 'number' && typeof value !== 'string') {
+      throw new Error('Expected a u64 transaction return value');
+    }
+    const decoded = BigInt(value);
+    if (decoded < 0n || decoded > 0xffff_ffff_ffff_ffffn) {
+      throw new Error('Transaction return value is outside the u64 range');
+    }
+    return decoded;
+  }
+
+  private decodeU32ReturnValue(returnValue: xdr.ScVal): number {
+    const value = this.decodeU64ReturnValue(returnValue);
+    if (value > 0xffff_ffffn) {
+      throw new Error('Transaction return value is outside the u32 range');
+    }
+    return Number(value);
+  }
+
   private async submitAdminWasmHashMutation(
     hookName: string,
     contractMethod: string,
@@ -2833,7 +3468,7 @@ export class OnboardingBridgeSDK {
                 this.optionalNonceToScVal(nonce),
               ),
             )
-            .setTimeout(30)
+            .setTimeout(this.config.timeout ?? 30)
             .build();
 
           const preparedTx = await withRpcHook(
@@ -2853,7 +3488,7 @@ export class OnboardingBridgeSDK {
 
           return {
             hash: response.hash,
-            status: response.status === 'ERROR' ? 'failed' : 'pending',
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
           };
         } catch (error: any) {
           return {
@@ -2880,7 +3515,11 @@ export class OnboardingBridgeSDK {
   }
 
   private metaFundParamsToScVal(params: MetaFundParams): xdr.ScVal {
-    return xdr.ScVal.scvMap([
+    // Soroban `ScMap` entries must be sorted by key (canonical XDR encoding);
+    // the host rejects maps whose keys are out of order. Build the entries
+    // via `scMapEntry` and sort them rather than relying on declaration order.
+    return this.sortedScMap([
+      this.scMapEntry('network_id', this.hexBytesToScVal(params.networkId, 32, 'networkId')),
       this.scMapEntry('source', new Address(params.source).toScVal()),
       this.scMapEntry('target', new Address(params.target).toScVal()),
       this.scMapEntry('asset', new Address(params.asset).toScVal()),
@@ -2897,6 +3536,22 @@ export class OnboardingBridgeSDK {
     });
   }
 
+  /**
+   * Sorts `ScMapEntry` values by their (symbol) key and wraps them in an
+   * `ScVal` map. Soroban's canonical XDR encoding requires map keys to be
+   * sorted; the host rejects maps whose keys are out of order. Use this
+   * (instead of `xdr.ScVal.scvMap` directly) for every struct encoder that
+   * builds an `ScMap` from field entries.
+   */
+  private sortedScMap(entries: xdr.ScMapEntry[]): xdr.ScVal {
+    const sorted = [...entries].sort((a, b) => {
+      const aKey = a.key().sym().toString();
+      const bKey = b.key().sym().toString();
+      return aKey < bKey ? -1 : aKey > bKey ? 1 : 0;
+    });
+    return xdr.ScVal.scvMap(sorted);
+  }
+
   private bytesToHex(value: unknown): string {
     if (typeof value === 'string') return value;
     if (value instanceof Uint8Array) return Buffer.from(value).toString('hex');
@@ -2908,19 +3563,10 @@ export class OnboardingBridgeSDK {
   }
 
   private feeTierToScVal(tier: FeeTier): xdr.ScVal {
-    return xdr.ScVal.scvMap([
-      new xdr.ScMapEntry({
-        key: xdr.ScVal.scvSymbol('fee_bps'),
-        val: nativeToScVal(tier.fee_bps, { type: 'u32' }),
-      }),
-      new xdr.ScMapEntry({
-        key: xdr.ScVal.scvSymbol('max_volume'),
-        val: nativeToScVal(BigInt(tier.max_volume), { type: 'i128' }),
-      }),
-      new xdr.ScMapEntry({
-        key: xdr.ScVal.scvSymbol('min_volume'),
-        val: nativeToScVal(BigInt(tier.min_volume), { type: 'i128' }),
-      }),
+    return this.sortedScMap([
+      this.scMapEntry('fee_bps', nativeToScVal(tier.fee_bps, { type: 'u32' })),
+      this.scMapEntry('max_volume', nativeToScVal(BigInt(tier.max_volume), { type: 'i128' })),
+      this.scMapEntry('min_volume', nativeToScVal(BigInt(tier.min_volume), { type: 'i128' })),
     ]);
   }
 }

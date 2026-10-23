@@ -76,11 +76,11 @@ fn update_asset_counters_overflow_returns_error_not_panic() {
 
 #[test]
 fn source_bridged_volume_overflow_returns_error_not_panic() {
-    let (env, bridge_id, _asset, source) = setup();
+    let (env, bridge_id, asset, source) = setup();
     env.as_contract(&bridge_id, || {
-        increment_source_bridged_volume(&env, &source, i128::MAX).unwrap();
+        increment_source_bridged_volume(&env, &source, &asset, i128::MAX).unwrap();
         assert_eq!(
-            increment_source_bridged_volume(&env, &source, 1),
+            increment_source_bridged_volume(&env, &source, &asset, 1),
             Err(BridgeError::Overflow)
         );
     });

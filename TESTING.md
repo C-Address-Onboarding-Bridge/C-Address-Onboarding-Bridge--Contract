@@ -434,10 +434,8 @@ cargo test --manifest-path indexer/Cargo.toml
 
 ## Relayer Tests
 
-The relayer is a TypeScript service under `relayer/`. It currently shares the
-repository TypeScript toolchain but has no dedicated test suite. Add tests around
-signature verification, replay protection inputs, chain listener parsing, and
-Soroban transaction submission boundaries.
+The relayer is a TypeScript service under `relayer/`. Its built-in self-tests
+cover payload, signature, replay, and listener behavior without live networks.
 
 Recommended coverage once test infrastructure exists:
 
@@ -449,10 +447,12 @@ Recommended coverage once test infrastructure exists:
 - Add integration tests only after local chain simulators or deterministic
   fixtures are available.
 
-Expected command shape:
+Run the committed checks with:
 
 ```bash
-npm test -- relayer
+npm --workspace relayer run typecheck
+npm --workspace relayer run self-test
+npm --workspace relayer run signer:self-test
 ```
 
 ## Running Tests

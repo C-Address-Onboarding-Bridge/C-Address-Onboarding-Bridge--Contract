@@ -11,9 +11,10 @@ import {
 import { assertAccountAddress, assertContractAddress } from './validate';
 import { withRpcRetry } from './retry';
 import {
-  SorobanRpc,
+  rpc,
   Contract,
   xdr,
+  Address,
   Keypair,
   nativeToScVal,
   scValToNative,
@@ -116,7 +117,7 @@ class ContractClient {
   private ttls: Record<CacheKey, number>;
   private sdk: any;
   private contract: Contract;
-  private provider: SorobanRpc.Server;
+  private provider: rpc.Server;
   private networkPassphrase: string;
 
   constructor(config: BridgeConfig, cache: ICacheProvider, ttls: Record<CacheKey, number>) {
@@ -126,7 +127,7 @@ class ContractClient {
     this.ttls = ttls;
     this.contract = new Contract(config.contractId);
     this.provider = withRpcRetry(
-      new SorobanRpc.Server(config.rpcUrl),
+      new rpc.Server(config.rpcUrl),
       config.retry,
     );
     this.networkPassphrase = config.networkPassphrase;
@@ -147,7 +148,8 @@ class ContractClient {
     }
 
     const scVal = (result as any).results?.[0]?.retval;
-    const fee = scVal ? Number(scValToNative(scVal)) : 0;
+    if (!scVal) throw new Error('query_fee_bps returned no value');
+    const fee = Number(scValToNative(scVal));
     await this.cache.set(cacheKey, fee, this.ttls[cacheKey]);
     return fee;
   }
@@ -167,7 +169,8 @@ class ContractClient {
     }
 
     const scVal = (result as any).results?.[0]?.retval;
-    const feeCollector = scVal ? scValToNative(scVal).toString() : '';
+    if (!scVal) throw new Error('query_fee_collector returned no value');
+    const feeCollector = scValToNative(scVal).toString();
     await this.cache.set(cacheKey, feeCollector, this.ttls[cacheKey]);
     return feeCollector;
   }
@@ -187,7 +190,8 @@ class ContractClient {
     }
 
     const scVal = (result as any).results?.[0]?.retval;
-    const admin = scVal ? scValToNative(scVal).toString() : '';
+    if (!scVal) throw new Error('query_admin returned no value');
+    const admin = scValToNative(scVal).toString();
     await this.cache.set(cacheKey, admin, this.ttls[cacheKey]);
     return admin;
   }
@@ -207,7 +211,8 @@ class ContractClient {
     }
 
     const scVal = (result as any).results?.[0]?.retval;
-    const initialized = scVal ? Boolean(scValToNative(scVal)) : false;
+    if (!scVal) throw new Error('query_is_initialized returned no value');
+    const initialized = Boolean(scValToNative(scVal));
     await this.cache.set(cacheKey, initialized, this.ttls[cacheKey]);
     return initialized;
   }
@@ -225,24 +230,31 @@ class ContractClient {
     preparedTx.sign(signer);
     const response = await this.provider.sendTransaction(preparedTx);
 
-    if (response.status !== 'ERROR') {
+    if (response.status === 'PENDING') {
       await Promise.all(CACHE_KEYS.map((key) => this.cache.delete(key)));
       void this.invalidateAfterConfirmation(response.hash);
     }
 
     return {
       hash: response.hash,
-      status: response.status === 'ERROR' ? 'failed' : 'pending',
+      status: response.status === 'PENDING' ? 'pending' : 'failed',
     };
   }
 
   private async invalidateAfterConfirmation(hash: string): Promise<void> {
     try {
       let result = await this.provider.getTransaction(hash);
-      while (result.status === 'NOT_FOUND') {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+      const maxAttempts = Math.max(1, (this.config.timeout ?? 30) * 2);
+      let attempts = 0;
+      while (result.status === 'NOT_FOUND' && attempts < maxAttempts) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 500);
+          if (typeof timer.unref === 'function') timer.unref();
+        });
+        attempts += 1;
         result = await this.provider.getTransaction(hash);
       }
+      if (result.status === 'NOT_FOUND') return;
       await Promise.all(CACHE_KEYS.map((key) => this.cache.delete(key)));
     } catch {
       // Cache was already invalidated on submission; confirmation invalidation
@@ -263,7 +275,14 @@ class ContractClient {
       .addOperation(
         this.contract.call(
           'fund_c_address',
-          ...toScVals([options.source, options.target, options.asset, options.amount]),
+          ...toScVals([
+            new Address(options.source),
+            new Address(options.target),
+            new Address(options.asset),
+            { value: BigInt(options.amount), type: 'i128' },
+          ]),
+          options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' }),
+          options.deadline === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.deadline), { type: 'u64' }),
         ),
       );
 
@@ -286,14 +305,16 @@ class ContractClient {
         this.contract.call(
           'fund_c_address_with_swap',
           ...toScVals([
-            options.source,
-            options.target,
-            options.sourceAsset,
-            options.targetAsset,
-            options.sourceAmount,
-            options.minTargetAmount,
-            options.swapRoute,
+            new Address(options.source),
+            new Address(options.target),
+            new Address(options.sourceAsset),
+            new Address(options.targetAsset),
+            { value: BigInt(options.sourceAmount), type: 'i128' },
+            { value: BigInt(options.minTargetAmount), type: 'i128' },
+            options.swapRoute.map((address: string) => new Address(address)),
           ]),
+          options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' }),
+          options.deadline === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.deadline), { type: 'u64' }),
         ),
       );
 
@@ -309,7 +330,10 @@ class ContractClient {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(
-        this.contract.call('withdraw_fees', ...toScVals([options.asset, options.amount]),
+        this.contract.call('withdraw_fees', ...toScVals([
+          new Address(options.asset),
+          { value: BigInt(options.amount), type: 'i128' },
+        ]),
           options.nonce === undefined ? xdr.ScVal.scvVoid() : nativeToScVal(BigInt(options.nonce), { type: 'u64' })),
       );
 
@@ -323,7 +347,7 @@ class ContractClient {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(
-        this.contract.call('set_fee_bps', ...toScVals([newFeeBps])),
+        this.contract.call('set_fee_bps', nativeToScVal(newFeeBps, { type: 'u32' }), xdr.ScVal.scvVoid()),
       );
 
     return this.submitMutation('setFee', tx, adminKeypair);
@@ -337,7 +361,7 @@ class ContractClient {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(
-        this.contract.call('set_fee_collector', ...toScVals([newFeeCollector])),
+        this.contract.call('set_fee_collector', ...toScVals([new Address(newFeeCollector)]), xdr.ScVal.scvVoid()),
       );
 
     return this.submitMutation('setFeeCollector', tx, adminKeypair);
@@ -351,7 +375,7 @@ class ContractClient {
       networkPassphrase: this.networkPassphrase,
     })
       .addOperation(
-        this.contract.call('set_admin', ...toScVals([newAdmin])),
+        this.contract.call('set_admin', ...toScVals([new Address(newAdmin)]), xdr.ScVal.scvVoid()),
       );
 
     return this.submitMutation('setAdmin', tx, adminKeypair);

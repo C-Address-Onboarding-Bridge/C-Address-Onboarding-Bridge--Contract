@@ -31,49 +31,95 @@ jobs:
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Stellar SDK
+        working-directory: sdk
+        run: npm install --no-save --package-lock=false --ignore-scripts @stellar/stellar-sdk@^13.0.0
+
       - name: Build smoke tests
         run: cargo build -p onboarding-bridge --release --features testutils
 
-      # Confirms the address passed to this workflow is actually a deployed
-      # contract on the target network. The Rust tests below exercise contract
-      # behaviour locally; only this step touches the live chain.
+      # Confirms the address resolves to a contract instance and simulates a
+      # read-only query against it. The Rust tests below exercise behavior locally.
       - name: Verify contract exists on ${{ inputs.network }}
         env:
           CONTRACT_ADDRESS: ${{ inputs.contract_address }}
           NETWORK: ${{ inputs.network }}
+        working-directory: sdk
         run: |
           set -euo pipefail
 
-          if ! printf '%s' "$CONTRACT_ADDRESS" | grep -qE '^C[A-Z2-7]{55}$'; then
-            echo "::error::'$CONTRACT_ADDRESS' is not a well-formed Soroban contract address."
-            exit 1
-          fi
+          node <<'NODE'
+          const {
+            Account,
+            Address,
+            Contract,
+            Networks,
+            TransactionBuilder,
+            rpc,
+            scValToNative,
+            xdr,
+          } = require('@stellar/stellar-sdk');
 
-          case "$NETWORK" in
-            testnet) RPC_URL="https://soroban-testnet.stellar.org" ;;
-            mainnet) RPC_URL="https://soroban-rpc.stellar.org" ;;
-            *) echo "::error::Unknown network '$NETWORK'."; exit 1 ;;
-          esac
+          async function main() {
+            const contractId = process.env.CONTRACT_ADDRESS;
+            const network = process.env.NETWORK;
+            const networkConfig = {
+              testnet: {
+                rpcUrl: 'https://soroban-testnet.stellar.org',
+                passphrase: Networks.TESTNET,
+              },
+              mainnet: {
+                rpcUrl: 'https://mainnet.sorobanrpc.com',
+                passphrase: Networks.PUBLIC,
+              },
+            }[network];
 
-          echo "Querying $RPC_URL for $CONTRACT_ADDRESS"
-          RESPONSE=$(curl -sS --fail-with-body --max-time 30 -X POST "$RPC_URL" \
-            -H 'Content-Type: application/json' \
-            -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getLedgerEntries\",\"params\":{\"keys\":[\"$(
-              printf '%s' "$CONTRACT_ADDRESS"
-            )\"]}}" || true)
+            if (!networkConfig) throw new Error(`Unknown network "${network}".`);
 
-          echo "$RESPONSE" | jq . || echo "$RESPONSE"
+            const contractAddress = Address.fromString(contractId);
+            const ledgerKey = xdr.LedgerKey.contractData(
+              new xdr.LedgerKeyContractData({
+                contract: contractAddress.toScAddress(),
+                key: xdr.ScVal.scvLedgerKeyContractInstance(),
+                durability: xdr.ContractDataDurability.persistent(),
+              }),
+            );
+            const server = new rpc.Server(networkConfig.rpcUrl);
+            const entryResponse = await server.getLedgerEntries(ledgerKey);
+            if (!entryResponse.entries?.length) {
+              throw new Error(`No deployed contract instance found for ${contractId} on ${network}.`);
+            }
 
-          # An empty `entries` array means nothing is stored at that address.
-          ENTRY_COUNT=$(echo "$RESPONSE" | jq '(.result.entries // []) | length' 2>/dev/null || echo 0)
-          if [ "$ENTRY_COUNT" -eq 0 ]; then
-            echo "::warning::RPC returned no ledger entries for $CONTRACT_ADDRESS on $NETWORK."
-            echo "::warning::This can mean the contract is not deployed, or that the RPC needs the"
-            echo "::warning::contract-instance ledger key rather than the raw address. Not failing"
-            echo "::warning::the job on this signal alone — see the contract checks below."
-          else
-            echo "Contract instance found on $NETWORK."
-          fi
+            const account = new Account(
+              'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+              '0',
+            );
+            const tx = new TransactionBuilder(account, {
+              fee: '100',
+              networkPassphrase: networkConfig.passphrase,
+            })
+              .addOperation(new Contract(contractId).call('query_is_initialized'))
+              .setTimeout(30)
+              .build();
+            const simulation = await server.simulateTransaction(tx);
+            if (simulation.error) throw new Error(`Contract simulation failed: ${simulation.error}`);
+            const initialized = simulation.results?.[0]?.retval;
+            if (!initialized || scValToNative(initialized) !== true) {
+              throw new Error(`${contractId} is not initialized on ${network}.`);
+            }
+            console.log(`Verified initialized contract ${contractId} on ${network}.`);
+          }
+
+          main().catch((error) => {
+            console.error(error.message || error);
+            process.exit(1);
+          });
+          NODE
 
       - name: Run smoke tests
         env:

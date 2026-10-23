@@ -7,13 +7,18 @@ async function main() {
   const version = process.env.VERSION || 'v0.0.0-dev';
   const commit = process.env.COMMIT_SHA || 'unknown';
 
-  const wasmPath = path.join(__dirname, '../target/wasm32-unknown-unknown/release/onboarding_bridge.wasm');
+  const wasmArg = process.argv[2];
+  if (!wasmArg) {
+    console.error('Usage: node scripts/sign-release.js <wasm-path>');
+    process.exit(1);
+  }
+  const wasmPath = path.resolve(process.cwd(), wasmArg);
   const registryDir = path.join(__dirname, '../registry');
   const registryPath = path.join(registryDir, 'releases.json');
 
   if (!fs.existsSync(wasmPath)) {
     console.error(`Error: WASM file not found at: ${wasmPath}`);
-    console.error('Please run "cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown" first.');
+    console.error('Please run "cargo build -p onboarding-bridge --release --target wasm32v1-none" first.');
     process.exit(1);
   }
 
@@ -87,7 +92,7 @@ async function main() {
   console.log(`Successfully published release ${version} to registry: ${registryPath}`);
 
   // Also write a standalone verification metadata file for the release
-  const releaseMetadataPath = path.join(registryDir, `onboarding_bridge-${version}-verification.json`);
+  const releaseMetadataPath = path.join(registryDir, `address_onboarding_bridge-${version}-verification.json`);
   fs.writeFileSync(releaseMetadataPath, JSON.stringify(newEntry, null, 2) + '\n');
   console.log(`Saved standalone verification metadata: ${releaseMetadataPath}`);
 }

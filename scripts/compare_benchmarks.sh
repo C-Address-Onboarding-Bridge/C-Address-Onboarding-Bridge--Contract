@@ -3,8 +3,8 @@
 # Usage: ./compare_benchmarks.sh <baseline.json> <current.json> [threshold_percent]
 #
 # Exit codes:
-#   0 - all within threshold
-#   1 - at least one function exceeded threshold
+#   0 - all baseline benchmarks are present and within threshold
+#   1 - a benchmark is missing, gas exceeded the threshold, or input is invalid
 
 set -euo pipefail
 
@@ -28,72 +28,68 @@ echo "Current:  $CURRENT"
 echo "Threshold: ${THRESHOLD}%"
 echo ""
 
-EXCEEDED=0
+python3 - "$BASELINE" "$CURRENT" "$THRESHOLD" <<'PY'
+import json
+import sys
 
-printf "%-30s %-12s %-12s %-12s %-10s %s\n" "Function/Variant" "Base CPU" "Curr CPU" "Base Mem" "Curr Mem" "Status"
-printf "%-30s %-12s %-12s %-12s %-10s %s\n" "------------------------------" "--------" "--------" "--------" "--------" "------"
+baseline_path, current_path, threshold_arg = sys.argv[1:]
+try:
+    threshold = float(threshold_arg)
+except ValueError:
+    sys.exit(f"ERROR: invalid threshold: {threshold_arg}")
 
-# Parse and compare each benchmark entry
-BASELINE_COUNT=$(python3 -c "
-import json, sys
-with open('$BASELINE') as f:
-    data = json.load(f)
-print(len(data.get('benchmark_results', [])))
-" 2>/dev/null || echo "0")
-
-CURRENT_COUNT=$(python3 -c "
-import json, sys
-with open('$CURRENT') as f:
-    data = json.load(f)
-print(len(data.get('benchmark_results', [])))
-" 2>/dev/null || echo "0")
-
-python3 -c "
-import json, sys
-
-with open('$BASELINE') as f:
+with open(baseline_path) as f:
     baseline = json.load(f)
-with open('$CURRENT') as f:
+with open(current_path) as f:
     current = json.load(f)
 
-base_map = {}
-for r in baseline.get('benchmark_results', []):
-    key = f\"{r['function']}/{r['variant']}\"
-    base_map[key] = r
+baseline_results = baseline.get("benchmark_results", [])
+current_results = current.get("benchmark_results", [])
+base_map = {
+    f"{result['function']}/{result['variant']}": result
+    for result in baseline_results
+}
+current_map = {
+    f"{result['function']}/{result['variant']}": result
+    for result in current_results
+}
 
-exceeded = 0
-threshold = float($THRESHOLD)
+print(f"{'Function/Variant':<30} {'Base CPU':>12} {'Curr CPU':>12} {'Base Mem':>12} {'Curr Mem':>10} Status")
+print(f"{'-' * 30:<30} {'-' * 8:>12} {'-' * 8:>12} {'-' * 8:>12} {'-' * 8:>10} {'-' * 6}")
 
-for r in current.get('benchmark_results', []):
-    key = f\"{r['function']}/{r['variant']}\"
+failed = False
+for key, result in current_map.items():
     if key not in base_map:
-        print(f'{key:<30} {\"N/A\":>12} {r[\"cpu_insns\"]:>12} {\"N/A\":>12} {r[\"mem_bytes\"]:>10} NEW')
+        print(f"{key:<30} {'N/A':>12} {result['cpu_insns']:>12} {'N/A':>12} {result['mem_bytes']:>10} NEW")
         continue
 
-    b = base_map[key]
-    base_cpu = b['cpu_insns']
-    curr_cpu = r['cpu_insns']
-    base_mem = b['mem_bytes']
-    curr_mem = r['mem_bytes']
-
-    cpu_change = ((curr_cpu - base_cpu) / base_cpu * 100) if base_cpu > 0 else 0
-    mem_change = ((curr_mem - base_mem) / base_mem * 100) if base_mem > 0 else 0
-
-    status = 'OK'
+    base = base_map[key]
+    cpu_change = ((result["cpu_insns"] - base["cpu_insns"]) / base["cpu_insns"] * 100) if base["cpu_insns"] > 0 else 0
+    mem_change = ((result["mem_bytes"] - base["mem_bytes"]) / base["mem_bytes"] * 100) if base["mem_bytes"] > 0 else 0
+    status = "OK"
     if cpu_change > threshold or mem_change > threshold:
-        status = f'REGRESSION (+{max(cpu_change, mem_change):.1f}%)'
-        exceeded = 1
+        status = f"REGRESSION (+{max(cpu_change, mem_change):.1f}%)"
+        failed = True
+    print(
+        f"{key:<30} {base['cpu_insns']:>12} {result['cpu_insns']:>12} "
+        f"{base['mem_bytes']:>12} {result['mem_bytes']:>10} {status}"
+    )
 
-    print(f'{key:<30} {base_cpu:>12} {curr_cpu:>12} {base_mem:>12} {curr_mem:>10} {status}')
+missing = sorted(set(base_map) - set(current_map))
+if missing:
+    failed = True
+    print(f"\nERROR: {len(missing)} baseline benchmark(s) are missing from the current run:")
+    for key in missing:
+        print(f"  - {key}")
 
-sys.exit(exceeded)
-" || EXCEEDED=1
+if len(current_results) < len(baseline_results):
+    failed = True
+    print(
+        f"\nERROR: current benchmark count ({len(current_results)}) is lower than "
+        f"baseline count ({len(baseline_results)})."
+    )
 
-echo ""
-if [ "$EXCEEDED" -eq 1 ]; then
-    echo "WARNING: One or more functions exceeded the ${THRESHOLD}% gas increase threshold!"
-    exit 1
-else
-    echo "All benchmarks within ${THRESHOLD}% threshold."
-    exit 0
-fi
+if failed:
+    sys.exit(1)
+print(f"\nAll benchmarks within {threshold:g}% threshold.")
+PY

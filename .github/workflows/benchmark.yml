@@ -10,9 +10,6 @@ env:
   CARGO_TERM_COLOR: always
 
 permissions:
-  contents: write
-  pages: write
-  id-token: write
   pull-requests: write
 
 jobs:
@@ -44,27 +41,34 @@ jobs:
 
       - name: Extract benchmark JSON
         run: |
-          # Extract the JSON block from test output
-          python3 -c "
-          import re, sys
-          with open('benchmark_output.txt') as f:
-              content = f.read()
-          match = re.search(r'\{[\s\S]*benchmark_results[\s\S]*\}', content)
-          if match:
-              print(match.group())
-          else:
-              print('{\"benchmark_results\": []}')
-          " > benchmark_results.json
+          python3 - <<'PY' > benchmark_results.json
+          import json
+          from pathlib import Path
+
+          output = Path("benchmark_output.txt").read_text()
+          begin = "===BENCHMARK_JSON_BEGIN==="
+          end = "===BENCHMARK_JSON_END==="
+          if output.count(begin) != 1 or output.count(end) != 1:
+              raise SystemExit("ERROR: benchmark JSON markers are missing or repeated")
+
+          payload = output.split(begin, 1)[1].split(end, 1)[0].strip()
+          try:
+              data = json.loads(payload)
+          except json.JSONDecodeError as error:
+              raise SystemExit(f"ERROR: benchmark JSON is invalid: {error}") from error
+          if not isinstance(data.get("benchmark_results"), list):
+              raise SystemExit("ERROR: benchmark_results must be a JSON array")
+          print(json.dumps(data, indent=2))
+          PY
           cat benchmark_results.json
 
       - name: Download previous benchmark results
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: previous_benchmark.json
-          key: benchmark-results-${{ github.ref_name }}
+          key: benchmark-results-main-${{ github.sha }}
           restore-keys: |
-            benchmark-results-main
-            benchmark-results-
+            benchmark-results-main-
 
       - name: Compare with previous benchmarks
         run: |
@@ -108,6 +112,13 @@ jobs:
       - name: Save benchmark results as baseline
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: cp benchmark_results.json previous_benchmark.json
+
+      - name: Save benchmark baseline cache
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: previous_benchmark.json
+          key: benchmark-results-main-${{ github.sha }}
 
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4
@@ -178,10 +189,10 @@ jobs:
               f.write(html)
           "
 
-      - name: Deploy to GitHub Pages
+      - name: Upload benchmark dashboard
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        uses: peaceiris/actions-gh-pages@v4
+        uses: actions/upload-artifact@v4
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./benchmark-dashboard
-          destination_dir: benchmarks
+          name: benchmark-dashboard
+          path: benchmark-dashboard
+          retention-days: 7

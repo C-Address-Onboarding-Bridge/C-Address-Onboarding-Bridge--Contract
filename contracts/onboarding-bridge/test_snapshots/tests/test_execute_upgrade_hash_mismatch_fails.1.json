@@ -42,7 +42,7 @@
               "function_name": "schedule_upgrade",
               "args": [
                 {
-                  "bytes": "0707070707070707070707070707070707070707070707070707070707070707"
+                  "bytes": "0101010101010101010101010101010101010101010101010101010101010101"
                 },
                 "void"
               ]
@@ -56,7 +56,7 @@
   ],
   "ledger": {
     "protocol_version": 22,
-    "sequence_number": 0,
+    "sequence_number": 17280,
     "timestamp": 0,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 0,
@@ -185,35 +185,6 @@
                             },
                             {
                               "key": {
-                                "symbol": "fee_bps"
-                              },
-                              "val": {
-                                "u32": 50
-                              }
-                            },
-                            {
-                              "key": {
-                                "symbol": "fee_collector"
-                              },
-                              "val": {
-                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                              }
-                            }
-                          ]
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "Config"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "map": [
-                            {
-                              "key": {
                                 "symbol": "allowlist_mode"
                               },
                               "val": {
@@ -230,6 +201,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "fee_collector"
+                              },
+                              "val": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "paused"
                               },
                               "val": {
@@ -237,6 +216,18 @@
                               }
                             }
                           ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "CurrentWasmHash"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "bytes": "0000000000000000000000000000000000000000000000000000000000000000"
                         }
                       },
                       {
@@ -295,10 +286,18 @@
                             },
                             {
                               "key": {
+                                "symbol": "expires_after_ledger"
+                              },
+                              "val": {
+                                "u32": 34560
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "new_wasm_hash"
                               },
                               "val": {
-                                "bytes": "0707070707070707070707070707070707070707070707070707070707070707"
+                                "bytes": "0101010101010101010101010101010101010101010101010101010101010101"
                               }
                             }
                           ]

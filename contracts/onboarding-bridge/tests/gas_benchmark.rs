@@ -508,7 +508,7 @@ fn bench_tiered_fee_lookup() -> BenchResult {
             },
         ],
     );
-    bridge.set_fee_tiers(&tiers);
+    bridge.set_fee_tiers(&tiers, &None);
 
     // Fund once to build volume so tiered lookup is exercised.
     bridge.fund_c_address(
@@ -566,6 +566,7 @@ fn main() {
         bench_tiered_fee_lookup(),
     ];
 
+    println!("===BENCHMARK_JSON_BEGIN===");
     println!("{{");
     println!("  \"benchmark_results\": [");
     for (i, r) in results.iter().enumerate() {
@@ -577,6 +578,7 @@ fn main() {
     }
     println!("  ]");
     println!("}}");
+    println!("===BENCHMARK_JSON_END===");
 }
 
 #[cfg(test)]

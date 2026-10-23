@@ -112,7 +112,7 @@ graph TD
 | Asset and pool lists | `query_is_pool_whitelisted` | Check whether a swap pool is whitelisted |
 | Tiered fees | `set_fee_tiers` | Configure volume-based fee tiers |
 | Tiered fees | `query_fee_tiers` | Read configured fee tiers |
-| Tiered fees | `query_current_tier` | Read the current fee tier for a source |
+| Tiered fees | `query_current_tier` | Read the current fee tier for a source and asset |
 | Cross-chain relay | `fund_c_address_crosschain` | Fund a C-address from an external chain event with relayer signatures |
 | Cross-chain relay | `add_relayer` | Add an authorized relayer public key |
 | Cross-chain relay | `remove_relayer` | Remove an authorized relayer public key |
@@ -268,15 +268,20 @@ graph LR
 A Rust service (axum HTTP server + SQLite) that:
 
 - Polls the Soroban RPC (`poller.rs`) for `OnboardingBridge` contract events
-  (`events.rs`) — funding, batch completion, fee withdrawals, admin changes.
+  (`events.rs`) — funding, batch completion, fee withdrawals, admin changes,
+  initialization, upgrade lifecycle, emergency migrations, and referral-rate
+  changes.
 - Persists every event to its own database (`db.rs`) so historical event
   data survives independently of the chain's own retention/pruning.
 - Delivers webhooks (`webhook.rs`) to subscribers (dashboards, alerting,
   accounting systems) whenever a new event is indexed, so consumers don't
   need to poll the chain themselves.
 
-Configured via `SOROBAN_RPC_URL`, `CONTRACT_ID`, `DATABASE_URL`, and
-`LISTEN_ADDR` environment variables (see `indexer/src/main.rs`).
+Configured via `SOROBAN_RPC_URL`, `CONTRACT_ID`, `DATABASE_URL`, `LISTEN_ADDR`,
+and `API_KEY` environment variables (see `indexer/src/main.rs`). Read-only
+endpoints are public; subscription creation/deletion and event replay require
+`Authorization: Bearer <API_KEY>`. CORS accepts requests from any origin, but
+does not replace API-key authentication.
 
 #### Relayer (`relayer/`)
 
@@ -293,6 +298,13 @@ etc.) rather than Stellar directly:
    aggregated signatures are submitted to the Soroban contract's
    `fund_c_address_crosschain` method via the SDK — no single relayer can
    authorize a cross-chain fund on its own.
+
+Before enabling relayers for an asset, the admin must whitelist it and seed
+its payout liquidity with `fund_crosschain_reserve`. Cross-chain payouts draw
+only from that reserve; their calculated fees are not credited as accrued fees
+because the payout call does not receive tokens. Use `query_crosschain_reserve`
+to monitor available liquidity and `withdraw_crosschain_reserve` to withdraw
+unused reserve funds.
 
 ### SDK (`sdk/`)
 
@@ -603,7 +615,7 @@ async function withdrawAccumulatedFees() {
 
 **Access control**
 - The admin keypair can change fee rate, fee collector, and admin address. Treat it with the same care as a root credential.
-- Rotate admin and fee collector keys periodically. Use `sdk.setAdmin()` and `sdk.setFeeCollector()` to perform the rotation atomically.
+- Rotate admin and fee collector keys periodically. Prefer the two-step handover — `sdk.proposeNewAdmin()` / `sdk.acceptAdmin()` and `sdk.proposeNewFeeCollector()` / `sdk.acceptFeeCollector()` — over `sdk.setAdmin()` / `sdk.setFeeCollector()`, since the two-step path proves the new key is usable before the role is moved.
 
 **Contract upgrades**
 - Keep the deployed WASM hash in version control alongside the source. Before upgrading, verify the new WASM hash corresponds to audited source.
@@ -653,11 +665,13 @@ import { Keypair, Networks } from '@stellar/stellar-sdk';
 
 const sdk = new OnboardingBridgeSDK({
   contractId: 'CA...', // deployed contract C-address
-  rpcUrl: 'https://soroban-mainnet.stellar.org',
+  rpcUrl: 'https://mainnet.sorobanrpc.com',
   networkPassphrase: Networks.PUBLIC,
   timeout: 30, // optional, seconds
 });
 ```
+
+For mainnet, choose a Soroban RPC provider; the Stellar Development Foundation does not operate a public mainnet endpoint.
 
 ### Funding a C-Address
 
@@ -750,11 +764,19 @@ const adminKeypair = Keypair.fromSecret(process.env.ADMIN_SECRET!);
 // Update fee rate (max 1000 bps)
 await sdk.setFee(75, adminKeypair);
 
-// Rotate fee collector
-await sdk.setFeeCollector('G...newCollector', adminKeypair);
+// Rotate fee collector or admin: prefer the two-step propose/accept handover
+// below over setFeeCollector()/setAdmin(), which transfer the role
+// immediately and unrecoverably if the new key turns out to be unusable.
 
-// Transfer admin role
-await sdk.setAdmin('G...newAdmin', adminKeypair);
+// Propose + accept a fee-collector handover
+await sdk.proposeNewFeeCollector('G...newCollector', adminKeypair);
+const pendingCollector = await sdk.getPendingFeeCollector(); // 'G...newCollector'
+await sdk.acceptFeeCollector(newCollectorKeypair); // signed by the new collector
+
+// Propose + accept an admin handover
+await sdk.proposeNewAdmin('G...newAdmin', adminKeypair);
+const pendingAdmin = await sdk.getPendingAdmin(); // 'G...newAdmin'
+await sdk.acceptAdmin(newAdminKeypair); // signed by the new admin
 
 // Recover accidentally sent tokens
 await sdk.reclaimTokens(
@@ -783,7 +805,7 @@ await sdk.withdrawFees(
 
 ```ts
 const offramp = new OffRampIntegration({
-  moonpayApiKey: process.env.MOONPAY_API_KEY,
+  moonpayApiKey: process.env.MOONPAY_KEY,
   transakApiKey: process.env.TRANSAK_API_KEY,
   testMode: false, // true → sandbox URLs
 });
@@ -863,3 +885,14 @@ for (const event of events) {
 ## License
 
 MIT
+
+## Handsoff notes
+
+<!-- handsoff-issue-680 -->
+- #680: sdk: add wrappers for pause/unpause and blocklist/allowlist administration
+
+<!-- handsoff-issue-681 -->
+- #681: sdk: add wrappers for asset whitelist and limit configuration
+
+<!-- handsoff-issue-682 -->
+- #682: sdk: add register_meta_signer and a helper that builds the exact meta-tx payload the contract verifies

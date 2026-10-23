@@ -31,9 +31,10 @@
  * | {@link OnboardingBridgeSDK} | Main SDK class — wraps all contract calls |
  * | {@link OffRampIntegration} | Moonpay / Transak / Ramp / Banxa URL builder + CEX memo helpers |
  * | `assertAccountAddress` | Validates a G-address; throws on invalid input |
+ * | `assertAddress` | Validates a G-address or C-address; throws on invalid input |
  * | `assertContractAddress` | Validates a C-address; throws on invalid input |
  * | `withRetry` | Low-level retry wrapper for arbitrary async functions |
- * | `withRpcRetry` | Wraps a `SorobanRpc.Server` with automatic retries |
+ * | `withRpcRetry` | Wraps an `rpc.Server` with automatic retries |
  * | `isRetryableRpcError` | Classifies an error as transient (worth retrying) |
  * | `computeBackoffDelay` | Computes exponential backoff delay with optional jitter |
  * | `VIEW_RETRY_POLICY` | Default retry policy for idempotent read calls |
@@ -51,9 +52,10 @@
  * @packageDocumentation
  */
 
-export { OnboardingBridgeSDK, BATCH_TX_LIMIT, BASE_RESERVE_STROOPS } from './bridge';
+export { OnboardingBridgeSDK, BATCH_TX_LIMIT, BASE_RESERVE_STROOPS, computeCommitmentHash } from './bridge';
+export type { CommitmentHashOptions } from './bridge';
 export { OffRampIntegration } from './offramp';
-export { assertAccountAddress, assertContractAddress } from './validate';
+export { assertAccountAddress, assertAddress, assertContractAddress } from './validate';
 export { CachedContractClient } from './cachedBridge';
 export type { CacheOptions, CacheKey } from './cachedBridge';
 export { InMemoryCache } from './cache';
@@ -89,7 +91,10 @@ export type {
   Unsubscribe,
   CAddressFundedEvent,
   FeesWithdrawnEvent,
-  AdminChangedEvent,
+  AdminProposedEvent,
+  AdminTransferredEvent,
+  FeeCollectorTransferProposedEvent,
+  FeeCollectorTransferredEvent,
   MetaFundExecutedEvent,
   GenericBridgeEvent,
 } from './events';

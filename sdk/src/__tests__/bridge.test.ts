@@ -1,7 +1,7 @@
 import { OnboardingBridgeSDK, BASE_RESERVE_STROOPS } from "../bridge";
 import { OffRampIntegration } from "../offramp";
 import {
-  SorobanRpc,
+  rpc,
   Contract,
   scValToNative,
   xdr,
@@ -12,7 +12,7 @@ import {
 } from "@stellar/stellar-sdk";
 
 jest.mock("@stellar/stellar-sdk", () => ({
-  SorobanRpc: {
+  rpc: {
     Server: jest.fn(),
   },
   Contract: jest.fn().mockImplementation(() => ({
@@ -107,11 +107,12 @@ describe("OnboardingBridgeSDK", () => {
       sendTransaction: jest
         .fn()
         .mockResolvedValue({ hash: "mock_tx_hash", status: "PENDING" }),
+      getTransaction: jest.fn(),
       simulateTransaction: jest.fn().mockResolvedValue({}),
       getLedgerEntries: jest.fn().mockResolvedValue(ledgerEntriesFor(0)),
     };
 
-    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    (rpc.Server as jest.Mock).mockImplementation(() => mockProvider);
     sdk = new OnboardingBridgeSDK(CONFIG);
   });
 
@@ -227,8 +228,163 @@ describe("OnboardingBridgeSDK", () => {
     });
   });
 
+  describe("fundCAddressTimelocked", () => {
+    it("passes nonce and deadline to contract.call when provided", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      const result = await sdk.fundCAddressTimelocked(
+        {
+          source: MOCK_ADDRESS,
+          target: MOCK_ASSET,
+          asset: MOCK_ASSET,
+          amount: "1000",
+          releaseTime: 2000000000,
+          cliffTime: 1900000000,
+          nonce: 42,
+          deadline: 1234567890,
+        },
+        mockKeypair,
+      );
+
+      expect(result.status).toBe("pending");
+      // 1 method name + 6 base args + 2 optional args = 9 total
+      expect(contract.call).toHaveBeenCalledWith(
+        "fund_c_address_timelocked",
+        expect.anything(), // source
+        expect.anything(), // target
+        expect.anything(), // asset
+        expect.anything(), // amount
+        expect.anything(), // releaseTime
+        expect.anything(), // cliffTime
+        expect.anything(), // nonce
+        expect.anything(), // deadline
+      );
+    });
+
+    it("omits nonce and deadline (scvVoid) when not provided", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      const result = await sdk.fundCAddressTimelocked(
+        {
+          source: MOCK_ADDRESS,
+          target: MOCK_ASSET,
+          asset: MOCK_ASSET,
+          amount: "1000",
+          releaseTime: 2000000000,
+        },
+        mockKeypair,
+      );
+
+      expect(result.status).toBe("pending");
+      expect(contract.call).toHaveBeenCalledWith(
+        "fund_c_address_timelocked",
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it("returns the confirmed timelock ID", async () => {
+      mockProvider.getTransaction.mockResolvedValue({
+        status: "SUCCESS",
+        returnValue: {},
+      });
+      (scValToNative as jest.Mock).mockReturnValueOnce(12n);
+
+      const result = await sdk.fundCAddressTimelockedAndWait(
+        {
+          source: MOCK_ADDRESS,
+          target: MOCK_ASSET,
+          asset: MOCK_ASSET,
+          amount: "1000",
+          releaseTime: 2000000000,
+        },
+        mockKeypair,
+      );
+
+      expect(result).toEqual({
+        hash: "mock_tx_hash",
+        status: "success",
+        timelockId: 12n,
+      });
+      expect(mockProvider.getTransaction).toHaveBeenCalledWith("mock_tx_hash");
+    });
+  });
+
+  describe("fundCAddressWithSwap", () => {
+    it("passes nonce and deadline to contract.call when provided", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      const result = await sdk.fundCAddressWithSwap(
+        {
+          source: MOCK_ADDRESS,
+          target: MOCK_ASSET,
+          sourceAsset: MOCK_ASSET,
+          targetAsset: MOCK_ASSET,
+          sourceAmount: "1000",
+          minTargetAmount: "900",
+          swapRoute: [MOCK_ASSET],
+          nonce: 42,
+          deadline: 1234567890,
+        },
+        mockKeypair,
+      );
+
+      expect(result.status).toBe("pending");
+      // 1 method name + 7 base args + 2 optional args = 10 total
+      expect(contract.call).toHaveBeenCalledWith(
+        "fund_c_address_with_swap",
+        expect.anything(), // source
+        expect.anything(), // target
+        expect.anything(), // sourceAsset
+        expect.anything(), // targetAsset
+        expect.anything(), // sourceAmount
+        expect.anything(), // minTargetAmount
+        expect.anything(), // swapRoute
+        expect.anything(), // nonce
+        expect.anything(), // deadline
+      );
+    });
+
+    it("omits nonce and deadline (scvVoid) when not provided", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      const result = await sdk.fundCAddressWithSwap(
+        {
+          source: MOCK_ADDRESS,
+          target: MOCK_ASSET,
+          sourceAsset: MOCK_ASSET,
+          targetAsset: MOCK_ASSET,
+          sourceAmount: "1000",
+          minTargetAmount: "900",
+          swapRoute: [MOCK_ASSET],
+        },
+        mockKeypair,
+      );
+
+      expect(result.status).toBe("pending");
+      expect(contract.call).toHaveBeenCalledWith(
+        "fund_c_address_with_swap",
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
   describe("fundCAddressWithReferral", () => {
-    it("submits fund_c_address_with_referral", async () => {
+    it("submits fund_c_address_with_referral with all contract arguments", async () => {
       const result = await sdk.fundCAddressWithReferral(
         {
           source: MOCK_ADDRESS,
@@ -236,6 +392,8 @@ describe("OnboardingBridgeSDK", () => {
           asset: MOCK_ASSET,
           amount: "1000",
           referrer: MOCK_ADDRESS,
+          nonce: 7,
+          deadline: 123456,
         },
         mockKeypair,
       );
@@ -244,6 +402,8 @@ describe("OnboardingBridgeSDK", () => {
       expect(result.status).toBe("pending");
       expect(contract.call).toHaveBeenCalledWith(
         "fund_c_address_with_referral",
+        expect.anything(),
+        expect.anything(),
         expect.anything(),
         expect.anything(),
         expect.anything(),
@@ -277,6 +437,33 @@ describe("OnboardingBridgeSDK", () => {
         expect.anything(),
         expect.anything(),
       );
+    });
+
+    it("returns the confirmed commitment ID", async () => {
+      mockProvider.getTransaction.mockResolvedValue({
+        status: "SUCCESS",
+        returnValue: {},
+      });
+      (scValToNative as jest.Mock).mockReturnValueOnce(7n);
+
+      const result = await sdk.commitFundAndWait(
+        {
+          source: MOCK_ADDRESS,
+          target: MOCK_ASSET,
+          asset: MOCK_ASSET,
+          amount: "1000",
+          amountHash: "ab".repeat(32),
+          deadline: 123456,
+        },
+        mockKeypair,
+      );
+
+      expect(result).toEqual({
+        hash: "mock_tx_hash",
+        status: "success",
+        commitmentId: 7n,
+      });
+      expect(mockProvider.getTransaction).toHaveBeenCalledWith("mock_tx_hash");
     });
   });
 
@@ -422,6 +609,33 @@ describe("OnboardingBridgeSDK", () => {
       expect(results[1].hash).toBe("tx_hash_2");
       expect(results[2].hash).toBe("tx_hash_3");
       results.forEach((r) => expect(r.status).toBe("pending"));
+    });
+
+    it("increments nonces and confirms each chunk before submitting the next", async () => {
+      const targets = Array(101).fill(MOCK_ASSET);
+      const amounts = Array(101).fill("100");
+      const submissionSequence: string[] = [];
+      mockProvider.sendTransaction.mockImplementation(async () => {
+        submissionSequence.push("send");
+        return { hash: "nonce_tx", status: "PENDING" };
+      });
+      mockProvider.getTransaction.mockImplementation(async () => {
+        submissionSequence.push("confirm");
+        return { status: "SUCCESS" };
+      });
+
+      const results = await sdk.batchFundCAddresses(
+        { source: MOCK_ADDRESS, targets, amounts, asset: MOCK_ASSET, nonce: 7 },
+        mockKeypair,
+      );
+
+      const nonceValues = (nativeToScVal as jest.Mock).mock.calls
+        .filter(([, options]) => options?.type === "u64")
+        .map(([value]) => value);
+      expect(nonceValues).toEqual([7n, 8n]);
+      expect(submissionSequence).toEqual(["send", "confirm", "send"]);
+      expect(results).toHaveLength(2);
+      expect(results.every((result) => result.status === "pending")).toBe(true);
     });
 
     it("does not split when targets count equals BATCH_TX_LIMIT exactly", async () => {
@@ -673,7 +887,7 @@ describe("OnboardingBridgeSDK", () => {
 
   describe("setLoyaltyToken", () => {
     it("submits set_loyalty_token", async () => {
-      const result = await sdk.setLoyaltyToken(MOCK_ASSET, "10", mockKeypair);
+      const result = await sdk.setLoyaltyToken(MOCK_ASSET, "10", mockKeypair, 123);
 
       const contract = (Contract as jest.Mock).mock.results[0].value;
       expect(result.status).toBe("pending");
@@ -681,7 +895,9 @@ describe("OnboardingBridgeSDK", () => {
         "set_loyalty_token",
         expect.anything(),
         expect.anything(),
+        expect.anything(),
       );
+      expect(nativeToScVal).toHaveBeenCalledWith(BigInt(123), { type: "u64" });
     });
   });
 
@@ -690,6 +906,7 @@ describe("OnboardingBridgeSDK", () => {
       const result = await sdk.setFeeTiers(
         [{ min_volume: "0", max_volume: "1000", fee_bps: 50 }],
         mockKeypair,
+        123,
       );
 
       const contract = (Contract as jest.Mock).mock.results[0].value;
@@ -697,7 +914,9 @@ describe("OnboardingBridgeSDK", () => {
       expect(contract.call).toHaveBeenCalledWith(
         "set_fee_tiers",
         expect.anything(),
+        expect.anything(),
       );
+      expect(nativeToScVal).toHaveBeenCalledWith(BigInt(123), { type: "u64" });
     });
   });
 
@@ -745,6 +964,110 @@ describe("OnboardingBridgeSDK", () => {
     });
   });
 
+  describe("proposeNewAdmin", () => {
+    it("returns pending status on success", async () => {
+      const result = await sdk.proposeNewAdmin(MOCK_ADDRESS, mockKeypair);
+
+      expect(result.status).toBe("pending");
+    });
+
+    it("passes nonce to contract.call when provided", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      const result = await sdk.proposeNewAdmin(MOCK_ADDRESS, mockKeypair, 789);
+
+      expect(result.status).toBe("pending");
+      expect(contract.call).toHaveBeenCalledWith(
+        "propose_new_admin",
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
+  describe("acceptAdmin", () => {
+    it("returns pending status on success, signed by the pending admin", async () => {
+      const result = await sdk.acceptAdmin(mockKeypair);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith("accept_admin");
+      expect(result.status).toBe("pending");
+    });
+  });
+
+  describe("getPendingAdmin", () => {
+    it("returns the pending admin address when one is set", async () => {
+      (scValToNative as jest.Mock).mockReturnValue({ toString: () => MOCK_ADDRESS });
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const result = await sdk.getPendingAdmin();
+
+      expect(result).toBe(MOCK_ADDRESS);
+    });
+
+    it("returns null when there is no pending admin", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+
+      const result = await sdk.getPendingAdmin();
+
+      expect(result).toBeNull();
+    });
+  });
+
+  describe("proposeNewFeeCollector", () => {
+    it("returns pending status on success", async () => {
+      const result = await sdk.proposeNewFeeCollector(MOCK_ADDRESS, mockKeypair);
+
+      expect(result.status).toBe("pending");
+    });
+
+    it("passes nonce to contract.call when provided", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      const result = await sdk.proposeNewFeeCollector(MOCK_ADDRESS, mockKeypair, 321);
+
+      expect(result.status).toBe("pending");
+      expect(contract.call).toHaveBeenCalledWith(
+        "propose_new_fee_collector",
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+  });
+
+  describe("acceptFeeCollector", () => {
+    it("returns pending status on success, signed by the pending collector", async () => {
+      const result = await sdk.acceptFeeCollector(mockKeypair);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith("accept_fee_collector");
+      expect(result.status).toBe("pending");
+    });
+  });
+
+  describe("getPendingFeeCollector", () => {
+    it("returns the pending fee collector address when one is set", async () => {
+      (scValToNative as jest.Mock).mockReturnValue({ toString: () => MOCK_ADDRESS });
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const result = await sdk.getPendingFeeCollector();
+
+      expect(result).toBe(MOCK_ADDRESS);
+    });
+
+    it("returns null when there is no pending fee collector", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+
+      const result = await sdk.getPendingFeeCollector();
+
+      expect(result).toBeNull();
+    });
+  });
+
   describe("timelocked upgrades", () => {
     const wasmHash = "a".repeat(64);
 
@@ -761,6 +1084,26 @@ describe("OnboardingBridgeSDK", () => {
         expect.anything(),
         expect.anything(),
       );
+    });
+
+    it("returns the confirmed executable ledger", async () => {
+      mockProvider.getTransaction.mockResolvedValue({
+        status: "SUCCESS",
+        returnValue: {},
+      });
+      (scValToNative as jest.Mock).mockReturnValueOnce(1234);
+
+      const result = await sdk.scheduleUpgradeAndWait(
+        { newWasmHash: wasmHash, nonce: 1 },
+        mockKeypair,
+      );
+
+      expect(result).toEqual({
+        hash: "mock_tx_hash",
+        status: "success",
+        executableAfterLedger: 1234,
+      });
+      expect(mockProvider.getTransaction).toHaveBeenCalledWith("mock_tx_hash");
     });
 
     it("submits execute_upgrade", async () => {
@@ -968,12 +1311,28 @@ describe("OnboardingBridgeSDK", () => {
   describe("queryLoyaltyToken", () => {
     it("returns loyalty token config from simulation result", async () => {
       const config = { token: MOCK_ASSET, amount_per_fund: "10" };
-      (scValToNative as jest.Mock).mockReturnValue(config);
+      (scValToNative as jest.Mock).mockReturnValue([MOCK_ASSET, 10n]);
       mockProvider.simulateTransaction.mockResolvedValue({
         results: [{ retval: {} }],
       });
 
-      await expect(sdk.queryLoyaltyToken()).resolves.toBe(config);
+      await expect(sdk.queryLoyaltyToken()).resolves.toEqual(config);
+    });
+
+    it("returns null when the contract has no loyalty token", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({
+        error: "HostError: Error(Contract, #14)",
+      });
+
+      await expect(sdk.queryLoyaltyToken()).resolves.toBeNull();
+    });
+
+    it("throws for other contract errors", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({
+        error: "HostError: Error(Contract, #10)",
+      });
+
+      await expect(sdk.queryLoyaltyToken()).rejects.toThrow("Failed to get loyalty token");
     });
   });
 
@@ -997,7 +1356,22 @@ describe("OnboardingBridgeSDK", () => {
         results: [{ retval: {} }],
       });
 
-      await expect(sdk.queryCurrentTier(MOCK_ADDRESS)).resolves.toBe(tier);
+      await expect(sdk.queryCurrentTier(MOCK_ADDRESS, MOCK_ASSET)).resolves.toBe(tier);
+
+      expect(Address).toHaveBeenNthCalledWith(1, MOCK_ADDRESS);
+      expect(Address).toHaveBeenNthCalledWith(2, MOCK_ASSET);
+      expect((sdk as any).contract.call).toHaveBeenCalledWith(
+        "query_current_tier",
+        {},
+        {},
+      );
+    });
+
+    it("rejects an invalid asset address", async () => {
+      await expect(sdk.queryCurrentTier(MOCK_ADDRESS, "not-a-contract")).rejects.toThrow(
+        'Invalid contract address for "asset"',
+      );
+      expect(mockProvider.simulateTransaction).not.toHaveBeenCalled();
     });
   });
 
@@ -1110,10 +1484,42 @@ describe("OnboardingBridgeSDK", () => {
     });
   });
 
+  describe("getWhitelistedAssets", () => {
+    it("passes offset/limit to query_whitelisted_assets and paginates on-chain", async () => {
+      (scValToNative as jest.Mock).mockReturnValue([
+        { toString: () => MOCK_ASSET },
+      ]);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const page = await sdk.getWhitelistedAssets(undefined, 1);
+
+      expect(nativeToScVal).toHaveBeenCalledWith(0, { type: "u32" });
+      expect(nativeToScVal).toHaveBeenCalledWith(1, { type: "u32" });
+      expect(page.items).toEqual([MOCK_ASSET]);
+      // A full page (length === limit) means there may be more on-chain.
+      expect(page.hasMore).toBe(true);
+      expect(page.cursor).toBeDefined();
+    });
+
+    it("reports hasMore=false when the contract returns fewer than `limit` entries", async () => {
+      (scValToNative as jest.Mock).mockReturnValue([]);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const page = await sdk.getWhitelistedAssets(undefined, 20);
+
+      expect(page.items).toEqual([]);
+      expect(page.hasMore).toBe(false);
+      expect(page.cursor).toBeUndefined();
+    });
+  });
+
   describe("getAllBalances", () => {
-    it("returns a record of asset → balance strings", async () => {
-      const mockMap = new Map([[MOCK_ASSET, BigInt(1000)]]);
-      (scValToNative as jest.Mock).mockReturnValue(mockMap);
+    it("returns a record of asset → balance strings from a plain object", async () => {
+      (scValToNative as jest.Mock).mockReturnValue({ [MOCK_ASSET]: BigInt(1000) });
       mockProvider.simulateTransaction.mockResolvedValue({
         results: [{ retval: {} }],
       });
@@ -1122,6 +1528,41 @@ describe("OnboardingBridgeSDK", () => {
 
       expect(result).toEqual({ [MOCK_ASSET]: "1000" });
       expect(mockProvider.simulateTransaction).toHaveBeenCalled();
+    });
+
+    it("decodes a real scvMap into balance strings", async () => {
+      const stellarSdk = jest.requireActual<typeof import("@stellar/stellar-sdk")>(
+        "@stellar/stellar-sdk",
+      );
+      const scvMap = stellarSdk.xdr.ScVal.scvMap([
+        new stellarSdk.xdr.ScMapEntry({
+          key: stellarSdk.xdr.ScVal.scvAddress(
+            stellarSdk.Address.fromString(MOCK_ASSET).toScAddress(),
+          ),
+          val: stellarSdk.nativeToScVal(1000n, { type: "i128" }),
+        }),
+      ]);
+      (scValToNative as jest.Mock).mockImplementationOnce(stellarSdk.scValToNative);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: scvMap }],
+      });
+
+      const result = await sdk.getAllBalances([MOCK_ASSET]);
+
+      expect(result).toEqual({ [MOCK_ASSET]: "1000" });
+    });
+
+    it("also supports Map values", async () => {
+      (scValToNative as jest.Mock).mockReturnValue(
+        new Map([[MOCK_ASSET, BigInt(1000)]]),
+      );
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const result = await sdk.getAllBalances([MOCK_ASSET]);
+
+      expect(result).toEqual({ [MOCK_ASSET]: "1000" });
     });
 
     it("returns empty object when no results", async () => {
@@ -1140,6 +1581,29 @@ describe("OnboardingBridgeSDK", () => {
       await expect(sdk.getAllBalances([MOCK_ASSET])).rejects.toThrow(
         "Failed to get all balances",
       );
+    });
+  });
+
+  describe("read query address arguments", () => {
+    it("wraps every address parameter in Address before building the simulation", async () => {
+      await sdk.getCAddressBalance(MOCK_ASSET, MOCK_ASSET);
+      await sdk.getFeeBalance(MOCK_ASSET);
+      await sdk.getContractBalance(MOCK_ASSET);
+      await sdk.getAllBalances([MOCK_ASSET, MOCK_ASSET]);
+      await sdk.queryCurrentTier(MOCK_ADDRESS);
+      await sdk.isBlocked(MOCK_ADDRESS);
+      await sdk.isAllowlisted(MOCK_ASSET);
+
+      expect(Address).toHaveBeenNthCalledWith(1, MOCK_ASSET);
+      expect(Address).toHaveBeenNthCalledWith(2, MOCK_ASSET);
+      expect(Address).toHaveBeenNthCalledWith(3, MOCK_ASSET);
+      expect(Address).toHaveBeenNthCalledWith(4, MOCK_ASSET);
+      expect(Address).toHaveBeenNthCalledWith(5, MOCK_ASSET);
+      expect(Address).toHaveBeenNthCalledWith(6, MOCK_ASSET);
+      expect(Address).toHaveBeenNthCalledWith(7, MOCK_ADDRESS);
+      expect(Address).toHaveBeenNthCalledWith(8, MOCK_ADDRESS);
+      expect(Address).toHaveBeenNthCalledWith(9, MOCK_ASSET);
+      expect(Address).toHaveBeenCalledTimes(9);
     });
   });
 
@@ -1285,11 +1749,18 @@ describe("OnboardingBridgeSDK", () => {
   describe("removeRelayer", () => {
     it("returns pending status on success", async () => {
       const result = await sdk.removeRelayer(
-        { pubkey: "a".repeat(64) },
+        { pubkey: "a".repeat(64), nonce: 123 },
         mockKeypair,
       );
 
       expect(result.status).toBe("pending");
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith(
+        "remove_relayer",
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(nativeToScVal).toHaveBeenCalledWith(BigInt(123), { type: "u64" });
     });
 
     it("returns failed on network error", async () => {
@@ -1389,10 +1860,17 @@ describe("OnboardingBridgeSDK", () => {
 
   describe("setRelayerThreshold", () => {
     it("returns pending status on success", async () => {
-      const result = await sdk.setRelayerThreshold(2, mockKeypair);
+      const result = await sdk.setRelayerThreshold(2, mockKeypair, 123);
 
       expect(result.status).toBe("pending");
       expect(mockProvider.sendTransaction).toHaveBeenCalled();
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith(
+        "set_relayer_threshold",
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(nativeToScVal).toHaveBeenCalledWith(BigInt(123), { type: "u64" });
     });
   });
 
@@ -1451,6 +1929,82 @@ describe("OnboardingBridgeSDK", () => {
       await expect(sdk.queryIsRelayer("a".repeat(64))).rejects.toThrow(
         "Failed to query relayer",
       );
+    });
+  });
+
+  describe("isBlocked", () => {
+    it("calls query_is_blocked and returns its boolean result", async () => {
+      (scValToNative as jest.Mock).mockReturnValue(true);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const result = await sdk.isBlocked(MOCK_ADDRESS);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith("query_is_blocked", expect.anything());
+      expect(result).toBe(true);
+    });
+
+    it("returns false when no results", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+
+      const result = await sdk.isBlocked(MOCK_ADDRESS);
+
+      expect(result).toBe(false);
+    });
+
+    it("throws on simulation error", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({ error: "fail" });
+
+      await expect(sdk.isBlocked(MOCK_ADDRESS)).rejects.toThrow(
+        "Failed to query blocklist status",
+      );
+    });
+
+    it("rejects an invalid address before simulation", async () => {
+      await expect(sdk.isBlocked("not-an-address")).rejects.toThrow(
+        'Invalid address for "address"',
+      );
+      expect(mockProvider.simulateTransaction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("isAllowlisted", () => {
+    it("calls query_is_allowlisted and returns its boolean result", async () => {
+      (scValToNative as jest.Mock).mockReturnValue(true);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const result = await sdk.isAllowlisted(MOCK_ADDRESS);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith("query_is_allowlisted", expect.anything());
+      expect(result).toBe(true);
+    });
+
+    it("returns false when no results", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+
+      const result = await sdk.isAllowlisted(MOCK_ADDRESS);
+
+      expect(result).toBe(false);
+    });
+
+    it("throws on simulation error", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({ error: "fail" });
+
+      await expect(sdk.isAllowlisted(MOCK_ADDRESS)).rejects.toThrow(
+        "Failed to query allowlist status",
+      );
+    });
+
+    it("rejects an invalid address before simulation", async () => {
+      await expect(sdk.isAllowlisted("not-an-address")).rejects.toThrow(
+        'Invalid address for "address"',
+      );
+      expect(mockProvider.simulateTransaction).not.toHaveBeenCalled();
     });
   });
 
@@ -1545,7 +2099,7 @@ describe("address validation", () => {
         .mockResolvedValue({ hash: "h", status: "PENDING" }),
       simulateTransaction: jest.fn().mockResolvedValue({}),
     };
-    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    (rpc.Server as jest.Mock).mockImplementation(() => mockProvider);
     sdk = new OnboardingBridgeSDK(CONFIG);
   });
 
@@ -1719,7 +2273,7 @@ describe("Error handling - invalid inputs", () => {
         .mockResolvedValue({ hash: "h", status: "PENDING" }),
       simulateTransaction: jest.fn().mockResolvedValue({}),
     };
-    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    (rpc.Server as jest.Mock).mockImplementation(() => mockProvider);
     sdk = new OnboardingBridgeSDK(CONFIG);
   });
 
@@ -1900,7 +2454,7 @@ describe("Type validation at runtime", () => {
         .mockResolvedValue({ hash: "h", status: "PENDING" }),
       simulateTransaction: jest.fn().mockResolvedValue({}),
     };
-    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    (rpc.Server as jest.Mock).mockImplementation(() => mockProvider);
     sdk = new OnboardingBridgeSDK(CONFIG);
   });
 
@@ -1916,7 +2470,7 @@ describe("Type validation at runtime", () => {
   });
 
   it("uses the configured timeout instead of the default 30 seconds", async () => {
-    (SorobanRpc.Server as jest.Mock).mockClear();
+    (rpc.Server as jest.Mock).mockClear();
     (TransactionBuilder as unknown as jest.Mock).mockClear();
 
     const setTimeoutSpy = jest.fn().mockReturnThis();
@@ -1936,7 +2490,7 @@ describe("Type validation at runtime", () => {
         .mockResolvedValue({ hash: "h", status: "PENDING" }),
       simulateTransaction: jest.fn().mockResolvedValue({}),
     };
-    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    (rpc.Server as jest.Mock).mockImplementation(() => mockProvider);
 
     await customSdk.fundCAddress(
       {
@@ -1958,7 +2512,7 @@ describe("Type validation at runtime", () => {
   });
 
   it("falls back to 30-second timeout when config.timeout is omitted", async () => {
-    (SorobanRpc.Server as jest.Mock).mockClear();
+    (rpc.Server as jest.Mock).mockClear();
     (TransactionBuilder as unknown as jest.Mock).mockClear();
 
     const setTimeoutSpy = jest.fn().mockReturnThis();
@@ -1978,7 +2532,7 @@ describe("Type validation at runtime", () => {
         .mockResolvedValue({ hash: "h", status: "PENDING" }),
       simulateTransaction: jest.fn().mockResolvedValue({}),
     };
-    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    (rpc.Server as jest.Mock).mockImplementation(() => mockProvider);
 
     await (defaultSdk as any).fundCAddress(
       {
@@ -2090,7 +2644,7 @@ describe("Observability hooks - onRpcCall coverage", () => {
       getLedgerEntries: jest.fn().mockResolvedValue(ledgerEntriesFor(0)),
     };
 
-    (SorobanRpc.Server as jest.Mock).mockImplementation(() => mockProvider);
+    (rpc.Server as jest.Mock).mockImplementation(() => mockProvider);
     (scValToNative as jest.Mock).mockReturnValue({ toString: () => "100" });
 
     sdk = new OnboardingBridgeSDK({
@@ -2125,16 +2679,12 @@ describe("Observability hooks - onRpcCall coverage", () => {
       call: (s: OnboardingBridgeSDK) => s.getWhitelistedAssets(),
     },
     {
-      name: "getFeeExemptAddresses",
-      call: (s: OnboardingBridgeSDK) => s.getFeeExemptAddresses(),
+      name: "isBlocked",
+      call: (s: OnboardingBridgeSDK) => s.isBlocked(MOCK_ADDRESS),
     },
     {
-      name: "getBlocklistedAddresses",
-      call: (s: OnboardingBridgeSDK) => s.getBlocklistedAddresses(),
-    },
-    {
-      name: "getAllowlistedAddresses",
-      call: (s: OnboardingBridgeSDK) => s.getAllowlistedAddresses(),
+      name: "isAllowlisted",
+      call: (s: OnboardingBridgeSDK) => s.isAllowlisted(MOCK_ADDRESS),
     },
     {
       name: "estimateCost",

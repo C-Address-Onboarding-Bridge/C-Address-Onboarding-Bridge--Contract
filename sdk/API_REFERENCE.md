@@ -22,6 +22,7 @@ This document provides a comprehensive API reference for all exported classes, i
    - [WithdrawFeesOptions](#withdrawfeesoptions)
    - [OffRampConfig](#offrampconfig)
    - [TransactionResult](#transactionresult)
+   - [ConfirmedTransactionResult](#confirmedtransactionresult)
    - [FundCAddressWithSwapOptions](#fundcaddresswithswapoptions)
    - [CrossChainFundOptions](#crosschainfundoptions)
    - [CreateCOptions](#createcoptions)
@@ -52,6 +53,31 @@ This document provides a comprehensive API reference for all exported classes, i
 ### `OnboardingBridgeSDK`
 
 Main entry point for interacting with the deployed Onboarding Bridge Soroban contract.
+
+Admin-authorized state-changing contract methods accept an optional final
+`nonce: Option<u64>` ABI argument. Pass `undefined` in SDK methods that expose
+the nonce to send `void` and use Stellar transaction replay protection; pass a
+sequential value to enforce per-admin ordering. For direct Soroban calls, append
+this argument to each of these methods:
+
+| Contract method | Arguments before nonce |
+|---|---|
+| `set_loyalty_token` | `token, amount_per_fund` |
+| `set_fee_tiers` | `tiers` |
+| `remove_relayer` | `pubkey` |
+| `set_relayer_threshold` | `threshold` |
+| `extend_instance_ttl` | `ttl` |
+| `extend_persistent_ttl` | `key_asset, ttl` |
+| `extend_source_persistent_ttl` | `source, asset, ttl` |
+| `set_max_instance_ttl` | `ttl` |
+| `set_max_persistent_ttl` | `ttl` |
+| `set_meta_tx_network_id` | `network_id` |
+
+The SDK exposes nonce parameters on `setLoyaltyToken`, `setFeeTiers`,
+`removeRelayer` (in `RelayerManagementOptions`), and `setRelayerThreshold`.
+The six TTL and network-ID methods in the table do not have SDK convenience
+wrappers; call them through the contract client with the listed arguments
+followed by the optional nonce.
 
 #### Constructor
 
@@ -115,6 +141,38 @@ const results = await sdk.batchFundCAddresses(
   (completed, total, txHash) => console.log(`${completed}/${total}`, txHash),
 );
 ```
+
+##### `commitFundAndWait`
+```ts
+async commitFundAndWait(
+  options: CommitFundOptions,
+  sourceKeypair: Keypair
+): Promise<ConfirmedTransactionResult<{ commitmentId: bigint }>>
+```
+Submits a commit-reveal funding commitment and waits for the transaction to
+reach `SUCCESS` or `FAILED`. On success, `commitmentId` is decoded from the
+contract return value and can be passed to `revealFund` or `cancelCommitment`.
+
+##### `fundCAddressTimelockedAndWait`
+```ts
+async fundCAddressTimelockedAndWait(
+  options: FundCTimelockedOptions,
+  sourceKeypair: Keypair
+): Promise<ConfirmedTransactionResult<{ timelockId: bigint }>>
+```
+Submits a timelocked funding operation and waits for confirmation. On success,
+`timelockId` is decoded from the contract return value and can be passed to
+`claimTimelocked`.
+
+##### `scheduleUpgradeAndWait`
+```ts
+async scheduleUpgradeAndWait(
+  options: ScheduleUpgradeOptions,
+  adminKeypair: Keypair
+): Promise<ConfirmedTransactionResult<{ executableAfterLedger: number }>>
+```
+Schedules an upgrade and waits for confirmation. On success,
+`executableAfterLedger` is decoded from the contract return value.
 
 ##### `withdrawFees`
 ```ts
@@ -185,6 +243,17 @@ Queries accrued, uncollected protocol fees for a given token contract.
   - `asset`: `string` — Token contract address.
 - **Returns**: `Promise<string>`
 
+##### `queryCurrentTier`
+```ts
+async queryCurrentTier(source: string, asset: string): Promise<FeeTier | null>
+```
+Queries the current fee tier for a source account and token asset. The fee
+tier is selected using the source's bridged volume for that specific asset.
+- **Parameters**:
+  - `source`: `string` — Stellar account (G-address).
+  - `asset`: `string` — Token contract (C-address).
+- **Returns**: `Promise<FeeTier | null>`
+
 ##### `getContractBalance`
 ```ts
 async getContractBalance(asset: string): Promise<string>
@@ -250,6 +319,64 @@ Transfers the contract admin role (admin only).
   - `adminKeypair`: `Keypair`
 - **Returns**: `Promise<TransactionResult>`
 
+##### `proposeNewAdmin`
+```ts
+async proposeNewAdmin(
+  newAdmin: string,
+  adminKeypair: Keypair
+): Promise<TransactionResult>
+```
+Proposes an admin handover (admin only). Prefer this over `setAdmin` — it proves the new admin controls the key (via `acceptAdmin`) before the role moves.
+- **Parameters**:
+  - `newAdmin`: `string` — Proposed admin's G-address.
+  - `adminKeypair`: `Keypair`
+- **Returns**: `Promise<TransactionResult>`
+
+##### `acceptAdmin`
+```ts
+async acceptAdmin(pendingAdminKeypair: Keypair): Promise<TransactionResult>
+```
+Accepts a pending admin handover. Must be signed by the proposed admin.
+- **Parameters**:
+  - `pendingAdminKeypair`: `Keypair` — Keypair of the proposed admin.
+- **Returns**: `Promise<TransactionResult>`
+
+##### `getPendingAdmin`
+```ts
+async getPendingAdmin(): Promise<string | null>
+```
+Returns the pending admin's G-address, or `null` if there is no pending handover.
+- **Returns**: `Promise<string | null>`
+
+##### `proposeNewFeeCollector`
+```ts
+async proposeNewFeeCollector(
+  newCollector: string,
+  adminKeypair: Keypair
+): Promise<TransactionResult>
+```
+Proposes a fee-collector handover (admin only). Prefer this over `setFeeCollector` — it proves the new collector controls the key (via `acceptFeeCollector`) before the role moves.
+- **Parameters**:
+  - `newCollector`: `string` — Proposed collector's G-address.
+  - `adminKeypair`: `Keypair`
+- **Returns**: `Promise<TransactionResult>`
+
+##### `acceptFeeCollector`
+```ts
+async acceptFeeCollector(pendingCollectorKeypair: Keypair): Promise<TransactionResult>
+```
+Accepts a pending fee-collector handover. Must be signed by the proposed collector.
+- **Parameters**:
+  - `pendingCollectorKeypair`: `Keypair` — Keypair of the proposed fee collector.
+- **Returns**: `Promise<TransactionResult>`
+
+##### `getPendingFeeCollector`
+```ts
+async getPendingFeeCollector(): Promise<string | null>
+```
+Returns the pending fee collector's G-address, or `null` if there is no pending handover.
+- **Returns**: `Promise<string | null>`
+
 ##### `upgrade`
 ```ts
 async upgrade(
@@ -298,7 +425,8 @@ async removeRelayer(
   adminKeypair: Keypair
 ): Promise<TransactionResult>
 ```
-Removes a registered relayer public key (admin only).
+Removes a registered relayer public key (admin only). Pass `nonce` in
+`options` to enforce sequential admin ordering.
 - **Parameters**:
   - `options`: `RelayerManagementOptions`
   - `adminKeypair`: `Keypair`
@@ -308,13 +436,16 @@ Removes a registered relayer public key (admin only).
 ```ts
 async setRelayerThreshold(
   threshold: number,
-  adminKeypair: Keypair
+  adminKeypair: Keypair,
+  nonce?: string | number | bigint
 ): Promise<TransactionResult>
 ```
-Configures the required threshold of relayer signatures (admin only).
+Configures the required threshold of relayer signatures (admin only). The
+optional nonce enforces sequential admin ordering.
 - **Parameters**:
   - `threshold`: `number`
   - `adminKeypair`: `Keypair`
+  - `nonce`: optional sequential admin nonce (`string | number | bigint`)
 - **Returns**: `Promise<TransactionResult>`
 
 ##### `queryRelayerThreshold`
@@ -351,50 +482,33 @@ async getWhitelistedAssets(
   limit?: number
 ): Promise<PaginatedResult<string>>
 ```
-Queries the list of whitelisted tokens with client-side pagination.
+Queries the list of whitelisted tokens with on-chain pagination (the cursor encodes the offset).
 - **Parameters**:
   - `cursor`: `string` (optional base64 cursor)
   - `limit`: `number` (optional, default 20)
 - **Returns**: `Promise<PaginatedResult<string>>`
 
-##### `getFeeExemptAddresses`
+##### `isBlocked`
 ```ts
-async getFeeExemptAddresses(
-  cursor?: string,
-  limit?: number
-): Promise<PaginatedResult<string>>
+async isBlocked(address: string): Promise<boolean>
 ```
-Queries fee-exempt addresses with client-side pagination.
+Checks whether `address` is on the blocklist. The contract only exposes a
+per-address membership check (`query_is_blocked`) — there is no call that
+lists the full blocklist.
 - **Parameters**:
-  - `cursor`: `string` (optional)
-  - `limit`: `number` (optional)
-- **Returns**: `Promise<PaginatedResult<string>>`
+  - `address`: `string`
+- **Returns**: `Promise<boolean>`
 
-##### `getBlocklistedAddresses`
+##### `isAllowlisted`
 ```ts
-async getBlocklistedAddresses(
-  cursor?: string,
-  limit?: number
-): Promise<PaginatedResult<string>>
+async isAllowlisted(address: string): Promise<boolean>
 ```
-Queries the blocklist with client-side pagination.
+Checks whether `address` is on the allowlist. The contract only exposes a
+per-address membership check (`query_is_allowlisted`) — there is no call that
+lists the full allowlist.
 - **Parameters**:
-  - `cursor`: `string` (optional)
-  - `limit`: `number` (optional)
-- **Returns**: `Promise<PaginatedResult<string>>`
-
-##### `getAllowlistedAddresses`
-```ts
-async getAllowlistedAddresses(
-  cursor?: string,
-  limit?: number
-): Promise<PaginatedResult<string>>
-```
-Queries the allowlist with client-side pagination.
-- **Parameters**:
-  - `cursor`: `string` (optional)
-  - `limit`: `number` (optional)
-- **Returns**: `Promise<PaginatedResult<string>>`
+  - `address`: `string`
+- **Returns**: `Promise<boolean>`
 
 ##### `estimateCost`
 ```ts
@@ -894,13 +1008,27 @@ Static key definitions for off-ramp integrations.
 ---
 
 ### `TransactionResult`
-The result of an on-chain transaction submission.
+The result of submitting a transaction without waiting for ledger confirmation.
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `hash` | `string` | On-chain transaction hash. |
-| `status` | `'success' \| 'pending' \| 'failed'` | Execution status. |
+| `status` | `'pending' \| 'failed'` | Submission status. |
 | `error` | `string` | *Optional*. Error description if `status` is `'failed'`. |
+
+---
+
+### `ConfirmedTransactionResult<T>`
+The result of a transaction that has been polled until it reaches a terminal
+on-chain status.
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `hash` | `string` | On-chain transaction hash. |
+| `status` | `'success' \| 'failed'` | Final transaction status. |
+| `error` | `string` | *Optional*. Error description if `status` is `'failed'`. |
+
+On success, the result also contains the decoded return-value fields in `T`.
 
 ---
 

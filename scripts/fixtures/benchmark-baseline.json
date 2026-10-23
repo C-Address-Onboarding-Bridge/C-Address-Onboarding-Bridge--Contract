@@ -1,0 +1,16 @@
+{
+  "benchmark_results": [
+    {
+      "function": "fund_c_address",
+      "variant": "default",
+      "cpu_insns": 1000,
+      "mem_bytes": 500
+    },
+    {
+      "function": "query_balance",
+      "variant": "default",
+      "cpu_insns": 200,
+      "mem_bytes": 100
+    }
+  ]
+}

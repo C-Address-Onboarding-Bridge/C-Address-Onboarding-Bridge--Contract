@@ -17,10 +17,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.88.0
           components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -29,13 +30,6 @@ jobs:
       # pre-commit hook only covers fmt and `--no-verify` skips it entirely.
       - name: Check formatting
         run: cargo fmt --all -- --check
-
-      # `--all-targets` compiles the test target, and the upgrade tests in
-      # src/tests.rs `include_bytes!` the release wasm -- so on a clean runner
-      # clippy fails with "couldn't read ...onboarding_bridge.wasm" unless the
-      # wasm is built first (same ordering fix as the Soroban Contract job).
-      - name: Build WASM fixture for the test target
-        run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -47,7 +41,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -55,8 +51,8 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
-      # Covers the contract, indexer, and relayer crates via the workspace lockfile.
-      #
+      # The root lockfile covers the contract workspace only; indexer has its
+      # own lockfile and is audited separately below.
       - name: Audit Rust dependencies
         # These are transitive Soroban-host advisories with no compatible
         # upstream replacement in the SDK 22 dependency graph. Keep the audit
@@ -66,6 +62,9 @@ jobs:
           --ignore RUSTSEC-2024-0388
           --ignore RUSTSEC-2024-0436
           --ignore RUSTSEC-2023-0031
+
+      - name: Audit indexer Rust dependencies
+        run: cargo audit --file indexer/Cargo.lock --deny warnings
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -81,6 +80,12 @@ jobs:
         run: npm audit --audit-level=high
         continue-on-error: true
 
+      # Advisory until known vulnerabilities in the shared workspace lockfile
+      # are resolved; retain the audit report without making CI permanently red.
+      - name: Audit relayer dependencies
+        run: npm audit --workspace=@stellar/c-address-onboarding-bridge-relayer --audit-level=high
+        continue-on-error: true
+
   contract:
     name: Soroban Contract
     runs-on: ubuntu-latest
@@ -88,18 +93,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.88.0
           targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
 
-      # The wasm has to exist BEFORE anything compiles the test target: the
-      # upgrade tests in src/tests.rs `include_bytes!` it, so `cargo check
-      # --all-targets` fails outright on a clean checkout if the build runs
-      # after it. This ordering bug is why the job never reached the suite.
-      - name: Build WASM (release)
+      # Build the legacy WASM artifact used by the hash check and upload step.
+      - name: Build WASM (wasm32-unknown-unknown)
         run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
 
       # Fast fail on type errors (including the test target) before paying for
@@ -111,22 +114,14 @@ jobs:
       - name: Build contract
         run: cargo build -p onboarding-bridge --release
 
-      # wasm32v1-none is the current canonical Soroban deployment target; build
-      # it too so CI actually exercises the artifact that gets deployed, not
-      # just the legacy wasm32-unknown-unknown target the hash below is pinned to.
+      # wasm32v1-none is the canonical Soroban release artifact. Its hash is
+      # verified below using the same Rust toolchain and target as release.yml.
       - name: Build WASM (wasm32v1-none)
         run: cargo build -p onboarding-bridge --release --target wasm32v1-none
 
-      # TODO(next-bounty): advisory only. wasm_hash.txt does not match a build of
-      # this source on any current stable toolchain -- rustc codegen changes
-      # between releases, and this job pins `dtolnay/rust-toolchain@stable`,
-      # which moves. A meaningful artifact hash needs a pinned toolchain and a
-      # reproducible build (e.g. `stellar contract build` in a pinned image).
-      # Until then this reports the drift instead of failing every run.
       - name: Verify WASM Hash
-        continue-on-error: true
         run: |
-          COMPUTED_HASH=$(sha256sum target/wasm32-unknown-unknown/release/onboarding_bridge.wasm | cut -d' ' -f1)
+          COMPUTED_HASH=$(sha256sum target/wasm32v1-none/release/onboarding_bridge.wasm | cut -d' ' -f1)
           if [ ! -f wasm_hash.txt ]; then
             echo "::error::wasm_hash.txt not found!"
             exit 1
@@ -145,7 +140,7 @@ jobs:
       # test target is completely broken. `cargo test` is the only thing that
       # actually compiles and runs the suite.
       - name: Run contract tests
-        run: cargo test -p onboarding-bridge --features testutils 2>&1 | tee contract_test_output.txt
+        run: set -o pipefail; cargo test -p onboarding-bridge --features testutils 2>&1 | tee contract_test_output.txt
 
       # Surfaces the pass/fail count in the job summary so a suite that
       # silently shrinks (fewer tests collected, not just fewer passing) is
@@ -155,6 +150,10 @@ jobs:
           COUNT_LINE=$(grep -E "^test result:" contract_test_output.txt | tail -n1)
           if [ -z "$COUNT_LINE" ]; then
             echo "::error::No 'test result:' line found in contract test output — the suite may not have run at all."
+            exit 1
+          fi
+          if [[ "$COUNT_LINE" == "test result: FAILED"* ]]; then
+            echo "::error::Contract tests reported failures: $COUNT_LINE"
             exit 1
           fi
           echo "$COUNT_LINE"
@@ -169,13 +168,17 @@ jobs:
       # and runs it too — same rationale as the contract test step above.
       - name: Run indexer tests
         working-directory: indexer
-        run: cargo test 2>&1 | tee ../indexer_test_output.txt
+        run: set -o pipefail; cargo test 2>&1 | tee ../indexer_test_output.txt
 
       - name: Report indexer test count
         run: |
           COUNT_LINE=$(grep -E "^test result:" indexer_test_output.txt | tail -n1)
           if [ -z "$COUNT_LINE" ]; then
             echo "::error::No 'test result:' line found in indexer test output — the suite may not have run at all."
+            exit 1
+          fi
+          if [[ "$COUNT_LINE" == "test result: FAILED"* ]]; then
+            echo "::error::Indexer tests reported failures: $COUNT_LINE"
             exit 1
           fi
           echo "$COUNT_LINE"
@@ -186,6 +189,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run benchmarks
+        shell: bash
         run: |
           cargo test -p onboarding-bridge --features testutils bench_ -- --nocapture 2>/dev/null \
             | grep '^BENCH' \
@@ -285,9 +289,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
-          targets: wasm32-unknown-unknown
+          toolchain: 1.88.0
+          targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Pin Soroban SDK major version
         run: |
@@ -303,10 +308,6 @@ jobs:
       - name: Build contract
         run: cargo build -p onboarding-bridge --release
 
-      # The upgrade tests include_bytes! the compiled wasm; build it first.
-      - name: Build WASM fixture for tests
-        run: cargo build -p onboarding-bridge --release --target wasm32-unknown-unknown
-
       - name: Run contract tests
         run: cargo test -p onboarding-bridge --features testutils
 
@@ -320,9 +321,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.88.0
           components: rustfmt, clippy
+          targets: wasm32-unknown-unknown,wasm32v1-none
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -369,6 +372,10 @@ jobs:
 
       - name: TypeScript type-check
         run: npx tsc --noEmit
+
+      - name: Check SDK documentation examples
+        working-directory: .
+        run: node scripts/check-migration-sdk-docs.js
 
       - name: Build SDK
         run: npm run build
@@ -420,3 +427,41 @@ jobs:
 
       - name: Build SDK
         run: npm run build
+
+  relayer:
+    name: Relayer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run deployment script tests
+        run: npm run test:scripts
+      - name: Type-check deployment script
+        run: npx tsc --noEmit --skipLibCheck --target ES2022 --module commonjs --esModuleInterop scripts/deploy.ts
+
+      - name: Build SDK
+        run: npm run build --workspace=sdk
+
+      - name: Type-check relayer
+        working-directory: relayer
+        run: npm run typecheck
+
+      - name: Run self-test
+        working-directory: relayer
+        run: npm run self-test

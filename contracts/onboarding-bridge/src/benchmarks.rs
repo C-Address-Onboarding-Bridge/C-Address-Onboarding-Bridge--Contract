@@ -138,7 +138,7 @@ fn bench_initialize_warm() {
 fn bench_fund_amount(amount: i128) {
     let (env, bridge_id, token_id, _admin, _fee_collector) = initialized_setup();
     let bridge = crate::OnboardingBridgeClient::new(&env, &bridge_id);
-    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
+    let _network_id = BytesN::from_array(&env, &[0x11u8; 32]);
     let user = Address::generate(&env);
     let target = Address::generate(&env);
     mint(&env, &token_id, &user, amount * 2);
@@ -440,10 +440,11 @@ fn bench_fund_c_address_crosschain() {
     let relayer_signing_key = SigningKey::from_bytes(&relayer_secret);
     let relayer_pubkey = BytesN::from_array(&env, relayer_signing_key.verifying_key().as_bytes());
     bridge.add_relayer(&relayer_pubkey, &None);
-    bridge.set_relayer_threshold(&1u32);
+    bridge.set_relayer_threshold(&1u32, &None);
 
-    // Fund the bridge so it can transfer to target.
-    mint(&env, &token_id, &bridge_id, 10_000i128);
+    // Seed the dedicated reserve through the admin deposit path.
+    mint(&env, &token_id, &admin, 10_000i128);
+    bridge.fund_crosschain_reserve(&token_id, &10_000i128);
 
     let target = Address::generate(&env);
     let chain_id = 1u32;
@@ -658,7 +659,7 @@ fn bench_execute_meta_fund() {
     let signing_key = SigningKey::from_bytes(&secret);
     let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
     bridge.register_meta_signer(&source, &pubkey);
-    bridge.set_meta_tx_network_id(&network_id);
+    let network_id = env.ledger().network_id();
 
     // Build the canonical meta-fund payload and sign it.
     use soroban_sdk::Bytes;
@@ -697,12 +698,7 @@ fn bench_execute_meta_fund() {
         deadline,
     };
 
-    soroban_sdk::token::Client::new(&env, &token_id).approve(
-        &source,
-        &bridge_id,
-        &amount,
-        &100u32,
-    );
+    soroban_sdk::token::Client::new(&env, &token_id).approve(&source, &bridge_id, &amount, &100u32);
     measure(&env, "execute_meta_fund", || {
         bridge.execute_meta_fund(&params, &pubkey, &signature);
     });
@@ -738,7 +734,7 @@ fn bench_tiered_fee_lookup() {
             },
         ],
     );
-    bridge.set_fee_tiers(&tiers);
+    bridge.set_fee_tiers(&tiers, &None);
     mint(&env, &token_id, &user, 1_000_000i128 * 2);
 
     // Fund once to build volume so the tiered lookup activates.

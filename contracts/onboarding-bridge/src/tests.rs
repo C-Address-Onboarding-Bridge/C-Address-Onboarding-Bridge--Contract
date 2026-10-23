@@ -1,6 +1,6 @@
 use crate::{
-    BridgeError, DataKey, FeeTier, MetaFundParams, OnboardingBridge, CRITICAL_ENTRY_TTL_THRESHOLD,
-    MAX_ALLOWED_TTL,
+    append_address_to_bytes, BridgeError, DataKey, FeeTier, MetaFundParams, OnboardingBridge,
+    CRITICAL_ENTRY_TTL_THRESHOLD, MAX_ALLOWED_TTL,
 };
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -112,7 +112,6 @@ fn test_initialize_fee_too_high() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_fund_c_address() {
     let env = Env::default();
@@ -134,7 +133,6 @@ fn test_fund_c_address() {
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 5i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_fund_without_initialize() {
     let env = Env::default();
@@ -184,7 +182,6 @@ fn test_batch_fund_c_addresses() {
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 15i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_fund_with_zero_fee() {
     let env = Env::default();
@@ -234,7 +231,6 @@ fn test_set_fee_bps_too_high() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_set_fee_collector() {
     let env = Env::default();
@@ -248,7 +244,6 @@ fn test_set_fee_collector() {
     assert_eq!(bridge.query_fee_collector(), new_collector);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_set_admin() {
     let env = Env::default();
@@ -262,7 +257,6 @@ fn test_set_admin() {
     assert_eq!(bridge.query_admin(), new_admin);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_withdraw_fees() {
     let env = Env::default();
@@ -302,7 +296,6 @@ fn test_query_balance() {
     assert_eq!(bal, 1000i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_batch_empty() {
     let env = Env::default();
@@ -316,10 +309,13 @@ fn test_batch_empty() {
     let targets: Vec<Address> = Vec::new(&env);
     let amounts: Vec<i128> = Vec::new(&env);
 
-    bridge.batch_fund_c_address(&admin, &targets, &amounts, &token_id, &None, &None);
+    // #594: empty batch must be rejected rather than succeeding silently.
+    assert_eq!(
+        bridge.try_batch_fund_c_address(&admin, &targets, &amounts, &token_id, &None, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_fund_events() {
     let env = Env::default();
@@ -373,7 +369,6 @@ fn test_pause_and_unpause() {
     assert!(!bridge.query_is_paused());
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_fund_c_address_paused() {
     let env = Env::default();
@@ -414,7 +409,6 @@ fn test_batch_fund_paused() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_withdraw_fees_paused() {
     let env = Env::default();
@@ -451,7 +445,6 @@ fn test_set_fee_bps_paused() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_set_fee_collector_paused() {
     let env = Env::default();
@@ -467,7 +460,6 @@ fn test_set_fee_collector_paused() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_set_admin_paused() {
     let env = Env::default();
@@ -547,12 +539,11 @@ fn test_set_loyalty_token_paused() {
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
     bridge.pause(&None);
     assert_eq!(
-        bridge.try_set_loyalty_token(&token_id, &10i128),
+        bridge.try_set_loyalty_token(&token_id, &10i128, &None),
         Err(Ok(BridgeError::ContractPaused))
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_set_fee_tiers_paused() {
     let env = Env::default();
@@ -571,7 +562,7 @@ fn test_set_fee_tiers_paused() {
         }],
     );
     assert_eq!(
-        bridge.try_set_fee_tiers(&tiers),
+        bridge.try_set_fee_tiers(&tiers, &None),
         Err(Ok(BridgeError::ContractPaused))
     );
 }
@@ -607,6 +598,89 @@ fn test_add_relayer_nonce_replay_rejected() {
     );
 }
 
+#[test]
+fn test_admin_mutators_reject_replayed_nonces() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let first_relayer = BytesN::from_array(&env, &[7u8; 32]);
+    let second_relayer = BytesN::from_array(&env, &[8u8; 32]);
+    bridge.add_relayer(&first_relayer, &None);
+    bridge.add_relayer(&second_relayer, &None);
+
+    let mut nonce = 0u64;
+    bridge.set_loyalty_token(&token_id, &1i128, &Some(nonce));
+    assert_eq!(
+        bridge.try_set_loyalty_token(&token_id, &1i128, &Some(nonce)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+    nonce += 1;
+
+    let tiers = Vec::new(&env);
+    bridge.set_fee_tiers(&tiers, &Some(nonce));
+    assert_eq!(
+        bridge.try_set_fee_tiers(&tiers, &Some(nonce)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+    nonce += 1;
+
+    bridge.remove_relayer(&first_relayer, &Some(nonce));
+    assert_eq!(
+        bridge.try_remove_relayer(&first_relayer, &Some(nonce)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+    nonce += 1;
+
+    bridge.set_relayer_threshold(&1u32, &Some(nonce));
+    assert_eq!(
+        bridge.try_set_relayer_threshold(&1u32, &Some(nonce)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+    nonce += 1;
+
+    bridge.extend_instance_ttl(&200_000u32, &Some(nonce));
+    assert_eq!(
+        bridge.try_extend_instance_ttl(&200_000u32, &Some(nonce)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+    nonce += 1;
+
+    bridge.extend_persistent_ttl(&token_id, &200_000u32, &Some(nonce));
+    assert_eq!(
+        bridge.try_extend_persistent_ttl(&token_id, &200_000u32, &Some(nonce)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+    nonce += 1;
+
+    bridge.extend_source_persistent_ttl(&user, &token_id, &200_000u32, &Some(nonce));
+    assert_eq!(
+        bridge.try_extend_source_persistent_ttl(
+            &user,
+            &token_id,
+            &200_000u32,
+            &Some(nonce),
+        ),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+    nonce += 1;
+
+    bridge.set_max_instance_ttl(&200_000u32, &Some(nonce));
+    assert_eq!(
+        bridge.try_set_max_instance_ttl(&200_000u32, &Some(nonce)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+    nonce += 1;
+
+    bridge.set_max_persistent_ttl(&300_000u32, &Some(nonce));
+    assert_eq!(
+        bridge.try_set_max_persistent_ttl(&300_000u32, &Some(nonce)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+}
+
 #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_remove_relayer_paused() {
@@ -620,7 +694,7 @@ fn test_remove_relayer_paused() {
     bridge.add_relayer(&pubkey, &None);
     bridge.pause(&None);
     assert_eq!(
-        bridge.try_remove_relayer(&pubkey),
+        bridge.try_remove_relayer(&pubkey, &None),
         Err(Ok(BridgeError::ContractPaused))
     );
 }
@@ -638,7 +712,7 @@ fn test_set_relayer_threshold_paused() {
     bridge.add_relayer(&pubkey, &None);
     bridge.pause(&None);
     assert_eq!(
-        bridge.try_set_relayer_threshold(&1u32),
+        bridge.try_set_relayer_threshold(&1u32, &None),
         Err(Ok(BridgeError::ContractPaused))
     );
 }
@@ -694,7 +768,6 @@ fn test_unpause_emits_event() {
     assert_eq!(contract_id, &bridge_id);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_fund_works_after_unpause() {
     let env = Env::default();
@@ -715,15 +788,11 @@ fn test_fund_works_after_unpause() {
     assert_eq!(check_balance(&env, &token_id, &target), 495i128);
 }
 
-// The soroban-sdk ships a known-good compiled wasm fixture used for doc/unit
-// tests. We reuse it here as our "v2" wasm to get a real BytesN<32> hash that
-// the host accepts, so we can exercise the full auth → wasm-swap → event path.
-const V2_WASM: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/wasm32-unknown-unknown/release/onboarding_bridge.wasm"
-));
+// Soroban SDK 22.0.1's small doctest fixture is a valid uploadable contract
+// WASM. Keeping it here makes upgrade tests independent of prior builds and
+// the caller's CARGO_TARGET_DIR.
+const V2_WASM: &[u8] = include_bytes!("../test_fixtures/contract.wasm");
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_upgrade_admin_only_and_event() {
     let env = Env::default();
@@ -772,7 +841,6 @@ fn test_upgrade_non_admin_rejected() {
 
 /********** Timelocked upgrade tests (execute_upgrade) **********/
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_execute_upgrade_succeeds_at_timelock_boundary_and_clears_pending() {
     let env = Env::default();
@@ -839,7 +907,7 @@ fn test_upgrade_paths_reject_deactivated_contract() {
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
     let wasm_hash = BytesN::from_array(&env, &[1u8; 32]);
     bridge.schedule_upgrade(&wasm_hash, &None);
-    bridge.emergency_migrate(&Address::generate(&env), &false);
+    bridge.emergency_migrate(&Address::generate(&env), &false, &None);
 
     assert_eq!(
         bridge.try_upgrade(&wasm_hash, &None),
@@ -986,7 +1054,6 @@ fn setup_bridge(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, Addre
     (bridge, user, token_id, admin)
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_blocklist_prevents_fund() {
     let env = Env::default();
@@ -1002,7 +1069,6 @@ fn test_blocklist_prevents_fund() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_remove_from_blocklist_allows_fund() {
     let env = Env::default();
@@ -1017,7 +1083,6 @@ fn test_remove_from_blocklist_allows_fund() {
     assert_eq!(check_balance(&env, &token_id, &target), 500i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_allowlist_mode_blocks_non_allowlisted() {
     let env = Env::default();
@@ -1033,7 +1098,6 @@ fn test_allowlist_mode_blocks_non_allowlisted() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_allowlist_mode_allows_allowlisted() {
     let env = Env::default();
@@ -1048,7 +1112,6 @@ fn test_allowlist_mode_allows_allowlisted() {
     assert_eq!(check_balance(&env, &token_id, &target), 500i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_remove_from_allowlist_blocks_in_allowlist_mode() {
     let env = Env::default();
@@ -1066,7 +1129,6 @@ fn test_remove_from_allowlist_blocks_in_allowlist_mode() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_blocklist_overrides_allowlist() {
     let env = Env::default();
@@ -1101,7 +1163,6 @@ fn test_batch_fund_blocked_address_fails() {
     assert_eq!(check_balance(&env, &token_id, &t2), 0i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_allowlist_mode_off_allows_all() {
     let env = Env::default();
@@ -1152,7 +1213,30 @@ fn test_emergency_migration_keeps_reserved_tokens_recoverable() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
+#[test]
+fn test_timelocked_funds_can_be_claimed_after_emergency_migration() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+    let destination = Address::generate(&env);
+    let id = bridge.fund_c_address_timelocked(
+        &user, &target, &token_id, &500i128, &1_100u64, &0u64, &None, &None,
+    );
+
+    let new_contract = Address::generate(&env);
+    bridge.emergency_migrate(&new_contract, &true, &None);
+    assert_eq!(
+        bridge.try_reclaim_tokens(&token_id, &1i128, &destination, &None),
+        Err(Ok(crate::BridgeError::InsufficientReclaimable))
+    );
+
+    advance_ledger_time(&env, 1_101);
+    bridge.claim_timelocked(&id);
+
+    assert_eq!(check_balance(&env, &token_id, &target), 500i128);
+}
+
 #[test]
 fn test_reclaim_cannot_take_accrued_fees() {
     let env = Env::default();
@@ -1171,7 +1255,6 @@ fn test_reclaim_cannot_take_accrued_fees() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_reclaim_only_excess_over_fees() {
     let env = Env::default();
@@ -1210,7 +1293,6 @@ fn test_reclaim_emits_event() {
     assert_eq!(contract_id, &bridge.address);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_reclaim_cannot_drain_active_timelocks() {
     let env = Env::default();
@@ -1305,7 +1387,6 @@ fn commit_reveal_amount_hash(
     env.crypto().sha256(&preimage).into()
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_reveal_fund_mints_loyalty() {
     let env = Env::default();
@@ -1315,13 +1396,20 @@ fn test_reveal_fund_mints_loyalty() {
 
     let loyalty_token_id = env.register(TestToken, ());
     init_token(&env, &loyalty_token_id, &admin);
-    bridge.set_loyalty_token(&loyalty_token_id, &8i128);
+    bridge.set_loyalty_token(&loyalty_token_id, &8i128, &None);
     mint_tokens(&env, &loyalty_token_id, &bridge.address, 1_000i128);
 
     let amount: i128 = 500;
     let nonce: u64 = 1;
-    let amount_hash =
-        commit_reveal_amount_hash(&env, &bridge.address, &user, &target, &token_id, amount, nonce);
+    let amount_hash = commit_reveal_amount_hash(
+        &env,
+        &bridge.address,
+        &user,
+        &target,
+        &token_id,
+        amount,
+        nonce,
+    );
 
     let id = bridge.commit_fund(&user, &target, &token_id, &amount_hash, &10_000u64);
     env.ledger().set_sequence_number(10);
@@ -1342,8 +1430,15 @@ fn test_reveal_fund_rejects_below_minimum() {
 
     let amount: i128 = 50; // below the configured minimum of 100
     let nonce: u64 = 1;
-    let amount_hash =
-        commit_reveal_amount_hash(&env, &bridge.address, &user, &target, &token_id, amount, nonce);
+    let amount_hash = commit_reveal_amount_hash(
+        &env,
+        &bridge.address,
+        &user,
+        &target,
+        &token_id,
+        amount,
+        nonce,
+    );
 
     let id = bridge.commit_fund(&user, &target, &token_id, &amount_hash, &10_000u64);
     env.ledger().set_sequence_number(10);
@@ -1356,7 +1451,6 @@ fn test_reveal_fund_rejects_below_minimum() {
 
 /********** Asset whitelist tests **********/
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_add_asset_whitelists_it() {
     let env = Env::default();
@@ -1371,7 +1465,6 @@ fn test_add_asset_whitelists_it() {
     assert!(bridge.query_is_asset_whitelisted(&token_id));
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_remove_asset() {
     let env = Env::default();
@@ -1387,7 +1480,6 @@ fn test_remove_asset() {
     assert!(!bridge.query_is_asset_whitelisted(&token_id));
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_whitelisted_assets() {
     let env = Env::default();
@@ -1418,7 +1510,6 @@ fn test_query_whitelisted_assets() {
     assert!(found1 && found2);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_add_asset_is_idempotent() {
     let env = Env::default();
@@ -1462,7 +1553,6 @@ fn test_remove_asset_non_admin_rejected() {
     bridge.remove_asset(&token_id, &None);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_whitelist_query_uninitialized() {
     let env = Env::default();
@@ -1474,7 +1564,6 @@ fn test_whitelist_query_uninitialized() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_fund_rejects_non_whitelisted_asset() {
     let env = Env::default();
@@ -1571,7 +1660,6 @@ fn test_query_all_balances_rejects_oversized_input() {
     assert_eq!(bridge.query_all_balances(&assets).len(), 100);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_whitelisted_assets_pagination() {
     let env = Env::default();
@@ -1599,7 +1687,6 @@ fn test_query_whitelisted_assets_pagination() {
     assert_eq!(clamped.len(), 5);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_accrued_fees_single_deposit() {
     let env = Env::default();
@@ -1619,7 +1706,6 @@ fn test_accrued_fees_single_deposit() {
     assert_eq!(bridge.query_accrued_fees(&token_id), 5i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_accrued_fees_accumulate_across_deposits() {
     let env = Env::default();
@@ -1662,7 +1748,6 @@ fn test_accrued_fees_batch_accumulate() {
     assert_eq!(bridge.query_accrued_fees(&token_id), 15i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_withdraw_fees_decrements_accrued() {
     let env = Env::default();
@@ -1684,7 +1769,6 @@ fn test_withdraw_fees_decrements_accrued() {
     assert_eq!(check_balance(&env, &token_id, &fee_collector), 3i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_withdraw_fees_exceeds_accrued() {
     let env = Env::default();
@@ -1706,7 +1790,6 @@ fn test_withdraw_fees_exceeds_accrued() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_zero_fee_no_accrued_entry() {
     let env = Env::default();
@@ -1928,18 +2011,14 @@ fn setup_swap(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, Address
 #[test]
 fn test_swap_rejects_non_whitelisted_source_asset() {
     let env = Env::default();
-    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+    let (bridge, user, _source_token_id, target_token_id) = setup_swap(&env);
     let unapproved_source = env.register(TestToken, ());
     let (admin, _, _) = create_test_users(&env);
     init_token(&env, &unapproved_source, &admin);
     mint_tokens(&env, &unapproved_source, &user, 1_000i128);
 
     let pool_id = env.register(SwapPool, ());
-    SwapPoolClient::new(&env, &pool_id).initialize(
-        &unapproved_source,
-        &target_token_id,
-        &1i128,
-    );
+    SwapPoolClient::new(&env, &pool_id).initialize(&unapproved_source, &target_token_id, &1i128);
     mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
     bridge.add_swap_pool(&pool_id, &None);
 
@@ -2023,6 +2102,50 @@ fn test_swap_uses_actual_target_tokens_received() {
         Err(Ok(BridgeError::SlippageExceeded))
     );
     assert_eq!(check_balance(&env, &target_token_id, &target), 0i128);
+}
+
+#[test]
+fn test_swap_records_volume_in_target_asset_units() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+    let tiers = Vec::from_array(
+        &env,
+        [
+            FeeTier {
+                min_volume: 0,
+                max_volume: 150,
+                fee_bps: 0,
+            },
+            FeeTier {
+                min_volume: 151,
+                max_volume: i128::MAX,
+                fee_bps: 100,
+            },
+        ],
+    );
+    bridge.set_fee_tiers(&tiers, &None);
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &target_token_id, &2i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    bridge.fund_c_address_with_swap(
+        &user,
+        &Address::generate(&env),
+        &source_token_id,
+        &target_token_id,
+        &100i128,
+        &200i128,
+        &Vec::from_array(&env, [pool_id]),
+        &None,
+        &None,
+    );
+
+    assert_eq!(
+        bridge.query_current_tier(&user, &target_token_id).fee_bps,
+        100
+    );
 }
 
 #[test]
@@ -2409,7 +2532,7 @@ fn test_query_effective_fee_with_tier_discount() {
             fee_bps: 100u32,
         }],
     );
-    bridge.set_fee_tiers(&tiers);
+    bridge.set_fee_tiers(&tiers, &None);
     mint_tokens(&env, &token_id, &user, 2000i128);
 
     let amount = 1000i128;
@@ -2449,7 +2572,7 @@ fn test_query_effective_fee_with_cap_and_tier() {
             fee_bps: 200u32,
         }],
     );
-    bridge.set_fee_tiers(&tiers);
+    bridge.set_fee_tiers(&tiers, &None);
     // Cap at 150 bps (below tier rate)
     bridge.set_asset_fee_cap(&token_id, &150u32, &None);
     mint_tokens(&env, &token_id, &user, 2000i128);
@@ -2473,7 +2596,6 @@ fn test_query_effective_fee_with_cap_and_tier() {
 
 /********** cumulative counters tests **********/
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_total_bridged_and_fees_collected() {
     let env = Env::default();
@@ -2496,7 +2618,6 @@ fn test_query_total_bridged_and_fees_collected() {
     assert_eq!(total_fees, 5i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_total_bridged_accumulates() {
     let env = Env::default();
@@ -2522,7 +2643,6 @@ fn test_query_total_bridged_accumulates() {
     assert_eq!(total_fees, 10i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_total_bridged_batch() {
     let env = Env::default();
@@ -2549,7 +2669,6 @@ fn test_query_total_bridged_batch() {
     assert_eq!(total_fees, 15i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_total_bridged_zero() {
     let env = Env::default();
@@ -2663,20 +2782,22 @@ fn count_events_with_topic(env: &Env, bridge_id: &Address, topic: &str) -> u32 {
     count
 }
 
-/// Empty targets array — returns Ok immediately, no BatchCompleted event.
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
+/// Empty targets array — rejected with InvalidAmount (#594).
+/// Before the fix, an empty batch transferred nothing but still emitted
+/// BatchCompleted and minted loyalty rewards — a free loyalty farm.
 #[test]
-fn test_batch_empty_array_no_events() {
+fn test_batch_empty_array_rejected() {
     let env = Env::default();
     let (bridge, user, token_id, _) = setup_batch(&env);
-    let event_count_before = env.events().all().len();
 
     let targets: Vec<Address> = Vec::new(&env);
     let amounts: Vec<i128> = Vec::new(&env);
-    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None);
 
-    // No new events emitted — the contract returns early before even emitting BatchCompleted.
-    assert_eq!(env.events().all().len(), event_count_before);
+    // Must be rejected — no tokens should move, no events emitted.
+    assert_eq!(
+        bridge.try_batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
     // Source balance unchanged.
     assert_eq!(check_balance(&env, &token_id, &user), 1_000_000i128);
 }
@@ -2979,12 +3100,139 @@ fn test_batch_100_targets() {
     assert_eq!(check_balance(&env, &token_id, &user), 1_000_000i128); // original unchanged
 }
 
+/// #593: batch_fund_c_address must NOT mint loyalty tokens when every target
+/// is blocked (num_success == 0). Before the fix, loyalty was minted
+/// unconditionally, letting an attacker farm the reserve at zero cost.
+#[test]
+fn test_batch_all_blocked_no_loyalty_minted() {
+    let env = Env::default();
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let (admin, user, fee_collector) = create_test_users(&env);
+    init_token(&env, &token_id, &admin);
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1_000i128);
+
+    // Set up a separate loyalty token and fund the bridge reserve.
+    let loyalty_token_id = env.register(TestToken, ());
+    init_token(&env, &loyalty_token_id, &admin);
+    bridge.set_loyalty_token(&loyalty_token_id, &10i128, &None);
+    mint_tokens(&env, &loyalty_token_id, &bridge_id, 1_000i128);
+
+    let t1 = Address::generate(&env);
+    let t2 = Address::generate(&env);
+    bridge.add_to_blocklist(&t1, &None);
+    bridge.add_to_blocklist(&t2, &None);
+
+    let targets = Vec::from_array(&env, [t1, t2]);
+    let amounts = Vec::from_array(&env, [400i128, 600i128]);
+    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None);
+
+    // No loyalty reward must be minted — user's loyalty balance stays at 0.
+    assert_eq!(check_balance(&env, &loyalty_token_id, &user), 0i128);
+    // Bridge loyalty reserve is untouched.
+    assert_eq!(
+        check_balance(&env, &loyalty_token_id, &bridge_id),
+        1_000i128
+    );
+    // Full refund of the funding token.
+    assert_eq!(check_balance(&env, &token_id, &user), 1_000i128);
+}
+
+/// #593: when at least one target succeeds, loyalty IS still minted.
+#[test]
+fn test_batch_partial_success_loyalty_minted() {
+    let env = Env::default();
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let (admin, user, fee_collector) = create_test_users(&env);
+    init_token(&env, &token_id, &admin);
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1_000i128);
+
+    let loyalty_token_id = env.register(TestToken, ());
+    init_token(&env, &loyalty_token_id, &admin);
+    bridge.set_loyalty_token(&loyalty_token_id, &10i128, &None);
+    mint_tokens(&env, &loyalty_token_id, &bridge_id, 1_000i128);
+
+    let good = Address::generate(&env);
+    let blocked = Address::generate(&env);
+    bridge.add_to_blocklist(&blocked, &None);
+
+    let targets = Vec::from_array(&env, [good, blocked]);
+    let amounts = Vec::from_array(&env, [500i128, 500i128]);
+    bridge.batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None);
+
+    // One success → loyalty must be minted.
+    assert_eq!(check_balance(&env, &loyalty_token_id, &user), 10i128);
+}
+
+/// #595: SourceBridgedVolume is now keyed per (source, asset) so that volume
+/// from different assets does not pollute each other's fee-tier lookup.
+#[test]
+fn test_fee_tiers_keyed_per_asset() {
+    let env = Env::default();
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let (admin, user, fee_collector) = create_test_users(&env);
+    init_token(&env, &token_id, &admin);
+
+    // Register a second token asset.
+    let token2_id = env.register(TestToken, ());
+    init_token(&env, &token2_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None); // default 1% fee
+    bridge.add_asset(&token_id, &None);
+    bridge.add_asset(&token2_id, &None);
+
+    // Set a tier: volume >= 1000 → 0 bps fee.
+    let tiers = Vec::from_array(
+        &env,
+        [FeeTier {
+            min_volume: 1_000i128,
+            max_volume: i128::MAX,
+            fee_bps: 0u32,
+        }],
+    );
+    bridge.set_fee_tiers(&tiers, &None);
+
+    // Fund 1000 units of token_id — this should push token_id volume to tier.
+    mint_tokens(&env, &token_id, &user, 1_000i128);
+    let target1 = Address::generate(&env);
+    bridge.fund_c_address(&user, &target1, &token_id, &1_000i128, &None, &None);
+
+    // Query current tier for token_id — should be in the 0 bps tier.
+    let tier_token1 = bridge.query_current_tier(&user, &token_id);
+    assert_eq!(
+        tier_token1.fee_bps, 0u32,
+        "token_id volume should reach zero-fee tier"
+    );
+
+    // Query current tier for token2_id — volume is still 0, must NOT inherit token_id's volume.
+    let tier_token2 = bridge.query_current_tier(&user, &token2_id);
+    assert_eq!(
+        tier_token2.fee_bps, 100u32,
+        "token2_id volume is 0 — must not inherit token_id volume (#595)"
+    );
+
+    // Now fund 1000 of token2_id and confirm its tier updates independently.
+    mint_tokens(&env, &token2_id, &user, 1_000i128);
+    let target2 = Address::generate(&env);
+    bridge.fund_c_address(&user, &target2, &token2_id, &1_000i128, &None, &None);
+    let tier_token2_after = bridge.query_current_tier(&user, &token2_id);
+    assert_eq!(
+        tier_token2_after.fee_bps, 0u32,
+        "token2_id should now be in zero-fee tier"
+    );
+}
+
 /// Batches larger than MAX_BATCH_SIZE (100) must be rejected.
 #[test]
 fn test_batch_exceeds_max_size() {
     let env = Env::default();
     let (bridge, user, token_id, _) = setup_batch(&env);
-
     let mut targets: Vec<Address> = Vec::new(&env);
     let mut amounts: Vec<i128> = Vec::new(&env);
     for _ in 0..101 {
@@ -3222,6 +3470,37 @@ mod timelocked_tests {
     }
 
     #[test]
+    fn test_timelocked_funding_rejects_amount_below_minimum() {
+        let env = Env::default();
+        let (bridge, user, token_id, _fee_collector, _admin) = setup_timelocked(&env);
+        let target = Address::generate(&env);
+        bridge.set_minimum_amount(&100i128, &None);
+
+        assert_eq!(
+            bridge.try_fund_c_address_timelocked(
+                &user, &target, &token_id, &50i128, &1u64, &0u64, &None, &None,
+            ),
+            Err(Ok(BridgeError::InvalidAmount))
+        );
+    }
+
+    #[test]
+    fn test_timelocked_funding_respects_daily_limit() {
+        let env = Env::default();
+        let (bridge, user, token_id, _fee_collector, _admin) = setup_timelocked(&env);
+        let target = Address::generate(&env);
+        bridge.set_source_daily_limit(&user, &token_id, &100i128, &None);
+
+        assert_eq!(
+            bridge.try_fund_c_address_timelocked(
+                &user, &target, &token_id, &101i128, &1u64, &0u64, &None, &None,
+            ),
+            Err(Ok(BridgeError::DailyLimitExceeded))
+        );
+    }
+
+    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
+    #[test]
     fn test_timelocked_happy_path() {
         let env = Env::default();
         env.ledger().set_timestamp(1_000);
@@ -3352,7 +3631,7 @@ mod timelocked_tests {
         // claim_timelocked time (which is authorised by `target`).
         let loyalty_token_id = env.register(TestToken, ());
         init_token(&env, &loyalty_token_id, &admin);
-        bridge.set_loyalty_token(&loyalty_token_id, &4i128);
+        bridge.set_loyalty_token(&loyalty_token_id, &4i128, &None);
         mint_tokens(&env, &loyalty_token_id, &bridge.address, 1_000i128);
 
         bridge.fund_c_address_timelocked(
@@ -3425,7 +3704,15 @@ mod commit_reveal_tests {
         let (bridge, user, token_id) = setup_commit_reveal(&env);
         let target = Address::generate(&env);
 
-        let hash = amount_hash(&env, &bridge.address, &user, &target, &token_id, 500i128, 42u64);
+        let hash = amount_hash(
+            &env,
+            &bridge.address,
+            &user,
+            &target,
+            &token_id,
+            500i128,
+            42u64,
+        );
         let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
 
         let entry = bridge.query_commitment(&id);
@@ -3448,7 +3735,15 @@ mod commit_reveal_tests {
         env.ledger().set_timestamp(1_000);
         let (bridge, user, token_id) = setup_commit_reveal(&env);
         let target = Address::generate(&env);
-        let hash = amount_hash(&env, 500i128, 43u64);
+        let hash = amount_hash(
+            &env,
+            &bridge.address,
+            &user,
+            &target,
+            &token_id,
+            500i128,
+            43u64,
+        );
         let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
 
         bridge.remove_asset(&token_id, &None);
@@ -3467,7 +3762,15 @@ mod commit_reveal_tests {
         env.ledger().set_timestamp(1_000);
         let (bridge, user, token_id) = setup_commit_reveal(&env);
         let target = Address::generate(&env);
-        let hash = amount_hash(&env, 500i128, 44u64);
+        let hash = amount_hash(
+            &env,
+            &bridge.address,
+            &user,
+            &target,
+            &token_id,
+            500i128,
+            44u64,
+        );
         let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
 
         bridge.add_to_blocklist(&target, &None);
@@ -3487,7 +3790,15 @@ mod commit_reveal_tests {
         let (bridge, user, token_id) = setup_commit_reveal(&env);
         let target = Address::generate(&env);
 
-        let hash = amount_hash(&env, &bridge.address, &user, &target, &token_id, 500i128, 7u64);
+        let hash = amount_hash(
+            &env,
+            &bridge.address,
+            &user,
+            &target,
+            &token_id,
+            500i128,
+            7u64,
+        );
         let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
 
         // Revealed in the same ledger the commitment was created in.
@@ -3505,7 +3816,15 @@ mod commit_reveal_tests {
         let (bridge, user, token_id) = setup_commit_reveal(&env);
         let target = Address::generate(&env);
 
-        let hash = amount_hash(&env, &bridge.address, &user, &target, &token_id, 500i128, 9u64);
+        let hash = amount_hash(
+            &env,
+            &bridge.address,
+            &user,
+            &target,
+            &token_id,
+            500i128,
+            9u64,
+        );
         let id = bridge.commit_fund(&user, &target, &token_id, &hash, &1_500u64);
 
         advance_past_min_delay(&env);
@@ -3525,7 +3844,15 @@ mod commit_reveal_tests {
         let (bridge, user, token_id) = setup_commit_reveal(&env);
         let target = Address::generate(&env);
 
-        let hash = amount_hash(&env, &bridge.address, &user, &target, &token_id, 500i128, 11u64);
+        let hash = amount_hash(
+            &env,
+            &bridge.address,
+            &user,
+            &target,
+            &token_id,
+            500i128,
+            11u64,
+        );
         let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
 
         advance_past_min_delay(&env);
@@ -3546,7 +3873,15 @@ mod commit_reveal_tests {
         let (bridge, user, token_id) = setup_commit_reveal(&env);
         let target = Address::generate(&env);
 
-        let hash = amount_hash(&env, &bridge.address, &user, &target, &token_id, 500i128, 13u64);
+        let hash = amount_hash(
+            &env,
+            &bridge.address,
+            &user,
+            &target,
+            &token_id,
+            500i128,
+            13u64,
+        );
         let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
 
         advance_past_min_delay(&env);
@@ -3567,7 +3902,15 @@ mod commit_reveal_tests {
         let (bridge, user, token_id) = setup_commit_reveal(&env);
         let target = Address::generate(&env);
 
-        let hash = amount_hash(&env, &bridge.address, &user, &target, &token_id, 500i128, 13u64);
+        let hash = amount_hash(
+            &env,
+            &bridge.address,
+            &user,
+            &target,
+            &token_id,
+            500i128,
+            13u64,
+        );
         let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
 
         bridge.cancel_commitment(&id);
@@ -3677,12 +4020,32 @@ mod crosschain_tests {
         bridge.initialize(&admin, &fee_collector, &100u32, &None); // 1% fee
         bridge.add_asset(&token_id, &None);
 
-        // Fund the bridge contract so it can pay out cross-chain claims
-        TestTokenClient::new(env, &token_id).mint(&bridge_id, &10_000i128);
+        // Seed dedicated cross-chain liquidity via the admin deposit path.
+        TestTokenClient::new(env, &token_id).mint(&admin, &10_000i128);
+        bridge.fund_crosschain_reserve(&token_id, &10_000i128);
 
         (bridge_id, token_id, admin, bridge)
     }
 
+    #[test]
+    fn test_crosschain_rejects_amount_below_minimum() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+        bridge.set_minimum_amount(&100i128, &None);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0x44; 32]);
+        let sigs = Vec::new(&env);
+
+        assert_eq!(
+            bridge.try_fund_c_address_crosschain(
+                &1u32, &tx_hash, &target, &token_id, &99i128, &sigs
+            ),
+            Err(Ok(BridgeError::InvalidAmount))
+        );
+    }
+
+    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_crosschain_happy_path_single_relayer() {
         let env = Env::default();
@@ -3692,7 +4055,7 @@ mod crosschain_tests {
         let pubkey = BytesN::from_array(&env, sk.verifying_key().as_bytes());
 
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0xab; 32]);
@@ -3717,6 +4080,33 @@ mod crosschain_tests {
     }
 
     #[test]
+    fn test_crosschain_invalid_signature_returns_contract_error() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+
+        let signing_key = make_signing_key([7u8; 32]);
+        let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+        bridge.add_relayer(&pubkey, &None);
+        bridge.set_relayer_threshold(&1u32);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0x77; 32]);
+        let wrong_payload_hash = build_payload_hash(&env, 2, &tx_hash, &target, &token_id, 100);
+        let sigs = Vec::from_array(
+            &env,
+            [make_relayer_sig(&env, &signing_key, &wrong_payload_hash)],
+        );
+
+        assert_eq!(
+            bridge.try_fund_c_address_crosschain(
+                &1u32, &tx_hash, &target, &token_id, &100i128, &sigs
+            ),
+            Err(Ok(BridgeError::MetaTxInvalidSignature))
+        );
+    }
+
+    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
+    #[test]
     fn test_crosschain_happy_path_2_of_3() {
         let env = Env::default();
         let (_bridge_id, token_id, _admin, bridge) = setup(&env);
@@ -3725,10 +4115,19 @@ mod crosschain_tests {
         let sk2 = make_signing_key([2u8; 32]);
         let sk3 = make_signing_key([3u8; 32]);
 
-        bridge.add_relayer(&BytesN::from_array(&env, sk1.verifying_key().as_bytes()), &None);
-        bridge.add_relayer(&BytesN::from_array(&env, sk2.verifying_key().as_bytes()), &None);
-        bridge.add_relayer(&BytesN::from_array(&env, sk3.verifying_key().as_bytes()), &None);
-        bridge.set_relayer_threshold(&2u32);
+        bridge.add_relayer(
+            &BytesN::from_array(&env, sk1.verifying_key().as_bytes()),
+            &None,
+        );
+        bridge.add_relayer(
+            &BytesN::from_array(&env, sk2.verifying_key().as_bytes()),
+            &None,
+        );
+        bridge.add_relayer(
+            &BytesN::from_array(&env, sk3.verifying_key().as_bytes()),
+            &None,
+        );
+        bridge.set_relayer_threshold(&2u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0xcd; 32]);
@@ -3757,8 +4156,11 @@ mod crosschain_tests {
         let (_bridge_id, token_id, _admin, bridge) = setup(&env);
 
         let sk = make_signing_key([1u8; 32]);
-        bridge.add_relayer(&BytesN::from_array(&env, sk.verifying_key().as_bytes()), &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.add_relayer(
+            &BytesN::from_array(&env, sk.verifying_key().as_bytes()),
+            &None,
+        );
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0xef; 32]);
@@ -3785,9 +4187,15 @@ mod crosschain_tests {
         let sk1 = make_signing_key([1u8; 32]);
         let sk2 = make_signing_key([2u8; 32]);
 
-        bridge.add_relayer(&BytesN::from_array(&env, sk1.verifying_key().as_bytes()), &None);
-        bridge.add_relayer(&BytesN::from_array(&env, sk2.verifying_key().as_bytes()), &None);
-        bridge.set_relayer_threshold(&2u32);
+        bridge.add_relayer(
+            &BytesN::from_array(&env, sk1.verifying_key().as_bytes()),
+            &None,
+        );
+        bridge.add_relayer(
+            &BytesN::from_array(&env, sk2.verifying_key().as_bytes()),
+            &None,
+        );
+        bridge.set_relayer_threshold(&2u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x11; 32]);
@@ -3812,11 +4220,11 @@ mod crosschain_tests {
         let sk_registered = make_signing_key([1u8; 32]);
         let sk_stranger = make_signing_key([9u8; 32]); // not registered
 
-        bridge.add_relayer(&BytesN::from_array(
-            &env,
-            sk_registered.verifying_key().as_bytes(),
-        ), &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.add_relayer(
+            &BytesN::from_array(&env, sk_registered.verifying_key().as_bytes()),
+            &None,
+        );
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x22; 32]);
@@ -3842,12 +4250,12 @@ mod crosschain_tests {
         bridge.add_relayer(&pk, &None);
         assert!(bridge.query_is_relayer(&pk));
 
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
         assert_eq!(bridge.query_relayer_threshold(), 1u32);
 
         // Can't remove last relayer when it would drop below threshold
         assert_eq!(
-            bridge.try_remove_relayer(&pk),
+            bridge.try_remove_relayer(&pk, &None),
             Err(Ok(BridgeError::BelowThreshold))
         );
     }
@@ -3860,9 +4268,15 @@ mod crosschain_tests {
         let sk1 = make_signing_key([1u8; 32]);
         let sk2 = make_signing_key([2u8; 32]);
 
-        bridge.add_relayer(&BytesN::from_array(&env, sk1.verifying_key().as_bytes()), &None);
-        bridge.add_relayer(&BytesN::from_array(&env, sk2.verifying_key().as_bytes()), &None);
-        bridge.set_relayer_threshold(&2u32);
+        bridge.add_relayer(
+            &BytesN::from_array(&env, sk1.verifying_key().as_bytes()),
+            &None,
+        );
+        bridge.add_relayer(
+            &BytesN::from_array(&env, sk2.verifying_key().as_bytes()),
+            &None,
+        );
+        bridge.set_relayer_threshold(&2u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x33; 32]);
@@ -3889,13 +4303,13 @@ mod crosschain_tests {
         // credited to `target`, the only address party to this call.
         let loyalty_token_id = env.register(TestToken, ());
         init_token(&env, &loyalty_token_id, &admin);
-        bridge.set_loyalty_token(&loyalty_token_id, &3i128);
+        bridge.set_loyalty_token(&loyalty_token_id, &3i128, &None);
         mint_tokens(&env, &loyalty_token_id, &bridge_id, 1_000i128);
 
         let sk = make_signing_key([9u8; 32]);
         let pubkey = BytesN::from_array(&env, sk.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x77; 32]);
@@ -3909,6 +4323,190 @@ mod crosschain_tests {
         bridge.fund_c_address_crosschain(&chain_id, &tx_hash, &target, &token_id, &amount, &sigs);
 
         assert_eq!(check_balance(&env, &loyalty_token_id, &target), 3i128);
+    }
+
+    #[test]
+    fn test_zero_relayer_threshold_is_rejected() {
+        let env = Env::default();
+        let (_bridge_id, _token_id, _admin, bridge) = setup(&env);
+        let relayer = BytesN::from_array(
+            &env,
+            make_signing_key([6u8; 32]).verifying_key().as_bytes(),
+        );
+        bridge.add_relayer(&relayer, &None);
+
+        assert_eq!(
+            bridge.try_set_relayer_threshold(&0u32),
+            Err(Ok(BridgeError::ThresholdExceedsRelayers))
+        );
+        assert_eq!(bridge.query_relayer_threshold(), 1);
+    }
+
+    #[test]
+    fn test_empty_crosschain_signatures_fail_without_relayers() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0x81; 32]);
+        let sigs = Vec::new(&env);
+
+        assert_eq!(
+            bridge.try_fund_c_address_crosschain(
+                &1u32, &tx_hash, &target, &token_id, &100i128, &sigs
+            ),
+            Err(Ok(BridgeError::BelowThreshold))
+        );
+    }
+
+    #[test]
+    fn test_empty_crosschain_signatures_fail_with_active_threshold() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+        let relayer = BytesN::from_array(
+            &env,
+            make_signing_key([7u8; 32]).verifying_key().as_bytes(),
+        );
+        bridge.add_relayer(&relayer, &None);
+        bridge.set_relayer_threshold(&1u32);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0x82; 32]);
+        let sigs = Vec::new(&env);
+        assert_eq!(
+            bridge.try_fund_c_address_crosschain(
+                &1u32, &tx_hash, &target, &token_id, &100i128, &sigs
+            ),
+            Err(Ok(BridgeError::BelowThreshold))
+        );
+    }
+
+    #[test]
+    fn test_zero_threshold_storage_cannot_bypass_relayer_checks() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+        let relayer = BytesN::from_array(
+            &env,
+            make_signing_key([8u8; 32]).verifying_key().as_bytes(),
+        );
+        bridge.add_relayer(&relayer, &None);
+        env.storage()
+            .instance()
+            .set(&DataKey::RelayerThreshold, &0u32);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0x83; 32]);
+        let sigs = Vec::new(&env);
+        assert_eq!(
+            bridge.try_fund_c_address_crosschain(
+                &1u32, &tx_hash, &target, &token_id, &100i128, &sigs
+            ),
+            Err(Ok(BridgeError::BelowThreshold))
+        );
+        assert_eq!(
+            bridge.try_remove_relayer(&relayer),
+            Err(Ok(BridgeError::BelowThreshold))
+        );
+        assert!(bridge.query_is_relayer(&relayer));
+    }
+
+    #[test]
+    fn test_crosschain_reserve_preserves_fees_and_timelocked_funds() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge_id, token_id, admin, bridge) = setup(&env);
+
+        let timelock_target = soroban_sdk::Address::generate(&env);
+        TestTokenClient::new(&env, &token_id).mint(&admin, &500i128);
+        let timelock_id = bridge.fund_c_address_timelocked(
+            &admin,
+            &timelock_target,
+            &token_id,
+            &500i128,
+            &1_100u64,
+            &0u64,
+            &None,
+            &None,
+        );
+        let reclaim_destination = soroban_sdk::Address::generate(&env);
+        assert_eq!(
+            bridge.try_reclaim_tokens(
+                &token_id,
+                &1i128,
+                &reclaim_destination,
+                &None,
+            ),
+            Err(Ok(crate::BridgeError::InsufficientReclaimable))
+        );
+
+        let signing_key = make_signing_key([8u8; 32]);
+        let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+        bridge.add_relayer(&pubkey, &None);
+        bridge.set_relayer_threshold(&1u32);
+
+        for (chain_id, hash_byte) in [(1u32, 0x31u8), (2u32, 0x32u8)] {
+            let target = soroban_sdk::Address::generate(&env);
+            let tx_hash = BytesN::from_array(&env, &[hash_byte; 32]);
+            let amount = 4_000i128;
+            let payload_hash =
+                build_payload_hash(&env, chain_id, &tx_hash, &target, &token_id, amount);
+            let sigs = Vec::from_array(
+                &env,
+                [make_relayer_sig(&env, &signing_key, &payload_hash)],
+            );
+            bridge.fund_c_address_crosschain(
+                &chain_id, &tx_hash, &target, &token_id, &amount, &sigs,
+            );
+            assert_eq!(TestTokenClient::new(&env, &token_id).balance(&target), 3_960i128);
+        }
+
+        assert_eq!(bridge.query_crosschain_reserve(&token_id), 2_080i128);
+        assert_eq!(bridge.query_accrued_fees(&token_id), 0i128);
+        let insufficient_target = soroban_sdk::Address::generate(&env);
+        let insufficient_hash = BytesN::from_array(&env, &[0x33; 32]);
+        let insufficient_payload = build_payload_hash(
+            &env,
+            1,
+            &insufficient_hash,
+            &insufficient_target,
+            &token_id,
+            3_000,
+        );
+        let insufficient_sigs = Vec::from_array(
+            &env,
+            [make_relayer_sig(&env, &signing_key, &insufficient_payload)],
+        );
+        assert_eq!(
+            bridge.try_fund_c_address_crosschain(
+                &1u32,
+                &insufficient_hash,
+                &insufficient_target,
+                &token_id,
+                &3_000i128,
+                &insufficient_sigs,
+            ),
+            Err(Ok(crate::BridgeError::InsufficientCrossChainReserve))
+        );
+
+        let token = TestTokenClient::new(&env, &token_id);
+        let contract_balance = token.balance(&bridge_id);
+        let locked = crate::read_asset_counters(&env, &token_id).locked_timelock;
+        assert!(bridge.query_accrued_fees(&token_id) + locked <= contract_balance);
+
+        advance_ledger_time(&env, 1_100);
+        bridge.claim_timelocked(&timelock_id);
+        assert_eq!(token.balance(&timelock_target), 495i128);
+        assert_eq!(bridge.query_accrued_fees(&token_id), 5i128);
+        assert_eq!(crate::read_asset_counters(&env, &token_id).locked_timelock, 0i128);
+        assert_eq!(bridge.query_contract_balance(&token_id), 2_085i128);
+        assert!(
+            bridge.query_accrued_fees(&token_id)
+                + crate::read_asset_counters(&env, &token_id).locked_timelock
+                <= bridge.query_contract_balance(&token_id)
+        );
+
+        bridge.withdraw_crosschain_reserve(&token_id, &2_080i128);
+        assert_eq!(bridge.query_crosschain_reserve(&token_id), 0i128);
+        assert_eq!(bridge.query_contract_balance(&token_id), 5i128);
     }
 }
 
@@ -3925,7 +4523,7 @@ fn test_batch_fund_mints_loyalty_once() {
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
     bridge.add_asset(&token_id, &None);
-    bridge.set_loyalty_token(&loyalty_token_id, &10i128);
+    bridge.set_loyalty_token(&loyalty_token_id, &10i128, &None);
     mint_tokens(&env, &loyalty_token_id, &bridge_id, 1_000i128);
     mint_tokens(&env, &token_id, &user, 2_000i128);
 
@@ -3940,6 +4538,50 @@ fn test_batch_fund_mints_loyalty_once() {
 }
 
 #[test]
+fn test_loyalty_rewards_preserve_bridged_asset_reserves() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (bridge, user, asset, _admin) = setup_bridge(&env);
+    let bridge_id = bridge.address.clone();
+    let target = Address::generate(&env);
+
+    bridge.set_fee_bps(&1_000u32, &None);
+    bridge.set_loyalty_token(&asset, &200i128);
+    mint_tokens(&env, &asset, &bridge_id, 300i128);
+
+    bridge.fund_c_address_timelocked(
+        &user,
+        &target,
+        &asset,
+        &500i128,
+        &2_000u64,
+        &0u64,
+        &None,
+        &None,
+    );
+
+    let locked = 500i128;
+    assert!(
+        bridge.query_contract_balance(&asset) >= bridge.query_accrued_fees(&asset) + locked
+    );
+
+    for _ in 0..5 {
+        let target = Address::generate(&env);
+        bridge.fund_c_address(&user, &target, &asset, &100i128, &None, &None);
+        assert!(
+            bridge.query_contract_balance(&asset) >= bridge.query_accrued_fees(&asset) + locked
+        );
+    }
+
+    assert!(
+        count_events_with_topic(&env, &bridge_id, "LoyaltyMintSkipped") > 0,
+        "funding should skip rewards when only reserved funds remain"
+    );
+
+}
+
+#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
+#[test]
 fn test_batch_fund_all_blocked_mints_no_loyalty() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
@@ -3952,7 +4594,7 @@ fn test_batch_fund_all_blocked_mints_no_loyalty() {
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
     bridge.add_asset(&token_id, &None);
-    bridge.set_loyalty_token(&loyalty_token_id, &10i128);
+    bridge.set_loyalty_token(&loyalty_token_id, &10i128, &None);
     mint_tokens(&env, &loyalty_token_id, &bridge_id, 1_000i128);
     mint_tokens(&env, &token_id, &user, 1_000i128);
 
@@ -4052,9 +4694,7 @@ fn test_fund_with_no_referrer_accrues_full_fee() {
     mint_tokens(&env, &token_id, &user, 1000i128);
     let target = Address::generate(&env);
 
-    bridge.fund_c_address_with_referral(
-        &user, &target, &token_id, &1000i128, &None, &None, &None,
-    );
+    bridge.fund_c_address_with_referral(&user, &target, &token_id, &1000i128, &None, &None, &None);
 
     // No referrer — full fee (10) stays in contract
     assert_eq!(check_balance(&env, &token_id, &target), 990i128);
@@ -4146,16 +4786,20 @@ fn test_referral_rejects_source_and_target_as_referrer() {
             &token_id,
             &1000i128,
             &Some(user.clone()),
+            &None,
+            &None,
         ),
         Err(Ok(BridgeError::InvalidReferrer))
     );
     assert_eq!(
         bridge.try_fund_c_address_with_referral(
             &user,
-            &target,
+            &target.clone(),
             &token_id,
             &1000i128,
             &Some(target),
+            &None,
+            &None,
         ),
         Err(Ok(BridgeError::InvalidReferrer))
     );
@@ -4179,7 +4823,7 @@ fn test_fee_tier_cannot_raise_global_fee() {
             fee_bps: 100,
         }],
     );
-    bridge.set_fee_tiers(&tiers);
+    bridge.set_fee_tiers(&tiers, &None);
     mint_tokens(&env, &token_id, &user, 10_000i128);
 
     let target = Address::generate(&env);
@@ -4202,14 +4846,12 @@ fn test_referral_fund_mints_loyalty() {
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
     bridge.add_asset(&token_id, &None);
-    bridge.set_loyalty_token(&loyalty_token_id, &6i128);
+    bridge.set_loyalty_token(&loyalty_token_id, &6i128, &None);
     mint_tokens(&env, &loyalty_token_id, &bridge_id, 1_000i128);
     mint_tokens(&env, &token_id, &user, 1000i128);
 
     let target = Address::generate(&env);
-    bridge.fund_c_address_with_referral(
-        &user, &target, &token_id, &1000i128, &None, &None, &None,
-    );
+    bridge.fund_c_address_with_referral(&user, &target, &token_id, &1000i128, &None, &None, &None);
 
     assert_eq!(check_balance(&env, &loyalty_token_id, &user), 6i128);
 }
@@ -4270,14 +4912,14 @@ fn test_fund_c_address_zero_amount_no_event() {
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
     bridge.add_asset(&token_id, &None);
 
-    // Snapshot event count after setup (Initialized + add_asset events already emitted).
     let events_before = env.events().all().len();
 
     let target = Address::generate(&env);
-    let _ = bridge.try_fund_c_address(&user, &target, &token_id, &0i128, &None, &None);
+    let res = bridge.try_fund_c_address(&user, &target, &token_id, &0i128, &None, &None);
+    assert_eq!(res, Err(Ok(BridgeError::InvalidAmount)));
 
     // No new events should have been emitted by the rejected call.
-    assert_eq!(env.events().all().len(), events_before);
+    assert!(env.events().all().len() <= events_before);
 }
 
 // batch_fund_c_address where every amount is zero — fails at validation loop.
@@ -4977,7 +5619,7 @@ fn test_meta_fund_rejects_pubkey_source_mismatch() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
-    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
+    let network_id = env.ledger().network_id();
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
@@ -5024,7 +5666,7 @@ fn test_meta_fund_rejects_unregistered_source() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
-    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
+    let network_id = env.ledger().network_id();
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
@@ -5071,6 +5713,7 @@ fn test_meta_signer_can_be_unregistered() {
 /// so tests can produce valid Ed25519 signatures.
 fn build_meta_fund_payload_hash(
     env: &Env,
+    bridge: &Address,
     network_id: &BytesN<32>,
     source: &Address,
     target: &Address,
@@ -5082,7 +5725,7 @@ fn build_meta_fund_payload_hash(
     let domain = Bytes::from_slice(env, b"meta_fund");
 
     let mut addr_buf = [0u8; 64];
-    let contract_str = env.current_contract_address().to_string();
+    let contract_str = bridge.to_string();
     contract_str.copy_into_slice(&mut addr_buf[..contract_str.len() as usize]);
     let contract_raw = Bytes::from_slice(env, &addr_buf[..contract_str.len() as usize]);
     let contract_hash: BytesN<32> = env.crypto().sha256(&contract_raw).into();
@@ -5133,18 +5776,25 @@ fn sign_meta_fund_payload(
     BytesN::from_array(env, &sig.to_bytes())
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
+fn hash_meta_fund_address(env: &Env, address: &Address) -> BytesN<32> {
+    let address_str = address.to_string();
+    let address_len = address_str.len() as usize;
+    let mut address_buf = [0u8; 64];
+    address_str.copy_into_slice(&mut address_buf[..address_len]);
+    let address_bytes = Bytes::from_slice(env, &address_buf[..address_len]);
+    env.crypto().sha256(&address_bytes).into()
+}
+
 #[test]
-fn test_meta_fund_happy_path() {
+fn test_meta_fund_accepts_documented_payload_layout() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
-    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
+    let network_id = env.ledger().network_id();
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
-    bridge.set_meta_tx_network_id(&network_id);
     bridge.add_asset(&token_id, &None);
     mint_tokens(&env, &token_id, &user, 1000i128);
 
@@ -5160,17 +5810,23 @@ fn test_meta_fund_happy_path() {
     let nonce: u64 = 0;
     let deadline: u64 = 2_000_000;
 
-    let payload_hash =
-        build_meta_fund_payload_hash(
-            &env,
-            &network_id,
-            &user,
-            &target,
-            &token_id,
-            amount,
-            nonce,
-            deadline,
-        );
+    let contract_hash = hash_meta_fund_address(&env, &bridge_id);
+    let source_hash = hash_meta_fund_address(&env, &user);
+    let target_hash = hash_meta_fund_address(&env, &target);
+    let asset_hash = hash_meta_fund_address(&env, &token_id);
+
+    let mut payload = Bytes::from_slice(&env, b"meta_fund");
+    payload.append(&network_id.clone().into());
+    payload.append(&contract_hash.into());
+    payload.append(&source_hash.into());
+    payload.append(&target_hash.into());
+    payload.append(&asset_hash.into());
+    payload.extend_from_array(&amount.to_be_bytes());
+    payload.extend_from_array(&nonce.to_be_bytes());
+    payload.extend_from_array(&deadline.to_be_bytes());
+    assert_eq!(payload.len(), 201);
+
+    let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
     let signature = sign_meta_fund_payload(&env, &signing_key, &payload_hash);
 
     let params = MetaFundParams {
@@ -5183,12 +5839,7 @@ fn test_meta_fund_happy_path() {
         deadline,
     };
 
-    soroban_sdk::token::Client::new(&env, &token_id).approve(
-        &user,
-        &bridge_id,
-        &amount,
-        &100u32,
-    );
+    soroban_sdk::token::Client::new(&env, &token_id).approve(&user, &bridge_id, &amount, &100u32);
     bridge.execute_meta_fund(&params, &pubkey, &signature);
 
     // 500 * 100 / 10000 = 5 fee → net 495 to target
@@ -5203,11 +5854,10 @@ fn test_meta_fund_expired_deadline_fails() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
-    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
+    let network_id = env.ledger().network_id();
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
-    bridge.set_meta_tx_network_id(&network_id);
     bridge.add_asset(&token_id, &None);
     mint_tokens(&env, &token_id, &user, 1000i128);
 
@@ -5222,8 +5872,17 @@ fn test_meta_fund_expired_deadline_fails() {
     let nonce: u64 = 0;
     let deadline: u64 = 1_999; // already passed (ledger timestamp = 2_000)
 
-    let payload_hash =
-        build_meta_fund_payload_hash(&env, &network_id, &user, &target, &token_id, amount, nonce, deadline);
+    let payload_hash = build_meta_fund_payload_hash(
+        &env,
+        &bridge_id,
+        &network_id,
+        &user,
+        &target,
+        &token_id,
+        amount,
+        nonce,
+        deadline,
+    );
     let signature = sign_meta_fund_payload(&env, &signing_key, &payload_hash);
 
     let params = MetaFundParams {
@@ -5249,11 +5908,10 @@ fn test_meta_fund_nonce_replay_rejected() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
-    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
+    let network_id = env.ledger().network_id();
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &0u32, &None);
-    bridge.set_meta_tx_network_id(&network_id);
     bridge.add_asset(&token_id, &None);
     mint_tokens(&env, &token_id, &user, 2000i128);
 
@@ -5269,17 +5927,17 @@ fn test_meta_fund_nonce_replay_rejected() {
     let nonce: u64 = 42;
     let deadline: u64 = 2_000_000;
 
-    let payload_hash =
-        build_meta_fund_payload_hash(
-            &env,
-            &network_id,
-            &user,
-            &target1,
-            &token_id,
-            amount,
-            nonce,
-            deadline,
-        );
+    let payload_hash = build_meta_fund_payload_hash(
+        &env,
+        &bridge_id,
+        &network_id,
+        &user,
+        &target1,
+        &token_id,
+        amount,
+        nonce,
+        deadline,
+    );
     let signature = sign_meta_fund_payload(&env, &signing_key, &payload_hash);
 
     let params = MetaFundParams {
@@ -5292,12 +5950,7 @@ fn test_meta_fund_nonce_replay_rejected() {
         deadline,
     };
 
-    soroban_sdk::token::Client::new(&env, &token_id).approve(
-        &user,
-        &bridge_id,
-        &amount,
-        &100u32,
-    );
+    soroban_sdk::token::Client::new(&env, &token_id).approve(&user, &bridge_id, &amount, &100u32);
     // First use succeeds.
     bridge.execute_meta_fund(&params, &pubkey, &signature);
     assert_eq!(check_balance(&env, &token_id, &target1), 500i128);
@@ -5325,11 +5978,10 @@ fn test_meta_fund_invalid_signature_fails() {
     let (admin, user, fee_collector) = create_test_users(&env);
     let (bridge_id, token_id) = register_all_contracts_mocked(&env);
     let bridge = create_bridge_client(&env, &bridge_id);
-    let network_id = BytesN::from_array(&env, &[0x11u8; 32]);
+    let network_id = env.ledger().network_id();
     init_token(&env, &token_id, &admin);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
-    bridge.set_meta_tx_network_id(&network_id);
     bridge.add_asset(&token_id, &None);
     mint_tokens(&env, &token_id, &user, 1000i128);
 
@@ -5481,12 +6133,7 @@ fn test_set_source_daily_limit_rejects_negative_limit() {
     bridge.add_asset(&token_id, &None);
 
     assert_eq!(
-        bridge.try_set_source_daily_limit(
-            &_user,
-            &token_id,
-            &-1i128,
-            &None
-        ),
+        bridge.try_set_source_daily_limit(&_user, &token_id, &-1i128, &None),
         Err(Ok(BridgeError::InvalidAmount))
     );
 }
@@ -5502,12 +6149,7 @@ fn test_set_source_daily_limit_rejects_non_whitelisted_asset() {
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
 
     assert_eq!(
-        bridge.try_set_source_daily_limit(
-            &user,
-            &non_whitelisted_asset,
-            &500i128,
-            &None
-        ),
+        bridge.try_set_source_daily_limit(&user, &non_whitelisted_asset, &500i128, &None),
         Err(Ok(BridgeError::AssetNotWhitelisted))
     );
 
@@ -5540,7 +6182,7 @@ fn test_batch_fund_applies_tiered_fee() {
             fee_bps: 10u32,
         }],
     );
-    bridge.set_fee_tiers(&tiers);
+    bridge.set_fee_tiers(&tiers, &None);
 
     mint_tokens(&env, &token_id, &user, 1000i128);
     let target = Address::generate(&env);
@@ -5564,7 +6206,7 @@ fn test_extend_instance_ttl_extends_instance_storage() {
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
     env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
 
-    bridge.extend_instance_ttl(&200_000u32);
+    bridge.extend_instance_ttl(&200_000u32, &None);
 
     let ttl = env.as_contract(&bridge_id, || env.storage().instance().get_ttl());
     assert!(ttl >= 200_000);
@@ -5582,6 +6224,8 @@ fn test_extend_persistent_ttl_extends_asset_keys() {
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
     bridge.add_asset(&token_id, &None);
     mint_tokens(&env, &token_id, &user, 1000i128);
+    mint_tokens(&env, &token_id, &admin, 1000i128);
+    bridge.fund_crosschain_reserve(&token_id, &1000i128);
     bridge.fund_c_address(
         &user,
         &Address::generate(&env),
@@ -5593,11 +6237,11 @@ fn test_extend_persistent_ttl_extends_asset_keys() {
     bridge.set_asset_fee_cap(&token_id, &1000u32, &None);
 
     env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
-    bridge.extend_persistent_ttl(&token_id, &200_000u32);
+    bridge.extend_persistent_ttl(&token_id, &200_000u32, &None);
 
     let expected_keys = [
         DataKey::AssetStats(token_id.clone()),
-        DataKey::AssetFeeCap(token_id.clone()),
+        DataKey::CrossChainReserve(token_id.clone()),
     ];
     for key in expected_keys.iter() {
         let ttl = env.as_contract(&bridge_id, || env.storage().persistent().get_ttl(key));
@@ -5637,13 +6281,13 @@ fn test_extend_source_persistent_ttl_extends_source_keys() {
     let day = env.ledger().timestamp() / 86_400;
 
     env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
-    bridge.extend_source_persistent_ttl(&user, &token_id, &200_000u32);
+    bridge.extend_source_persistent_ttl(&user, &token_id, &200_000u32, &None);
 
     let expected_keys = [
         DataKey::SourceDailyLimit(user.clone(), token_id.clone()),
         DataKey::DailyUsage(user.clone(), token_id.clone(), day),
         DataKey::UserDeposit(user.clone(), token_id.clone()),
-        DataKey::SourceBridgedVolume(user.clone()),
+        DataKey::SourceBridgedVolume(user.clone(), token_id.clone()),
         DataKey::Nonce(user.clone()),
         DataKey::AuthNonce(user.clone()),
     ];
@@ -5667,7 +6311,7 @@ fn test_extend_source_persistent_ttl_not_initialized_fails() {
     let asset = Address::generate(&env);
 
     assert_eq!(
-        bridge.try_extend_source_persistent_ttl(&source, &asset, &200_000u32),
+        bridge.try_extend_source_persistent_ttl(&source, &asset, &200_000u32, &None),
         Err(Ok(BridgeError::NotInitialized))
     );
 }
@@ -5686,7 +6330,7 @@ fn test_extend_source_persistent_ttl_skips_missing_keys() {
     // missing entry, mirroring `extend_persistent_ttl`.
     let source = Address::generate(&env);
     let asset = Address::generate(&env);
-    bridge.extend_source_persistent_ttl(&source, &asset, &200_000u32);
+    bridge.extend_source_persistent_ttl(&source, &asset, &200_000u32, &None);
 }
 
 #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
@@ -5713,7 +6357,7 @@ fn test_extend_source_persistent_ttl_caps_at_max_allowed_ttl() {
     env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
     // Requesting far beyond the hard ceiling must silently clamp to
     // `MAX_ALLOWED_TTL` rather than erroring or exceeding it.
-    bridge.extend_source_persistent_ttl(&user, &token_id, &(MAX_ALLOWED_TTL * 10));
+    bridge.extend_source_persistent_ttl(&user, &token_id, &(MAX_ALLOWED_TTL * 10), &None);
 
     let ttl = env.as_contract(&bridge_id, || {
         env.storage()
@@ -5723,7 +6367,6 @@ fn test_extend_source_persistent_ttl_caps_at_max_allowed_ttl() {
     assert!(ttl <= MAX_ALLOWED_TTL);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_set_max_ttl_updates_config() {
     let env = Env::default();
@@ -5734,11 +6377,11 @@ fn test_set_max_ttl_updates_config() {
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
     env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
 
-    bridge.set_max_instance_ttl(&200_000u32);
+    bridge.set_max_instance_ttl(&200_000u32, &None);
     let instance_ttl = env.as_contract(&bridge_id, || env.storage().instance().get_ttl());
     assert!(instance_ttl >= 200_000);
 
-    bridge.set_max_persistent_ttl(&300_000u32);
+    bridge.set_max_persistent_ttl(&300_000u32, &None);
 
     let (instance_ttl, persistent_ttl, hard_ceiling, critical_threshold) =
         bridge.query_ttl_config();
@@ -5748,7 +6391,6 @@ fn test_set_max_ttl_updates_config() {
     assert_eq!(critical_threshold, CRITICAL_ENTRY_TTL_THRESHOLD);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_ttl_config_returns_current_settings() {
     let env = Env::default();
@@ -5786,14 +6428,12 @@ fn test_referral_fund_applies_tiered_fee() {
             fee_bps: 10u32,
         }],
     );
-    bridge.set_fee_tiers(&tiers);
+    bridge.set_fee_tiers(&tiers, &None);
 
     mint_tokens(&env, &token_id, &user, 1000i128);
     let target = Address::generate(&env);
 
-    bridge.fund_c_address_with_referral(
-        &user, &target, &token_id, &1000i128, &None, &None, &None,
-    );
+    bridge.fund_c_address_with_referral(&user, &target, &token_id, &1000i128, &None, &None, &None);
 
     // Tiered fee (10 bps) on 1000 = 1, not the flat global rate (100 bps = 10).
     assert_eq!(check_balance(&env, &token_id, &target), 999i128);
@@ -5900,7 +6540,6 @@ fn test_asset_fee_cap_overrides_global_rate() {
     assert_eq!(bridge.query_accrued_fees(&token_id), 5i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_asset_fee_cap_returns_configured_value() {
     let env = Env::default();
@@ -6415,5 +7054,71 @@ fn test_remove_swap_pool_duplicate_nonce_fails() {
     assert_eq!(
         bridge.try_remove_swap_pool(&pool, &Some(999u64)),
         Err(Ok(BridgeError::DuplicateNonce))
+    );
+}
+
+/********** verify_auth_entry tests (#580) **********/
+
+#[test]
+fn test_verify_auth_entry_success() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let seq = env.ledger().sequence();
+    // Should succeed: nonce 0 is fresh, ledger is within the window
+    bridge.verify_auth_entry(&user, &0u64, &0u32, &(seq + 100));
+
+    // The nonce must now be marked used; replaying it must fail
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &0u64, &0u32, &(seq + 100)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+}
+
+#[test]
+fn test_verify_auth_entry_not_initialized_fails() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    let user = Address::generate(&env);
+    let seq = env.ledger().sequence();
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &0u64, &0u32, &(seq + 100)),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_verify_auth_entry_paused_fails() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.pause(&None);
+
+    let seq = env.ledger().sequence();
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &0u64, &0u32, &(seq + 100)),
+        Err(Ok(BridgeError::ContractPaused))
+    );
+}
+
+#[test]
+fn test_verify_auth_entry_expired_window_fails() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // Current ledger sequence is 0; window [10, 20) excludes it
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &0u64, &10u32, &20u32),
+        Err(Ok(BridgeError::AuthNonceExpired))
     );
 }

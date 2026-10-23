@@ -9,6 +9,7 @@
  * @module offramp
  */
 
+import { createHmac } from 'crypto';
 import {
   OffRampConfig,
   OffRampProvider,
@@ -18,6 +19,36 @@ import {
   ProviderComparison,
 } from './types';
 import { assertAccountAddress, assertContractAddress } from './validate';
+
+/**
+ * Sign a MoonPay widget URL server-side.
+ *
+ * MoonPay requires any URL that pre-fills `walletAddress` to carry a
+ * `signature` query parameter: the HMAC-SHA256 of the URL's query string,
+ * keyed by your MoonPay secret key.
+ *
+ * **SECURITY:** the `secretKey` must never be shipped to browsers or embedded
+ * in client bundles.  Call this helper only from a trusted server (or a
+ * serverless function) and hand the resulting signed URL to the client.
+ *
+ * @param url       - The unsigned widget URL (with or without a `signature`).
+ * @param secretKey - Your MoonPay secret key. Server-side only.
+ *
+ * @returns The URL with a `signature` query parameter appended.
+ *
+ * @example
+ * ```ts
+ * // server-side only
+ * const signed = signUrl(unsignedUrl, process.env.MOONPAY_SECRET_KEY!);
+ * ```
+ */
+export function signUrl(url: string, secretKey: string): string {
+  const queryIndex = url.indexOf('?');
+  const query = queryIndex === -1 ? '' : url.slice(queryIndex + 1);
+  const signature = createHmac('sha256', secretKey).update(query).digest('base64');
+  const separator = queryIndex === -1 ? '?' : '&';
+  return `${url}${separator}signature=${encodeURIComponent(signature)}`;
+}
 
 /**
  * Builds on-ramp and off-ramp widget URLs for multiple fiat-to-crypto
@@ -69,8 +100,12 @@ export class OffRampIntegration {
    * with a credit card or bank transfer and receive `params.asset` at
    * `params.cAddress` on Stellar.
    *
-   * @param params - Provider, fiat amount, fiat currency, crypto asset, and
-   *                 destination C-address.
+   * When `params.signer` is provided it is invoked with the built URL so the
+   * caller can attach a server-side signature (see {@link signUrl}).  This is
+   * required for MoonPay URLs that pre-fill `walletAddress`.
+   *
+   * @param params - Provider, fiat amount, fiat currency, crypto asset,
+   *                 destination C-address, and an optional `signer` callback.
    *
    * @returns A fully-formed URL string ready for `window.open()` or a webview.
    *
@@ -89,18 +124,24 @@ export class OffRampIntegration {
    */
   getOnRampUrl(params: OnRampUrlParams): string {
     assertContractAddress(params.cAddress, 'cAddress');
+    let url: string;
     switch (params.provider) {
       case 'moonpay':
-        return this.getMoonpayOnRampUrl(params);
+        url = this.getMoonpayOnRampUrl(params);
+        break;
       case 'transak':
-        return this.getTransakOnRampUrl(params);
+        url = this.getTransakOnRampUrl(params);
+        break;
       case 'ramp':
-        return this.getRampOnRampUrl(params);
+        url = this.getRampOnRampUrl(params);
+        break;
       case 'banxa':
-        return this.getBanxaOnRampUrl(params);
+        url = this.getBanxaOnRampUrl(params);
+        break;
       default:
         throw new Error(`Unsupported provider: ${params.provider}`);
     }
+    return params.signer ? params.signer(url) : url;
   }
 
   /**
@@ -232,9 +273,10 @@ export class OffRampIntegration {
   /**
    * Compare all providers for a given transaction and return fee/settlement data.
    *
-   * Filters to providers that support both `asset` and `fiatCurrency`, then
-   * calculates the fee amount, net amount, and approximate settlement time for
-   * each.  Useful for rendering a "best rate" comparison UI.
+   * Filters to providers that support both `asset` and `fiatCurrency` and whose
+   * `minAmount`/`maxAmount` limits include `amount`, then calculates the fee
+   * amount, net amount, and approximate settlement time for each.  Useful for
+   * rendering a "best rate" comparison UI.
    *
    * @param amount       - Gross fiat amount as a decimal string (e.g. `'100'`).
    * @param asset        - Crypto asset code (e.g. `'XLM'`, `'USDC'`).
@@ -242,7 +284,8 @@ export class OffRampIntegration {
    *
    * @returns A partial record mapping each supported provider to a
    *          {@link ProviderComparison} object.  Providers that do not support
-   *          the asset or currency are omitted.
+   *          the asset or currency, or whose amount limits exclude `amount`,
+   *          are omitted.
    *
    * @example
    * ```ts
@@ -274,6 +317,11 @@ export class OffRampIntegration {
 
       // Check if provider supports this fiat currency
       if (!config.supportedFiatCurrencies.includes(fiatCurrency)) {
+        continue;
+      }
+
+      // Skip providers whose amount limits exclude this amount (bounds inclusive)
+      if (amountNum < parseFloat(config.minAmount) || amountNum > parseFloat(config.maxAmount)) {
         continue;
       }
 
