@@ -2342,7 +2342,6 @@ fn test_swap_deadline_in_future_passes() {
     assert_eq!(check_balance(&env, &target_token_id, &target), 500i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_swap_slippage_exceeded_fails() {
     let env = Env::default();
@@ -4087,7 +4086,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([7u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x77; 32]);
@@ -4336,7 +4335,7 @@ mod crosschain_tests {
         bridge.add_relayer(&relayer, &None);
 
         assert_eq!(
-            bridge.try_set_relayer_threshold(&0u32),
+            bridge.try_set_relayer_threshold(&0u32, &None),
             Err(Ok(BridgeError::ThresholdExceedsRelayers))
         );
         assert_eq!(bridge.query_relayer_threshold(), 1);
@@ -4367,7 +4366,7 @@ mod crosschain_tests {
             make_signing_key([7u8; 32]).verifying_key().as_bytes(),
         );
         bridge.add_relayer(&relayer, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x82; 32]);
@@ -4403,7 +4402,7 @@ mod crosschain_tests {
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert_eq!(
-            bridge.try_remove_relayer(&relayer),
+            bridge.try_remove_relayer(&relayer, &None),
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert!(bridge.query_is_relayer(&relayer));
@@ -4441,7 +4440,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([8u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         for (chain_id, hash_byte) in [(1u32, 0x31u8), (2u32, 0x32u8)] {
             let target = soroban_sdk::Address::generate(&env);
@@ -4484,7 +4483,7 @@ mod crosschain_tests {
                 &3_000i128,
                 &insufficient_sigs,
             ),
-            Err(Ok(crate::BridgeError::InsufficientCrossChainReserve))
+            Err(Ok(crate::BridgeError::InsufficientReclaimable))
         );
 
         let token = TestTokenClient::new(&env, &token_id);
@@ -4546,7 +4545,7 @@ fn test_loyalty_rewards_preserve_bridged_asset_reserves() {
     let target = Address::generate(&env);
 
     bridge.set_fee_bps(&1_000u32, &None);
-    bridge.set_loyalty_token(&asset, &200i128);
+    bridge.set_loyalty_token(&asset, &200i128, &None);
     mint_tokens(&env, &asset, &bridge_id, 300i128);
 
     bridge.fund_c_address_timelocked(
@@ -6286,7 +6285,6 @@ fn test_extend_source_persistent_ttl_extends_source_keys() {
     let expected_keys = [
         DataKey::SourceDailyLimit(user.clone(), token_id.clone()),
         DataKey::DailyUsage(user.clone(), token_id.clone(), day),
-        DataKey::UserDeposit(user.clone(), token_id.clone()),
         DataKey::SourceBridgedVolume(user.clone(), token_id.clone()),
         DataKey::Nonce(user.clone()),
         DataKey::AuthNonce(user.clone()),
@@ -6362,7 +6360,7 @@ fn test_extend_source_persistent_ttl_caps_at_max_allowed_ttl() {
     let ttl = env.as_contract(&bridge_id, || {
         env.storage()
             .persistent()
-            .get_ttl(&DataKey::UserDeposit(user.clone(), token_id.clone()))
+            .get_ttl(&DataKey::SourceBridgedVolume(user.clone(), token_id.clone()))
     });
     assert!(ttl <= MAX_ALLOWED_TTL);
 }
@@ -7136,4 +7134,79 @@ fn test_set_max_withdraw_per_tx_paused() {
         bridge.try_set_max_withdraw_per_tx(&1000i128, &None),
         Err(Ok(BridgeError::ContractPaused))
     );
+}
+
+
+// ---------------------------------------------------------------------------
+// Issue #895: UserDeposit write-only storage removal & volume consistency
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_funding_paths_update_source_bridged_volume_without_write_only_user_deposit() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 5000i128);
+
+    // 1. Core funding path
+    let target0 = Address::generate(&env);
+    bridge.fund_c_address(&user, &target0, &token_id, &1000i128, &None, &None);
+
+    let volume1: i128 = env.as_contract(&bridge_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SourceBridgedVolume(user.clone(), token_id.clone()))
+            .unwrap_or(0)
+    });
+    assert_eq!(volume1, 1000i128);
+
+    // 2. Referral funding path
+    let referrer = Address::generate(&env);
+    let target1 = Address::generate(&env);
+    bridge.fund_c_address_with_referral(
+        &user,
+        &target1,
+        &token_id,
+        &2000i128,
+        &Some(referrer.clone()),
+        &None,
+        &None,
+    );
+
+    let volume2: i128 = env.as_contract(&bridge_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SourceBridgedVolume(user.clone(), token_id.clone()))
+            .unwrap_or(0)
+    });
+    assert_eq!(volume2, 3000i128);
+
+    // 3. Timelocked funding path (exercises the removed UserDeposit callsite)
+    let target2 = Address::generate(&env);
+    let current_time = env.ledger().timestamp();
+    bridge.fund_c_address_timelocked(
+        &user,
+        &target2,
+        &token_id,
+        &500i128,
+        &(current_time + 1000),
+        &(current_time + 500),
+        &None,
+        &None,
+    );
+
+    // 4. TTL extension succeeds cleanly without looking for UserDeposit
+    bridge.extend_source_persistent_ttl(&user, &token_id, &200_000u32, &None);
+
+    let volume_ttl = env.as_contract(&bridge_id, || {
+        let key = DataKey::SourceBridgedVolume(user.clone(), token_id.clone());
+        assert!(env.storage().persistent().has(&key));
+        env.storage().persistent().get_ttl(&key)
+    });
+    assert!(volume_ttl >= 200_000);
 }
