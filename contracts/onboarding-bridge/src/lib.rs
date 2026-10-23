@@ -34,8 +34,8 @@
 //!
 //! | Role | Stored as | Capabilities |
 //! |---|---|---|
-//! | `admin` | `DataKey::Admin` | All privileged mutations |
-//! | `fee_collector` | `DataKey::FeeCollector` | `withdraw_fees` only |
+//! | `admin` | `DataKey::BridgeConfig` | All privileged mutations |
+//! | `fee_collector` | `DataKey::BridgeConfig` | `withdraw_fees` only |
 //! | relayer set | `DataKey::Relayer(pubkey)` | Cross-chain attestation |
 //!
 //! ## Replay Protection
@@ -185,12 +185,6 @@ pub enum BridgeError {
     InvalidTtl = 48,
     /// The supplied pubkey is not the registered meta-signer for `source`.
     MetaTxPubkeySourceMismatch = 49,
-    /// `tiers.len()` exceeds `MAX_FEE_TIERS`.
-    TooManyFeeTiers = 51,
-    /// Cross-chain payouts exceed the admin-funded liquidity reserve.
-    InsufficientCrossChainReserve = 52,
-    // Next free discriminant: 53. Always take the next unused value here and
-    // never renumber an existing variant — clients match on these values.
 }
 
 // ---------------------------------------------------------------------------
@@ -512,24 +506,42 @@ fn read_max_withdraw_per_tx(env: &Env) -> i128 {
 }
 
 fn read_bridge_config(env: &Env) -> BridgeConfigData {
-    env.storage()
+    if let Some(cfg) = env.storage().instance().get(&DataKey::BridgeConfig) {
+        return cfg;
+    }
+    // Migration fallback for legacy contracts deployed with individual keys:
+    let admin: Address = env
+        .storage()
         .instance()
-        .get(&DataKey::BridgeConfig)
-        .unwrap_or_else(|| BridgeConfigData {
-            admin: env
-                .storage()
-                .instance()
-                .get(&DataKey::Admin)
-                .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized)),
-            fee_collector: env
-                .storage()
-                .instance()
-                .get(&DataKey::FeeCollector)
-                .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized)),
-            fee_bps: env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0),
-            paused: false,
-            allowlist_mode: false,
-        })
+        .get(&DataKey::Admin)
+        .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized));
+    let fee_collector: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::FeeCollector)
+        .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized));
+    let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+    let paused: bool = env.storage().instance().get(&DataKey::Paused).unwrap_or(false);
+    let allowlist_mode: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::AllowlistMode)
+        .unwrap_or(false);
+
+    let config = BridgeConfigData {
+        admin,
+        fee_collector,
+        fee_bps,
+        paused,
+        allowlist_mode,
+    };
+    save_bridge_config(env, &config);
+    env.storage().instance().remove(&DataKey::Admin);
+    env.storage().instance().remove(&DataKey::FeeCollector);
+    env.storage().instance().remove(&DataKey::FeeBps);
+    env.storage().instance().remove(&DataKey::Paused);
+    env.storage().instance().remove(&DataKey::AllowlistMode);
+    config
 }
 
 fn save_bridge_config(env: &Env, cfg: &BridgeConfigData) {
@@ -601,48 +613,26 @@ fn increment_user_deposit(
 
 #[inline(never)]
 fn save_admin(env: &Env, admin: &Address) {
-    env.storage().instance().set(&DataKey::Admin, admin);
-    if let Some(mut config) = env
-        .storage()
-        .instance()
-        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
-    {
-        config.admin = admin.clone();
-        save_bridge_config(env, &config);
-    }
+    let mut config = read_bridge_config(env);
+    config.admin = admin.clone();
+    save_bridge_config(env, &config);
 }
 
 #[inline(never)]
 fn read_admin(env: &Env) -> Address {
-    env.storage()
-        .instance()
-        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
-        .map(|config| config.admin)
-        .or_else(|| env.storage().instance().get(&DataKey::Admin))
-        .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized))
+    read_bridge_config(env).admin
 }
 
 #[inline(never)]
 fn save_fee_collector(env: &Env, addr: &Address) {
-    env.storage().instance().set(&DataKey::FeeCollector, addr);
-    if let Some(mut config) = env
-        .storage()
-        .instance()
-        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
-    {
-        config.fee_collector = addr.clone();
-        save_bridge_config(env, &config);
-    }
+    let mut config = read_bridge_config(env);
+    config.fee_collector = addr.clone();
+    save_bridge_config(env, &config);
 }
 
 #[inline(never)]
 fn read_fee_collector(env: &Env) -> Address {
-    env.storage()
-        .instance()
-        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
-        .map(|config| config.fee_collector)
-        .or_else(|| env.storage().instance().get(&DataKey::FeeCollector))
-        .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized))
+    read_bridge_config(env).fee_collector
 }
 
 fn read_config(env: &Env) -> BridgeConfig {
@@ -897,7 +887,7 @@ fn decrement_crosschain_reserve(
 ) -> Result<(), BridgeError> {
     let reserve = read_crosschain_reserve(env, asset);
     if amount > reserve {
-        return Err(BridgeError::InsufficientCrossChainReserve);
+        return Err(BridgeError::InsufficientReclaimable);
     }
     write_crosschain_reserve(env, asset, safe_math::safe_sub(reserve, amount)?);
     Ok(())
@@ -1582,11 +1572,6 @@ impl OnboardingBridge {
                 allowlist_mode: false,
             },
         );
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeCollector, &fee_collector);
-        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         save_current_wasm_hash(&env, &wasm_hash);
         mark_initialized(&env);
         extend_instance_ttl(&env);
@@ -1785,7 +1770,7 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
 
         if targets.len() > MAX_BATCH_SIZE {
-            return Err(BridgeError::TooManyFeeTiers);
+            return Err(BridgeError::BatchTooLarge);
         }
         // #594: reject empty batches — a zero-length call transfers nothing but
         // would still emit BatchCompleted and mint loyalty rewards.
@@ -2139,9 +2124,6 @@ impl OnboardingBridge {
         extend_instance_ttl(&env);
         let old_collector = read_fee_collector(&env);
         save_fee_collector(&env, &new_fee_collector);
-        let mut config = read_bridge_config(&env);
-        config.fee_collector = new_fee_collector.clone();
-        save_bridge_config(&env, &config);
         env.events().publish(
             ("FeeCollectorChanged", old_collector, new_fee_collector),
             (admin,),
@@ -2182,9 +2164,6 @@ impl OnboardingBridge {
         extend_instance_ttl(&env);
         let old_collector = read_fee_collector(&env);
         save_fee_collector(&env, &pending);
-        let mut config = read_bridge_config(&env);
-        config.fee_collector = pending.clone();
-        save_bridge_config(&env, &config);
         remove_pending_fee_collector(&env);
         env.events()
             .publish(("FeeCollectorTransferred", old_collector, pending), ());
@@ -2204,9 +2183,6 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         save_admin(&env, &new_admin);
-        let mut config = read_bridge_config(&env);
-        config.admin = new_admin.clone();
-        save_bridge_config(&env, &config);
         env.events().publish(("AdminChanged", admin, new_admin), ());
         Ok(())
     }
@@ -2243,9 +2219,6 @@ impl OnboardingBridge {
         extend_instance_ttl(&env);
         let old_admin = read_admin(&env);
         save_admin(&env, &pending);
-        let mut config = read_bridge_config(&env);
-        config.admin = pending.clone();
-        save_bridge_config(&env, &config);
         remove_pending_admin(&env);
         env.events()
             .publish(("AdminTransferred", old_admin, pending), ());
@@ -3883,7 +3856,7 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
-    /// * [`BridgeError::TooManyFeeTiers`] — `tiers.len()` exceeds `MAX_FEE_TIERS` (50).
+    /// * [`BridgeError::BatchTooLarge`] — `tiers.len()` exceeds `MAX_FEE_TIERS` (50).
     /// * [`BridgeError::FeeTooHigh`] — Any tier's `fee_bps` exceeds 1 000.
     ///
     /// # Events
@@ -4015,7 +3988,7 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
-    /// * [`BridgeError::InsufficientCrossChainReserve`] — `amount` exceeds the
+    /// * [`BridgeError::InsufficientReclaimable`] — `amount` exceeds the
     ///   reserve balance.
     pub fn withdraw_crosschain_reserve(
         env: Env,
@@ -4097,7 +4070,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::BelowThreshold`] — No active relayers, a zero threshold,
     ///   or fewer than `threshold` valid signatures.
     /// * [`BridgeError::InvalidAddress`] — A strkey exceeds `MAX_STRKEY_LEN` (64) bytes.
-    /// * [`BridgeError::InsufficientCrossChainReserve`] — The reserve cannot
+    /// * [`BridgeError::InsufficientReclaimable`] — The reserve cannot
     ///   cover `net_amount`.
     ///
     /// # Events
@@ -4284,7 +4257,8 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        if is_relayer(&env, &pubkey) {
+        let was_registered = is_relayer(&env, &pubkey);
+        if was_registered {
             let count = relayer_count(&env);
             if count <= 1 || count.saturating_sub(1) < relayer_threshold(&env) {
                 return Err(BridgeError::BelowThreshold);
@@ -5473,6 +5447,9 @@ impl OnboardingBridge {
 
         if amount_out <= 0 {
             return Err(BridgeError::SwapFailed);
+        }
+        if amount_out < min_target_amount {
+            return Err(BridgeError::SlippageExceeded);
         }
 
         let balance_after = target_token.balance(&contract_addr);

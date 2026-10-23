@@ -2342,7 +2342,6 @@ fn test_swap_deadline_in_future_passes() {
     assert_eq!(check_balance(&env, &target_token_id, &target), 500i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_swap_slippage_exceeded_fails() {
     let env = Env::default();
@@ -4087,7 +4086,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([7u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x77; 32]);
@@ -4336,7 +4335,7 @@ mod crosschain_tests {
         bridge.add_relayer(&relayer, &None);
 
         assert_eq!(
-            bridge.try_set_relayer_threshold(&0u32),
+            bridge.try_set_relayer_threshold(&0u32, &None),
             Err(Ok(BridgeError::ThresholdExceedsRelayers))
         );
         assert_eq!(bridge.query_relayer_threshold(), 1);
@@ -4367,7 +4366,7 @@ mod crosschain_tests {
             make_signing_key([7u8; 32]).verifying_key().as_bytes(),
         );
         bridge.add_relayer(&relayer, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x82; 32]);
@@ -4403,7 +4402,7 @@ mod crosschain_tests {
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert_eq!(
-            bridge.try_remove_relayer(&relayer),
+            bridge.try_remove_relayer(&relayer, &None),
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert!(bridge.query_is_relayer(&relayer));
@@ -4441,7 +4440,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([8u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         for (chain_id, hash_byte) in [(1u32, 0x31u8), (2u32, 0x32u8)] {
             let target = soroban_sdk::Address::generate(&env);
@@ -4484,7 +4483,7 @@ mod crosschain_tests {
                 &3_000i128,
                 &insufficient_sigs,
             ),
-            Err(Ok(crate::BridgeError::InsufficientCrossChainReserve))
+            Err(Ok(crate::BridgeError::InsufficientReclaimable))
         );
 
         let token = TestTokenClient::new(&env, &token_id);
@@ -4546,7 +4545,7 @@ fn test_loyalty_rewards_preserve_bridged_asset_reserves() {
     let target = Address::generate(&env);
 
     bridge.set_fee_bps(&1_000u32, &None);
-    bridge.set_loyalty_token(&asset, &200i128);
+    bridge.set_loyalty_token(&asset, &200i128, &None);
     mint_tokens(&env, &asset, &bridge_id, 300i128);
 
     bridge.fund_c_address_timelocked(
@@ -7137,3 +7136,178 @@ fn test_set_max_withdraw_per_tx_paused() {
         Err(Ok(BridgeError::ContractPaused))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #896: BridgeConfig single source of truth & handover write tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_bridge_config_is_single_source_of_truth_on_initialize() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    env.as_contract(&bridge_id, || {
+        // Legacy individual keys must NOT be written to instance storage
+        assert!(!env.storage().instance().has(&DataKey::Admin));
+        assert!(!env.storage().instance().has(&DataKey::FeeCollector));
+        assert!(!env.storage().instance().has(&DataKey::FeeBps));
+
+        // Packed BridgeConfigData must exist and be authoritative
+        let config: crate::BridgeConfigData = env
+            .storage()
+            .instance()
+            .get(&DataKey::BridgeConfig)
+            .expect("BridgeConfig should be stored");
+        assert_eq!(config.admin, admin);
+        assert_eq!(config.fee_collector, fee_collector);
+        assert_eq!(config.fee_bps, 50);
+        assert!(!config.paused);
+        assert!(!config.allowlist_mode);
+    });
+}
+
+#[test]
+fn test_set_fee_bps_stored_representations_agree() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.set_fee_bps(&250u32, &None);
+
+    assert_eq!(bridge.query_fee_bps(), 250u32);
+
+    env.as_contract(&bridge_id, || {
+        let config: crate::BridgeConfigData = env
+            .storage()
+            .instance()
+            .get(&DataKey::BridgeConfig)
+            .expect("BridgeConfig should be stored");
+        assert_eq!(config.fee_bps, 250);
+
+        // No conflicting legacy FeeBps key exists
+        assert!(!env.storage().instance().has(&DataKey::FeeBps));
+    });
+}
+
+#[test]
+fn test_legacy_keys_one_time_migration_preserves_paused_and_allowlist() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    // Simulate legacy deployment storing individual keys without BridgeConfig
+    env.as_contract(&bridge_id, || {
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::FeeCollector, &fee_collector);
+        env.storage().instance().set(&DataKey::FeeBps, &75u32);
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.storage().instance().set(&DataKey::AllowlistMode, &true);
+        env.storage().instance().set(&DataKey::Initialized, &true);
+        assert!(!env.storage().instance().has(&DataKey::BridgeConfig));
+    });
+
+    // Querying through public interface triggers one-time migration
+    assert!(bridge.query_is_paused());
+    assert_eq!(bridge.query_fee_bps(), 75u32);
+    assert_eq!(bridge.query_admin(), admin);
+    assert_eq!(bridge.query_fee_collector(), fee_collector);
+    assert!(bridge.query_allowlist_mode());
+
+    // Storage is migrated into BridgeConfigData and legacy keys are pruned
+    env.as_contract(&bridge_id, || {
+        let config: crate::BridgeConfigData = env
+            .storage()
+            .instance()
+            .get(&DataKey::BridgeConfig)
+            .expect("BridgeConfig should be migrated");
+        assert_eq!(config.admin, admin);
+        assert_eq!(config.fee_collector, fee_collector);
+        assert_eq!(config.fee_bps, 75);
+        assert!(config.paused);
+        assert!(config.allowlist_mode);
+
+        assert!(!env.storage().instance().has(&DataKey::Admin));
+        assert!(!env.storage().instance().has(&DataKey::FeeCollector));
+        assert!(!env.storage().instance().has(&DataKey::FeeBps));
+        assert!(!env.storage().instance().has(&DataKey::Paused));
+        assert!(!env.storage().instance().has(&DataKey::AllowlistMode));
+    });
+}
+
+#[test]
+fn test_handover_functions_perform_single_config_write() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let new_admin = Address::generate(&env);
+    bridge.set_admin(&new_admin, &None);
+    assert_eq!(bridge.query_admin(), new_admin);
+
+    env.as_contract(&bridge_id, || {
+        assert!(!env.storage().instance().has(&DataKey::Admin));
+        let config: crate::BridgeConfigData = env
+            .storage()
+            .instance()
+            .get(&DataKey::BridgeConfig)
+            .unwrap();
+        assert_eq!(config.admin, new_admin);
+    });
+
+    let new_collector = Address::generate(&env);
+    bridge.set_fee_collector(&new_collector, &None);
+    assert_eq!(bridge.query_fee_collector(), new_collector);
+
+    env.as_contract(&bridge_id, || {
+        assert!(!env.storage().instance().has(&DataKey::FeeCollector));
+        let config: crate::BridgeConfigData = env
+            .storage()
+            .instance()
+            .get(&DataKey::BridgeConfig)
+            .unwrap();
+        assert_eq!(config.fee_collector, new_collector);
+    });
+
+    // Two-step admin proposal and acceptance
+    let next_admin = Address::generate(&env);
+    bridge.propose_new_admin(&next_admin, &None);
+    bridge.accept_admin();
+    assert_eq!(bridge.query_admin(), next_admin);
+
+    env.as_contract(&bridge_id, || {
+        assert!(!env.storage().instance().has(&DataKey::Admin));
+        let config: crate::BridgeConfigData = env
+            .storage()
+            .instance()
+            .get(&DataKey::BridgeConfig)
+            .unwrap();
+        assert_eq!(config.admin, next_admin);
+    });
+
+    // Two-step fee collector proposal and acceptance
+    let next_collector = Address::generate(&env);
+    bridge.propose_new_fee_collector(&next_collector, &None);
+    bridge.accept_fee_collector();
+    assert_eq!(bridge.query_fee_collector(), next_collector);
+
+    env.as_contract(&bridge_id, || {
+        assert!(!env.storage().instance().has(&DataKey::FeeCollector));
+        let config: crate::BridgeConfigData = env
+            .storage()
+            .instance()
+            .get(&DataKey::BridgeConfig)
+            .unwrap();
+        assert_eq!(config.fee_collector, next_collector);
+    });
+}
+
