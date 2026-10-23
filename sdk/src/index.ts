@@ -30,6 +30,7 @@
  * |---|---|
  * | {@link OnboardingBridgeSDK} | Main SDK class — wraps all contract calls |
  * | {@link OffRampIntegration} | Moonpay / Transak / Ramp / Banxa URL builder + CEX memo helpers |
+ * | `signUrl` | Signs a MoonPay URL with HMAC-SHA256 (replaces any existing signature) |
  * | `assertAccountAddress` | Validates a G-address; throws on invalid input |
  * | `assertAddress` | Validates a G-address or C-address; throws on invalid input |
  * | `assertContractAddress` | Validates a C-address; throws on invalid input |
@@ -54,7 +55,7 @@
 
 export { OnboardingBridgeSDK, BATCH_TX_LIMIT, BASE_RESERVE_STROOPS, computeCommitmentHash } from './bridge';
 export type { CommitmentHashOptions } from './bridge';
-export { OffRampIntegration } from './offramp';
+export { OffRampIntegration, signUrl } from './offramp';
 export { assertAccountAddress, assertAddress, assertContractAddress } from './validate';
 export { CachedContractClient } from './cachedBridge';
 export type { CacheOptions, CacheKey } from './cachedBridge';
