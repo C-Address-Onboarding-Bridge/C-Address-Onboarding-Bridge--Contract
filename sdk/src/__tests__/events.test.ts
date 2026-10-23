@@ -2,7 +2,27 @@
  * Tests for the EventSubscriber polling event API (issue #57).
  */
 import { EventSubscriber } from '../events';
-import type { CAddressFundedEvent, BridgeEventPayload } from '../events';
+import type {
+  CAddressFundedEvent,
+  BridgeEventPayload,
+  FeeCollectorTransferredEvent,
+} from '../events';
+
+// ---------------------------------------------------------------------------
+// Type-level regression test for issue #863:
+// FeeCollectorTransferredEvent must have exactly the fields the parser fills
+// (from, to) and must NOT require oldFeeCollector / newFeeCollector.
+// This block is never executed at runtime — the TypeScript compiler checks it.
+// ---------------------------------------------------------------------------
+/* eslint-disable @typescript-eslint/no-unused-vars */
+const _feeCollectorTransferredTypeCheck = {
+  name: 'FeeCollectorTransferred' as const,
+  from: 'GPREV',
+  to: 'GNEW',
+  ledger: 1,
+  pagingToken: 'p',
+} satisfies FeeCollectorTransferredEvent;
+/* eslint-enable @typescript-eslint/no-unused-vars */
 
 const mockGetEvents = jest.fn();
 const mockGetLatestLedger = jest.fn();
