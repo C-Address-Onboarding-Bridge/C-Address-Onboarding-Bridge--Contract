@@ -896,3 +896,6 @@ MIT
 
 <!-- handsoff-issue-682 -->
 - #682: sdk: add register_meta_signer and a helper that builds the exact meta-tx payload the contract verifies
+
+<!-- handsoff-issue-865 -->
+- #865: tests: meta-transaction tests and bench_execute_meta_fund fail — the test token has no approve/transfer_from
