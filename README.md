@@ -896,3 +896,6 @@ MIT
 
 <!-- handsoff-issue-682 -->
 - #682: sdk: add register_meta_signer and a helper that builds the exact meta-tx payload the contract verifies
+
+<!-- handsoff-issue-868 -->
+- #868: tests: TTL extender tests jump the ledger past the entries' TTL and fail on archived keys
