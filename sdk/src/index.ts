@@ -59,7 +59,9 @@ export { assertAccountAddress, assertAddress, assertContractAddress } from './va
 export { CachedContractClient } from './cachedBridge';
 export type { CacheOptions, CacheKey } from './cachedBridge';
 export { InMemoryCache } from './cache';
-export type { ICacheProvider } from './cache';
+export type { ICacheProvider, InMemoryCacheOptions } from './cache';
+export { toSingleScVal, toScVals } from './encoding';
+export type { TypedArg, TypeOptions } from './encoding';
 export {
   withRetry,
   withRpcRetry,
