@@ -2179,7 +2179,6 @@ fn test_swap_rejects_non_whitelisted_pool() {
     assert_eq!(check_balance(&env, &source_token_id, &user), 1_000i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_swap_multi_hop_route_rejected() {
     let env = Env::default();
@@ -2211,7 +2210,6 @@ fn test_swap_multi_hop_route_rejected() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_swap_happy_path_single_hop() {
     let env = Env::default();
@@ -2240,7 +2238,6 @@ fn test_swap_happy_path_single_hop() {
     assert_eq!(check_balance(&env, &target_token_id, &target), 500i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_swap_nonce_replay_rejected() {
     let env = Env::default();
@@ -2285,7 +2282,6 @@ fn test_swap_nonce_replay_rejected() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_swap_deadline_expired_reverts() {
     let env = Env::default();
@@ -2318,7 +2314,6 @@ fn test_swap_deadline_expired_reverts() {
     assert_eq!(check_balance(&env, &source_token_id, &user), 1_000i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_swap_deadline_in_future_passes() {
     let env = Env::default();
@@ -2380,7 +2375,6 @@ fn test_swap_slippage_exceeded_fails() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_swap_pool_call_failure_reverts() {
     let env = Env::default();
@@ -2487,7 +2481,6 @@ fn test_query_effective_fee_matches_fund_c_address() {
     assert_eq!(check_balance(&env, &token_id, &bridge_id), predicted_fee);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_effective_fee_with_asset_cap() {
     let env = Env::default();
@@ -2519,7 +2512,6 @@ fn test_query_effective_fee_with_asset_cap() {
     assert_eq!(check_balance(&env, &token_id, &bridge_id), predicted_fee);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_effective_fee_with_tier_discount() {
     let env = Env::default();
@@ -2560,7 +2552,6 @@ fn test_query_effective_fee_with_tier_discount() {
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 10i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_effective_fee_with_cap_and_tier() {
     let env = Env::default();
@@ -2725,7 +2716,6 @@ fn test_fee_bps_changed_emits_event() {
     assert_eq!(contract_id, &bridge_id);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_fee_collector_changed_emits_event() {
     let env = Env::default();
@@ -2742,7 +2732,6 @@ fn test_fee_collector_changed_emits_event() {
     assert_eq!(contract_id, &bridge_id);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_admin_changed_emits_event() {
     let env = Env::default();
@@ -3355,7 +3344,6 @@ fn test_nonce_independent_per_caller() {
     let _ = admin;
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_fund_c_address_nonce() {
     let env = Env::default();
@@ -3375,7 +3363,6 @@ fn test_fund_c_address_nonce() {
 
 /********** Deadline tests **********/
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_fund_c_address_deadline_none_always_passes() {
     let env = Env::default();
@@ -3386,7 +3373,6 @@ fn test_fund_c_address_deadline_none_always_passes() {
     assert_eq!(check_balance(&env, &token_id, &target), 99i128); // 1% fee
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_fund_c_address_deadline_in_future_passes() {
     let env = Env::default();
@@ -3397,7 +3383,6 @@ fn test_fund_c_address_deadline_in_future_passes() {
     assert_eq!(check_balance(&env, &token_id, &target), 99i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_fund_c_address_deadline_exact_passes() {
     let env = Env::default();
@@ -3409,7 +3394,6 @@ fn test_fund_c_address_deadline_exact_passes() {
     assert_eq!(check_balance(&env, &token_id, &target), 99i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_fund_c_address_deadline_expired_reverts() {
     let env = Env::default();
@@ -3542,7 +3526,6 @@ mod timelocked_tests {
         assert_eq!(bridge.query_accrued_fees(&token_id), 5i128);
     }
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_timelocked_claim_before_release_fails() {
         let env = Env::default();
@@ -3567,7 +3550,6 @@ mod timelocked_tests {
         );
     }
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_timelocked_cliff_time_after_release_fails() {
         let env = Env::default();
@@ -3583,7 +3565,6 @@ mod timelocked_tests {
         );
     }
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_timelocked_release_in_past_fails() {
         let env = Env::default();
@@ -3599,7 +3580,6 @@ mod timelocked_tests {
         );
     }
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_timelocked_double_claim_fails() {
         let env = Env::default();
@@ -3628,7 +3608,6 @@ mod timelocked_tests {
         );
     }
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_query_timelocked_unknown_id_fails() {
         let env = Env::default();
@@ -3640,7 +3619,6 @@ mod timelocked_tests {
         );
     }
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_timelocked_fund_mints_loyalty_at_deposit() {
         let env = Env::default();
@@ -4172,7 +4150,6 @@ mod crosschain_tests {
         );
     }
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_crosschain_replay_rejected() {
         let env = Env::default();
@@ -4202,7 +4179,6 @@ mod crosschain_tests {
         );
     }
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_crosschain_below_threshold_rejected() {
         let env = Env::default();
@@ -4236,7 +4212,6 @@ mod crosschain_tests {
         );
     }
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_crosschain_non_relayer_rejected() {
         let env = Env::default();
@@ -4265,7 +4240,6 @@ mod crosschain_tests {
         );
     }
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_add_remove_relayer_and_threshold() {
         let env = Env::default();
@@ -4286,7 +4260,6 @@ mod crosschain_tests {
         );
     }
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_crosschain_duplicate_relayer_signature_rejected() {
         let env = Env::default();
@@ -4321,7 +4294,6 @@ mod crosschain_tests {
         );
     }
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_crosschain_mints_loyalty_to_target() {
         let env = Env::default();
@@ -4538,7 +4510,6 @@ mod crosschain_tests {
     }
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_batch_fund_mints_loyalty_once() {
     let env = Env::default();
@@ -4862,7 +4833,6 @@ fn test_fee_tier_cannot_raise_global_fee() {
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 30i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_referral_fund_mints_loyalty() {
     let env = Env::default();
@@ -4912,7 +4882,6 @@ fn test_referral_fund_rejects_below_minimum() {
 
 // fund_c_address with amount=0 — the contract guards `amount <= 0` before
 // require_auth, so it must return InvalidAmount immediately.
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_fund_c_address_zero_amount_fails() {
     let env = Env::default();
@@ -5018,7 +4987,6 @@ fn test_calculate_fee_zero_amount() {
 }
 
 // Confirm zero amount is rejected even with a max fee rate configured.
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_fund_c_address_zero_amount_max_fee_fails() {
     let env = Env::default();
@@ -5185,7 +5153,6 @@ mod concurrent_sequential_tests {
     //   - no double-spending or ghost balance
     // -----------------------------------------------------------------------
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_sequential_fund_then_withdraw_fees_correct_state() {
         let s = ConcurrentSetup::new();
@@ -5212,7 +5179,6 @@ mod concurrent_sequential_tests {
         );
     }
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_sequential_withdraw_exceeds_accrued_after_partial_withdrawal() {
         let s = ConcurrentSetup::new();
@@ -5321,7 +5287,6 @@ mod concurrent_sequential_tests {
     // accrued-fees counter and never allow over-withdrawal.
     // -----------------------------------------------------------------------
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_multiple_sequential_fee_withdrawals() {
         let s = ConcurrentSetup::new();
@@ -5356,7 +5321,6 @@ mod concurrent_sequential_tests {
         );
     }
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_sequential_fund_withdraw_fund_withdraw_interleaved() {
         let s = ConcurrentSetup::new();
@@ -5474,7 +5438,6 @@ mod concurrent_sequential_tests {
     // allowing the next sequential call to proceed normally.
     // -----------------------------------------------------------------------
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_sequential_calls_after_reentrancy_guard_clears() {
         let s = ConcurrentSetup::new();
@@ -5531,7 +5494,6 @@ mod concurrent_sequential_tests {
     // all counters (accrued_fees, total_bridged, total_fees_collected) consistent.
     // -----------------------------------------------------------------------
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
     #[test]
     fn test_mixed_batch_and_single_fee_counter_consistency() {
         let s = ConcurrentSetup::new();
@@ -6200,7 +6162,6 @@ fn test_set_source_daily_limit_rejects_non_whitelisted_asset() {
 // get_tiered_fee_bps was only consulted by fund_c_address, reveal_fund,
 // fund_c_address_with_swap, and execute_meta_fund — batch_fund_c_address computed
 // its fee from the flat global rate, silently bypassing the volume-tier discount.
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_batch_fund_applies_tiered_fee() {
     let env = Env::default();
@@ -6235,7 +6196,6 @@ fn test_batch_fund_applies_tiered_fee() {
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 1i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_extend_instance_ttl_extends_instance_storage() {
     let env = Env::default();
@@ -6342,7 +6302,6 @@ fn test_extend_source_persistent_ttl_extends_source_keys() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_extend_source_persistent_ttl_not_initialized_fails() {
     let env = Env::default();
@@ -6357,7 +6316,6 @@ fn test_extend_source_persistent_ttl_not_initialized_fails() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_extend_source_persistent_ttl_skips_missing_keys() {
     let env = Env::default();
@@ -6452,7 +6410,6 @@ fn test_query_ttl_config_returns_current_settings() {
 
 // fund_c_address_with_referral computed its fee straight from the global rate via
 // get_effective_fee_bps, never consulting the caller's volume tier.
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_referral_fund_applies_tiered_fee() {
     let env = Env::default();
@@ -6487,7 +6444,6 @@ fn test_referral_fund_applies_tiered_fee() {
 
 // check_daily_limit has never been exercised to confirm it actually rejects
 // an over-limit transfer via fund_c_address.
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_daily_limit_blocks_excess_funding() {
     let env = Env::default();
@@ -6516,7 +6472,6 @@ fn test_daily_limit_blocks_excess_funding() {
 
 // Verify that the daily limit counter resets on the next UTC day,
 // allowing transfers that would have been blocked the previous day.
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_daily_limit_resets_next_day() {
     let env = Env::default();
@@ -6561,7 +6516,6 @@ fn test_daily_limit_resets_next_day() {
 
 // When a per-asset fee cap is set lower than the global rate, the effective
 // fee must use the cap rather than the global rate.
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_asset_fee_cap_overrides_global_rate() {
     let env = Env::default();
@@ -6883,7 +6837,6 @@ fn setup_extend_timelock(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Addre
     (bridge, bridge_id, id)
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_extend_timelock_ttl_extends_entry() {
     let env = Env::default();
@@ -6896,7 +6849,6 @@ fn test_extend_timelock_ttl_extends_entry() {
     assert!(ttl >= 200_000);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_extend_timelock_ttl_emits_event() {
     let env = Env::default();
@@ -6911,7 +6863,6 @@ fn test_extend_timelock_ttl_emits_event() {
 
 // Boundary: a ttl above MAX_ALLOWED_TTL must be silently capped, never stored
 // or applied verbatim.
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_extend_timelock_ttl_caps_at_max_allowed_ttl() {
     let env = Env::default();

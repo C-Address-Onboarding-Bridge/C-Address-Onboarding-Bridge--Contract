@@ -371,20 +371,35 @@ export class EventSubscriber {
 
   private startPolling(): void {
     if (this.intervalHandle !== null) return;
-    this.intervalHandle = setInterval(() => {
-      this.fetchAndDispatch().catch((err) => {
-        // Emit to error listeners so consumers can detect persistently-down
-        // RPC endpoints and react (e.g. circuit break, alert, reconnect).
-        this.dispatchError(err instanceof Error ? err : new Error(String(err)));
-      });
-    }, this.pollingIntervalMs);
+    this.intervalHandle = setTimeout(() => this.runPollTick(), this.pollingIntervalMs);
   }
 
   private stopPolling(): void {
     if (this.intervalHandle !== null) {
-      clearInterval(this.intervalHandle);
+      clearTimeout(this.intervalHandle);
       this.intervalHandle = null;
     }
+  }
+
+  /**
+   * Self-scheduling poll tick: runs one fetch, then arms the next tick only
+   * after this one settles. Combined with the `polling` in-flight guard,
+   * this ensures a slow RPC call can never overlap with the next poll, even
+   * if `poll()` is also called manually while a scheduled tick is running.
+   */
+  private runPollTick(): void {
+    this.fetchAndDispatch()
+      .catch((err) => {
+        // Emit to error listeners so consumers can detect persistently-down
+        // RPC endpoints and react (e.g. circuit break, alert, reconnect).
+        this.dispatchError(err instanceof Error ? err : new Error(String(err)));
+      })
+      .finally(() => {
+        // Only re-arm if stopPolling()/destroy() wasn't called while we awaited.
+        if (!this.destroyed && this.intervalHandle !== null) {
+          this.intervalHandle = setTimeout(() => this.runPollTick(), this.pollingIntervalMs);
+        }
+      });
   }
 
   private async fetchAndDispatch(): Promise<void> {
@@ -405,12 +420,20 @@ export class EventSubscriber {
     };
 
     // Attach cursor: either startLedger (number) or pagingToken (string).
+    //
+    // Soroban RPC's getEvents requires startLedger when no cursor is given
+    // and rejects the request otherwise — it does NOT default to "current
+    // ledger" when both are omitted. So on the very first poll while cursor
+    // is still the 'now' sentinel, resolve the current ledger via
+    // getLatestLedger() and use its sequence as startLedger.
     if (typeof this.cursor === 'number') {
       params.startLedger = this.cursor;
     } else if (typeof this.cursor === 'string' && this.cursor !== 'now') {
       params.cursor = this.cursor;
+    } else {
+      const latest = await this.server.getLatestLedger();
+      params.startLedger = latest.sequence;
     }
-    // When cursor === 'now', omit both — the RPC defaults to current ledger
 
     const response = await this.server.getEvents(params);
 
