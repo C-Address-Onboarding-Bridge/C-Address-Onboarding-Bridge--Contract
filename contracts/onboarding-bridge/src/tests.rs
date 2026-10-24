@@ -1636,7 +1636,6 @@ fn test_query_all_balances_empty_input() {
     assert_eq!(balances.len(), 0);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_all_balances_rejects_oversized_input() {
     let env = Env::default();
@@ -1645,11 +1644,15 @@ fn test_query_all_balances_rejects_oversized_input() {
     let bridge = create_bridge_client(&env, &bridge_id);
     bridge.initialize(&admin, &fee_collector, &0u32, &None);
 
-    // MAX_BATCH_SIZE is 100 — one more than that must be rejected.
+    // Register 100 real token contracts for the accepted-size batch.
     let mut assets: Vec<Address> = Vec::new(&env);
-    for _ in 0..101 {
-        assets.push_back(Address::generate(&env));
+    for _ in 0..100 {
+        let token_addr = env.register(TestToken, ());
+        assets.push_back(token_addr);
     }
+
+    // MAX_BATCH_SIZE is 100 — one more than that must be rejected.
+    assets.push_back(Address::generate(&env));
     assert_eq!(
         bridge.try_query_all_balances(&assets),
         Err(Ok(BridgeError::BatchTooLarge))
@@ -1657,7 +1660,11 @@ fn test_query_all_balances_rejects_oversized_input() {
 
     // Exactly MAX_BATCH_SIZE is accepted.
     assets.pop_back();
-    assert_eq!(bridge.query_all_balances(&assets).len(), 100);
+    let balances = bridge.query_all_balances(&assets);
+    assert_eq!(balances.len(), 100);
+    for asset in assets.iter() {
+        assert_eq!(balances.get(asset).unwrap(), 0i128);
+    }
 }
 
 #[test]
@@ -2342,7 +2349,6 @@ fn test_swap_deadline_in_future_passes() {
     assert_eq!(check_balance(&env, &target_token_id, &target), 500i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_swap_slippage_exceeded_fails() {
     let env = Env::default();
@@ -4087,7 +4093,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([7u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x77; 32]);
@@ -4336,7 +4342,7 @@ mod crosschain_tests {
         bridge.add_relayer(&relayer, &None);
 
         assert_eq!(
-            bridge.try_set_relayer_threshold(&0u32),
+            bridge.try_set_relayer_threshold(&0u32, &None),
             Err(Ok(BridgeError::ThresholdExceedsRelayers))
         );
         assert_eq!(bridge.query_relayer_threshold(), 1);
@@ -4367,7 +4373,7 @@ mod crosschain_tests {
             make_signing_key([7u8; 32]).verifying_key().as_bytes(),
         );
         bridge.add_relayer(&relayer, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x82; 32]);
@@ -4403,7 +4409,7 @@ mod crosschain_tests {
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert_eq!(
-            bridge.try_remove_relayer(&relayer),
+            bridge.try_remove_relayer(&relayer, &None),
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert!(bridge.query_is_relayer(&relayer));
@@ -4441,7 +4447,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([8u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         for (chain_id, hash_byte) in [(1u32, 0x31u8), (2u32, 0x32u8)] {
             let target = soroban_sdk::Address::generate(&env);
@@ -4484,7 +4490,7 @@ mod crosschain_tests {
                 &3_000i128,
                 &insufficient_sigs,
             ),
-            Err(Ok(crate::BridgeError::InsufficientCrossChainReserve))
+            Err(Ok(crate::BridgeError::InsufficientReclaimable))
         );
 
         let token = TestTokenClient::new(&env, &token_id);
@@ -4546,7 +4552,7 @@ fn test_loyalty_rewards_preserve_bridged_asset_reserves() {
     let target = Address::generate(&env);
 
     bridge.set_fee_bps(&1_000u32, &None);
-    bridge.set_loyalty_token(&asset, &200i128);
+    bridge.set_loyalty_token(&asset, &200i128, &None);
     mint_tokens(&env, &asset, &bridge_id, 300i128);
 
     bridge.fund_c_address_timelocked(
