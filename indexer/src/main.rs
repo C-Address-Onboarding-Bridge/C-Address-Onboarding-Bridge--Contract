@@ -1,3 +1,5 @@
+#![deny(unreachable_patterns)]
+
 mod db;
 mod events;
 mod poller;
@@ -360,12 +362,14 @@ async fn replay_events(
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
 pub struct DeliveryQuery {
     pub status: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
 
+#[allow(dead_code)]
 async fn list_deliveries(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<DeliveryQuery>,
@@ -382,6 +386,7 @@ async fn list_deliveries(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+#[allow(dead_code)]
 async fn retry_delivery(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
