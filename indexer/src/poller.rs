@@ -191,9 +191,7 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("getEvents RPC error: {}", message).into());
         }
 
-        let result = body
-            .get("result")
-            .ok_or("getEvents: missing result")?;
+        let result = body.get("result").ok_or("getEvents: missing result")?;
 
         let events: Vec<serde_json::Value> = result
             .get("events")
@@ -229,7 +227,8 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
             let event_index = *counter;
             *counter += 1;
 
-            if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id, event_index) {
+            if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id, event_index)
+            {
                 // Insert the event and queue its webhook deliveries atomically
                 // (one SQLite transaction) so a crash between the two can never
                 // leave an indexed event with no deliveries queued. See #647.
@@ -350,9 +349,25 @@ fn parse_contract_event(
             insert_topic_str(&mut data, &decoded_topics, 3, "source");
             insert_topic_str(&mut data, &decoded_topics, 4, "target");
         }
-        BridgeEventType::CAddressFunded
-        | BridgeEventType::CommitRevealFunded
-        | BridgeEventType::MetaFundExecuted => {
+        BridgeEventType::CAddressFunded => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "asset");
+            insert_topic_str(&mut data, &decoded_topics, 2, "source");
+            insert_topic_str(&mut data, &decoded_topics, 3, "target");
+            let amount_and_fee = if let Some(serde_json::Value::Array(items)) = data.get("value") {
+                let amount = items.first().cloned();
+                let fee = items.get(1).cloned();
+                Some((amount, fee))
+            } else {
+                None
+            };
+            if let Some((Some(amount), fee_opt)) = amount_and_fee {
+                data.insert("amount".to_string(), amount);
+                if let Some(fee) = fee_opt {
+                    data.insert("fee".to_string(), fee);
+                }
+            }
+        }
+        BridgeEventType::CommitRevealFunded | BridgeEventType::MetaFundExecuted => {
             insert_topic_str(&mut data, &decoded_topics, 1, "asset");
             insert_topic_str(&mut data, &decoded_topics, 2, "source");
             insert_topic_str(&mut data, &decoded_topics, 3, "target");
@@ -444,7 +459,10 @@ fn insert_topic_str(
     key: &str,
 ) {
     if let Some(value) = topics.get(idx).and_then(serde_json::Value::as_str) {
-        data.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+        data.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
     }
 }
 
@@ -461,29 +479,59 @@ fn decode_rpc_scval(value: &serde_json::Value) -> serde_json::Value {
 }
 
 fn decode_scval(bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
-    if bytes.len() < 4 {
-        return Err("missing ScVal type");
+    let mut cursor = 0;
+    decode_scval_cursor(bytes, &mut cursor, 0)
+}
+
+fn decode_scval_cursor(
+    bytes: &[u8],
+    cursor: &mut usize,
+    depth: usize,
+) -> Result<serde_json::Value, &'static str> {
+    if depth > 32 {
+        return Err("max ScVal recursion depth exceeded");
     }
-    let kind = u32::from_be_bytes(bytes[0..4].try_into().map_err(|_| "invalid type")?);
-    let mut cursor = 4;
+    let kind = read_u32(bytes, cursor)?;
     match kind {
-        0 => Ok(serde_json::Value::Bool(read_u32(bytes, &mut cursor)? != 0)),
+        0 => Ok(serde_json::Value::Bool(read_u32(bytes, cursor)? != 0)),
         1 => Ok(serde_json::Value::Null),
-        3 => Ok(serde_json::Value::Number(
-            read_u32(bytes, &mut cursor)?.into(),
-        )),
+        3 => Ok(serde_json::Value::Number(read_u32(bytes, cursor)?.into())),
         4 => Ok(serde_json::Value::Number(
-            (read_u32(bytes, &mut cursor)? as i32).into(),
+            (read_u32(bytes, cursor)? as i32).into(),
         )),
         5 | 7 | 8 => {
-            let number = read_u64(bytes, &mut cursor)?;
+            let number = read_u64(bytes, cursor)?;
             Ok(serde_json::Value::Number(number.into()))
         }
         6 => Ok(serde_json::Value::Number(
-            (read_u64(bytes, &mut cursor)? as i64).into(),
+            (read_u64(bytes, cursor)? as i64).into(),
         )),
+        9 => {
+            let hi = read_u64(bytes, cursor)?;
+            let lo = read_u64(bytes, cursor)?;
+            let val = ((hi as u128) << 64) | (lo as u128);
+            if let Ok(num) = u64::try_from(val) {
+                Ok(serde_json::Value::Number(num.into()))
+            } else {
+                Ok(serde_json::Value::String(val.to_string()))
+            }
+        }
+        10 => {
+            let hi = read_u64(bytes, cursor)? as i64;
+            let lo = read_u64(bytes, cursor)?;
+            let val = ((hi as i128) << 64) | (lo as u128 as i128);
+            if let Ok(num) = i64::try_from(val) {
+                Ok(serde_json::Value::Number(num.into()))
+            } else {
+                Ok(serde_json::Value::String(val.to_string()))
+            }
+        }
+        11 | 12 => {
+            let raw = read_bytes(bytes, cursor, 32)?;
+            Ok(serde_json::Value::String(format!("0x{}", hex::encode(raw))))
+        }
         13..=15 => {
-            let raw = read_opaque(bytes, &mut cursor)?;
+            let raw = read_opaque(bytes, cursor)?;
             if kind == 15 || kind == 14 {
                 Ok(serde_json::Value::String(
                     String::from_utf8(raw).map_err(|_| "invalid ScVal text")?,
@@ -492,9 +540,46 @@ fn decode_scval(bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
                 Ok(serde_json::Value::String(format!("0x{}", hex::encode(raw))))
             }
         }
+        16 => {
+            let has_vec = read_u32(bytes, cursor)?;
+            if has_vec == 0 {
+                return Ok(serde_json::Value::Null);
+            }
+            let count = read_u32(bytes, cursor)? as usize;
+            if count > 10_000 {
+                return Err("ScVal vec length exceeds limit");
+            }
+            let mut items = Vec::with_capacity(count);
+            for _ in 0..count {
+                items.push(decode_scval_cursor(bytes, cursor, depth + 1)?);
+            }
+            Ok(serde_json::Value::Array(items))
+        }
+        17 => {
+            let has_map = read_u32(bytes, cursor)?;
+            if has_map == 0 {
+                return Ok(serde_json::Value::Null);
+            }
+            let count = read_u32(bytes, cursor)? as usize;
+            if count > 10_000 {
+                return Err("ScVal map length exceeds limit");
+            }
+            let mut map = serde_json::Map::with_capacity(count);
+            for _ in 0..count {
+                let key_val = decode_scval_cursor(bytes, cursor, depth + 1)?;
+                let key = match key_val {
+                    serde_json::Value::String(s) => s,
+                    serde_json::Value::Number(n) => n.to_string(),
+                    other => other.to_string(),
+                };
+                let val = decode_scval_cursor(bytes, cursor, depth + 1)?;
+                map.insert(key, val);
+            }
+            Ok(serde_json::Value::Object(map))
+        }
         18 => {
-            let address_kind = read_u32(bytes, &mut cursor)?;
-            let address = read_bytes(bytes, &mut cursor, 32)?;
+            let address_kind = read_u32(bytes, cursor)?;
+            let address = read_bytes(bytes, cursor, 32)?;
             Ok(serde_json::Value::String(format!(
                 "scaddress:{}:{}",
                 address_kind,
@@ -672,7 +757,12 @@ mod tests {
     /// topics[3] is extracted into `data["target"]` for CAddressFunded.
     #[test]
     fn test_parse_extracts_target_from_topics_index_2() {
-        let raw = raw_event(serde_json::json!(["CAddressFunded", "GASSET", "GSOURCE", "CTARGET"]));
+        let raw = raw_event(serde_json::json!([
+            "CAddressFunded",
+            "GASSET",
+            "GSOURCE",
+            "CTARGET"
+        ]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(
             event.data["target"].as_str(),
@@ -755,7 +845,11 @@ mod tests {
     /// #641: AdminTransferred layout is ("AdminTransferred", old_admin, pending).
     #[test]
     fn test_admin_transferred_topic_mapping() {
-        let raw = raw_event(serde_json::json!(["AdminTransferred", "GOLDADMIN", "GNEWADMIN"]));
+        let raw = raw_event(serde_json::json!([
+            "AdminTransferred",
+            "GOLDADMIN",
+            "GNEWADMIN"
+        ]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(event.data["from"].as_str(), Some("GOLDADMIN"));
         assert_eq!(event.data["to"].as_str(), Some("GNEWADMIN"));
@@ -789,7 +883,11 @@ mod tests {
     #[test]
     fn test_old_incorrect_role_change_topics_produce_no_event() {
         let raw_admin = raw_event(serde_json::json!(["AdminChanged", "GADMIN", "GNEWADMIN"]));
-        let raw_fc = raw_event(serde_json::json!(["FeeCollectorChanged", "GCOL", "GNEWCOL"]));
+        let raw_fc = raw_event(serde_json::json!([
+            "FeeCollectorChanged",
+            "GCOL",
+            "GNEWCOL"
+        ]));
         assert!(
             parse_contract_event(&raw_admin, "C1", 0).is_none(),
             "'AdminChanged' must yield None - contract never emits this"
@@ -934,11 +1032,7 @@ mod tests {
     /// `BatchTransferFailed` uses the generic (name, source, target) layout.
     #[test]
     fn test_parse_batch_transfer_failed_extracts_source_and_target() {
-        let raw = raw_event(serde_json::json!([
-            "BatchTransferFailed",
-            "GSRC",
-            "CTGT"
-        ]));
+        let raw = raw_event(serde_json::json!(["BatchTransferFailed", "GSRC", "CTGT"]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(event.event_type, "BatchTransferFailed");
         assert_eq!(event.data["source"].as_str(), Some("GSRC"));
@@ -1154,12 +1248,9 @@ mod tests {
             lookback_ledgers: 720,
         };
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            poll_once(&state),
-        )
-        .await
-        .expect("poll_once must terminate (no infinite loop)");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), poll_once(&state))
+            .await
+            .expect("poll_once must terminate (no infinite loop)");
 
         result.expect("poll_once must succeed");
 
@@ -1181,6 +1272,78 @@ mod tests {
             last_ledger,
             Some(249),
             "cursor must advance to the last event's ledger (200 + 49)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #749: Vec / tuple ScVal decoding and CAddressFunded payload
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_scval_vec_and_i128() {
+        // Base64-encoded ScVal::Vec([ScVal::I128(1000), ScVal::I128(10)])
+        let b64 = "AAAAEAAAAAEAAAACAAAACgAAAAAAAAAAAAAAAAAAA+gAAAAKAAAAAAAAAAAAAAAAAAAACg==";
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        let decoded = decode_scval(&bytes).expect("decode vec");
+        assert_eq!(
+            decoded,
+            serde_json::json!([1000, 10]),
+            "ScVal::Vec with I128 elements must decode into JSON array"
+        );
+    }
+
+    #[test]
+    fn test_decode_scval_map() {
+        // Base64-encoded ScVal::Map([key: Symbol("key1"), val: U64(123)])
+        let b64 = "AAAAEQAAAAEAAAABAAAADwAAAARrZXkxAAAABQAAAAAAAAB7";
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        let decoded = decode_scval(&bytes).expect("decode map");
+        assert_eq!(
+            decoded,
+            serde_json::json!({"key1": 123}),
+            "ScVal::Map must decode into JSON object"
+        );
+    }
+
+    #[test]
+    fn test_caddress_funded_vec_payload_and_topics_decoded() {
+        // Topics: ("CAddressFunded", asset, source, target)
+        // Value: ScVal::Vec([ScVal::I128(1000), ScVal::I128(10)]) -> (amount, fee)
+        let raw = serde_json::json!({
+            "topic": [
+                "AAAADwAAAA5DQWRkcmVzc0Z1bmRlZAAA",
+                "AAAADwAAAApDQVNTRVRBRERSAAA=",
+                "AAAADwAAAAtHU09VUkNFQUREUgA=",
+                "AAAADwAAAAtDVEFSR0VUQUREUgA="
+            ],
+            "ledger": 100,
+            "txHash": "cafebabe11112222",
+            "createdAt": "2024-06-01T12:00:00Z",
+            "value": "AAAAEAAAAAEAAAACAAAACgAAAAAAAAAAAAAAAAAAA+gAAAAKAAAAAAAAAAAAAAAAAAAACg=="
+        });
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.event_type, "CAddressFunded");
+        assert_eq!(event.data["asset"].as_str(), Some("CASSETADDR"));
+        assert_eq!(event.data["source"].as_str(), Some("GSOURCEADDR"));
+        assert_eq!(event.data["target"].as_str(), Some("CTARGETADDR"));
+        assert_eq!(
+            event.data["value"],
+            serde_json::json!([1000, 10]),
+            "value must be decoded into array [amount, fee]"
+        );
+        assert_eq!(
+            event.data["amount"],
+            serde_json::json!(1000),
+            "amount must be extracted into named field"
+        );
+        assert_eq!(
+            event.data["fee"],
+            serde_json::json!(10),
+            "fee must be extracted into named field"
         );
     }
 }
