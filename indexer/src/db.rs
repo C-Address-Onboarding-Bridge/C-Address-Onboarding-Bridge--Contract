@@ -153,14 +153,23 @@ impl Database {
             "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, secret, created_at
              FROM subscriptions WHERE active = 1",
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await?;
 
         let now = chrono::Utc::now().to_rfc3339();
         let data = &event.data;
 
-        for (sub_id, _url, event_type, asset_filter, source_filter, target_filter, _active, _secret, _created_at) in
-            subs
+        for (
+            sub_id,
+            _url,
+            event_type,
+            asset_filter,
+            source_filter,
+            target_filter,
+            _active,
+            _secret,
+            _created_at,
+        ) in subs
         {
             if let Some(ref et) = event_type {
                 if et != &event.event_type {
@@ -168,13 +177,22 @@ impl Database {
                 }
             }
             if let Some(ref af) = asset_filter {
-                match data.get("asset").and_then(|v| v.as_str()) { Some(asset) if asset == af => {}, _ => continue }
+                match data.get("asset").and_then(|v| v.as_str()) {
+                    Some(asset) if asset == af => {}
+                    _ => continue,
+                }
             }
             if let Some(ref sf) = source_filter {
-                match data.get("source").and_then(|v| v.as_str()) { Some(source) if source == sf => {}, _ => continue }
+                match data.get("source").and_then(|v| v.as_str()) {
+                    Some(source) if source == sf => {}
+                    _ => continue,
+                }
             }
             if let Some(ref tf) = target_filter {
-                match data.get("target").and_then(|v| v.as_str()) { Some(target) if target == tf => {}, _ => continue }
+                match data.get("target").and_then(|v| v.as_str()) {
+                    Some(target) if target == tf => {}
+                    _ => continue,
+                }
             }
 
             let delivery_id = uuid::Uuid::new_v4().to_string();
@@ -186,7 +204,7 @@ impl Database {
             .bind(&sub_id)
             .bind(&event.id)
             .bind(&now)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
         Ok(())
