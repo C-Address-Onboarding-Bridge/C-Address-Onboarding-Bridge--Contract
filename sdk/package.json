@@ -10,7 +10,8 @@
     "prepublishOnly": "npm run build",
     "test": "jest",
     "lint": "eslint src/",
-    "docs": "typedoc --out docs src/index.ts --name \"C-Address Onboarding Bridge SDK\" --includeVersion"
+    "docs": "typedoc --out docs src/index.ts --name \"C-Address Onboarding Bridge SDK\" --includeVersion",
+    "check:docs": "node scripts/check-api-docs.js"
   },
   "keywords": ["stellar", "soroban", "c-address", "onboarding", "bridge"],
   "license": "MIT",
