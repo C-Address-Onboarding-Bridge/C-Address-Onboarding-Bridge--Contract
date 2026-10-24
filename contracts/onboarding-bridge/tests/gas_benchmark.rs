@@ -388,6 +388,40 @@ fn bench_claim_timelocked() -> BenchResult {
     }
 }
 
+fn compute_commitment_hash(
+    env: &Env,
+    bridge_id: &Address,
+    source: &Address,
+    target: &Address,
+    asset: &Address,
+    amount: i128,
+    nonce: u64,
+) -> BytesN<32> {
+    let mut preimage = soroban_sdk::Bytes::new(env);
+    preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
+    let mut address_buffer = [0u8; 64];
+    let bridge_string = bridge_id.to_string();
+    let bridge_length = bridge_string.len() as usize;
+    bridge_string.copy_into_slice(&mut address_buffer[..bridge_length]);
+    preimage.append(&soroban_sdk::Bytes::from_slice(
+        env,
+        &address_buffer[..bridge_length],
+    ));
+    preimage.append(&env.ledger().network_id().into());
+    for address in [source, target, asset] {
+        let address_string = address.to_string();
+        let length = address_string.len() as usize;
+        address_string.copy_into_slice(&mut address_buffer[..length]);
+        preimage.append(&soroban_sdk::Bytes::from_slice(
+            env,
+            &address_buffer[..length],
+        ));
+    }
+    preimage.extend_from_array(&amount.to_be_bytes());
+    preimage.extend_from_array(&nonce.to_be_bytes());
+    env.crypto().sha256(&preimage).into()
+}
+
 fn bench_commit_fund() -> BenchResult {
     let (env, bridge_id, token_id, admin, fee_collector) = setup_env();
     let bridge = onboarding_bridge::OnboardingBridgeClient::new(&env, &bridge_id);
@@ -397,29 +431,17 @@ fn bench_commit_fund() -> BenchResult {
 
     let user = Address::generate(&env);
     let target = Address::generate(&env);
-    let mut preimage = soroban_sdk::Bytes::new(&env);
-    preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
-    let mut address_buffer = [0u8; 64];
-    let bridge_string = bridge_id.to_string();
-    let bridge_length = bridge_string.len() as usize;
-    bridge_string.copy_into_slice(&mut address_buffer[..bridge_length]);
-    preimage.append(&soroban_sdk::Bytes::from_slice(
+    let amount: i128 = 10_000;
+    let nonce: u64 = 1;
+    let amount_hash = compute_commitment_hash(
         &env,
-        &address_buffer[..bridge_length],
-    ));
-    preimage.append(&env.ledger().network_id().into());
-    for address in [&user, &target, &token_id] {
-        let address_string = address.to_string();
-        let length = address_string.len() as usize;
-        address_string.copy_into_slice(&mut address_buffer[..length]);
-        preimage.append(&soroban_sdk::Bytes::from_slice(
-            &env,
-            &address_buffer[..length],
-        ));
-    }
-    preimage.extend_from_array(&10_000i128.to_be_bytes());
-    preimage.extend_from_array(&1u64.to_be_bytes());
-    let amount_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+        &bridge_id,
+        &user,
+        &target,
+        &token_id,
+        amount,
+        nonce,
+    );
     let deadline = env.ledger().timestamp() + 86_400;
 
     env.cost_estimate().budget().reset_default();
@@ -452,10 +474,15 @@ fn bench_reveal_fund() -> BenchResult {
     let nonce: u64 = 1;
     token.mint(&user, &(amount * 2));
 
-    let mut preimage = soroban_sdk::Bytes::new(&env);
-    preimage.extend_from_array(&amount.to_be_bytes());
-    preimage.extend_from_array(&nonce.to_be_bytes());
-    let amount_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+    let amount_hash = compute_commitment_hash(
+        &env,
+        &bridge_id,
+        &user,
+        &target,
+        &token_id,
+        amount,
+        nonce,
+    );
     let deadline = env.ledger().timestamp() + 86_400;
     let id = bridge.commit_fund(&user, &target, &token_id, &amount_hash, &deadline);
     env.ledger()
@@ -543,6 +570,22 @@ fn bench_tiered_fee_lookup() -> BenchResult {
     }
 }
 
+fn print_benchmark_json(results: &[BenchResult]) {
+    println!("===BENCHMARK_JSON_BEGIN===");
+    println!("{{");
+    println!("  \"benchmark_results\": [");
+    for (i, r) in results.iter().enumerate() {
+        let comma = if i < results.len() - 1 { "," } else { "" };
+        println!(
+            "    {{ \"function\": \"{}\", \"variant\": \"{}\", \"cpu_insns\": {}, \"mem_bytes\": {} }}{}",
+            r.function_name, r.variant, r.cpu_insns, r.mem_bytes, comma
+        );
+    }
+    println!("  ]");
+    println!("}}");
+    println!("===BENCHMARK_JSON_END===");
+}
+
 fn main() {
     let results = vec![
         bench_initialize(),
@@ -566,19 +609,7 @@ fn main() {
         bench_tiered_fee_lookup(),
     ];
 
-    println!("===BENCHMARK_JSON_BEGIN===");
-    println!("{{");
-    println!("  \"benchmark_results\": [");
-    for (i, r) in results.iter().enumerate() {
-        let comma = if i < results.len() - 1 { "," } else { "" };
-        println!(
-            "    {{ \"function\": \"{}\", \"variant\": \"{}\", \"cpu_insns\": {}, \"mem_bytes\": {} }}{}",
-            r.function_name, r.variant, r.cpu_insns, r.mem_bytes, comma
-        );
-    }
-    println!("  ]");
-    println!("}}");
-    println!("===BENCHMARK_JSON_END===");
+    print_benchmark_json(&results);
 }
 
 #[cfg(test)]
@@ -586,7 +617,6 @@ mod bench_tests {
     use super::*;
 
     #[test]
-    #[ignore = "TODO(next-bounty): benchmarks call fund_c_address and friends, which are still todo!() stubs; un-ignore once they are implemented"]
     fn run_all_benchmarks() {
         let results = vec![
             bench_initialize(),
@@ -609,6 +639,8 @@ mod bench_tests {
             bench_reveal_fund(),
             bench_tiered_fee_lookup(),
         ];
+
+        print_benchmark_json(&results);
 
         for r in &results {
             assert!(
