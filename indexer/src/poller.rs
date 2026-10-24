@@ -363,38 +363,16 @@ fn parse_contract_event(
         }
         // ("FeesWithdrawn", fee_collector) - asset carried in value, not topics
         BridgeEventType::FeesWithdrawn => {
-            if let Some(collector) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert(
-                    "fee_collector".to_string(),
-                    serde_json::Value::String(collector.to_string()),
-                );
-            }
+            insert_topic_str(&mut data, &decoded_topics, 1, "fee_collector");
         }
         // ("AdminProposed", admin, new_admin) / ("AdminTransferred", old_admin, pending)
-        BridgeEventType::AdminProposed | BridgeEventType::AdminTransferred => {
-            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert(
-                    "from".to_string(),
-                    serde_json::Value::String(from.to_string()),
-                );
-            }
-            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
-                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
-            }
-        }
-        // ("FeeCollectorTransferProposed", admin, new_collector) /
-        // ("FeeCollectorTransferred", old, pending)
-        BridgeEventType::FeeCollectorTransferProposed
+        // ("FeeCollectorTransferProposed", admin, new_collector) / ("FeeCollectorTransferred", old, pending)
+        BridgeEventType::AdminProposed
+        | BridgeEventType::AdminTransferred
+        | BridgeEventType::FeeCollectorTransferProposed
         | BridgeEventType::FeeCollectorTransferred => {
-            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert(
-                    "from".to_string(),
-                    serde_json::Value::String(from.to_string()),
-                );
-            }
-            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
-                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
-            }
+            insert_topic_str(&mut data, &decoded_topics, 1, "from");
+            insert_topic_str(&mut data, &decoded_topics, 2, "to");
         }
         _ => {
             // CommitFund, BatchTransferFailed, and the remaining admin/config
@@ -750,6 +728,8 @@ mod tests {
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(event.data["from"].as_str(), Some("GADMIN"));
         assert_eq!(event.data["to"].as_str(), Some("GNEWADMIN"));
+        assert!(event.data.get("source").is_none());
+        assert!(event.data.get("target").is_none());
     }
 
     /// #641: AdminTransferred layout is ("AdminTransferred", old_admin, pending).
@@ -759,9 +739,12 @@ mod tests {
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(event.data["from"].as_str(), Some("GOLDADMIN"));
         assert_eq!(event.data["to"].as_str(), Some("GNEWADMIN"));
+        assert!(event.data.get("source").is_none());
+        assert!(event.data.get("target").is_none());
     }
 
-    /// #641: FeeCollectorTransferProposed and FeeCollectorTransferred are now recognised.
+    /// #641: FeeCollectorTransferProposed and FeeCollectorTransferred are now recognised
+    /// and map to specific from / to fields without generic source / target.
     #[test]
     fn test_fee_collector_role_change_topics_are_recognised() {
         let proposed = raw_event(serde_json::json!([
@@ -774,14 +757,19 @@ mod tests {
             "GOLDCOLLECTOR",
             "GNEWCOLLECTOR"
         ]));
-        assert!(
-            parse_contract_event(&proposed, "C1", 0).is_some(),
-            "FeeCollectorTransferProposed must be recognised"
-        );
-        assert!(
-            parse_contract_event(&transferred, "C1", 0).is_some(),
-            "FeeCollectorTransferred must be recognised"
-        );
+        let event_proposed = parse_contract_event(&proposed, "C1", 0)
+            .expect("FeeCollectorTransferProposed must parse");
+        assert_eq!(event_proposed.data["from"].as_str(), Some("GADMIN"));
+        assert_eq!(event_proposed.data["to"].as_str(), Some("GNEWCOLLECTOR"));
+        assert!(event_proposed.data.get("source").is_none());
+        assert!(event_proposed.data.get("target").is_none());
+
+        let event_transferred = parse_contract_event(&transferred, "C1", 0)
+            .expect("FeeCollectorTransferred must parse");
+        assert_eq!(event_transferred.data["from"].as_str(), Some("GOLDCOLLECTOR"));
+        assert_eq!(event_transferred.data["to"].as_str(), Some("GNEWCOLLECTOR"));
+        assert!(event_transferred.data.get("source").is_none());
+        assert!(event_transferred.data.get("target").is_none());
     }
 
     /// #641: The old incorrect topic strings AdminChanged / FeeCollectorChanged
