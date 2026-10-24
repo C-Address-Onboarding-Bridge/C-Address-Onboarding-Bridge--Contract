@@ -276,6 +276,17 @@ jobs:
           name: onboarding-bridge-wasm
           path: target/wasm32-unknown-unknown/release/*.wasm
 
+      - name: Setup Node.js for SDK conformance
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run SDK <-> Contract ABI conformance suite
+        working-directory: sdk
+        run: |
+          npm ci
+          npx jest src/__tests__/conformance.test.ts
+
   contract-compatibility:
     name: Contract Compatibility (Soroban SDK ${{ matrix.soroban-sdk-version }}.x)
     runs-on: ubuntu-latest
@@ -379,6 +390,9 @@ jobs:
 
       - name: Build SDK
         run: npm run build
+
+      - name: Run SDK conformance suite
+        run: npx jest src/__tests__/conformance.test.ts
 
   # Type-check the example programs against the built SDK so API drift (e.g.
   # batchFundCAddresses returning TransactionResult[] instead of a single

@@ -420,7 +420,6 @@ describe("OnboardingBridgeSDK", () => {
           source: MOCK_ADDRESS,
           target: MOCK_ASSET,
           asset: MOCK_ASSET,
-          amount: "1000",
           amountHash: "ab".repeat(32),
           deadline: 123456,
         },
@@ -451,7 +450,6 @@ describe("OnboardingBridgeSDK", () => {
           source: MOCK_ADDRESS,
           target: MOCK_ASSET,
           asset: MOCK_ASSET,
-          amount: "1000",
           amountHash: "ab".repeat(32),
           deadline: 123456,
         },
@@ -1161,6 +1159,7 @@ describe("OnboardingBridgeSDK", () => {
             target: MOCK_ASSET,
             asset: MOCK_ASSET,
             amount: "1000",
+            networkId: "Test SDF Network ; September 2015",
             nonce: 1,
             deadline: 9999999999,
           },
@@ -1590,7 +1589,7 @@ describe("OnboardingBridgeSDK", () => {
       await sdk.getFeeBalance(MOCK_ASSET);
       await sdk.getContractBalance(MOCK_ASSET);
       await sdk.getAllBalances([MOCK_ASSET, MOCK_ASSET]);
-      await sdk.queryCurrentTier(MOCK_ADDRESS);
+      await sdk.queryCurrentTier(MOCK_ADDRESS, MOCK_ASSET);
       await sdk.isBlocked(MOCK_ADDRESS);
       await sdk.isAllowlisted(MOCK_ASSET);
 
@@ -1601,9 +1600,10 @@ describe("OnboardingBridgeSDK", () => {
       expect(Address).toHaveBeenNthCalledWith(5, MOCK_ASSET);
       expect(Address).toHaveBeenNthCalledWith(6, MOCK_ASSET);
       expect(Address).toHaveBeenNthCalledWith(7, MOCK_ADDRESS);
-      expect(Address).toHaveBeenNthCalledWith(8, MOCK_ADDRESS);
-      expect(Address).toHaveBeenNthCalledWith(9, MOCK_ASSET);
-      expect(Address).toHaveBeenCalledTimes(9);
+      expect(Address).toHaveBeenNthCalledWith(8, MOCK_ASSET);
+      expect(Address).toHaveBeenNthCalledWith(9, MOCK_ADDRESS);
+      expect(Address).toHaveBeenNthCalledWith(10, MOCK_ASSET);
+      expect(Address).toHaveBeenCalledTimes(10);
     });
   });
 
