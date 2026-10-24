@@ -185,12 +185,6 @@ pub enum BridgeError {
     InvalidTtl = 48,
     /// The supplied pubkey is not the registered meta-signer for `source`.
     MetaTxPubkeySourceMismatch = 49,
-    /// `tiers.len()` exceeds `MAX_FEE_TIERS`.
-    TooManyFeeTiers = 51,
-    /// Cross-chain payouts exceed the admin-funded liquidity reserve.
-    InsufficientCrossChainReserve = 52,
-    // Next free discriminant: 53. Always take the next unused value here and
-    // never renumber an existing variant — clients match on these values.
 }
 
 // ---------------------------------------------------------------------------
@@ -897,7 +891,7 @@ fn decrement_crosschain_reserve(
 ) -> Result<(), BridgeError> {
     let reserve = read_crosschain_reserve(env, asset);
     if amount > reserve {
-        return Err(BridgeError::InsufficientCrossChainReserve);
+        return Err(BridgeError::InsufficientReclaimable);
     }
     write_crosschain_reserve(env, asset, safe_math::safe_sub(reserve, amount)?);
     Ok(())
@@ -1785,7 +1779,7 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
 
         if targets.len() > MAX_BATCH_SIZE {
-            return Err(BridgeError::TooManyFeeTiers);
+            return Err(BridgeError::BatchTooLarge);
         }
         // #594: reject empty batches — a zero-length call transfers nothing but
         // would still emit BatchCompleted and mint loyalty rewards.
@@ -1984,6 +1978,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if limit_amount < 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -2062,6 +2057,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if max_fee_bps > MAX_FEE_BPS {
             return Err(BridgeError::FeeTooHigh);
         }
@@ -2293,6 +2289,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if amount < 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -2409,6 +2406,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if amount < 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -2460,6 +2458,7 @@ impl OnboardingBridge {
     /// * `("ReferralRateChanged", bps)` — no additional data.
     pub fn set_referral_rate(env: Env, bps: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -2906,6 +2905,7 @@ impl OnboardingBridge {
     /// so that an upgrade can fix whatever condition required the pause.
     pub fn pause(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -2937,6 +2937,7 @@ impl OnboardingBridge {
     /// * `("ContractUnpaused",)` — data: `(admin,)`
     pub fn unpause(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3282,6 +3283,7 @@ impl OnboardingBridge {
         }
 
         env.storage().instance().set(&DataKey::Deactivated, &true);
+        set_paused(&env, true);
         env.events()
             .publish(("EmergencyMigrated", admin), (new_contract,));
 
@@ -3319,6 +3321,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3352,6 +3355,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3391,6 +3395,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3427,6 +3432,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3468,6 +3474,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3602,6 +3609,7 @@ impl OnboardingBridge {
     pub fn add_asset(env: Env, asset: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3637,6 +3645,7 @@ impl OnboardingBridge {
     pub fn remove_asset(env: Env, asset: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3724,6 +3733,7 @@ impl OnboardingBridge {
     pub fn add_swap_pool(env: Env, pool: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3761,6 +3771,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3820,6 +3831,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if amount_per_fund < 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -3883,7 +3895,7 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
-    /// * [`BridgeError::TooManyFeeTiers`] — `tiers.len()` exceeds `MAX_FEE_TIERS` (50).
+    /// * [`BridgeError::BatchTooLarge`] — `tiers.len()` exceeds `MAX_FEE_TIERS` (50).
     /// * [`BridgeError::FeeTooHigh`] — Any tier's `fee_bps` exceeds 1 000.
     ///
     /// # Events
@@ -3992,6 +4004,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -4015,7 +4028,7 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
-    /// * [`BridgeError::InsufficientCrossChainReserve`] — `amount` exceeds the
+    /// * [`BridgeError::InsufficientReclaimable`] — `amount` exceeds the
     ///   reserve balance.
     pub fn withdraw_crosschain_reserve(
         env: Env,
@@ -4024,6 +4037,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -4097,7 +4111,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::BelowThreshold`] — No active relayers, a zero threshold,
     ///   or fewer than `threshold` valid signatures.
     /// * [`BridgeError::InvalidAddress`] — A strkey exceeds `MAX_STRKEY_LEN` (64) bytes.
-    /// * [`BridgeError::InsufficientCrossChainReserve`] — The reserve cannot
+    /// * [`BridgeError::InsufficientReclaimable`] — The reserve cannot
     ///   cover `net_amount`.
     ///
     /// # Events
@@ -4248,6 +4262,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -4281,10 +4296,12 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        if is_relayer(&env, &pubkey) {
+        let was_registered = is_relayer(&env, &pubkey);
+        if was_registered {
             let count = relayer_count(&env);
             if count <= 1 || count.saturating_sub(1) < relayer_threshold(&env) {
                 return Err(BridgeError::BelowThreshold);
@@ -4319,6 +4336,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -4871,6 +4889,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -4916,6 +4935,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
 
         if ttl < MIN_ALLOWED_TTL {
             return Err(BridgeError::InvalidTtl);
@@ -5473,6 +5493,9 @@ impl OnboardingBridge {
 
         if amount_out <= 0 {
             return Err(BridgeError::SwapFailed);
+        }
+        if amount_out < min_target_amount {
+            return Err(BridgeError::SlippageExceeded);
         }
 
         let balance_after = target_token.balance(&contract_addr);
