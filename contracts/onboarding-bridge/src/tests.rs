@@ -657,12 +657,7 @@ fn test_admin_mutators_reject_replayed_nonces() {
 
     bridge.extend_source_persistent_ttl(&user, &token_id, &200_000u32, &Some(nonce));
     assert_eq!(
-        bridge.try_extend_source_persistent_ttl(
-            &user,
-            &token_id,
-            &200_000u32,
-            &Some(nonce),
-        ),
+        bridge.try_extend_source_persistent_ttl(&user, &token_id, &200_000u32, &Some(nonce),),
         Err(Ok(BridgeError::DuplicateNonce))
     );
     nonce += 1;
@@ -2146,6 +2141,107 @@ fn test_swap_records_volume_in_target_asset_units() {
         bridge.query_current_tier(&user, &target_token_id).fee_bps,
         100
     );
+}
+
+#[test]
+fn test_query_current_tier_reflects_volume_after_referral_and_swap() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+
+    // Configure fee tiers:
+    // Tier 0: volume 0..=499 -> 100 bps
+    // Tier 1: volume 500..=999 -> 50 bps
+    // Tier 2: volume 1000..=i128::MAX -> 10 bps
+    let tiers = Vec::from_array(
+        &env,
+        [
+            FeeTier {
+                min_volume: 0,
+                max_volume: 499,
+                fee_bps: 100,
+            },
+            FeeTier {
+                min_volume: 500,
+                max_volume: 999,
+                fee_bps: 50,
+            },
+            FeeTier {
+                min_volume: 1_000,
+                max_volume: i128::MAX,
+                fee_bps: 10,
+            },
+        ],
+    );
+    bridge.set_fee_tiers(&tiers, &None);
+
+    // Initial state: both assets start at Tier 0 (100 bps)
+    assert_eq!(
+        bridge.query_current_tier(&user, &source_token_id).fee_bps,
+        100
+    );
+    assert_eq!(
+        bridge.query_current_tier(&user, &target_token_id).fee_bps,
+        100
+    );
+
+    // Part 1: Fund via referral with source_token_id (500 units)
+    let referrer = Address::generate(&env);
+    let target = Address::generate(&env);
+    bridge.set_referral_rate(&1_000u32, &None);
+    mint_tokens(&env, &source_token_id, &user, 1_000i128);
+
+    bridge.fund_c_address_with_referral(
+        &user,
+        &target,
+        &source_token_id,
+        &500i128,
+        &Some(referrer),
+        &None,
+        &None,
+    );
+
+    // query_current_tier for source_token_id must now reflect Tier 1 (50 bps, volume 500)
+    let source_tier = bridge.query_current_tier(&user, &source_token_id);
+    assert_eq!(source_tier.fee_bps, 50);
+    assert_eq!(source_tier.min_volume, 500);
+
+    // target_token_id must still be untouched at Tier 0 (100 bps)
+    assert_eq!(
+        bridge.query_current_tier(&user, &target_token_id).fee_bps,
+        100
+    );
+
+    // Part 2: Fund via swap (source_token_id -> target_token_id)
+    // Setup swap pool with 1:2 exchange rate (500 source_token -> 1000 target_token)
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &target_token_id, &2i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let swap_target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+
+    bridge.fund_c_address_with_swap(
+        &user,
+        &swap_target,
+        &source_token_id,
+        &target_token_id,
+        &500i128,
+        &1_000i128,
+        &swap_route,
+        &None,
+        &None,
+    );
+
+    // Swap received 1000 units of target_token_id.
+    // query_current_tier for target_token_id must reflect Tier 2 (10 bps, volume >= 1000)
+    let target_tier = bridge.query_current_tier(&user, &target_token_id);
+    assert_eq!(target_tier.fee_bps, 10);
+    assert_eq!(target_tier.min_volume, 1_000);
+
+    // source_token_id volume must NOT have increased from the swap (still Tier 1, 50 bps)
+    let source_tier_after_swap = bridge.query_current_tier(&user, &source_token_id);
+    assert_eq!(source_tier_after_swap.fee_bps, 50);
 }
 
 #[test]
@@ -4038,9 +4134,8 @@ mod crosschain_tests {
         let sigs = Vec::new(&env);
 
         assert_eq!(
-            bridge.try_fund_c_address_crosschain(
-                &1u32, &tx_hash, &target, &token_id, &99i128, &sigs
-            ),
+            bridge
+                .try_fund_c_address_crosschain(&1u32, &tx_hash, &target, &token_id, &99i128, &sigs),
             Err(Ok(BridgeError::InvalidAmount))
         );
     }
@@ -4087,7 +4182,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([7u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x77; 32]);
@@ -4329,14 +4424,12 @@ mod crosschain_tests {
     fn test_zero_relayer_threshold_is_rejected() {
         let env = Env::default();
         let (_bridge_id, _token_id, _admin, bridge) = setup(&env);
-        let relayer = BytesN::from_array(
-            &env,
-            make_signing_key([6u8; 32]).verifying_key().as_bytes(),
-        );
+        let relayer =
+            BytesN::from_array(&env, make_signing_key([6u8; 32]).verifying_key().as_bytes());
         bridge.add_relayer(&relayer, &None);
 
         assert_eq!(
-            bridge.try_set_relayer_threshold(&0u32),
+            bridge.try_set_relayer_threshold(&0u32, &None),
             Err(Ok(BridgeError::ThresholdExceedsRelayers))
         );
         assert_eq!(bridge.query_relayer_threshold(), 1);
@@ -4362,12 +4455,10 @@ mod crosschain_tests {
     fn test_empty_crosschain_signatures_fail_with_active_threshold() {
         let env = Env::default();
         let (_bridge_id, token_id, _admin, bridge) = setup(&env);
-        let relayer = BytesN::from_array(
-            &env,
-            make_signing_key([7u8; 32]).verifying_key().as_bytes(),
-        );
+        let relayer =
+            BytesN::from_array(&env, make_signing_key([7u8; 32]).verifying_key().as_bytes());
         bridge.add_relayer(&relayer, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x82; 32]);
@@ -4384,10 +4475,8 @@ mod crosschain_tests {
     fn test_zero_threshold_storage_cannot_bypass_relayer_checks() {
         let env = Env::default();
         let (_bridge_id, token_id, _admin, bridge) = setup(&env);
-        let relayer = BytesN::from_array(
-            &env,
-            make_signing_key([8u8; 32]).verifying_key().as_bytes(),
-        );
+        let relayer =
+            BytesN::from_array(&env, make_signing_key([8u8; 32]).verifying_key().as_bytes());
         bridge.add_relayer(&relayer, &None);
         env.storage()
             .instance()
@@ -4403,7 +4492,7 @@ mod crosschain_tests {
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert_eq!(
-            bridge.try_remove_relayer(&relayer),
+            bridge.try_remove_relayer(&relayer, &None),
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert!(bridge.query_is_relayer(&relayer));
@@ -4429,19 +4518,14 @@ mod crosschain_tests {
         );
         let reclaim_destination = soroban_sdk::Address::generate(&env);
         assert_eq!(
-            bridge.try_reclaim_tokens(
-                &token_id,
-                &1i128,
-                &reclaim_destination,
-                &None,
-            ),
+            bridge.try_reclaim_tokens(&token_id, &1i128, &reclaim_destination, &None,),
             Err(Ok(crate::BridgeError::InsufficientReclaimable))
         );
 
         let signing_key = make_signing_key([8u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         for (chain_id, hash_byte) in [(1u32, 0x31u8), (2u32, 0x32u8)] {
             let target = soroban_sdk::Address::generate(&env);
@@ -4449,14 +4533,13 @@ mod crosschain_tests {
             let amount = 4_000i128;
             let payload_hash =
                 build_payload_hash(&env, chain_id, &tx_hash, &target, &token_id, amount);
-            let sigs = Vec::from_array(
-                &env,
-                [make_relayer_sig(&env, &signing_key, &payload_hash)],
+            let sigs = Vec::from_array(&env, [make_relayer_sig(&env, &signing_key, &payload_hash)]);
+            bridge
+                .fund_c_address_crosschain(&chain_id, &tx_hash, &target, &token_id, &amount, &sigs);
+            assert_eq!(
+                TestTokenClient::new(&env, &token_id).balance(&target),
+                3_960i128
             );
-            bridge.fund_c_address_crosschain(
-                &chain_id, &tx_hash, &target, &token_id, &amount, &sigs,
-            );
-            assert_eq!(TestTokenClient::new(&env, &token_id).balance(&target), 3_960i128);
         }
 
         assert_eq!(bridge.query_crosschain_reserve(&token_id), 2_080i128);
@@ -4496,7 +4579,10 @@ mod crosschain_tests {
         bridge.claim_timelocked(&timelock_id);
         assert_eq!(token.balance(&timelock_target), 495i128);
         assert_eq!(bridge.query_accrued_fees(&token_id), 5i128);
-        assert_eq!(crate::read_asset_counters(&env, &token_id).locked_timelock, 0i128);
+        assert_eq!(
+            crate::read_asset_counters(&env, &token_id).locked_timelock,
+            0i128
+        );
         assert_eq!(bridge.query_contract_balance(&token_id), 2_085i128);
         assert!(
             bridge.query_accrued_fees(&token_id)
@@ -4546,24 +4632,15 @@ fn test_loyalty_rewards_preserve_bridged_asset_reserves() {
     let target = Address::generate(&env);
 
     bridge.set_fee_bps(&1_000u32, &None);
-    bridge.set_loyalty_token(&asset, &200i128);
+    bridge.set_loyalty_token(&asset, &200i128, &None);
     mint_tokens(&env, &asset, &bridge_id, 300i128);
 
     bridge.fund_c_address_timelocked(
-        &user,
-        &target,
-        &asset,
-        &500i128,
-        &2_000u64,
-        &0u64,
-        &None,
-        &None,
+        &user, &target, &asset, &500i128, &2_000u64, &0u64, &None, &None,
     );
 
     let locked = 500i128;
-    assert!(
-        bridge.query_contract_balance(&asset) >= bridge.query_accrued_fees(&asset) + locked
-    );
+    assert!(bridge.query_contract_balance(&asset) >= bridge.query_accrued_fees(&asset) + locked);
 
     for _ in 0..5 {
         let target = Address::generate(&env);
@@ -4577,7 +4654,6 @@ fn test_loyalty_rewards_preserve_bridged_asset_reserves() {
         count_events_with_topic(&env, &bridge_id, "LoyaltyMintSkipped") > 0,
         "funding should skip rewards when only reserved funds remain"
     );
-
 }
 
 #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
