@@ -66,7 +66,7 @@ async fn fetch_latest_ledger(state: &AppState) -> Result<i64, Box<dyn std::error
     // #637 - surface JSON-RPC errors instead of silently treating them as
     // missing fields.
     if let Some(err) = body.get("error") {
-        return Err(format!("getLatestLedger RPC error: {}", err).into());
+        return Err(format!("getLatestLedger RPC error: {err}").into());
     }
 
     let seq = body
@@ -122,6 +122,9 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
     // the next poll resumes exactly where we left off.
     let mut cursor: Option<String> = None;
     let mut max_ledger = start_ledger;
+    // #885 - Keep fallback per-transaction event counters outside the page loop
+    // so multi-page batches within a single poll never reset to 0 on page 2+.
+    let mut events_seen_per_tx: HashMap<String, usize> = HashMap::new();
 
     loop {
         let params = match cursor {
@@ -188,12 +191,10 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
-            return Err(format!("getEvents RPC error: {}", message).into());
+            return Err(format!("getEvents RPC error: {message}").into());
         }
 
-        let result = body
-            .get("result")
-            .ok_or("getEvents: missing result")?;
+        let result = body.get("result").ok_or("getEvents: missing result")?;
 
         let events: Vec<serde_json::Value> = result
             .get("events")
@@ -211,7 +212,6 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|l| l.as_i64())
             .unwrap_or(0);
 
-        let mut events_seen_per_tx: HashMap<&str, usize> = HashMap::new();
         for raw_event in &events {
             let ledger = raw_event
                 .get("ledger")
@@ -225,11 +225,12 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
                 .get("txHash")
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
-            let counter = events_seen_per_tx.entry(tx_hash).or_insert(0);
+            let counter = events_seen_per_tx.entry(tx_hash.to_string()).or_insert(0);
             let event_index = *counter;
             *counter += 1;
 
-            if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id, event_index) {
+            if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id, event_index)
+            {
                 // Insert the event and queue its webhook deliveries atomically
                 // (one SQLite transaction) so a crash between the two can never
                 // leave an indexed event with no deliveries queued. See #647.
@@ -363,38 +364,17 @@ fn parse_contract_event(
         }
         // ("FeesWithdrawn", fee_collector) - asset carried in value, not topics
         BridgeEventType::FeesWithdrawn => {
-            if let Some(collector) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert(
-                    "fee_collector".to_string(),
-                    serde_json::Value::String(collector.to_string()),
-                );
-            }
+            insert_topic_str(&mut data, &decoded_topics, 1, "fee_collector");
         }
         // ("AdminProposed", admin, new_admin) / ("AdminTransferred", old_admin, pending)
-        BridgeEventType::AdminProposed | BridgeEventType::AdminTransferred => {
-            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert(
-                    "from".to_string(),
-                    serde_json::Value::String(from.to_string()),
-                );
-            }
-            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
-                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
-            }
-        }
         // ("FeeCollectorTransferProposed", admin, new_collector) /
         // ("FeeCollectorTransferred", old, pending)
-        BridgeEventType::FeeCollectorTransferProposed
+        BridgeEventType::AdminProposed
+        | BridgeEventType::AdminTransferred
+        | BridgeEventType::FeeCollectorTransferProposed
         | BridgeEventType::FeeCollectorTransferred => {
-            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert(
-                    "from".to_string(),
-                    serde_json::Value::String(from.to_string()),
-                );
-            }
-            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
-                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
-            }
+            insert_topic_str(&mut data, &decoded_topics, 1, "from");
+            insert_topic_str(&mut data, &decoded_topics, 2, "to");
         }
         _ => {
             // CommitFund, BatchTransferFailed, and the remaining admin/config
@@ -404,16 +384,26 @@ fn parse_contract_event(
         }
     }
 
-    // #634 - Deterministic ID: sha256(ledger || tx_hash || event_type ||
-    // first_topic || event_index) encoded as a 64-char hex string.
+    // #885 / #634 - Derive `IndexedEvent.id` from the globally unique Soroban
+    // RPC event `id` (or `pagingToken`, formatted `<toid>-<event_index>`) via
+    // SHA-256 so event IDs are stable across page boundaries and process
+    // restarts. When unit-test fixtures omit `"id"`, fall back to hashing
+    // `(ledger, tx_hash, event_type, first_topic, event_index)` where
+    // `event_index` is tracked across all pages of the poll cycle.
     //
-    // Using SHA-256 (rather than std::hash::DefaultHasher, whose output is
-    // explicitly NOT stable across Rust releases) ensures:
-    //   1. The id never changes when the toolchain is upgraded.
-    //   2. The id space is large enough (256 bits) to avoid collisions.
-    //   3. Re-indexing the same on-chain event always produces the same id,
-    //      so `INSERT OR IGNORE` remains the sole deduplication mechanism.
-    let id = {
+    // Re-index path: migration `0003_reindex_event_ids.sql` (and
+    // `Database::reset_for_reindex`) clears pre-#885 events and cursor state
+    // so existing deployments re-index without colliding or duplicate IDs.
+    let id = if let Some(rpc_event_id) = raw
+        .get("id")
+        .or_else(|| raw.get("pagingToken"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        let mut hasher = Sha256::new();
+        hasher.update(rpc_event_id.as_bytes());
+        hex::encode(hasher.finalize())
+    } else {
         let mut hasher = Sha256::new();
         hasher.update(ledger.to_le_bytes());
         hasher.update(tx_hash.as_bytes());
@@ -444,7 +434,10 @@ fn insert_topic_str(
     key: &str,
 ) {
     if let Some(value) = topics.get(idx).and_then(serde_json::Value::as_str) {
-        data.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+        data.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
     }
 }
 
@@ -672,7 +665,12 @@ mod tests {
     /// topics[3] is extracted into `data["target"]` for CAddressFunded.
     #[test]
     fn test_parse_extracts_target_from_topics_index_2() {
-        let raw = raw_event(serde_json::json!(["CAddressFunded", "GASSET", "GSOURCE", "CTARGET"]));
+        let raw = raw_event(serde_json::json!([
+            "CAddressFunded",
+            "GASSET",
+            "GSOURCE",
+            "CTARGET"
+        ]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(
             event.data["target"].as_str(),
@@ -741,6 +739,10 @@ mod tests {
             event.data.get("asset").is_none(),
             "FeesWithdrawn has no asset topic - data['asset'] must be absent"
         );
+        assert!(
+            event.data.get("source").is_none() && event.data.get("target").is_none(),
+            "FeesWithdrawn must not fall through to generic source/target mapping"
+        );
     }
 
     /// #641: AdminProposed layout is ("AdminProposed", admin, new_admin).
@@ -750,18 +752,26 @@ mod tests {
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(event.data["from"].as_str(), Some("GADMIN"));
         assert_eq!(event.data["to"].as_str(), Some("GNEWADMIN"));
+        assert!(event.data.get("source").is_none());
+        assert!(event.data.get("target").is_none());
     }
 
     /// #641: AdminTransferred layout is ("AdminTransferred", old_admin, pending).
     #[test]
     fn test_admin_transferred_topic_mapping() {
-        let raw = raw_event(serde_json::json!(["AdminTransferred", "GOLDADMIN", "GNEWADMIN"]));
+        let raw = raw_event(serde_json::json!([
+            "AdminTransferred",
+            "GOLDADMIN",
+            "GNEWADMIN"
+        ]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(event.data["from"].as_str(), Some("GOLDADMIN"));
         assert_eq!(event.data["to"].as_str(), Some("GNEWADMIN"));
+        assert!(event.data.get("source").is_none());
+        assert!(event.data.get("target").is_none());
     }
 
-    /// #641: FeeCollectorTransferProposed and FeeCollectorTransferred are now recognised.
+    /// #641/#891: FeeCollectorTransferProposed and FeeCollectorTransferred map topics[1..=2] to from/to.
     #[test]
     fn test_fee_collector_role_change_topics_are_recognised() {
         let proposed = raw_event(serde_json::json!([
@@ -774,14 +784,22 @@ mod tests {
             "GOLDCOLLECTOR",
             "GNEWCOLLECTOR"
         ]));
-        assert!(
-            parse_contract_event(&proposed, "C1", 0).is_some(),
-            "FeeCollectorTransferProposed must be recognised"
+        let proposed_event = parse_contract_event(&proposed, "C1", 0)
+            .expect("FeeCollectorTransferProposed must be recognised");
+        assert_eq!(proposed_event.data["from"].as_str(), Some("GADMIN"));
+        assert_eq!(proposed_event.data["to"].as_str(), Some("GNEWCOLLECTOR"));
+        assert!(proposed_event.data.get("source").is_none());
+        assert!(proposed_event.data.get("target").is_none());
+
+        let transferred_event = parse_contract_event(&transferred, "C1", 0)
+            .expect("FeeCollectorTransferred must be recognised");
+        assert_eq!(
+            transferred_event.data["from"].as_str(),
+            Some("GOLDCOLLECTOR")
         );
-        assert!(
-            parse_contract_event(&transferred, "C1", 0).is_some(),
-            "FeeCollectorTransferred must be recognised"
-        );
+        assert_eq!(transferred_event.data["to"].as_str(), Some("GNEWCOLLECTOR"));
+        assert!(transferred_event.data.get("source").is_none());
+        assert!(transferred_event.data.get("target").is_none());
     }
 
     /// #641: The old incorrect topic strings AdminChanged / FeeCollectorChanged
@@ -789,7 +807,11 @@ mod tests {
     #[test]
     fn test_old_incorrect_role_change_topics_produce_no_event() {
         let raw_admin = raw_event(serde_json::json!(["AdminChanged", "GADMIN", "GNEWADMIN"]));
-        let raw_fc = raw_event(serde_json::json!(["FeeCollectorChanged", "GCOL", "GNEWCOL"]));
+        let raw_fc = raw_event(serde_json::json!([
+            "FeeCollectorChanged",
+            "GCOL",
+            "GNEWCOL"
+        ]));
         assert!(
             parse_contract_event(&raw_admin, "C1", 0).is_none(),
             "'AdminChanged' must yield None - contract never emits this"
@@ -934,11 +956,7 @@ mod tests {
     /// `BatchTransferFailed` uses the generic (name, source, target) layout.
     #[test]
     fn test_parse_batch_transfer_failed_extracts_source_and_target() {
-        let raw = raw_event(serde_json::json!([
-            "BatchTransferFailed",
-            "GSRC",
-            "CTGT"
-        ]));
+        let raw = raw_event(serde_json::json!(["BatchTransferFailed", "GSRC", "CTGT"]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(event.event_type, "BatchTransferFailed");
         assert_eq!(event.data["source"].as_str(), Some("GSRC"));
@@ -1035,7 +1053,7 @@ mod tests {
         db.migrate().await;
         let state = crate::AppState {
             db,
-            rpc_url: format!("http://{}", addr),
+            rpc_url: format!("http://{addr}"),
             contract_id: "C_TEST".to_string(),
             rpc_client,
             webhook_client: reqwest::Client::new(),
@@ -1082,11 +1100,11 @@ mod tests {
 
         // Page 1: MAX_EVENTS_PER_POLL events (full page).
         let page1_events: Vec<_> = (0..MAX_EVENTS_PER_POLL)
-            .map(|i| make_event_json(100 + i as i64, &format!("tx-p1-{}", i)))
+            .map(|i| make_event_json(100 + i as i64, &format!("tx-p1-{i}")))
             .collect();
         // Page 2: 50 events (partial page -> must break).
         let page2_events: Vec<_> = (0..50)
-            .map(|i| make_event_json(200 + i as i64, &format!("tx-p2-{}", i)))
+            .map(|i| make_event_json(200 + i as i64, &format!("tx-p2-{i}")))
             .collect();
 
         let page1_response = serde_json::json!({
@@ -1146,7 +1164,7 @@ mod tests {
 
         let state = crate::AppState {
             db: db.clone(),
-            rpc_url: format!("http://{}", addr),
+            rpc_url: format!("http://{addr}"),
             contract_id: "C_TEST".to_string(),
             rpc_client: reqwest::Client::new(),
             webhook_client: reqwest::Client::new(),
@@ -1154,12 +1172,9 @@ mod tests {
             lookback_ledgers: 720,
         };
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            poll_once(&state),
-        )
-        .await
-        .expect("poll_once must terminate (no infinite loop)");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), poll_once(&state))
+            .await
+            .expect("poll_once must terminate (no infinite loop)");
 
         result.expect("poll_once must succeed");
 
@@ -1181,6 +1196,128 @@ mod tests {
             last_ledger,
             Some(249),
             "cursor must advance to the last event's ledger (200 + 49)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #885 - event ID uniqueness across pages for single-tx batches
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_uses_rpc_event_id_when_present() {
+        let ev0 = serde_json::json!({
+            "id": "00004294967296-0000000000",
+            "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
+            "ledger": 500,
+            "txHash": "same-batch-tx",
+            "createdAt": "2024-06-01T12:00:00Z",
+            "value": 100
+        });
+        let ev1 = serde_json::json!({
+            "id": "00004294967296-0000000001",
+            "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
+            "ledger": 500,
+            "txHash": "same-batch-tx",
+            "createdAt": "2024-06-01T12:00:00Z",
+            "value": 100
+        });
+
+        let parsed0 = parse_contract_event(&ev0, "C1", 0).expect("must parse ev0");
+        // Even if event_index resets to 0 on a subsequent page or restart,
+        // the RPC event id keeps the generated IDs distinct.
+        let parsed1 = parse_contract_event(&ev1, "C1", 0).expect("must parse ev1");
+        assert_ne!(
+            parsed0.id, parsed1.id,
+            "distinct RPC event IDs must never collide even when event_index is 0"
+        );
+
+        let expected0 = hex::encode(Sha256::digest(b"00004294967296-0000000000"));
+        assert_eq!(parsed0.id, expected0);
+    }
+
+    /// A 150-event single-transaction batch split over two pages (100 + 50)
+    /// must store all 150 rows without page-boundary ID collisions.
+    #[tokio::test]
+    async fn test_poll_once_150_single_tx_events_split_over_two_pages_stores_all_150() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        fn make_batch_event(seq: usize) -> serde_json::Value {
+            serde_json::json!({
+                "id": format!("000214748364800-{seq:010}"),
+                "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
+                "ledger": 500,
+                "txHash": "single-batch-tx-hash",
+                "createdAt": "2024-06-01T12:00:00Z",
+                "value": seq as i64,
+            })
+        }
+
+        let page1_events: Vec<_> = (0..MAX_EVENTS_PER_POLL).map(make_batch_event).collect();
+        let page2_events: Vec<_> = (MAX_EVENTS_PER_POLL..150).map(make_batch_event).collect();
+
+        let page1_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": page1_events,
+                "cursor": "000214748364800-0000000099",
+                "latestLedger": 500,
+            }
+        });
+        let page2_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": page2_events,
+                "cursor": "000214748364800-0000000149",
+                "latestLedger": 500,
+            }
+        });
+
+        let request_count = Arc::new(AtomicU32::new(0));
+        let request_count_clone = Arc::clone(&request_count);
+
+        let mock_router = axum::Router::new().route(
+            "/",
+            post(move || {
+                let count = request_count_clone.fetch_add(1, Ordering::SeqCst);
+                let response = match count {
+                    0 => page1_response.clone(),
+                    _ => page2_response.clone(),
+                };
+                async move { axum::Json(response) }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.unwrap();
+        });
+
+        let db = crate::db::Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        db.set_last_ledger(499).await.unwrap();
+
+        let state = crate::AppState {
+            db: db.clone(),
+            rpc_url: format!("http://{addr}"),
+            contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::new(),
+            api_key_hash: String::new(),
+            lookback_ledgers: 720,
+        };
+
+        poll_once(&state).await.expect("poll_once must succeed");
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let stored = db.list_events(500, 0).await.expect("list events");
+        assert_eq!(
+            stored.len(),
+            150,
+            "all 150 events from the single-tx batch across 2 pages must be stored"
         );
     }
 }
