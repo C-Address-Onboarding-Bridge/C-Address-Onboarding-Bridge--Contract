@@ -4087,7 +4087,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([7u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x77; 32]);
@@ -4336,7 +4336,7 @@ mod crosschain_tests {
         bridge.add_relayer(&relayer, &None);
 
         assert_eq!(
-            bridge.try_set_relayer_threshold(&0u32),
+            bridge.try_set_relayer_threshold(&0u32, &None),
             Err(Ok(BridgeError::ThresholdExceedsRelayers))
         );
         assert_eq!(bridge.query_relayer_threshold(), 1);
@@ -4367,7 +4367,7 @@ mod crosschain_tests {
             make_signing_key([7u8; 32]).verifying_key().as_bytes(),
         );
         bridge.add_relayer(&relayer, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x82; 32]);
@@ -4389,9 +4389,11 @@ mod crosschain_tests {
             make_signing_key([8u8; 32]).verifying_key().as_bytes(),
         );
         bridge.add_relayer(&relayer, &None);
-        env.storage()
-            .instance()
-            .set(&DataKey::RelayerThreshold, &0u32);
+        env.as_contract(&bridge.address, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::RelayerThreshold, &0u32);
+        });
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x83; 32]);
@@ -4403,7 +4405,7 @@ mod crosschain_tests {
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert_eq!(
-            bridge.try_remove_relayer(&relayer),
+            bridge.try_remove_relayer(&relayer, &None),
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert!(bridge.query_is_relayer(&relayer));
@@ -4441,7 +4443,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([8u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         for (chain_id, hash_byte) in [(1u32, 0x31u8), (2u32, 0x32u8)] {
             let target = soroban_sdk::Address::generate(&env);
@@ -4489,18 +4491,22 @@ mod crosschain_tests {
 
         let token = TestTokenClient::new(&env, &token_id);
         let contract_balance = token.balance(&bridge_id);
-        let locked = crate::read_asset_counters(&env, &token_id).locked_timelock;
+        let locked = env.as_contract(&bridge_id, || {
+            crate::read_asset_counters(&env, &token_id).locked_timelock
+        });
         assert!(bridge.query_accrued_fees(&token_id) + locked <= contract_balance);
 
         advance_ledger_time(&env, 1_100);
         bridge.claim_timelocked(&timelock_id);
         assert_eq!(token.balance(&timelock_target), 495i128);
         assert_eq!(bridge.query_accrued_fees(&token_id), 5i128);
-        assert_eq!(crate::read_asset_counters(&env, &token_id).locked_timelock, 0i128);
+        let locked_0 = env.as_contract(&bridge_id, || {
+            crate::read_asset_counters(&env, &token_id).locked_timelock
+        });
+        assert_eq!(locked_0, 0i128);
         assert_eq!(bridge.query_contract_balance(&token_id), 2_085i128);
         assert!(
-            bridge.query_accrued_fees(&token_id)
-                + crate::read_asset_counters(&env, &token_id).locked_timelock
+            bridge.query_accrued_fees(&token_id) + locked_0
                 <= bridge.query_contract_balance(&token_id)
         );
 
@@ -4546,7 +4552,7 @@ fn test_loyalty_rewards_preserve_bridged_asset_reserves() {
     let target = Address::generate(&env);
 
     bridge.set_fee_bps(&1_000u32, &None);
-    bridge.set_loyalty_token(&asset, &200i128);
+    bridge.set_loyalty_token(&asset, &200i128, &None);
     mint_tokens(&env, &asset, &bridge_id, 300i128);
 
     bridge.fund_c_address_timelocked(
@@ -7137,3 +7143,170 @@ fn test_set_max_withdraw_per_tx_paused() {
         Err(Ok(BridgeError::ContractPaused))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #897 tests: persistent whitelists, relayer cap, and migration
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_whitelisting_500_assets_per_call_cost_does_not_grow() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let asset_0 = Address::generate(&env);
+    bridge.add_asset(&asset_0, &None);
+
+    // Instance storage must not hold an unbounded AssetWhitelist map
+    env.as_contract(&bridge_id, || {
+        assert!(!env.storage().instance().has(&DataKey::AssetWhitelist));
+    });
+
+    // Measure invocation cost with 1 whitelisted asset
+    env.cost_estimate().budget().reset_default();
+    env.cost_estimate().budget().reset_tracker();
+    assert_eq!(bridge.query_is_asset_whitelisted(&asset_0), true);
+    let _cpu_1 = env.cost_estimate().budget().cpu_instruction_cost();
+
+    // Whitelist first 10 assets
+    for _ in 1..=10 {
+        let asset = Address::generate(&env);
+        bridge.add_asset(&asset, &None);
+    }
+
+    env.cost_estimate().budget().reset_default();
+    env.cost_estimate().budget().reset_tracker();
+    assert_eq!(bridge.query_is_asset_whitelisted(&asset_0), true);
+    let cpu_10 = env.cost_estimate().budget().cpu_instruction_cost();
+
+    // Whitelist up to 500 assets (490 more)
+    for _ in 11..=500 {
+        let asset = Address::generate(&env);
+        bridge.add_asset(&asset, &None);
+    }
+
+    // Verify instance storage still does not hold the legacy unbounded map
+    env.as_contract(&bridge_id, || {
+        assert!(!env.storage().instance().has(&DataKey::AssetWhitelist));
+    });
+
+    // Measure invocation cost with 501 whitelisted assets
+    env.cost_estimate().budget().reset_default();
+    env.cost_estimate().budget().reset_tracker();
+    assert_eq!(bridge.query_is_asset_whitelisted(&asset_0), true);
+    let cpu_500 = env.cost_estimate().budget().cpu_instruction_cost();
+
+    // In a map stored in instance storage, CPU cost would scale linearly (50x) with total map size.
+    // With per-key persistent entries, cost is O(1) and remains bounded.
+    assert!(
+        cpu_500 <= cpu_10 * 12 / 10 || cpu_500 < 150_000,
+        "Per-call cost grew significantly: cpu_10={}, cpu_500={}",
+        cpu_10,
+        cpu_500
+    );
+
+    // Verify paginated query works correctly
+    let page1 = bridge.query_whitelisted_assets(&0, &100);
+    assert_eq!(page1.len(), 100);
+    let page_tail = bridge.query_whitelisted_assets(&450, &100);
+    assert_eq!(page_tail.len(), 51); // 501 total assets: 0..=500
+
+    // Remove asset_0 and verify count & lookup update cleanly
+    bridge.remove_asset(&asset_0, &None);
+    assert_eq!(bridge.query_is_asset_whitelisted(&asset_0), false);
+}
+
+#[test]
+fn test_migration_from_legacy_instance_whitelist_and_relayers() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let asset_a = Address::generate(&env);
+    let asset_b = Address::generate(&env);
+    let pool_a = Address::generate(&env);
+    let pool_b = Address::generate(&env);
+    let relayer_a = BytesN::from_array(&env, &[0x11; 32]);
+    let relayer_b = BytesN::from_array(&env, &[0x22; 32]);
+
+    // Seed legacy instance storage entries
+    env.as_contract(&bridge_id, || {
+        let mut asset_map: soroban_sdk::Map<Address, bool> = soroban_sdk::Map::new(&env);
+        asset_map.set(asset_a.clone(), true);
+        asset_map.set(asset_b.clone(), true);
+        env.storage().instance().set(&DataKey::AssetWhitelist, &asset_map);
+
+        let mut pool_map: soroban_sdk::Map<Address, bool> = soroban_sdk::Map::new(&env);
+        pool_map.set(pool_a.clone(), true);
+        pool_map.set(pool_b.clone(), true);
+        env.storage().instance().set(&DataKey::PoolWhitelist, &pool_map);
+
+        let mut relayer_vec: soroban_sdk::Vec<BytesN<32>> = soroban_sdk::Vec::new(&env);
+        relayer_vec.push_back(relayer_a.clone());
+        relayer_vec.push_back(relayer_b.clone());
+        env.storage().instance().set(&DataKey::RelayerSet, &relayer_vec);
+    });
+
+    // Verify transparent read fallback before migration
+    assert_eq!(bridge.query_is_asset_whitelisted(&asset_a), true);
+    assert_eq!(bridge.query_is_asset_whitelisted(&asset_b), true);
+    assert_eq!(bridge.query_is_pool_whitelisted(&pool_a), true);
+    assert_eq!(bridge.query_is_pool_whitelisted(&pool_b), true);
+    assert_eq!(bridge.query_whitelisted_assets(&0, &10).len(), 2);
+
+    // Execute migration
+    bridge.migrate_whitelists(&None);
+
+    // Verify legacy instance keys were pruned to prevent size-cap exhaustion
+    env.as_contract(&bridge_id, || {
+        assert!(!env.storage().instance().has(&DataKey::AssetWhitelist));
+        assert!(!env.storage().instance().has(&DataKey::PoolWhitelist));
+        assert!(!env.storage().instance().has(&DataKey::RelayerSet));
+    });
+
+    // Verify all entries remain whitelisted and accessible after migration
+    assert_eq!(bridge.query_is_asset_whitelisted(&asset_a), true);
+    assert_eq!(bridge.query_is_asset_whitelisted(&asset_b), true);
+    assert_eq!(bridge.query_is_pool_whitelisted(&pool_a), true);
+    assert_eq!(bridge.query_is_pool_whitelisted(&pool_b), true);
+    assert_eq!(bridge.query_is_relayer(&relayer_a), true);
+    assert_eq!(bridge.query_is_relayer(&relayer_b), true);
+    assert_eq!(bridge.query_whitelisted_assets(&0, &10).len(), 2);
+}
+
+#[test]
+fn test_relayers_capped_at_max_limit() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // Add up to MAX_RELAYERS (50)
+    for i in 0..50u8 {
+        let pubkey = BytesN::from_array(&env, &[i; 32]);
+        bridge.add_relayer(&pubkey, &None);
+    }
+    assert_eq!(bridge.query_relayer_count(), 50);
+
+    // 51st relayer must be rejected to bound relayer set size
+    let extra_relayer = BytesN::from_array(&env, &[99u8; 32]);
+    assert_eq!(
+        bridge.try_add_relayer(&extra_relayer, &None),
+        Err(Ok(BridgeError::BatchTooLarge))
+    );
+
+    // Remove one relayer (threshold is 1, count is 50 -> removing 1 is allowed)
+    let first_relayer = BytesN::from_array(&env, &[0u8; 32]);
+    bridge.remove_relayer(&first_relayer, &None);
+    assert_eq!(bridge.query_relayer_count(), 49);
+
+    // Now adding the extra relayer succeeds
+    bridge.add_relayer(&extra_relayer, &None);
+    assert_eq!(bridge.query_relayer_count(), 50);
+}
+

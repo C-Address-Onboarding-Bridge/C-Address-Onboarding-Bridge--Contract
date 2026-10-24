@@ -80,7 +80,7 @@ use soroban_sdk::{
 /// Every public function that can fail returns `Result<_, BridgeError>`.
 /// Callers should match on these variants to distinguish recoverable from
 /// unrecoverable conditions.
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BridgeError {
     /// Contract has not been initialized yet. Call `initialize` first.
@@ -198,7 +198,7 @@ pub enum BridgeError {
 // ---------------------------------------------------------------------------
 
 /// Keys used to address every piece of contract state in Soroban storage.
-#[contracttype]
+#[contracttype(export = false)]
 pub enum DataKey {
     Admin,
     FeeCollector,
@@ -262,6 +262,14 @@ pub enum DataKey {
     PoolWhitelistEntry(Address),
     RelayerSet,
     CrossChainReserve(Address),
+    AssetCount,
+    AssetByIndex(u32),
+    AssetIndex(Address),
+    PoolCount,
+    PoolByIndex(u32),
+    PoolIndex(Address),
+    RelayerByIndex(u32),
+    RelayerIndex(BytesN<32>),
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +279,7 @@ pub enum DataKey {
 const MAX_FEE_BPS: u32 = 1_000;
 const FEE_DENOMINATOR: i128 = 10_000;
 const MAX_BATCH_SIZE: u32 = 100;
+pub const MAX_RELAYERS: u32 = 50;
 /// Maximum number of tiers accepted by `set_fee_tiers`. `get_tiered_fee_bps`
 /// / `find_current_tier` scan the full tier list linearly on every funding
 /// call, so this bounds the per-call cost of that scan.
@@ -782,12 +791,58 @@ fn check_access(env: &Env, target: &Address) -> Result<(), BridgeError> {
     Ok(())
 }
 
-#[inline(never)]
-fn read_whitelist(env: &Env) -> Map<Address, bool> {
+fn read_asset_count(env: &Env) -> u32 {
     env.storage()
         .instance()
-        .get(&DataKey::AssetWhitelist)
-        .unwrap_or_else(|| Map::new(env))
+        .get(&DataKey::AssetCount)
+        .unwrap_or(0u32)
+}
+
+fn save_asset_count(env: &Env, count: u32) {
+    env.storage().instance().set(&DataKey::AssetCount, &count);
+}
+
+fn is_asset_whitelisted_entry(env: &Env, asset: &Address) -> bool {
+    if let Some(whitelisted) = env
+        .storage()
+        .persistent()
+        .get(&DataKey::AssetWhitelistEntry(asset.clone()))
+    {
+        return whitelisted;
+    }
+    // Backward-compatibility fallback: check legacy instance map if present
+    env.storage()
+        .instance()
+        .get::<_, Map<Address, bool>>(&DataKey::AssetWhitelist)
+        .and_then(|map| map.get(asset.clone()))
+        .unwrap_or(false)
+}
+
+#[inline(never)]
+fn read_whitelist(env: &Env) -> Map<Address, bool> {
+    let mut map = Map::new(env);
+    let count = read_asset_count(env);
+    for i in 0..count {
+        if let Some(asset) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::AssetByIndex(i))
+        {
+            map.set(asset, true);
+        }
+    }
+    if let Some(legacy) = env
+        .storage()
+        .instance()
+        .get::<_, Map<Address, bool>>(&DataKey::AssetWhitelist)
+    {
+        for (asset, allowed) in legacy.iter() {
+            if allowed {
+                map.set(asset, true);
+            }
+        }
+    }
+    map
 }
 
 #[inline(never)]
@@ -798,20 +853,66 @@ fn save_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
 }
 
 fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError> {
-    if !read_whitelist(env).get(asset.clone()).unwrap_or(false) {
+    if !is_asset_whitelisted_entry(env, asset) {
         return Err(BridgeError::AssetNotWhitelisted);
     }
     Ok(())
+}
+
+fn read_pool_count(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::PoolCount)
+        .unwrap_or(0u32)
+}
+
+fn save_pool_count(env: &Env, count: u32) {
+    env.storage().instance().set(&DataKey::PoolCount, &count);
+}
+
+fn is_pool_whitelisted_entry(env: &Env, pool: &Address) -> bool {
+    if let Some(whitelisted) = env
+        .storage()
+        .persistent()
+        .get(&DataKey::PoolWhitelistEntry(pool.clone()))
+    {
+        return whitelisted;
+    }
+    // Backward-compatibility fallback: check legacy instance map if present
+    env.storage()
+        .instance()
+        .get::<_, Map<Address, bool>>(&DataKey::PoolWhitelist)
+        .and_then(|map| map.get(pool.clone()))
+        .unwrap_or(false)
 }
 
 // fund_c_address_with_swap must not invoke arbitrary caller-supplied pool
 // addresses. Mirrors the asset whitelist pattern above.
 #[inline(never)]
 fn read_pool_whitelist(env: &Env) -> Map<Address, bool> {
-    env.storage()
+    let mut map = Map::new(env);
+    let count = read_pool_count(env);
+    for i in 0..count {
+        if let Some(pool) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::PoolByIndex(i))
+        {
+            map.set(pool, true);
+        }
+    }
+    if let Some(legacy) = env
+        .storage()
         .instance()
-        .get(&DataKey::PoolWhitelist)
-        .unwrap_or_else(|| Map::new(env))
+        .get::<_, Map<Address, bool>>(&DataKey::PoolWhitelist)
+    {
+        for (pool, allowed) in legacy.iter() {
+            if allowed {
+                map.set(pool, true);
+            }
+        }
+    }
+    map
 }
 
 #[inline(never)]
@@ -822,7 +923,7 @@ fn save_pool_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
 }
 
 fn check_pool_whitelisted(env: &Env, pool: &Address) -> Result<(), BridgeError> {
-    if !read_pool_whitelist(env).get(pool.clone()).unwrap_or(false) {
+    if !is_pool_whitelisted_entry(env, pool) {
         return Err(BridgeError::PoolNotWhitelisted);
     }
     Ok(())
@@ -1102,23 +1203,62 @@ fn is_relayer(env: &Env, pubkey: &BytesN<32>) -> bool {
         .unwrap_or(false)
 }
 
-fn add_relayer(env: &Env, pubkey: &BytesN<32>) {
+fn add_relayer(env: &Env, pubkey: &BytesN<32>) -> Result<(), BridgeError> {
     if !is_relayer(env, pubkey) {
+        let count = relayer_count(env);
+        if count >= MAX_RELAYERS {
+            return Err(BridgeError::BatchTooLarge);
+        }
+        let key = DataKey::Relayer(pubkey.clone());
+        env.storage().persistent().set(&key, &true);
+        let max_ttl = read_max_persistent_ttl(env);
         env.storage()
             .persistent()
-            .set(&DataKey::Relayer(pubkey.clone()), &true);
+            .extend_ttl(&key, max_ttl / 4, max_ttl);
+
+        let index_key = DataKey::RelayerByIndex(count);
+        env.storage().persistent().set(&index_key, pubkey);
+        env.storage()
+            .persistent()
+            .extend_ttl(&index_key, max_ttl / 4, max_ttl);
+
+        let rev_key = DataKey::RelayerIndex(pubkey.clone());
+        env.storage().persistent().set(&rev_key, &count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&rev_key, max_ttl / 4, max_ttl);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::RelayerCount, &(count + 1));
+
+        // If legacy RelayerSet exists in instance storage, also update it up to MAX_RELAYERS
         let mut relayers = read_relayer_set(env);
-        relayers.push_back(pubkey.clone());
-        env.storage()
-            .instance()
-            .set(&DataKey::RelayerSet, &relayers);
-        env.storage()
-            .instance()
-            .set(&DataKey::RelayerCount, &(relayer_count(env) + 1));
+        if !relayers.contains(pubkey) && relayers.len() < MAX_RELAYERS {
+            relayers.push_back(pubkey.clone());
+            env.storage().instance().set(&DataKey::RelayerSet, &relayers);
+        }
     }
+    Ok(())
 }
 
 fn read_relayer_set(env: &Env) -> Vec<BytesN<32>> {
+    let count = relayer_count(env);
+    if count > 0 {
+        let mut relayers = Vec::new(env);
+        for idx in 0..count {
+            if let Some(pk) = env
+                .storage()
+                .persistent()
+                .get::<_, BytesN<32>>(&DataKey::RelayerByIndex(idx))
+            {
+                relayers.push_back(pk);
+            }
+        }
+        if !relayers.is_empty() {
+            return relayers;
+        }
+    }
     env.storage()
         .instance()
         .get(&DataKey::RelayerSet)
@@ -1130,17 +1270,58 @@ fn remove_relayer(env: &Env, pubkey: &BytesN<32>) {
         env.storage()
             .persistent()
             .remove(&DataKey::Relayer(pubkey.clone()));
+
+        if let Some(index) = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::RelayerIndex(pubkey.clone()))
+        {
+            let count = relayer_count(env);
+            if count > 0 {
+                let last_idx = count - 1;
+                if index < last_idx {
+                    if let Some(last_pubkey) = env
+                        .storage()
+                        .persistent()
+                        .get::<_, BytesN<32>>(&DataKey::RelayerByIndex(last_idx))
+                    {
+                        let idx_key = DataKey::RelayerByIndex(index);
+                        env.storage().persistent().set(&idx_key, &last_pubkey);
+                        let max_ttl = read_max_persistent_ttl(env);
+                        env.storage()
+                            .persistent()
+                            .extend_ttl(&idx_key, max_ttl / 4, max_ttl);
+
+                        let rev_key = DataKey::RelayerIndex(last_pubkey.clone());
+                        env.storage().persistent().set(&rev_key, &index);
+                        env.storage()
+                            .persistent()
+                            .extend_ttl(&rev_key, max_ttl / 4, max_ttl);
+                    }
+                }
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::RelayerByIndex(last_idx));
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::RelayerIndex(pubkey.clone()));
+                env.storage()
+                    .instance()
+                    .set(&DataKey::RelayerCount, &last_idx);
+            }
+        } else {
+            let count = relayer_count(env).saturating_sub(1);
+            env.storage()
+                .instance()
+                .set(&DataKey::RelayerCount, &count);
+        }
+
+        // If legacy RelayerSet exists, remove from it
         let mut relayers = read_relayer_set(env);
         if let Some(index) = relayers.first_index_of(pubkey.clone()) {
             relayers.remove(index);
+            env.storage().instance().set(&DataKey::RelayerSet, &relayers);
         }
-        let count = relayers.len();
-        env.storage()
-            .instance()
-            .set(&DataKey::RelayerSet, &relayers);
-        env.storage()
-            .instance()
-            .set(&DataKey::RelayerCount, &count);
     }
 }
 
@@ -1785,7 +1966,7 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
 
         if targets.len() > MAX_BATCH_SIZE {
-            return Err(BridgeError::TooManyFeeTiers);
+            return Err(BridgeError::BatchTooLarge);
         }
         // #594: reject empty batches — a zero-length call transfers nothing but
         // would still emit BatchCompleted and mint loyalty rewards.
@@ -2409,6 +2590,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         if amount < 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -3606,10 +3788,44 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
-        let mut whitelist = read_whitelist(&env);
-        let was_whitelisted = whitelist.get(asset.clone()).unwrap_or(false);
-        whitelist.set(asset.clone(), true);
-        save_whitelist(&env, &whitelist);
+        let was_whitelisted = is_asset_whitelisted_entry(&env, &asset);
+        if !was_whitelisted {
+            let key = DataKey::AssetWhitelistEntry(asset.clone());
+            env.storage().persistent().set(&key, &true);
+            let max_ttl = read_max_persistent_ttl(&env);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, max_ttl / 4, max_ttl);
+
+            let count = read_asset_count(&env);
+            let index_key = DataKey::AssetByIndex(count);
+            env.storage().persistent().set(&index_key, &asset);
+            env.storage()
+                .persistent()
+                .extend_ttl(&index_key, max_ttl / 4, max_ttl);
+
+            let rev_key = DataKey::AssetIndex(asset.clone());
+            env.storage().persistent().set(&rev_key, &count);
+            env.storage()
+                .persistent()
+                .extend_ttl(&rev_key, max_ttl / 4, max_ttl);
+
+            save_asset_count(&env, count + 1);
+
+            // Clean up legacy instance map if present
+            if let Some(mut legacy) = env
+                .storage()
+                .instance()
+                .get::<_, Map<Address, bool>>(&DataKey::AssetWhitelist)
+            {
+                legacy.remove(asset.clone());
+                if legacy.is_empty() {
+                    env.storage().instance().remove(&DataKey::AssetWhitelist);
+                } else {
+                    env.storage().instance().set(&DataKey::AssetWhitelist, &legacy);
+                }
+            }
+        }
         env.events()
             .publish(("AssetAdded",), (admin, asset, was_whitelisted));
         Ok(())
@@ -3641,10 +3857,63 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
-        let mut whitelist = read_whitelist(&env);
-        let was_present = whitelist.get(asset.clone()).unwrap_or(false);
-        whitelist.remove(asset.clone());
-        save_whitelist(&env, &whitelist);
+        let was_present = is_asset_whitelisted_entry(&env, &asset);
+        if was_present {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::AssetWhitelistEntry(asset.clone()));
+
+            if let Some(index) = env
+                .storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::AssetIndex(asset.clone()))
+            {
+                let count = read_asset_count(&env);
+                if count > 0 {
+                    let last_idx = count - 1;
+                    if index < last_idx {
+                        if let Some(last_asset) = env
+                            .storage()
+                            .persistent()
+                            .get::<_, Address>(&DataKey::AssetByIndex(last_idx))
+                        {
+                            let idx_key = DataKey::AssetByIndex(index);
+                            env.storage().persistent().set(&idx_key, &last_asset);
+                            let max_ttl = read_max_persistent_ttl(&env);
+                            env.storage()
+                                .persistent()
+                                .extend_ttl(&idx_key, max_ttl / 4, max_ttl);
+
+                            let rev_key = DataKey::AssetIndex(last_asset.clone());
+                            env.storage().persistent().set(&rev_key, &index);
+                            env.storage()
+                                .persistent()
+                                .extend_ttl(&rev_key, max_ttl / 4, max_ttl);
+                        }
+                    }
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::AssetByIndex(last_idx));
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::AssetIndex(asset.clone()));
+                    save_asset_count(&env, last_idx);
+                }
+            }
+
+            if let Some(mut legacy) = env
+                .storage()
+                .instance()
+                .get::<_, Map<Address, bool>>(&DataKey::AssetWhitelist)
+            {
+                legacy.remove(asset.clone());
+                if legacy.is_empty() {
+                    env.storage().instance().remove(&DataKey::AssetWhitelist);
+                } else {
+                    env.storage().instance().set(&DataKey::AssetWhitelist, &legacy);
+                }
+            }
+        }
         env.events().publish(("AssetRemoved",), (admin, asset, was_present));
         Ok(())
     }
@@ -3656,7 +3925,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_is_asset_whitelisted(env: Env, asset: Address) -> Result<bool, BridgeError> {
         check_initialized(&env)?;
-        Ok(read_whitelist(&env).get(asset).unwrap_or(false))
+        Ok(is_asset_whitelisted_entry(&env, &asset))
     }
 
     /// Returns a page of currently whitelisted asset addresses.
@@ -3684,16 +3953,35 @@ impl OnboardingBridge {
         } else {
             limit
         };
+        let count = read_asset_count(&env);
         let mut out: Vec<Address> = Vec::new(&env);
-        let mut idx: u32 = 0;
-        for (asset, allowed) in read_whitelist(&env).iter() {
-            if !allowed {
-                continue;
-            }
-            if idx >= offset && out.len() < limit {
+        let end = (offset.saturating_add(limit)).min(count);
+        for idx in offset..end {
+            if let Some(asset) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::AssetByIndex(idx))
+            {
                 out.push_back(asset);
             }
-            idx += 1;
+        }
+        if out.is_empty() && count == 0 {
+            if let Some(legacy) = env
+                .storage()
+                .instance()
+                .get::<_, Map<Address, bool>>(&DataKey::AssetWhitelist)
+            {
+                let mut idx: u32 = 0;
+                for (asset, allowed) in legacy.iter() {
+                    if !allowed {
+                        continue;
+                    }
+                    if idx >= offset && out.len() < limit {
+                        out.push_back(asset);
+                    }
+                    idx += 1;
+                }
+            }
         }
         Ok(out)
     }
@@ -3728,10 +4016,43 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
-        let mut whitelist = read_pool_whitelist(&env);
-        let was_present = whitelist.get(pool.clone()).unwrap_or(false);
-        whitelist.set(pool.clone(), true);
-        save_pool_whitelist(&env, &whitelist);
+        let was_present = is_pool_whitelisted_entry(&env, &pool);
+        if !was_present {
+            let key = DataKey::PoolWhitelistEntry(pool.clone());
+            env.storage().persistent().set(&key, &true);
+            let max_ttl = read_max_persistent_ttl(&env);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, max_ttl / 4, max_ttl);
+
+            let count = read_pool_count(&env);
+            let index_key = DataKey::PoolByIndex(count);
+            env.storage().persistent().set(&index_key, &pool);
+            env.storage()
+                .persistent()
+                .extend_ttl(&index_key, max_ttl / 4, max_ttl);
+
+            let rev_key = DataKey::PoolIndex(pool.clone());
+            env.storage().persistent().set(&rev_key, &count);
+            env.storage()
+                .persistent()
+                .extend_ttl(&rev_key, max_ttl / 4, max_ttl);
+
+            save_pool_count(&env, count + 1);
+
+            if let Some(mut legacy) = env
+                .storage()
+                .instance()
+                .get::<_, Map<Address, bool>>(&DataKey::PoolWhitelist)
+            {
+                legacy.remove(pool.clone());
+                if legacy.is_empty() {
+                    env.storage().instance().remove(&DataKey::PoolWhitelist);
+                } else {
+                    env.storage().instance().set(&DataKey::PoolWhitelist, &legacy);
+                }
+            }
+        }
         env.events().publish(("SwapPoolAdded",), (admin, pool, was_present));
         Ok(())
     }
@@ -3765,10 +4086,63 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
-        let mut whitelist = read_pool_whitelist(&env);
-        let was_present = whitelist.get(pool.clone()).unwrap_or(false);
-        whitelist.remove(pool.clone());
-        save_pool_whitelist(&env, &whitelist);
+        let was_present = is_pool_whitelisted_entry(&env, &pool);
+        if was_present {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::PoolWhitelistEntry(pool.clone()));
+
+            if let Some(index) = env
+                .storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::PoolIndex(pool.clone()))
+            {
+                let count = read_pool_count(&env);
+                if count > 0 {
+                    let last_idx = count - 1;
+                    if index < last_idx {
+                        if let Some(last_pool) = env
+                            .storage()
+                            .persistent()
+                            .get::<_, Address>(&DataKey::PoolByIndex(last_idx))
+                        {
+                            let idx_key = DataKey::PoolByIndex(index);
+                            env.storage().persistent().set(&idx_key, &last_pool);
+                            let max_ttl = read_max_persistent_ttl(&env);
+                            env.storage()
+                                .persistent()
+                                .extend_ttl(&idx_key, max_ttl / 4, max_ttl);
+
+                            let rev_key = DataKey::PoolIndex(last_pool.clone());
+                            env.storage().persistent().set(&rev_key, &index);
+                            env.storage()
+                                .persistent()
+                                .extend_ttl(&rev_key, max_ttl / 4, max_ttl);
+                        }
+                    }
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::PoolByIndex(last_idx));
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::PoolIndex(pool.clone()));
+                    save_pool_count(&env, last_idx);
+                }
+            }
+
+            if let Some(mut legacy) = env
+                .storage()
+                .instance()
+                .get::<_, Map<Address, bool>>(&DataKey::PoolWhitelist)
+            {
+                legacy.remove(pool.clone());
+                if legacy.is_empty() {
+                    env.storage().instance().remove(&DataKey::PoolWhitelist);
+                } else {
+                    env.storage().instance().set(&DataKey::PoolWhitelist, &legacy);
+                }
+            }
+        }
         env.events().publish(("SwapPoolRemoved",), (admin, pool, was_present));
         Ok(())
     }
@@ -3780,7 +4154,132 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_is_pool_whitelisted(env: Env, pool: Address) -> Result<bool, BridgeError> {
         check_initialized(&env)?;
-        Ok(read_pool_whitelist(&env).get(pool).unwrap_or(false))
+        Ok(is_pool_whitelisted_entry(&env, &pool))
+    }
+
+    /// Migrates existing legacy instance-storage maps (`AssetWhitelist`, `PoolWhitelist`,
+    /// and `RelayerSet`) to per-key persistent entries.
+    ///
+    /// This removes the unbounded maps/vectors from the single instance entry, preventing
+    /// instance storage size-limit exhaustion as the number of assets, pools, and relayers grows.
+    pub fn migrate_whitelists(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        extend_instance_ttl(&env);
+
+        // 1. Migrate AssetWhitelist instance Map
+        if let Some(legacy_assets) = env
+            .storage()
+            .instance()
+            .get::<_, Map<Address, bool>>(&DataKey::AssetWhitelist)
+        {
+            let max_ttl = read_max_persistent_ttl(&env);
+            for (asset, allowed) in legacy_assets.iter() {
+                if allowed {
+                    let key = DataKey::AssetWhitelistEntry(asset.clone());
+                    if !env.storage().persistent().has(&key) {
+                        env.storage().persistent().set(&key, &true);
+                        env.storage()
+                            .persistent()
+                            .extend_ttl(&key, max_ttl / 4, max_ttl);
+
+                        let count = read_asset_count(&env);
+                        let idx_key = DataKey::AssetByIndex(count);
+                        env.storage().persistent().set(&idx_key, &asset);
+                        env.storage()
+                            .persistent()
+                            .extend_ttl(&idx_key, max_ttl / 4, max_ttl);
+
+                        let rev_key = DataKey::AssetIndex(asset.clone());
+                        env.storage().persistent().set(&rev_key, &count);
+                        env.storage()
+                            .persistent()
+                            .extend_ttl(&rev_key, max_ttl / 4, max_ttl);
+
+                        save_asset_count(&env, count + 1);
+                    }
+                }
+            }
+            env.storage().instance().remove(&DataKey::AssetWhitelist);
+        }
+
+        // 2. Migrate PoolWhitelist instance Map
+        if let Some(legacy_pools) = env
+            .storage()
+            .instance()
+            .get::<_, Map<Address, bool>>(&DataKey::PoolWhitelist)
+        {
+            let max_ttl = read_max_persistent_ttl(&env);
+            for (pool, allowed) in legacy_pools.iter() {
+                if allowed {
+                    let key = DataKey::PoolWhitelistEntry(pool.clone());
+                    if !env.storage().persistent().has(&key) {
+                        env.storage().persistent().set(&key, &true);
+                        env.storage()
+                            .persistent()
+                            .extend_ttl(&key, max_ttl / 4, max_ttl);
+
+                        let count = read_pool_count(&env);
+                        let idx_key = DataKey::PoolByIndex(count);
+                        env.storage().persistent().set(&idx_key, &pool);
+                        env.storage()
+                            .persistent()
+                            .extend_ttl(&idx_key, max_ttl / 4, max_ttl);
+
+                        let rev_key = DataKey::PoolIndex(pool.clone());
+                        env.storage().persistent().set(&rev_key, &count);
+                        env.storage()
+                            .persistent()
+                            .extend_ttl(&rev_key, max_ttl / 4, max_ttl);
+
+                        save_pool_count(&env, count + 1);
+                    }
+                }
+            }
+            env.storage().instance().remove(&DataKey::PoolWhitelist);
+        }
+
+        // 3. Migrate RelayerSet instance Vector
+        if let Some(legacy_relayers) = env
+            .storage()
+            .instance()
+            .get::<_, Vec<BytesN<32>>>(&DataKey::RelayerSet)
+        {
+            let max_ttl = read_max_persistent_ttl(&env);
+            for pubkey in legacy_relayers.iter() {
+                let key = DataKey::Relayer(pubkey.clone());
+                if !env.storage().persistent().has(&key) {
+                    env.storage().persistent().set(&key, &true);
+                    env.storage()
+                        .persistent()
+                        .extend_ttl(&key, max_ttl / 4, max_ttl);
+
+                    let count = relayer_count(&env);
+                    let idx_key = DataKey::RelayerByIndex(count);
+                    env.storage().persistent().set(&idx_key, &pubkey);
+                    env.storage()
+                        .persistent()
+                        .extend_ttl(&idx_key, max_ttl / 4, max_ttl);
+
+                    let rev_key = DataKey::RelayerIndex(pubkey.clone());
+                    env.storage().persistent().set(&rev_key, &count);
+                    env.storage()
+                        .persistent()
+                        .extend_ttl(&rev_key, max_ttl / 4, max_ttl);
+
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::RelayerCount, &(count + 1));
+                }
+            }
+            env.storage().instance().remove(&DataKey::RelayerSet);
+        }
+
+        env.events().publish(("WhitelistsMigrated",), (admin,));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -4252,7 +4751,7 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
-        add_relayer(&env, &pubkey);
+        add_relayer(&env, &pubkey)?;
         env.events().publish(("RelayerAdded",), (admin, pubkey));
         Ok(())
     }
@@ -4284,7 +4783,8 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        if is_relayer(&env, &pubkey) {
+        let was_registered = is_relayer(&env, &pubkey);
+        if was_registered {
             let count = relayer_count(&env);
             if count <= 1 || count.saturating_sub(1) < relayer_threshold(&env) {
                 return Err(BridgeError::BelowThreshold);
@@ -4340,6 +4840,16 @@ impl OnboardingBridge {
     pub fn query_relayer_threshold(env: Env) -> Result<u32, BridgeError> {
         check_initialized(&env)?;
         Ok(relayer_threshold(&env))
+    }
+
+    /// Returns the number of registered relayers.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    pub fn query_relayer_count(env: Env) -> Result<u32, BridgeError> {
+        check_initialized(&env)?;
+        Ok(relayer_count(&env))
     }
 
     /// Returns `true` if `pubkey` is a registered relayer.
@@ -4659,6 +5169,10 @@ impl OnboardingBridge {
         let fee_cap_key = DataKey::AssetFeeCap(key_asset.clone());
         if env.storage().persistent().has(&fee_cap_key) {
             env.storage().persistent().extend_ttl(&fee_cap_key, threshold, max_ttl);
+        }
+        let whitelist_key = DataKey::AssetWhitelistEntry(key_asset.clone());
+        if env.storage().persistent().has(&whitelist_key) {
+            env.storage().persistent().extend_ttl(&whitelist_key, threshold, max_ttl);
         }
         env.events()
             .publish(("PersistentTtlExtended",), (admin, key_asset, max_ttl));
