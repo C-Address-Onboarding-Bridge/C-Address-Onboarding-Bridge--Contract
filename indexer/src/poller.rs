@@ -66,7 +66,7 @@ async fn fetch_latest_ledger(state: &AppState) -> Result<i64, Box<dyn std::error
     // #637 - surface JSON-RPC errors instead of silently treating them as
     // missing fields.
     if let Some(err) = body.get("error") {
-        return Err(format!("getLatestLedger RPC error: {}", err).into());
+        return Err(format!("getLatestLedger RPC error: {err}").into());
     }
 
     let seq = body
@@ -90,9 +90,9 @@ async fn fetch_latest_ledger(state: &AppState) -> Result<i64, Box<dyn std::error
 /// - The ledger cursor is persisted **after** the whole page is stored, so a
 ///   crash mid-page causes the next poll to replay that page (safe: inserts
 ///   are `INSERT OR IGNORE`).
-async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
-    let start_ledger = match state.db.get_last_ledger().await? {
-        Some(last) => last + 1,
+async fn resolve_start_ledger(state: &AppState) -> Result<i64, Box<dyn std::error::Error>> {
+    match state.db.get_last_ledger().await? {
+        Some(last) => Ok(last + 1),
         None => {
             // First run - no persisted cursor.  Requesting from ledger 0 would
             // be rejected by any real (non-quickstart) Soroban RPC endpoint
@@ -112,15 +112,26 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
                 latest,
                 lookback,
             );
-            fallback
+            Ok(fallback)
         }
+    }
+}
+
+async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
+    // #882 - Resume from the persisted RPC cursor (`last_cursor` in
+    // `indexer_state`) when available, falling back to `startLedger` only on
+    // first run or when the cursor has expired.
+    let mut cursor: Option<String> = state.db.get_last_cursor().await?;
+    let mut start_ledger = if cursor.is_some() {
+        state.db.get_last_ledger().await?.map_or(0, |l| l + 1)
+    } else {
+        resolve_start_ledger(state).await?
     };
 
     // #635 - page through all results using the RPC cursor so that more than
     // MAX_EVENTS_PER_POLL events in a single poll window are never silently
-    // dropped.  We persist the ledger position after each page completes so
-    // the next poll resumes exactly where we left off.
-    let mut cursor: Option<String> = None;
+    // dropped.  We persist the ledger position and cursor after each page
+    // completes so the next poll resumes exactly where we left off.
     let mut max_ledger = start_ledger;
 
     loop {
@@ -168,6 +179,28 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(err) = body.get("error") {
             let message = err.to_string();
 
+            // #882 - when a persisted cursor has expired or fallen outside the
+            // RPC retention window, clear `last_cursor` and fall back to
+            // `startLedger`.
+            if cursor.is_some()
+                && (message.contains("cursor")
+                    || message.contains("expired")
+                    || message.contains("startLedger")
+                    || message.contains("out of range")
+                    || message.contains("beforeOldestLedger"))
+            {
+                tracing::warn!(
+                    "Persisted RPC cursor {:?} expired or invalid ({}); falling back to startLedger.",
+                    cursor,
+                    message
+                );
+                state.db.clear_last_cursor().await?;
+                cursor = None;
+                start_ledger = resolve_start_ledger(state).await?;
+                max_ledger = max_ledger.max(start_ledger);
+                continue;
+            }
+
             // #636 - recover to the latest ledger tip when the requested
             // start ledger is outside the RPC's retention window.  Only the
             // very first request (startLedger-based) can hit this; cursor
@@ -188,12 +221,10 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
-            return Err(format!("getEvents RPC error: {}", message).into());
+            return Err(format!("getEvents RPC error: {message}").into());
         }
 
-        let result = body
-            .get("result")
-            .ok_or("getEvents: missing result")?;
+        let result = body.get("result").ok_or("getEvents: missing result")?;
 
         let events: Vec<serde_json::Value> = result
             .get("events")
@@ -204,6 +235,7 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
         let next_cursor: Option<String> = result
             .get("cursor")
             .and_then(|c| c.as_str())
+            .filter(|s| !s.is_empty())
             .map(str::to_string);
 
         let latest_ledger_from_rpc = result
@@ -229,7 +261,8 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
             let event_index = *counter;
             *counter += 1;
 
-            if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id, event_index) {
+            if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id, event_index)
+            {
                 // Insert the event and queue its webhook deliveries atomically
                 // (one SQLite transaction) so a crash between the two can never
                 // leave an indexed event with no deliveries queued. See #647.
@@ -245,12 +278,15 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // #850 - persist the ledger cursor only after the whole page is
-        // stored.  Advancing past the page mid-loop would lose events on a
-        // crash.  `INSERT OR IGNORE` makes the worst case (full replay of the
-        // page after a crash) safe and idempotent.
+        // #850/#882 - persist the ledger position and RPC cursor only after the
+        // whole page is stored. Advancing past the page mid-loop would lose
+        // events on a crash. `INSERT OR IGNORE` makes the worst case (full
+        // replay of the page after a crash) safe and idempotent.
         if !events.is_empty() || max_ledger > start_ledger {
             state.db.set_last_ledger(max_ledger).await?;
+        }
+        if let Some(ref c) = next_cursor {
+            state.db.set_last_cursor(c).await?;
         }
 
         // #850 - break when the page wasn't full (no more events to page
@@ -363,38 +399,17 @@ fn parse_contract_event(
         }
         // ("FeesWithdrawn", fee_collector) - asset carried in value, not topics
         BridgeEventType::FeesWithdrawn => {
-            if let Some(collector) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert(
-                    "fee_collector".to_string(),
-                    serde_json::Value::String(collector.to_string()),
-                );
-            }
+            insert_topic_str(&mut data, &decoded_topics, 1, "fee_collector");
         }
         // ("AdminProposed", admin, new_admin) / ("AdminTransferred", old_admin, pending)
-        BridgeEventType::AdminProposed | BridgeEventType::AdminTransferred => {
-            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert(
-                    "from".to_string(),
-                    serde_json::Value::String(from.to_string()),
-                );
-            }
-            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
-                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
-            }
-        }
         // ("FeeCollectorTransferProposed", admin, new_collector) /
         // ("FeeCollectorTransferred", old, pending)
-        BridgeEventType::FeeCollectorTransferProposed
+        BridgeEventType::AdminProposed
+        | BridgeEventType::AdminTransferred
+        | BridgeEventType::FeeCollectorTransferProposed
         | BridgeEventType::FeeCollectorTransferred => {
-            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert(
-                    "from".to_string(),
-                    serde_json::Value::String(from.to_string()),
-                );
-            }
-            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
-                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
-            }
+            insert_topic_str(&mut data, &decoded_topics, 1, "from");
+            insert_topic_str(&mut data, &decoded_topics, 2, "to");
         }
         _ => {
             // CommitFund, BatchTransferFailed, and the remaining admin/config
@@ -444,7 +459,10 @@ fn insert_topic_str(
     key: &str,
 ) {
     if let Some(value) = topics.get(idx).and_then(serde_json::Value::as_str) {
-        data.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+        data.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
     }
 }
 
@@ -672,7 +690,12 @@ mod tests {
     /// topics[3] is extracted into `data["target"]` for CAddressFunded.
     #[test]
     fn test_parse_extracts_target_from_topics_index_2() {
-        let raw = raw_event(serde_json::json!(["CAddressFunded", "GASSET", "GSOURCE", "CTARGET"]));
+        let raw = raw_event(serde_json::json!([
+            "CAddressFunded",
+            "GASSET",
+            "GSOURCE",
+            "CTARGET"
+        ]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(
             event.data["target"].as_str(),
@@ -741,6 +764,10 @@ mod tests {
             event.data.get("asset").is_none(),
             "FeesWithdrawn has no asset topic - data['asset'] must be absent"
         );
+        assert!(
+            event.data.get("source").is_none() && event.data.get("target").is_none(),
+            "FeesWithdrawn must not fall through to generic source/target mapping"
+        );
     }
 
     /// #641: AdminProposed layout is ("AdminProposed", admin, new_admin).
@@ -750,18 +777,26 @@ mod tests {
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(event.data["from"].as_str(), Some("GADMIN"));
         assert_eq!(event.data["to"].as_str(), Some("GNEWADMIN"));
+        assert!(event.data.get("source").is_none());
+        assert!(event.data.get("target").is_none());
     }
 
     /// #641: AdminTransferred layout is ("AdminTransferred", old_admin, pending).
     #[test]
     fn test_admin_transferred_topic_mapping() {
-        let raw = raw_event(serde_json::json!(["AdminTransferred", "GOLDADMIN", "GNEWADMIN"]));
+        let raw = raw_event(serde_json::json!([
+            "AdminTransferred",
+            "GOLDADMIN",
+            "GNEWADMIN"
+        ]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(event.data["from"].as_str(), Some("GOLDADMIN"));
         assert_eq!(event.data["to"].as_str(), Some("GNEWADMIN"));
+        assert!(event.data.get("source").is_none());
+        assert!(event.data.get("target").is_none());
     }
 
-    /// #641: FeeCollectorTransferProposed and FeeCollectorTransferred are now recognised.
+    /// #641/#891: FeeCollectorTransferProposed and FeeCollectorTransferred map topics[1..=2] to from/to.
     #[test]
     fn test_fee_collector_role_change_topics_are_recognised() {
         let proposed = raw_event(serde_json::json!([
@@ -774,14 +809,22 @@ mod tests {
             "GOLDCOLLECTOR",
             "GNEWCOLLECTOR"
         ]));
-        assert!(
-            parse_contract_event(&proposed, "C1", 0).is_some(),
-            "FeeCollectorTransferProposed must be recognised"
+        let proposed_event = parse_contract_event(&proposed, "C1", 0)
+            .expect("FeeCollectorTransferProposed must be recognised");
+        assert_eq!(proposed_event.data["from"].as_str(), Some("GADMIN"));
+        assert_eq!(proposed_event.data["to"].as_str(), Some("GNEWCOLLECTOR"));
+        assert!(proposed_event.data.get("source").is_none());
+        assert!(proposed_event.data.get("target").is_none());
+
+        let transferred_event = parse_contract_event(&transferred, "C1", 0)
+            .expect("FeeCollectorTransferred must be recognised");
+        assert_eq!(
+            transferred_event.data["from"].as_str(),
+            Some("GOLDCOLLECTOR")
         );
-        assert!(
-            parse_contract_event(&transferred, "C1", 0).is_some(),
-            "FeeCollectorTransferred must be recognised"
-        );
+        assert_eq!(transferred_event.data["to"].as_str(), Some("GNEWCOLLECTOR"));
+        assert!(transferred_event.data.get("source").is_none());
+        assert!(transferred_event.data.get("target").is_none());
     }
 
     /// #641: The old incorrect topic strings AdminChanged / FeeCollectorChanged
@@ -789,7 +832,11 @@ mod tests {
     #[test]
     fn test_old_incorrect_role_change_topics_produce_no_event() {
         let raw_admin = raw_event(serde_json::json!(["AdminChanged", "GADMIN", "GNEWADMIN"]));
-        let raw_fc = raw_event(serde_json::json!(["FeeCollectorChanged", "GCOL", "GNEWCOL"]));
+        let raw_fc = raw_event(serde_json::json!([
+            "FeeCollectorChanged",
+            "GCOL",
+            "GNEWCOL"
+        ]));
         assert!(
             parse_contract_event(&raw_admin, "C1", 0).is_none(),
             "'AdminChanged' must yield None - contract never emits this"
@@ -934,11 +981,7 @@ mod tests {
     /// `BatchTransferFailed` uses the generic (name, source, target) layout.
     #[test]
     fn test_parse_batch_transfer_failed_extracts_source_and_target() {
-        let raw = raw_event(serde_json::json!([
-            "BatchTransferFailed",
-            "GSRC",
-            "CTGT"
-        ]));
+        let raw = raw_event(serde_json::json!(["BatchTransferFailed", "GSRC", "CTGT"]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(event.event_type, "BatchTransferFailed");
         assert_eq!(event.data["source"].as_str(), Some("GSRC"));
@@ -1035,7 +1078,7 @@ mod tests {
         db.migrate().await;
         let state = crate::AppState {
             db,
-            rpc_url: format!("http://{}", addr),
+            rpc_url: format!("http://{addr}"),
             contract_id: "C_TEST".to_string(),
             rpc_client,
             webhook_client: reqwest::Client::new(),
@@ -1082,11 +1125,11 @@ mod tests {
 
         // Page 1: MAX_EVENTS_PER_POLL events (full page).
         let page1_events: Vec<_> = (0..MAX_EVENTS_PER_POLL)
-            .map(|i| make_event_json(100 + i as i64, &format!("tx-p1-{}", i)))
+            .map(|i| make_event_json(100 + i as i64, &format!("tx-p1-{i}")))
             .collect();
         // Page 2: 50 events (partial page -> must break).
         let page2_events: Vec<_> = (0..50)
-            .map(|i| make_event_json(200 + i as i64, &format!("tx-p2-{}", i)))
+            .map(|i| make_event_json(200 + i as i64, &format!("tx-p2-{i}")))
             .collect();
 
         let page1_response = serde_json::json!({
@@ -1146,7 +1189,7 @@ mod tests {
 
         let state = crate::AppState {
             db: db.clone(),
-            rpc_url: format!("http://{}", addr),
+            rpc_url: format!("http://{addr}"),
             contract_id: "C_TEST".to_string(),
             rpc_client: reqwest::Client::new(),
             webhook_client: reqwest::Client::new(),
@@ -1154,12 +1197,9 @@ mod tests {
             lookback_ledgers: 720,
         };
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            poll_once(&state),
-        )
-        .await
-        .expect("poll_once must terminate (no infinite loop)");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), poll_once(&state))
+            .await
+            .expect("poll_once must terminate (no infinite loop)");
 
         result.expect("poll_once must succeed");
 
@@ -1181,6 +1221,263 @@ mod tests {
             last_ledger,
             Some(249),
             "cursor must advance to the last event's ledger (200 + 49)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #882 - startLedger / cursor mutual exclusion & cursor persistence
+    // -----------------------------------------------------------------------
+
+    /// Mock `getEvents` that rejects any request carrying both `startLedger`
+    /// and `pagination.cursor`, and serves 250 events across 3 pages (100,
+    /// 100, 50). All 250 events must be stored and `last_cursor` persisted.
+    #[tokio::test]
+    async fn test_poll_once_rejects_both_start_ledger_and_cursor_over_three_pages() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        fn make_event_json(ledger: i64, tx_hash: &str) -> serde_json::Value {
+            serde_json::json!({
+                "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
+                "ledger": ledger,
+                "txHash": tx_hash,
+                "createdAt": "2024-06-01T12:00:00Z",
+                "value": null,
+            })
+        }
+
+        let page1_events: Vec<_> = (0..MAX_EVENTS_PER_POLL)
+            .map(|i| make_event_json(100 + i as i64, &format!("tx-p1-{i}")))
+            .collect();
+        let page2_events: Vec<_> = (0..MAX_EVENTS_PER_POLL)
+            .map(|i| make_event_json(200 + i as i64, &format!("tx-p2-{i}")))
+            .collect();
+        let page3_events: Vec<_> = (0..50)
+            .map(|i| make_event_json(300 + i as i64, &format!("tx-p3-{i}")))
+            .collect();
+
+        let page1_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": page1_events,
+                "cursor": "cursor-page-2",
+                "latestLedger": 400,
+            }
+        });
+        let page2_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": page2_events,
+                "cursor": "cursor-page-3",
+                "latestLedger": 400,
+            }
+        });
+        let page3_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": page3_events,
+                "cursor": "cursor-page-4",
+                "latestLedger": 400,
+            }
+        });
+
+        let request_count = Arc::new(AtomicU32::new(0));
+        let request_count_clone = Arc::clone(&request_count);
+
+        let mock_router = axum::Router::new().route(
+            "/",
+            post(move |axum::Json(req): axum::Json<serde_json::Value>| {
+                let count = request_count_clone.fetch_add(1, Ordering::SeqCst);
+                let p1 = page1_response.clone();
+                let p2 = page2_response.clone();
+                let p3 = page3_response.clone();
+                async move {
+                    let params = req.get("params").cloned().unwrap_or_default();
+                    let has_start_ledger = params.get("startLedger").is_some();
+                    let cursor_val = params
+                        .get("pagination")
+                        .and_then(|p| p.get("cursor"))
+                        .and_then(|c| c.as_str());
+
+                    if has_start_ledger && cursor_val.is_some() {
+                        return axum::Json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "error": {
+                                "code": -32600,
+                                "message": "startLedger and cursor cannot both be set"
+                            }
+                        }));
+                    }
+
+                    let response = match count {
+                        0 => {
+                            assert!(has_start_ledger, "page 1 on first run must use startLedger");
+                            assert!(cursor_val.is_none(), "page 1 must not send cursor");
+                            p1
+                        }
+                        1 => {
+                            assert!(!has_start_ledger, "page 2 must omit startLedger");
+                            assert_eq!(cursor_val, Some("cursor-page-2"));
+                            p2
+                        }
+                        2 => {
+                            assert!(!has_start_ledger, "page 3 must omit startLedger");
+                            assert_eq!(cursor_val, Some("cursor-page-3"));
+                            p3
+                        }
+                        _ => serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": { "events": [], "cursor": "cursor-page-4", "latestLedger": 400 }
+                        }),
+                    };
+                    axum::Json(response)
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.unwrap();
+        });
+
+        let db = crate::db::Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        db.set_last_ledger(99).await.unwrap();
+
+        let state = crate::AppState {
+            db: db.clone(),
+            rpc_url: format!("http://{addr}"),
+            contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::new(),
+            api_key_hash: String::new(),
+            lookback_ledgers: 720,
+        };
+
+        poll_once(&state).await.expect("poll_once must succeed");
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            3,
+            "exactly three getEvents calls must be made across 3 pages"
+        );
+
+        let events = db.list_events(500, 0).await.expect("list events");
+        assert_eq!(
+            events.len(),
+            250,
+            "all 250 events across all 3 pages must be stored"
+        );
+
+        assert_eq!(
+            db.get_last_cursor().await.expect("get_last_cursor"),
+            Some("cursor-page-4".to_string()),
+            "last_cursor must be persisted in indexer_state"
+        );
+    }
+
+    /// When `last_cursor` is persisted, `poll_once` resumes from it without
+    /// `startLedger`; if the RPC rejects the cursor as expired, `poll_once`
+    /// clears `last_cursor` and falls back to `startLedger`.
+    #[tokio::test]
+    async fn test_poll_once_resumes_from_last_cursor_and_falls_back_when_expired() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let request_count = Arc::new(AtomicU32::new(0));
+        let request_count_clone = Arc::clone(&request_count);
+
+        let mock_router = axum::Router::new().route(
+            "/",
+            post(move |axum::Json(req): axum::Json<serde_json::Value>| {
+                let count = request_count_clone.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let params = req.get("params").cloned().unwrap_or_default();
+                    let has_start_ledger = params.get("startLedger").is_some();
+                    let cursor_val = params
+                        .get("pagination")
+                        .and_then(|p| p.get("cursor"))
+                        .and_then(|c| c.as_str());
+
+                    if has_start_ledger && cursor_val.is_some() {
+                        return axum::Json(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "error": { "code": -32600, "message": "startLedger and cursor cannot both be set" }
+                        }));
+                    }
+
+                    match count {
+                        0 => {
+                            assert_eq!(cursor_val, Some("expired-cursor-1"));
+                            assert!(!has_start_ledger);
+                            axum::Json(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "error": { "code": -32602, "message": "cursor is out of range / expired" }
+                            }))
+                        }
+                        _ => {
+                            assert!(cursor_val.is_none(), "fallback request must omit expired cursor");
+                            assert_eq!(params.get("startLedger").and_then(|v| v.as_i64()), Some(500));
+                            axum::Json(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": {
+                                    "events": [{
+                                        "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
+                                        "ledger": 500,
+                                        "txHash": "tx-fallback-1",
+                                        "createdAt": "2024-06-01T12:00:00Z",
+                                        "value": null
+                                    }],
+                                    "cursor": "fresh-cursor-2",
+                                    "latestLedger": 505
+                                }
+                            }))
+                        }
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.unwrap();
+        });
+
+        let db = crate::db::Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        db.set_last_ledger(499).await.unwrap();
+        db.set_last_cursor("expired-cursor-1").await.unwrap();
+
+        let state = crate::AppState {
+            db: db.clone(),
+            rpc_url: format!("http://{addr}"),
+            contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::new(),
+            api_key_hash: String::new(),
+            lookback_ledgers: 720,
+        };
+
+        poll_once(&state)
+            .await
+            .expect("poll_once must recover from expired cursor");
+
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        let events = db.list_events(50, 0).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            db.get_last_cursor().await.unwrap(),
+            Some("fresh-cursor-2".to_string())
         );
     }
 }

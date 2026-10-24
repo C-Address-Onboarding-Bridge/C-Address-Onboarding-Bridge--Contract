@@ -68,6 +68,13 @@ pub enum BridgeEventType {
     ContractUpgraded,
     EmergencyMigrated,
     ReferralRateChanged,
+    // Funding paths that bypass the plain `fund_c_address` entry point (#642).
+    CommitFund,
+    CommitRevealFunded,
+    SwapAndFunded,
+    MetaFundExecuted,
+    ReferralPaid,
+    BatchTransferFailed,
 }
 
 impl BridgeEventType {
@@ -104,6 +111,12 @@ impl BridgeEventType {
             "ContractUpgraded" => Some(Self::ContractUpgraded),
             "EmergencyMigrated" => Some(Self::EmergencyMigrated),
             "ReferralRateChanged" => Some(Self::ReferralRateChanged),
+            "CommitFund" => Some(Self::CommitFund),
+            "CommitRevealFunded" => Some(Self::CommitRevealFunded),
+            "SwapAndFunded" => Some(Self::SwapAndFunded),
+            "MetaFundExecuted" => Some(Self::MetaFundExecuted),
+            "ReferralPaid" => Some(Self::ReferralPaid),
+            "BatchTransferFailed" => Some(Self::BatchTransferFailed),
             _ => None,
         }
     }
@@ -141,6 +154,12 @@ impl BridgeEventType {
             Self::ContractUpgraded => "ContractUpgraded",
             Self::EmergencyMigrated => "EmergencyMigrated",
             Self::ReferralRateChanged => "ReferralRateChanged",
+            Self::CommitFund => "CommitFund",
+            Self::CommitRevealFunded => "CommitRevealFunded",
+            Self::SwapAndFunded => "SwapAndFunded",
+            Self::MetaFundExecuted => "MetaFundExecuted",
+            Self::ReferralPaid => "ReferralPaid",
+            Self::BatchTransferFailed => "BatchTransferFailed",
         }
     }
 }
@@ -162,7 +181,10 @@ mod tests {
             // #641: contract emits these four role-change topics, not AdminChanged / FeeCollectorChanged
             ("AdminProposed", "AdminProposed"),
             ("AdminTransferred", "AdminTransferred"),
-            ("FeeCollectorTransferProposed", "FeeCollectorTransferProposed"),
+            (
+                "FeeCollectorTransferProposed",
+                "FeeCollectorTransferProposed",
+            ),
             ("FeeCollectorTransferred", "FeeCollectorTransferred"),
             ("FeeBpsChanged", "FeeBpsChanged"),
             ("ContractPaused", "ContractPaused"),
