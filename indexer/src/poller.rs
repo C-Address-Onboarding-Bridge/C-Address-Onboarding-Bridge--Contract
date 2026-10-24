@@ -191,9 +191,7 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("getEvents RPC error: {}", message).into());
         }
 
-        let result = body
-            .get("result")
-            .ok_or("getEvents: missing result")?;
+        let result = body.get("result").ok_or("getEvents: missing result")?;
 
         let events: Vec<serde_json::Value> = result
             .get("events")
@@ -229,7 +227,8 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
             let event_index = *counter;
             *counter += 1;
 
-            if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id, event_index) {
+            if let Some(indexed) = parse_contract_event(raw_event, &state.contract_id, event_index)
+            {
                 // Insert the event and queue its webhook deliveries atomically
                 // (one SQLite transaction) so a crash between the two can never
                 // leave an indexed event with no deliveries queued. See #647.
@@ -363,38 +362,16 @@ fn parse_contract_event(
         }
         // ("FeesWithdrawn", fee_collector) - asset carried in value, not topics
         BridgeEventType::FeesWithdrawn => {
-            if let Some(collector) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert(
-                    "fee_collector".to_string(),
-                    serde_json::Value::String(collector.to_string()),
-                );
-            }
+            insert_topic_str(&mut data, &decoded_topics, 1, "fee_collector");
         }
         // ("AdminProposed", admin, new_admin) / ("AdminTransferred", old_admin, pending)
-        BridgeEventType::AdminProposed | BridgeEventType::AdminTransferred => {
-            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert(
-                    "from".to_string(),
-                    serde_json::Value::String(from.to_string()),
-                );
-            }
-            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
-                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
-            }
-        }
-        // ("FeeCollectorTransferProposed", admin, new_collector) /
-        // ("FeeCollectorTransferred", old, pending)
-        BridgeEventType::FeeCollectorTransferProposed
+        // ("FeeCollectorTransferProposed", admin, new_collector) / ("FeeCollectorTransferred", old, pending)
+        BridgeEventType::AdminProposed
+        | BridgeEventType::AdminTransferred
+        | BridgeEventType::FeeCollectorTransferProposed
         | BridgeEventType::FeeCollectorTransferred => {
-            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert(
-                    "from".to_string(),
-                    serde_json::Value::String(from.to_string()),
-                );
-            }
-            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
-                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
-            }
+            insert_topic_str(&mut data, &decoded_topics, 1, "from");
+            insert_topic_str(&mut data, &decoded_topics, 2, "to");
         }
         _ => {
             // CommitFund, BatchTransferFailed, and the remaining admin/config
@@ -444,7 +421,10 @@ fn insert_topic_str(
     key: &str,
 ) {
     if let Some(value) = topics.get(idx).and_then(serde_json::Value::as_str) {
-        data.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+        data.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
     }
 }
 
@@ -494,15 +474,77 @@ fn decode_scval(bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
         }
         18 => {
             let address_kind = read_u32(bytes, &mut cursor)?;
-            let address = read_bytes(bytes, &mut cursor, 32)?;
-            Ok(serde_json::Value::String(format!(
-                "scaddress:{}:{}",
-                address_kind,
-                hex::encode(address)
-            )))
+            match address_kind {
+                0 => {
+                    // SC_ADDRESS_TYPE_ACCOUNT:
+                    // In XDR, AccountID is a union containing a PublicKey.
+                    // The 4-byte discriminant is PUBLIC_KEY_TYPE_ED25519 (= 0).
+                    let _pk_type = read_u32(bytes, &mut cursor)?;
+                    let pk_bytes = read_bytes(bytes, &mut cursor, 32)?;
+                    let strkey = encode_stellar_strkey(STRKEY_VERSION_ACCOUNT_ID, pk_bytes);
+                    Ok(serde_json::Value::String(strkey))
+                }
+                1 => {
+                    // SC_ADDRESS_TYPE_CONTRACT:
+                    // 32-byte contract hash payload.
+                    let contract_bytes = read_bytes(bytes, &mut cursor, 32)?;
+                    let strkey = encode_stellar_strkey(STRKEY_VERSION_CONTRACT, contract_bytes);
+                    Ok(serde_json::Value::String(strkey))
+                }
+                _ => Err("unsupported ScAddress type"),
+            }
         }
         _ => Err("unsupported ScVal type"),
     }
+}
+
+const STRKEY_VERSION_ACCOUNT_ID: u8 = 6 << 3; // 48 (G...)
+const STRKEY_VERSION_CONTRACT: u8 = 2 << 3; // 16 (C...)
+
+fn crc16_xmodem(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+    for &byte in data {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            if (crc & 0x8000) != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}
+
+fn encode_stellar_strkey(version_byte: u8, payload: &[u8]) -> String {
+    const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+    let mut raw = Vec::with_capacity(1 + payload.len() + 2);
+    raw.push(version_byte);
+    raw.extend_from_slice(payload);
+    let crc = crc16_xmodem(&raw);
+    raw.extend_from_slice(&crc.to_le_bytes());
+
+    let mut out = String::with_capacity(56);
+    let mut buffer: u64 = 0;
+    let mut bits_in_buffer: usize = 0;
+
+    for &byte in &raw {
+        buffer = (buffer << 8) | (byte as u64);
+        bits_in_buffer += 8;
+        while bits_in_buffer >= 5 {
+            bits_in_buffer -= 5;
+            let index = ((buffer >> bits_in_buffer) & 0x1F) as usize;
+            out.push(BASE32_ALPHABET[index] as char);
+        }
+    }
+
+    if bits_in_buffer > 0 {
+        let index = ((buffer << (5 - bits_in_buffer)) & 0x1F) as usize;
+        out.push(BASE32_ALPHABET[index] as char);
+    }
+
+    out
 }
 
 fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, &'static str> {
@@ -672,7 +714,12 @@ mod tests {
     /// topics[3] is extracted into `data["target"]` for CAddressFunded.
     #[test]
     fn test_parse_extracts_target_from_topics_index_2() {
-        let raw = raw_event(serde_json::json!(["CAddressFunded", "GASSET", "GSOURCE", "CTARGET"]));
+        let raw = raw_event(serde_json::json!([
+            "CAddressFunded",
+            "GASSET",
+            "GSOURCE",
+            "CTARGET"
+        ]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(
             event.data["target"].as_str(),
@@ -750,18 +797,27 @@ mod tests {
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(event.data["from"].as_str(), Some("GADMIN"));
         assert_eq!(event.data["to"].as_str(), Some("GNEWADMIN"));
+        assert!(event.data.get("source").is_none());
+        assert!(event.data.get("target").is_none());
     }
 
     /// #641: AdminTransferred layout is ("AdminTransferred", old_admin, pending).
     #[test]
     fn test_admin_transferred_topic_mapping() {
-        let raw = raw_event(serde_json::json!(["AdminTransferred", "GOLDADMIN", "GNEWADMIN"]));
+        let raw = raw_event(serde_json::json!([
+            "AdminTransferred",
+            "GOLDADMIN",
+            "GNEWADMIN"
+        ]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(event.data["from"].as_str(), Some("GOLDADMIN"));
         assert_eq!(event.data["to"].as_str(), Some("GNEWADMIN"));
+        assert!(event.data.get("source").is_none());
+        assert!(event.data.get("target").is_none());
     }
 
-    /// #641: FeeCollectorTransferProposed and FeeCollectorTransferred are now recognised.
+    /// #641: FeeCollectorTransferProposed and FeeCollectorTransferred are now recognised
+    /// and map to specific from / to fields without generic source / target.
     #[test]
     fn test_fee_collector_role_change_topics_are_recognised() {
         let proposed = raw_event(serde_json::json!([
@@ -774,14 +830,22 @@ mod tests {
             "GOLDCOLLECTOR",
             "GNEWCOLLECTOR"
         ]));
-        assert!(
-            parse_contract_event(&proposed, "C1", 0).is_some(),
-            "FeeCollectorTransferProposed must be recognised"
+        let event_proposed = parse_contract_event(&proposed, "C1", 0)
+            .expect("FeeCollectorTransferProposed must parse");
+        assert_eq!(event_proposed.data["from"].as_str(), Some("GADMIN"));
+        assert_eq!(event_proposed.data["to"].as_str(), Some("GNEWCOLLECTOR"));
+        assert!(event_proposed.data.get("source").is_none());
+        assert!(event_proposed.data.get("target").is_none());
+
+        let event_transferred = parse_contract_event(&transferred, "C1", 0)
+            .expect("FeeCollectorTransferred must parse");
+        assert_eq!(
+            event_transferred.data["from"].as_str(),
+            Some("GOLDCOLLECTOR")
         );
-        assert!(
-            parse_contract_event(&transferred, "C1", 0).is_some(),
-            "FeeCollectorTransferred must be recognised"
-        );
+        assert_eq!(event_transferred.data["to"].as_str(), Some("GNEWCOLLECTOR"));
+        assert!(event_transferred.data.get("source").is_none());
+        assert!(event_transferred.data.get("target").is_none());
     }
 
     /// #641: The old incorrect topic strings AdminChanged / FeeCollectorChanged
@@ -789,7 +853,11 @@ mod tests {
     #[test]
     fn test_old_incorrect_role_change_topics_produce_no_event() {
         let raw_admin = raw_event(serde_json::json!(["AdminChanged", "GADMIN", "GNEWADMIN"]));
-        let raw_fc = raw_event(serde_json::json!(["FeeCollectorChanged", "GCOL", "GNEWCOL"]));
+        let raw_fc = raw_event(serde_json::json!([
+            "FeeCollectorChanged",
+            "GCOL",
+            "GNEWCOL"
+        ]));
         assert!(
             parse_contract_event(&raw_admin, "C1", 0).is_none(),
             "'AdminChanged' must yield None - contract never emits this"
@@ -934,11 +1002,7 @@ mod tests {
     /// `BatchTransferFailed` uses the generic (name, source, target) layout.
     #[test]
     fn test_parse_batch_transfer_failed_extracts_source_and_target() {
-        let raw = raw_event(serde_json::json!([
-            "BatchTransferFailed",
-            "GSRC",
-            "CTGT"
-        ]));
+        let raw = raw_event(serde_json::json!(["BatchTransferFailed", "GSRC", "CTGT"]));
         let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
         assert_eq!(event.event_type, "BatchTransferFailed");
         assert_eq!(event.data["source"].as_str(), Some("GSRC"));
@@ -1154,12 +1218,9 @@ mod tests {
             lookback_ledgers: 720,
         };
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            poll_once(&state),
-        )
-        .await
-        .expect("poll_once must terminate (no infinite loop)");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), poll_once(&state))
+            .await
+            .expect("poll_once must terminate (no infinite loop)");
 
         result.expect("poll_once must succeed");
 
@@ -1181,6 +1242,99 @@ mod tests {
             last_ledger,
             Some(249),
             "cursor must advance to the last event's ledger (200 + 49)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #879 - ScAddress strkey decoding (G... / C...)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_scval_account_and_contract_strkeys() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        // Account address (ScAddress::Account, PublicKeyTypeEd25519)
+        let acc_bytes = STANDARD
+            .decode("AAAAEgAAAAAAAAAAAAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
+            .unwrap();
+        let decoded_acc = decode_scval(&acc_bytes).expect("must decode account ScAddress");
+        assert_eq!(
+            decoded_acc,
+            serde_json::Value::String(
+                "GAAACAQDAQCQMBYIBEFAWDANBYHRAEISCMKBKFQXDAMRUGY4DUPB7JZX".to_string()
+            ),
+            "Account ScAddress must decode into G... strkey"
+        );
+
+        // Contract address (ScAddress::Contract)
+        let contract_bytes = STANDARD
+            .decode("AAAAEgAAAAEAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHw==")
+            .unwrap();
+        let decoded_contract =
+            decode_scval(&contract_bytes).expect("must decode contract ScAddress");
+        assert_eq!(
+            decoded_contract,
+            serde_json::Value::String(
+                "CAAACAQDAQCQMBYIBEFAWDANBYHRAEISCMKBKFQXDAMRUGY4DUPB6N4O".to_string()
+            ),
+            "Contract ScAddress must decode into C... strkey"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scaddress_target_filter_matches_strkey() {
+        let db = crate::db::Database::new("sqlite::memory:").await;
+        db.migrate().await;
+
+        let target_strkey = "CAAACAQDAQCQMBYIBEFAWDANBYHRAEISCMKBKFQXDAMRUGY4DUPB6N4O";
+
+        // Create subscription with target_filter = target_strkey
+        db.create_subscription(crate::webhook::CreateSubscription {
+            url: "https://example.com/webhook".to_string(),
+            event_type: Some("CAddressFunded".to_string()),
+            asset_filter: None,
+            source_filter: None,
+            target_filter: Some(target_strkey.to_string()),
+        })
+        .await
+        .expect("must create subscription");
+
+        // Parse event where topic[3] is the contract address XDR
+        let raw = serde_json::json!({
+            "topic": [
+                "AAAADwAAAA5DQWRkcmVzc0Z1bmRlZAAA", // "CAddressFunded"
+                "AAAADwAAAApDQVNTRVRBRERSAAA=",     // asset
+                "AAAADwAAAAtHU09VUkNFQUREUgA=",     // source
+                "AAAAEgAAAAEAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHw==" // target C-address
+            ],
+            "ledger": 100,
+            "txHash": "deadbeef12345678",
+            "createdAt": "2024-06-01T12:00:00Z",
+            "value": "AAAAAwAAACo="
+        });
+
+        let event = parse_contract_event(&raw, "C_BRIDGE", 0).expect("must parse event");
+        assert_eq!(
+            event.data["target"].as_str(),
+            Some(target_strkey),
+            "event target must be decoded as strkey"
+        );
+
+        db.insert_event(&event).await.expect("insert event");
+        db.queue_webhook_deliveries(&event)
+            .await
+            .expect("queue deliveries");
+
+        // Webhook delivery should be queued because target_filter matched target_strkey
+        let deliveries = db
+            .get_pending_deliveries()
+            .await
+            .expect("get pending deliveries");
+        assert_eq!(
+            deliveries.len(),
+            1,
+            "delivery must be queued when target_filter matches decoded strkey"
         );
     }
 }
