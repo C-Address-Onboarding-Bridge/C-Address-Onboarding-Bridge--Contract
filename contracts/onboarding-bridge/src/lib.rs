@@ -80,7 +80,7 @@ use soroban_sdk::{
 /// Every public function that can fail returns `Result<_, BridgeError>`.
 /// Callers should match on these variants to distinguish recoverable from
 /// unrecoverable conditions.
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BridgeError {
     /// Contract has not been initialized yet. Call `initialize` first.
@@ -1138,9 +1138,7 @@ fn remove_relayer(env: &Env, pubkey: &BytesN<32>) {
         env.storage()
             .instance()
             .set(&DataKey::RelayerSet, &relayers);
-        env.storage()
-            .instance()
-            .set(&DataKey::RelayerCount, &count);
+        env.storage().instance().set(&DataKey::RelayerCount, &count);
     }
 }
 
@@ -1246,7 +1244,9 @@ fn save_asset_fee_cap(env: &Env, asset: &Address, max_fee_bps: u32) {
     let key = DataKey::AssetFeeCap(asset.clone());
     env.storage().persistent().set(&key, &max_fee_bps);
     let max_ttl = read_max_persistent_ttl(env);
-    env.storage().persistent().extend_ttl(&key, max_ttl / 4, max_ttl);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, max_ttl / 4, max_ttl);
 }
 
 fn read_asset_fee_cap(env: &Env, asset: &Address) -> u32 {
@@ -3645,7 +3645,8 @@ impl OnboardingBridge {
         let was_present = whitelist.get(asset.clone()).unwrap_or(false);
         whitelist.remove(asset.clone());
         save_whitelist(&env, &whitelist);
-        env.events().publish(("AssetRemoved",), (admin, asset, was_present));
+        env.events()
+            .publish(("AssetRemoved",), (admin, asset, was_present));
         Ok(())
     }
 
@@ -3732,7 +3733,8 @@ impl OnboardingBridge {
         let was_present = whitelist.get(pool.clone()).unwrap_or(false);
         whitelist.set(pool.clone(), true);
         save_pool_whitelist(&env, &whitelist);
-        env.events().publish(("SwapPoolAdded",), (admin, pool, was_present));
+        env.events()
+            .publish(("SwapPoolAdded",), (admin, pool, was_present));
         Ok(())
     }
 
@@ -3769,7 +3771,8 @@ impl OnboardingBridge {
         let was_present = whitelist.get(pool.clone()).unwrap_or(false);
         whitelist.remove(pool.clone());
         save_pool_whitelist(&env, &whitelist);
-        env.events().publish(("SwapPoolRemoved",), (admin, pool, was_present));
+        env.events()
+            .publish(("SwapPoolRemoved",), (admin, pool, was_present));
         Ok(())
     }
 
@@ -4284,7 +4287,8 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        if is_relayer(&env, &pubkey) {
+        let was_registered = is_relayer(&env, &pubkey);
+        if was_registered {
             let count = relayer_count(&env);
             if count <= 1 || count.saturating_sub(1) < relayer_threshold(&env) {
                 return Err(BridgeError::BelowThreshold);
@@ -4292,7 +4296,9 @@ impl OnboardingBridge {
         }
         remove_relayer(&env, &pubkey);
         extend_instance_ttl(&env);
-        if was_registered { env.events().publish(("RelayerRemoved",), (admin, pubkey)); }
+        if was_registered {
+            env.events().publish(("RelayerRemoved",), (admin, pubkey));
+        }
         Ok(())
     }
 
@@ -4328,7 +4334,10 @@ impl OnboardingBridge {
         let old_threshold = relayer_threshold(&env);
         save_relayer_threshold(&env, threshold);
         extend_instance_ttl(&env);
-        env.events().publish(("RelayerThresholdChanged",), (admin, old_threshold, threshold));
+        env.events().publish(
+            ("RelayerThresholdChanged",),
+            (admin, old_threshold, threshold),
+        );
         Ok(())
     }
 
@@ -4592,11 +4601,7 @@ impl OnboardingBridge {
     /// # Events
     ///
     /// * `("InstanceTtlExtended",)` — data: `(admin, actual_ttl)`
-    pub fn extend_instance_ttl(
-        env: Env,
-        ttl: u32,
-        nonce: Option<u64>,
-    ) -> Result<(), BridgeError> {
+    pub fn extend_instance_ttl(env: Env, ttl: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -4658,7 +4663,9 @@ impl OnboardingBridge {
         }
         let fee_cap_key = DataKey::AssetFeeCap(key_asset.clone());
         if env.storage().persistent().has(&fee_cap_key) {
-            env.storage().persistent().extend_ttl(&fee_cap_key, threshold, max_ttl);
+            env.storage()
+                .persistent()
+                .extend_ttl(&fee_cap_key, threshold, max_ttl);
         }
         env.events()
             .publish(("PersistentTtlExtended",), (admin, key_asset, max_ttl));
@@ -4865,11 +4872,7 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::InvalidTtl`] — `ttl` is below `MIN_ALLOWED_TTL`.
-    pub fn set_max_instance_ttl(
-        env: Env,
-        ttl: u32,
-        nonce: Option<u64>,
-    ) -> Result<(), BridgeError> {
+    pub fn set_max_instance_ttl(env: Env, ttl: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
@@ -4887,7 +4890,8 @@ impl OnboardingBridge {
             .instance()
             .set(&DataKey::MaxInstanceTtl, &capped);
         extend_instance_ttl(&env);
-        env.events().publish(("MaxInstanceTtlChanged",), (admin, old_ttl, capped));
+        env.events()
+            .publish(("MaxInstanceTtlChanged",), (admin, old_ttl, capped));
         Ok(())
     }
 
