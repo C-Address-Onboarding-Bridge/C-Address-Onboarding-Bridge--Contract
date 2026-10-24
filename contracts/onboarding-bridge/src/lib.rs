@@ -1978,6 +1978,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if limit_amount < 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -2056,6 +2057,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if max_fee_bps > MAX_FEE_BPS {
             return Err(BridgeError::FeeTooHigh);
         }
@@ -2287,6 +2289,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if amount < 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -2403,6 +2406,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if amount < 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -2454,6 +2458,7 @@ impl OnboardingBridge {
     /// * `("ReferralRateChanged", bps)` — no additional data.
     pub fn set_referral_rate(env: Env, bps: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -2900,6 +2905,7 @@ impl OnboardingBridge {
     /// so that an upgrade can fix whatever condition required the pause.
     pub fn pause(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -2931,6 +2937,7 @@ impl OnboardingBridge {
     /// * `("ContractUnpaused",)` — data: `(admin,)`
     pub fn unpause(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3276,6 +3283,7 @@ impl OnboardingBridge {
         }
 
         env.storage().instance().set(&DataKey::Deactivated, &true);
+        set_paused(&env, true);
         env.events()
             .publish(("EmergencyMigrated", admin), (new_contract,));
 
@@ -3313,6 +3321,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3346,6 +3355,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3385,6 +3395,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3421,6 +3432,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3462,6 +3474,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3596,6 +3609,7 @@ impl OnboardingBridge {
     pub fn add_asset(env: Env, asset: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3631,6 +3645,7 @@ impl OnboardingBridge {
     pub fn remove_asset(env: Env, asset: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3718,6 +3733,7 @@ impl OnboardingBridge {
     pub fn add_swap_pool(env: Env, pool: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3755,6 +3771,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3814,6 +3831,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if amount_per_fund < 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -3986,6 +4004,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -4018,6 +4037,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -4242,6 +4262,7 @@ impl OnboardingBridge {
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -4275,6 +4296,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -4314,6 +4336,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -4866,6 +4889,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -4911,6 +4935,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
 
         if ttl < MIN_ALLOWED_TTL {
             return Err(BridgeError::InvalidTtl);
