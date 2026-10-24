@@ -122,6 +122,9 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
     // the next poll resumes exactly where we left off.
     let mut cursor: Option<String> = None;
     let mut max_ledger = start_ledger;
+    // #885 - Maintain per-transaction event counter across pages so multi-page transactions
+    // do not reset their index counter.
+    let mut events_seen_per_tx: HashMap<String, usize> = HashMap::new();
 
     loop {
         let params = match cursor {
@@ -209,7 +212,6 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|l| l.as_i64())
             .unwrap_or(0);
 
-        let mut events_seen_per_tx: HashMap<&str, usize> = HashMap::new();
         for raw_event in &events {
             let ledger = raw_event
                 .get("ledger")
@@ -223,7 +225,7 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
                 .get("txHash")
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
-            let counter = events_seen_per_tx.entry(tx_hash).or_insert(0);
+            let counter = events_seen_per_tx.entry(tx_hash.to_string()).or_insert(0);
             let event_index = *counter;
             *counter += 1;
 
@@ -1482,6 +1484,116 @@ mod tests {
             events.len(),
             150,
             "all 150 events across both pages must be stored without collision drops"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_poll_once_single_tx_batch_across_pages_without_rpc_id_stores_all_150_events() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        fn make_batch_event_no_rpc_id(tx_hash: &str) -> serde_json::Value {
+            serde_json::json!({
+                "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
+                "ledger": 100,
+                "txHash": tx_hash,
+                "createdAt": "2024-06-01T12:00:00Z",
+                "value": null,
+            })
+        }
+
+        let shared_tx_hash = "tx-single-batch-fallback-150";
+
+        // Page 1: 100 events from the same transaction without an RPC id field
+        let page1_events: Vec<_> = (0..MAX_EVENTS_PER_POLL)
+            .map(|_| make_batch_event_no_rpc_id(shared_tx_hash))
+            .collect();
+        // Page 2: 50 events continuing the same transaction without an RPC id field
+        let page2_events: Vec<_> = (100..150)
+            .map(|_| make_batch_event_no_rpc_id(shared_tx_hash))
+            .collect();
+
+        let page1_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": page1_events,
+                "cursor": "cursor-page-2",
+                "latestLedger": 300,
+            }
+        });
+        let page2_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": page2_events,
+                "cursor": "cursor-page-3",
+                "latestLedger": 300,
+            }
+        });
+        let empty_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "events": [],
+                "cursor": "cursor-unused",
+                "latestLedger": 300,
+            }
+        });
+
+        let request_count = Arc::new(AtomicU32::new(0));
+        let request_count_clone = Arc::clone(&request_count);
+
+        let mock_router = axum::Router::new().route(
+            "/",
+            post(move || {
+                let count = request_count_clone.fetch_add(1, Ordering::SeqCst);
+                let response = match count {
+                    0 => page1_response.clone(),
+                    1 => page2_response.clone(),
+                    _ => empty_response.clone(),
+                };
+                async move { axum::Json(response) }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.unwrap();
+        });
+
+        let db = crate::db::Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        db.set_last_ledger(99).await.unwrap();
+
+        let state = crate::AppState {
+            db: db.clone(),
+            rpc_url: format!("http://{}", addr),
+            contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::new(),
+            api_key_hash: String::new(),
+            lookback_ledgers: 720,
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            poll_once(&state),
+        )
+        .await
+        .expect("poll_once must terminate");
+
+        result.expect("poll_once must succeed");
+
+        let count = request_count.load(Ordering::SeqCst);
+        assert_eq!(count, 2, "exactly two getEvents calls must be made");
+
+        let events = db.list_events(1000, 0).await.expect("list events");
+        assert_eq!(
+            events.len(),
+            150,
+            "all 150 events across both pages must be stored without collision drops even when relying on per-tx index fallback"
         );
     }
 }
