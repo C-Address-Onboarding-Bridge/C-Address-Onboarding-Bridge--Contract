@@ -38,6 +38,10 @@ import {
   PaginationOptions,
   CostEstimate,
   TimelockEntry,
+  PauseOptions,
+  BlocklistOptions,
+  AllowlistOptions,
+  AllowlistModeOptions,
 } from './types';
 import {
   type ObservabilityHooks,
@@ -3211,6 +3215,308 @@ export class OnboardingBridgeSDK {
   }
 
   /**
+   * Pause contract operations (admin only).
+   *
+   * While paused, funding paths and withdrawals reject calls with `Paused`.
+   * Only admin recovery operations remain active.
+   *
+   * @param adminKeypair - Keypair of the admin account.
+   * @param nonce        - Optional sequential admin nonce for replay protection.
+   *
+   * @returns A {@link TransactionResult}.
+   */
+  async pause(
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult>;
+  async pause(
+    options: PauseOptions,
+    adminKeypair: Keypair,
+  ): Promise<TransactionResult>;
+  async pause(
+    arg1: Keypair | PauseOptions,
+    arg2?: Keypair | string | number | bigint,
+  ): Promise<TransactionResult> {
+    const isOptionsFirst = !(arg1 instanceof Keypair) && typeof (arg1 as any)?.publicKey !== 'function';
+    const adminKeypair = (isOptionsFirst ? arg2 : arg1) as Keypair;
+    const nonce = isOptionsFirst ? (arg1 as PauseOptions).nonce : (arg2 as string | number | bigint | undefined);
+
+    return this.submitAdminOperation(
+      'pause',
+      'pause',
+      { nonce },
+      [this.optionalNonceToScVal(nonce)],
+      adminKeypair,
+    );
+  }
+
+  /**
+   * Resume normal contract operations after a pause (admin only).
+   *
+   * @param adminKeypair - Keypair of the admin account.
+   * @param nonce        - Optional sequential admin nonce for replay protection.
+   *
+   * @returns A {@link TransactionResult}.
+   */
+  async unpause(
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult>;
+  async unpause(
+    options: PauseOptions,
+    adminKeypair: Keypair,
+  ): Promise<TransactionResult>;
+  async unpause(
+    arg1: Keypair | PauseOptions,
+    arg2?: Keypair | string | number | bigint,
+  ): Promise<TransactionResult> {
+    const isOptionsFirst = !(arg1 instanceof Keypair) && typeof (arg1 as any)?.publicKey !== 'function';
+    const adminKeypair = (isOptionsFirst ? arg2 : arg1) as Keypair;
+    const nonce = isOptionsFirst ? (arg1 as PauseOptions).nonce : (arg2 as string | number | bigint | undefined);
+
+    return this.submitAdminOperation(
+      'unpause',
+      'unpause',
+      { nonce },
+      [this.optionalNonceToScVal(nonce)],
+      adminKeypair,
+    );
+  }
+
+  /**
+   * Check whether the contract is currently paused.
+   *
+   * When paused, funding and withdrawal methods revert.
+   *
+   * @returns `true` if paused, `false` otherwise.
+   *
+   * @throws {Error} On RPC failure.
+   */
+  async isPaused(): Promise<boolean> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_is_paused' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_is_paused', []),
+      ),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query paused status: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? Boolean(scValToNative(scVal)) : false;
+  }
+
+  /**
+   * Add an address to the blocklist (admin only).
+   *
+   * Blocklisted addresses cannot receive funds from the bridge.
+   *
+   * @param address      - Target address to blocklist.
+   * @param adminKeypair - Keypair of the admin account.
+   * @param nonce        - Optional sequential admin nonce for replay protection.
+   *
+   * @returns A {@link TransactionResult}.
+   */
+  async addToBlocklist(
+    address: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult>;
+  async addToBlocklist(
+    options: BlocklistOptions,
+    adminKeypair: Keypair,
+  ): Promise<TransactionResult>;
+  async addToBlocklist(
+    addressOrOptions: string | BlocklistOptions,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    const targetAddress = typeof addressOrOptions === 'string' ? addressOrOptions : addressOrOptions.address;
+    const actualNonce = typeof addressOrOptions === 'string' ? nonce : addressOrOptions.nonce;
+    assertAddress(targetAddress, 'address');
+
+    return this.submitAdminOperation(
+      'addToBlocklist',
+      'add_to_blocklist',
+      { address: targetAddress, nonce: actualNonce },
+      [new Address(targetAddress).toScVal(), this.optionalNonceToScVal(actualNonce)],
+      adminKeypair,
+    );
+  }
+
+  /**
+   * Remove an address from the blocklist (admin only).
+   *
+   * @param address      - Target address to unblock.
+   * @param adminKeypair - Keypair of the admin account.
+   * @param nonce        - Optional sequential admin nonce for replay protection.
+   *
+   * @returns A {@link TransactionResult}.
+   */
+  async removeFromBlocklist(
+    address: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult>;
+  async removeFromBlocklist(
+    options: BlocklistOptions,
+    adminKeypair: Keypair,
+  ): Promise<TransactionResult>;
+  async removeFromBlocklist(
+    addressOrOptions: string | BlocklistOptions,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    const targetAddress = typeof addressOrOptions === 'string' ? addressOrOptions : addressOrOptions.address;
+    const actualNonce = typeof addressOrOptions === 'string' ? nonce : addressOrOptions.nonce;
+    assertAddress(targetAddress, 'address');
+
+    return this.submitAdminOperation(
+      'removeFromBlocklist',
+      'remove_from_blocklist',
+      { address: targetAddress, nonce: actualNonce },
+      [new Address(targetAddress).toScVal(), this.optionalNonceToScVal(actualNonce)],
+      adminKeypair,
+    );
+  }
+
+  /**
+   * Add an address to the allowlist (admin only).
+   *
+   * In allowlist mode, only allowlisted addresses can receive bridge funds.
+   *
+   * @param address      - Target address to allowlist.
+   * @param adminKeypair - Keypair of the admin account.
+   * @param nonce        - Optional sequential admin nonce for replay protection.
+   *
+   * @returns A {@link TransactionResult}.
+   */
+  async addToAllowlist(
+    address: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult>;
+  async addToAllowlist(
+    options: AllowlistOptions,
+    adminKeypair: Keypair,
+  ): Promise<TransactionResult>;
+  async addToAllowlist(
+    addressOrOptions: string | AllowlistOptions,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    const targetAddress = typeof addressOrOptions === 'string' ? addressOrOptions : addressOrOptions.address;
+    const actualNonce = typeof addressOrOptions === 'string' ? nonce : addressOrOptions.nonce;
+    assertAddress(targetAddress, 'address');
+
+    return this.submitAdminOperation(
+      'addToAllowlist',
+      'add_to_allowlist',
+      { address: targetAddress, nonce: actualNonce },
+      [new Address(targetAddress).toScVal(), this.optionalNonceToScVal(actualNonce)],
+      adminKeypair,
+    );
+  }
+
+  /**
+   * Remove an address from the allowlist (admin only).
+   *
+   * @param address      - Target address to remove from allowlist.
+   * @param adminKeypair - Keypair of the admin account.
+   * @param nonce        - Optional sequential admin nonce for replay protection.
+   *
+   * @returns A {@link TransactionResult}.
+   */
+  async removeFromAllowlist(
+    address: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult>;
+  async removeFromAllowlist(
+    options: AllowlistOptions,
+    adminKeypair: Keypair,
+  ): Promise<TransactionResult>;
+  async removeFromAllowlist(
+    addressOrOptions: string | AllowlistOptions,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    const targetAddress = typeof addressOrOptions === 'string' ? addressOrOptions : addressOrOptions.address;
+    const actualNonce = typeof addressOrOptions === 'string' ? nonce : addressOrOptions.nonce;
+    assertAddress(targetAddress, 'address');
+
+    return this.submitAdminOperation(
+      'removeFromAllowlist',
+      'remove_from_allowlist',
+      { address: targetAddress, nonce: actualNonce },
+      [new Address(targetAddress).toScVal(), this.optionalNonceToScVal(actualNonce)],
+      adminKeypair,
+    );
+  }
+
+  /**
+   * Enable or disable allowlist enforcement mode (admin only).
+   *
+   * When enabled (`true`), only allowlisted addresses can receive funds.
+   *
+   * @param enabled      - `true` to enable allowlist mode, `false` to disable.
+   * @param adminKeypair - Keypair of the admin account.
+   * @param nonce        - Optional sequential admin nonce for replay protection.
+   *
+   * @returns A {@link TransactionResult}.
+   */
+  async setAllowlistMode(
+    enabled: boolean,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult>;
+  async setAllowlistMode(
+    options: AllowlistModeOptions,
+    adminKeypair: Keypair,
+  ): Promise<TransactionResult>;
+  async setAllowlistMode(
+    enabledOrOptions: boolean | AllowlistModeOptions,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    const enabled = typeof enabledOrOptions === 'boolean' ? enabledOrOptions : enabledOrOptions.enabled;
+    const actualNonce = typeof enabledOrOptions === 'boolean' ? nonce : enabledOrOptions.nonce;
+
+    return this.submitAdminOperation(
+      'setAllowlistMode',
+      'set_allowlist_mode',
+      { enabled, nonce: actualNonce },
+      [nativeToScVal(Boolean(enabled), { type: 'bool' }), this.optionalNonceToScVal(actualNonce)],
+      adminKeypair,
+    );
+  }
+
+  /**
+   * Check whether allowlist mode is currently enabled.
+   *
+   * @returns `true` if allowlist mode is enabled, `false` otherwise.
+   *
+   * @throws {Error} On RPC failure.
+   */
+  async getAllowlistMode(): Promise<boolean> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_allowlist_mode' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_allowlist_mode', []),
+      ),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query allowlist mode: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? Boolean(scValToNative(scVal)) : false;
+  }
+
+  /**
    * Estimate the transaction cost for a `fundCAddress` call without submitting
    * it to the network.
    *
@@ -3435,6 +3741,69 @@ export class OnboardingBridgeSDK {
       throw new Error('Transaction return value is outside the u32 range');
     }
     return Number(value);
+  }
+
+  private async submitAdminOperation(
+    hookName: string,
+    contractMethod: string,
+    params: Record<string, any>,
+    args: xdr.ScVal[],
+    adminKeypair: Keypair,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      hookName,
+      params,
+      async () => {
+        try {
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                contractMethod,
+                ...args,
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
   }
 
   private async submitAdminWasmHashMutation(
