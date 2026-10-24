@@ -30,9 +30,14 @@ jest.mock("@stellar/stellar-sdk", () => ({
       scvVec: jest.fn().mockReturnValue({}),
       scvBytes: jest.fn().mockReturnValue({}),
       scvMap: jest.fn().mockReturnValue({}),
-      scvSymbol: jest.fn().mockReturnValue({}),
+      scvSymbol: jest.fn((sym: string) => ({
+        sym: () => ({ toString: () => sym }),
+      })),
     },
-    ScMapEntry: jest.fn().mockImplementation(() => ({})),
+    ScMapEntry: jest.fn().mockImplementation(({ key, val }: any = {}) => ({
+      key: () => key,
+      val: () => val,
+    })),
     LedgerKey: {
       account: jest.fn().mockReturnValue({}),
     },
@@ -110,6 +115,7 @@ describe("OnboardingBridgeSDK", () => {
       getTransaction: jest.fn(),
       simulateTransaction: jest.fn().mockResolvedValue({}),
       getLedgerEntries: jest.fn().mockResolvedValue(ledgerEntriesFor(0)),
+      getFeeStats: jest.fn().mockResolvedValue({ sorobanInclusionFee: { p50: "100" } }),
     };
 
     (rpc.Server as jest.Mock).mockImplementation(() => mockProvider);
@@ -420,7 +426,6 @@ describe("OnboardingBridgeSDK", () => {
           source: MOCK_ADDRESS,
           target: MOCK_ASSET,
           asset: MOCK_ASSET,
-          amount: "1000",
           amountHash: "ab".repeat(32),
           deadline: 123456,
         },
@@ -451,7 +456,6 @@ describe("OnboardingBridgeSDK", () => {
           source: MOCK_ADDRESS,
           target: MOCK_ASSET,
           asset: MOCK_ASSET,
-          amount: "1000",
           amountHash: "ab".repeat(32),
           deadline: 123456,
         },
@@ -847,12 +851,16 @@ describe("OnboardingBridgeSDK", () => {
     });
 
     it("rejects fee bps outside the documented range before RPC", async () => {
-      await expect(sdk.setFee(-1, mockKeypair)).rejects.toThrow(
-        "Fee basis points must be between 0 and 1000",
-      );
-      await expect(sdk.setFee(1001, mockKeypair)).rejects.toThrow(
-        "Fee basis points must be between 0 and 1000",
-      );
+      await expect(sdk.setFee(-1, mockKeypair)).resolves.toEqual({
+        hash: "",
+        status: "failed",
+        error: "Fee basis points must be between 0 and 1000",
+      });
+      await expect(sdk.setFee(1001, mockKeypair)).resolves.toEqual({
+        hash: "",
+        status: "failed",
+        error: "Fee basis points must be between 0 and 1000",
+      });
       expect(mockProvider.getAccount).not.toHaveBeenCalled();
     });
 
@@ -1157,6 +1165,7 @@ describe("OnboardingBridgeSDK", () => {
       const result = await sdk.executeMetaFund(
         {
           params: {
+            networkId: "a".repeat(64),
             source: MOCK_ADDRESS,
             target: MOCK_ASSET,
             asset: MOCK_ASSET,
@@ -1590,7 +1599,7 @@ describe("OnboardingBridgeSDK", () => {
       await sdk.getFeeBalance(MOCK_ASSET);
       await sdk.getContractBalance(MOCK_ASSET);
       await sdk.getAllBalances([MOCK_ASSET, MOCK_ASSET]);
-      await sdk.queryCurrentTier(MOCK_ADDRESS);
+      await sdk.queryCurrentTier(MOCK_ADDRESS, MOCK_ASSET);
       await sdk.isBlocked(MOCK_ADDRESS);
       await sdk.isAllowlisted(MOCK_ASSET);
 
@@ -1601,9 +1610,10 @@ describe("OnboardingBridgeSDK", () => {
       expect(Address).toHaveBeenNthCalledWith(5, MOCK_ASSET);
       expect(Address).toHaveBeenNthCalledWith(6, MOCK_ASSET);
       expect(Address).toHaveBeenNthCalledWith(7, MOCK_ADDRESS);
-      expect(Address).toHaveBeenNthCalledWith(8, MOCK_ADDRESS);
-      expect(Address).toHaveBeenNthCalledWith(9, MOCK_ASSET);
-      expect(Address).toHaveBeenCalledTimes(9);
+      expect(Address).toHaveBeenNthCalledWith(8, MOCK_ASSET);
+      expect(Address).toHaveBeenNthCalledWith(9, MOCK_ADDRESS);
+      expect(Address).toHaveBeenNthCalledWith(10, MOCK_ASSET);
+      expect(Address).toHaveBeenCalledTimes(10);
     });
   });
 
@@ -2008,6 +2018,248 @@ describe("OnboardingBridgeSDK", () => {
     });
   });
 
+  describe("pause, unpause, and isPaused", () => {
+    it("pause calls pause with void nonce by default and returns pending", async () => {
+      const voidScVal = { kind: "void" };
+      (xdr.ScVal.scvVoid as jest.Mock).mockReturnValueOnce(voidScVal);
+
+      const result = await sdk.pause(mockKeypair);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith("pause", voidScVal);
+      expect(result).toEqual({ hash: "mock_tx_hash", status: "pending" });
+    });
+
+    it("pause encodes optional u64 nonce when provided", async () => {
+      const nonceScVal = { kind: "u64", value: 42n };
+      (nativeToScVal as jest.Mock).mockReturnValueOnce(nonceScVal);
+
+      const result = await sdk.pause(mockKeypair, 42n);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(nativeToScVal).toHaveBeenCalledWith(42n, { type: "u64" });
+      expect(contract.call).toHaveBeenCalledWith("pause", nonceScVal);
+      expect(result).toEqual({ hash: "mock_tx_hash", status: "pending" });
+    });
+
+    it("pause returns failed status on RPC error", async () => {
+      mockProvider.sendTransaction.mockRejectedValueOnce(new Error("RPC error"));
+
+      const result = await sdk.pause(mockKeypair);
+
+      expect(result).toEqual({ hash: "", status: "failed", error: "RPC error" });
+    });
+
+    it("unpause calls unpause with void nonce by default and returns pending", async () => {
+      const voidScVal = { kind: "void" };
+      (xdr.ScVal.scvVoid as jest.Mock).mockReturnValueOnce(voidScVal);
+
+      const result = await sdk.unpause(mockKeypair);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith("unpause", voidScVal);
+      expect(result).toEqual({ hash: "mock_tx_hash", status: "pending" });
+    });
+
+    it("unpause encodes optional u64 nonce when provided", async () => {
+      const nonceScVal = { kind: "u64", value: 99n };
+      (nativeToScVal as jest.Mock).mockReturnValueOnce(nonceScVal);
+
+      const result = await sdk.unpause(mockKeypair, 99n);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(nativeToScVal).toHaveBeenCalledWith(99n, { type: "u64" });
+      expect(contract.call).toHaveBeenCalledWith("unpause", nonceScVal);
+      expect(result).toEqual({ hash: "mock_tx_hash", status: "pending" });
+    });
+
+    it("isPaused calls query_is_paused and returns its boolean result", async () => {
+      (scValToNative as jest.Mock).mockReturnValue(true);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const result = await sdk.isPaused();
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith("query_is_paused");
+      expect(result).toBe(true);
+    });
+
+    it("isPaused returns false when simulation returns no results", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+
+      const result = await sdk.isPaused();
+
+      expect(result).toBe(false);
+    });
+
+    it("isPaused throws on simulation error", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({ error: "fail" });
+
+      await expect(sdk.isPaused()).rejects.toThrow("Failed to query pause status");
+    });
+  });
+
+  describe("blocklist and allowlist administration", () => {
+    it("addToBlocklist calls add_to_blocklist with Address ScVal and optional nonce", async () => {
+      const voidScVal = { kind: "void" };
+      (xdr.ScVal.scvVoid as jest.Mock).mockReturnValueOnce(voidScVal);
+
+      const result = await sdk.addToBlocklist(mockKeypair, MOCK_ADDRESS);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(Address).toHaveBeenCalledWith(MOCK_ADDRESS);
+      expect(contract.call).toHaveBeenCalledWith(
+        "add_to_blocklist",
+        expect.anything(),
+        voidScVal,
+      );
+      expect(result).toEqual({ hash: "mock_tx_hash", status: "pending" });
+    });
+
+    it("addToBlocklist also supports (address, adminKeypair, nonce) parameter order", async () => {
+      const nonceScVal = { kind: "u64", value: 7n };
+      (nativeToScVal as jest.Mock).mockReturnValueOnce(nonceScVal);
+
+      const result = await sdk.addToBlocklist(MOCK_ASSET, mockKeypair, 7n);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(Address).toHaveBeenCalledWith(MOCK_ASSET);
+      expect(nativeToScVal).toHaveBeenCalledWith(7n, { type: "u64" });
+      expect(contract.call).toHaveBeenCalledWith(
+        "add_to_blocklist",
+        expect.anything(),
+        nonceScVal,
+      );
+      expect(result).toEqual({ hash: "mock_tx_hash", status: "pending" });
+    });
+
+    it("addToBlocklist rejects invalid address before RPC", async () => {
+      const result = await sdk.addToBlocklist(mockKeypair, "not-an-address");
+
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain('Invalid address for "address"');
+      expect(mockProvider.getAccount).not.toHaveBeenCalled();
+    });
+
+    it("removeFromBlocklist calls remove_from_blocklist with Address ScVal and optional nonce", async () => {
+      const nonceScVal = { kind: "u64", value: 11n };
+      (nativeToScVal as jest.Mock).mockReturnValueOnce(nonceScVal);
+
+      const result = await sdk.removeFromBlocklist(mockKeypair, MOCK_ADDRESS, 11n);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(Address).toHaveBeenCalledWith(MOCK_ADDRESS);
+      expect(nativeToScVal).toHaveBeenCalledWith(11n, { type: "u64" });
+      expect(contract.call).toHaveBeenCalledWith(
+        "remove_from_blocklist",
+        expect.anything(),
+        nonceScVal,
+      );
+      expect(result).toEqual({ hash: "mock_tx_hash", status: "pending" });
+    });
+
+    it("addToAllowlist calls add_to_allowlist with Address ScVal and optional nonce", async () => {
+      const voidScVal = { kind: "void" };
+      (xdr.ScVal.scvVoid as jest.Mock).mockReturnValueOnce(voidScVal);
+
+      const result = await sdk.addToAllowlist(mockKeypair, MOCK_ADDRESS);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(Address).toHaveBeenCalledWith(MOCK_ADDRESS);
+      expect(contract.call).toHaveBeenCalledWith(
+        "add_to_allowlist",
+        expect.anything(),
+        voidScVal,
+      );
+      expect(result).toEqual({ hash: "mock_tx_hash", status: "pending" });
+    });
+
+    it("removeFromAllowlist calls remove_from_allowlist with Address ScVal and optional nonce", async () => {
+      const voidScVal = { kind: "void" };
+      (xdr.ScVal.scvVoid as jest.Mock).mockReturnValueOnce(voidScVal);
+
+      const result = await sdk.removeFromAllowlist(mockKeypair, MOCK_ADDRESS);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(Address).toHaveBeenCalledWith(MOCK_ADDRESS);
+      expect(contract.call).toHaveBeenCalledWith(
+        "remove_from_allowlist",
+        expect.anything(),
+        voidScVal,
+      );
+      expect(result).toEqual({ hash: "mock_tx_hash", status: "pending" });
+    });
+
+    it("setAllowlistMode calls set_allowlist_mode with bool ScVal and optional nonce", async () => {
+      const boolScVal = { kind: "bool", value: true };
+      const nonceScVal = { kind: "u64", value: 5n };
+      (nativeToScVal as jest.Mock)
+        .mockReturnValueOnce(boolScVal)
+        .mockReturnValueOnce(nonceScVal);
+
+      const result = await sdk.setAllowlistMode(mockKeypair, true, 5n);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(nativeToScVal).toHaveBeenNthCalledWith(1, true, { type: "bool" });
+      expect(nativeToScVal).toHaveBeenNthCalledWith(2, 5n, { type: "u64" });
+      expect(contract.call).toHaveBeenCalledWith(
+        "set_allowlist_mode",
+        boolScVal,
+        nonceScVal,
+      );
+      expect(result).toEqual({ hash: "mock_tx_hash", status: "pending" });
+    });
+
+    it("setAllowlistMode also supports (enabled, adminKeypair) parameter order", async () => {
+      const boolScVal = { kind: "bool", value: false };
+      const voidScVal = { kind: "void" };
+      (nativeToScVal as jest.Mock).mockReturnValueOnce(boolScVal);
+      (xdr.ScVal.scvVoid as jest.Mock).mockReturnValueOnce(voidScVal);
+
+      const result = await sdk.setAllowlistMode(false, mockKeypair);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(nativeToScVal).toHaveBeenCalledWith(false, { type: "bool" });
+      expect(contract.call).toHaveBeenCalledWith(
+        "set_allowlist_mode",
+        boolScVal,
+        voidScVal,
+      );
+      expect(result).toEqual({ hash: "mock_tx_hash", status: "pending" });
+    });
+
+    it("getAllowlistMode calls query_allowlist_mode and returns its boolean result", async () => {
+      (scValToNative as jest.Mock).mockReturnValue(true);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const result = await sdk.getAllowlistMode();
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith("query_allowlist_mode");
+      expect(result).toBe(true);
+    });
+
+    it("getAllowlistMode returns false when simulation returns no results", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+
+      const result = await sdk.getAllowlistMode();
+
+      expect(result).toBe(false);
+    });
+
+    it("getAllowlistMode throws on simulation error", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({ error: "fail" });
+
+      await expect(sdk.getAllowlistMode()).rejects.toThrow(
+        "Failed to query allowlist mode",
+      );
+    });
+  });
+
   describe("estimateCost minimum balance", () => {
     const ESTIMATE_ARGS = {
       source: MOCK_ADDRESS,
@@ -2075,7 +2327,8 @@ describe("OnboardingBridgeSDK", () => {
       const estimate = await sdk.estimateCost(ESTIMATE_ARGS);
 
       expect(estimate.resourceFee).toBe("5000");
-      expect(estimate.fee).toBe("5100"); // BASE_FEE (100) + resource fee
+      expect(estimate.fee).toBe("100");
+      expect(estimate.totalFee).toBe("5100"); // BASE_FEE (100) + resource fee
       expect(estimate.minBalance).toBe(String(3 * BASE_RESERVE_STROOPS));
     });
   });
@@ -2363,9 +2616,11 @@ describe("Error handling - invalid inputs", () => {
   });
 
   it("setFee rejects negative fee bps before RPC", async () => {
-    await expect(sdk.setFee(-100, mockKeypair)).rejects.toThrow(
-      "Fee basis points must be between 0 and 1000",
-    );
+    await expect(sdk.setFee(-100, mockKeypair)).resolves.toEqual({
+      hash: "",
+      status: "failed",
+      error: "Fee basis points must be between 0 and 1000",
+    });
     expect(mockProvider.getAccount).not.toHaveBeenCalled();
   });
 
@@ -2642,6 +2897,7 @@ describe("Observability hooks - onRpcCall coverage", () => {
         .fn()
         .mockResolvedValue({ results: [{ retval: {} }] }),
       getLedgerEntries: jest.fn().mockResolvedValue(ledgerEntriesFor(0)),
+      getFeeStats: jest.fn().mockResolvedValue({ sorobanInclusionFee: { p50: "100" } }),
     };
 
     (rpc.Server as jest.Mock).mockImplementation(() => mockProvider);
@@ -2685,6 +2941,14 @@ describe("Observability hooks - onRpcCall coverage", () => {
     {
       name: "isAllowlisted",
       call: (s: OnboardingBridgeSDK) => s.isAllowlisted(MOCK_ADDRESS),
+    },
+    {
+      name: "isPaused",
+      call: (s: OnboardingBridgeSDK) => s.isPaused(),
+    },
+    {
+      name: "getAllowlistMode",
+      call: (s: OnboardingBridgeSDK) => s.getAllowlistMode(),
     },
     {
       name: "estimateCost",
