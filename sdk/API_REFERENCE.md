@@ -18,6 +18,20 @@ This document provides a comprehensive API reference for all exported classes, i
 4. [Interfaces](#interfaces)
    - [BridgeConfig](#bridgeconfig)
    - [FundCOptions](#fundcoptions)
+   - [FundCAddressWithReferralOptions](#fundcaddresswithreferraloptions)
+   - [CommitFundOptions](#commitfundoptions)
+   - [RevealFundOptions](#revealfundoptions)
+   - [CommitmentEntry](#commitmententry)
+   - [FundCTimelockedOptions](#fundctimelockedoptions)
+   - [TimelockEntry](#timelockentry)
+   - [FeeTier](#feetier)
+   - [LoyaltyToken](#loyaltytoken)
+   - [ScheduleUpgradeOptions](#scheduleupgradeoptions)
+   - [ExecuteUpgradeOptions](#executeupgradeoptions)
+   - [CancelUpgradeOptions](#cancelupgradeoptions)
+   - [PendingUpgrade](#pendingupgrade)
+   - [MetaFundParams](#metafundparams)
+   - [ExecuteMetaFundOptions](#executemetafundoptions)
    - [BatchFundCOptions](#batchfundcoptions)
    - [WithdrawFeesOptions](#withdrawfeesoptions)
    - [OffRampConfig](#offrampconfig)
@@ -106,6 +120,22 @@ Funds a single C-address from a source account. The source account must have pre
   - `sourceKeypair`: `Keypair` (from `@stellar/stellar-sdk`)
 - **Returns**: `Promise<TransactionResult>`
 
+##### `fundCAddressWithReferral`
+```ts
+async fundCAddressWithReferral(
+  options: FundCAddressWithReferralOptions,
+  sourceKeypair: Keypair
+): Promise<TransactionResult>
+```
+Funds a single C-address from a source account with an optional referrer attribution. If configured on the contract, a share of the protocol fee is credited to `options.referrer`.
+- **Parameters**:
+  - `options`: [`FundCAddressWithReferralOptions`](#fundcaddresswithreferraloptions)
+  - `sourceKeypair`: `Keypair`
+- **Returns**: `Promise<TransactionResult>`
+- **Errors**:
+  - Rejects if `options.source` or `options.referrer` is not a valid G-address, or if `target`/`asset` is not a valid contract address.
+  - Returns `{ status: 'failed', error: string }` if contract call reverts (e.g. `AssetNotWhitelisted`, `AmountBelowMinimum`, `DailyLimitExceeded`, `AddressBlocked`, `ContractPaused`, `DuplicateNonce`).
+
 ##### `fundCAddressWithSwap`
 ```ts
 async fundCAddressWithSwap(
@@ -142,6 +172,22 @@ const results = await sdk.batchFundCAddresses(
 );
 ```
 
+##### `commitFund`
+```ts
+async commitFund(
+  options: CommitFundOptions,
+  sourceKeypair: Keypair
+): Promise<TransactionResult>
+```
+Submits the commit phase of a two-step commit-reveal funding operation. Creates an on-chain commitment with `amountHash` and a validity deadline without transferring tokens immediately.
+- **Parameters**:
+  - `options`: [`CommitFundOptions`](#commitfundoptions)
+  - `sourceKeypair`: `Keypair`
+- **Returns**: `Promise<TransactionResult>`
+- **Errors**:
+  - Rejects if `options.source` is invalid or `target`/`asset` is not a contract address.
+  - Returns `{ status: 'failed', error: string }` if deadline has passed or contract is paused.
+
 ##### `commitFundAndWait`
 ```ts
 async commitFundAndWait(
@@ -153,6 +199,36 @@ Submits a commit-reveal funding commitment and waits for the transaction to
 reach `SUCCESS` or `FAILED`. On success, `commitmentId` is decoded from the
 contract return value and can be passed to `revealFund` or `cancelCommitment`.
 
+##### `revealFund`
+```ts
+async revealFund(
+  options: RevealFundOptions,
+  sourceKeypair: Keypair
+): Promise<TransactionResult>
+```
+Submits the reveal phase of a commit-reveal funding operation. Validates that the commitment hash matches `(options.amount, options.nonce)`, transfers the tokens from `source`, deducts protocol fees, and credits the net amount to `target`.
+- **Parameters**:
+  - `options`: [`RevealFundOptions`](#revealfundoptions)
+  - `sourceKeypair`: `Keypair`
+- **Returns**: `Promise<TransactionResult>`
+- **Errors**:
+  - Returns `{ status: 'failed', error: string }` if commitment is expired, not found, already revealed, or the hash does not match.
+
+##### `fundCAddressTimelocked`
+```ts
+async fundCAddressTimelocked(
+  options: FundCTimelockedOptions,
+  sourceKeypair: Keypair
+): Promise<TransactionResult>
+```
+Creates a timelocked escrow funding entry for a C-address. Transfers `options.amount` of `options.asset` into the bridge immediately, locking them until `releaseTime`.
+- **Parameters**:
+  - `options`: [`FundCTimelockedOptions`](#fundctimelockedoptions)
+  - `sourceKeypair`: `Keypair`
+- **Returns**: `Promise<TransactionResult>`
+- **Errors**:
+  - Returns `{ status: 'failed', error: string }` if `releaseTime` is not in the future, `cliffTime > releaseTime`, or standard funding limits fail.
+
 ##### `fundCAddressTimelockedAndWait`
 ```ts
 async fundCAddressTimelockedAndWait(
@@ -163,6 +239,24 @@ async fundCAddressTimelockedAndWait(
 Submits a timelocked funding operation and waits for confirmation. On success,
 `timelockId` is decoded from the contract return value and can be passed to
 `claimTimelocked`.
+
+##### `claimTimelocked`
+```ts
+async claimTimelocked(
+  id: string | number | bigint,
+  transactionSourceKeypair: Keypair,
+  authorizeTarget?: (preparedTransaction: any) => Promise<void>
+): Promise<TransactionResult>
+```
+Claims a matured timelocked funding entry by its numerical identifier once `releaseTime` has passed. Releases the escrowed tokens to the target. For contract-based C-address targets, `authorizeTarget` callback must sign the required Soroban authorization entries.
+- **Parameters**:
+  - `id`: `string | number | bigint` — Timelock entry ID.
+  - `transactionSourceKeypair`: `Keypair` — Account submitting the transaction.
+  - `authorizeTarget`: `(preparedTransaction: any) => Promise<void>` (optional) — Callback signing authorization entries for the C-address target.
+- **Returns**: `Promise<TransactionResult>`
+- **Errors**:
+  - Rejects if `authorizeTarget` is omitted when claiming for a contract target.
+  - Returns `{ status: 'failed', error: string }` if timelock is not found, not yet unlocked, or already claimed.
 
 ##### `scheduleUpgradeAndWait`
 ```ts
@@ -254,6 +348,58 @@ tier is selected using the source's bridged volume for that specific asset.
   - `asset`: `string` — Token contract (C-address).
 - **Returns**: `Promise<FeeTier | null>`
 
+##### `queryTimelocked`
+```ts
+async queryTimelocked(id: number): Promise<TimelockEntry | null>
+```
+Queries a timelocked escrow funding record by its numerical identifier.
+- **Parameters**:
+  - `id`: `number` — Numerical identifier of the timelock entry.
+- **Returns**: `Promise<TimelockEntry | null>` — The timelock entry details or `null` if not found.
+- **Errors**:
+  - Throws `Error` if contract simulation fails or RPC error occurs.
+
+##### `queryCommitment`
+```ts
+async queryCommitment(id: string | number | bigint): Promise<CommitmentEntry | null>
+```
+Queries an on-chain commit-reveal funding commitment record by ID.
+- **Parameters**:
+  - `id`: `string | number | bigint` — Unique commitment identifier.
+- **Returns**: `Promise<CommitmentEntry | null>` — Details of the commitment entry or `null` if not found.
+- **Errors**:
+  - Throws `Error` on RPC simulation failure.
+
+##### `queryLoyaltyToken`
+```ts
+async queryLoyaltyToken(): Promise<LoyaltyToken | null>
+```
+Queries the configured protocol loyalty token contract address and fixed reward amount.
+- **Parameters**: None.
+- **Returns**: `Promise<LoyaltyToken | null>` — Configured loyalty token (`token`, `amount_per_fund`), or `null` if not configured.
+- **Errors**:
+  - Throws `Error` on RPC simulation failure.
+
+##### `queryFeeTiers`
+```ts
+async queryFeeTiers(): Promise<FeeTier[]>
+```
+Queries the volume-based tiered fee schedule configured on the bridge contract.
+- **Parameters**: None.
+- **Returns**: `Promise<FeeTier[]>` — Array of active fee tiers sorted by volume ascending.
+- **Errors**:
+  - Throws `Error` on RPC simulation failure.
+
+##### `queryReferralRate`
+```ts
+async queryReferralRate(): Promise<number>
+```
+Queries the global referral reward rate in basis points (e.g. `1000` = 10% of accrued fees).
+- **Parameters**: None.
+- **Returns**: `Promise<number>` — Referral share in basis points (0–10000).
+- **Errors**:
+  - Throws `Error` on RPC simulation failure.
+
 ##### `getContractBalance`
 ```ts
 async getContractBalance(asset: string): Promise<string>
@@ -292,6 +438,59 @@ Updates the protocol fee rate (admin only; capped at 1000 bps or 10%).
   - `newFeeBps`: `number` — New rate in basis points.
   - `adminKeypair`: `Keypair`
 - **Returns**: `Promise<TransactionResult>`
+
+##### `setReferralRate`
+```ts
+async setReferralRate(
+  bps: number,
+  adminKeypair: Keypair,
+  nonce?: string | number | bigint
+): Promise<TransactionResult>
+```
+Admin-only. Updates the protocol referral fee sharing rate in basis points.
+- **Parameters**:
+  - `bps`: `number` — Share in basis points (max 10000).
+  - `adminKeypair`: `Keypair` — Signer for the bridge admin account.
+  - `nonce`: `string | number | bigint` (optional) — Admin sequential nonce.
+- **Returns**: `Promise<TransactionResult>`
+- **Errors**:
+  - Returns `{ status: 'failed', error: string }` if caller is not admin, rate exceeds `MAX_REFERRAL_BPS`, or contract is deactivated.
+
+##### `setLoyaltyToken`
+```ts
+async setLoyaltyToken(
+  token: string,
+  amountPerFund: string | number | bigint,
+  adminKeypair: Keypair,
+  nonce?: string | number | bigint
+): Promise<TransactionResult>
+```
+Admin-only. Configures the loyalty reward token contract and the fixed reward distributed to sources on each successful `fund_c_address` execution.
+- **Parameters**:
+  - `token`: `string` — C-address of the loyalty token contract.
+  - `amountPerFund`: `string | number | bigint` — Fixed reward amount in token base units (0 disables rewards).
+  - `adminKeypair`: `Keypair` — Signer for the bridge admin account.
+  - `nonce`: `string | number | bigint` (optional) — Admin sequential nonce.
+- **Returns**: `Promise<TransactionResult>`
+- **Errors**:
+  - Returns `{ status: 'failed', error: string }` if caller is not admin, `amountPerFund < 0`, or contract is deactivated.
+
+##### `setFeeTiers`
+```ts
+async setFeeTiers(
+  tiers: FeeTier[],
+  adminKeypair: Keypair,
+  nonce?: string | number | bigint
+): Promise<TransactionResult>
+```
+Admin-only. Configures volume-based tiered fee brackets for protocol users.
+- **Parameters**:
+  - `tiers`: [`FeeTier[]`](#feetier) — Ordered list of contiguous fee tier brackets.
+  - `adminKeypair`: `Keypair` — Signer for the bridge admin account.
+  - `nonce`: `string | number | bigint` (optional) — Admin sequential nonce.
+- **Returns**: `Promise<TransactionResult>`
+- **Errors**:
+  - Returns `{ status: 'failed', error: string }` if caller is not admin, tiers are out of order, fee exceeds `MAX_FEE_BPS`, or contract is deactivated/paused.
 
 ##### `setFeeCollector`
 ```ts
@@ -390,6 +589,61 @@ Upgrades the contract implementation to a new compiled WASM hash (admin only).
   - `adminKeypair`: `Keypair`
 - **Returns**: `Promise<TransactionResult>`
 
+##### `scheduleUpgrade`
+```ts
+async scheduleUpgrade(
+  options: ScheduleUpgradeOptions,
+  adminKeypair: Keypair
+): Promise<TransactionResult>
+```
+Schedules a timelocked contract WASM upgrade (admin only). Initiates a mandatory 24-hour waiting period before `executeUpgrade` can be called.
+- **Parameters**:
+  - `options`: [`ScheduleUpgradeOptions`](#scheduleupgradeoptions)
+  - `adminKeypair`: `Keypair`
+- **Returns**: `Promise<TransactionResult>`
+- **Errors**:
+  - Returns `{ status: 'failed', error: string }` if caller is not admin, an upgrade is already pending, or contract is deactivated.
+
+##### `executeUpgrade`
+```ts
+async executeUpgrade(
+  options: ExecuteUpgradeOptions,
+  adminKeypair: Keypair
+): Promise<TransactionResult>
+```
+Executes a previously scheduled contract WASM upgrade once the delay has elapsed (admin only).
+- **Parameters**:
+  - `options`: [`ExecuteUpgradeOptions`](#executeupgradeoptions)
+  - `adminKeypair`: `Keypair`
+- **Returns**: `Promise<TransactionResult>`
+- **Errors**:
+  - Returns `{ status: 'failed', error: string }` if caller is not admin, timelock delay has not elapsed, upgrade expired, or hash does not match.
+
+##### `cancelUpgrade`
+```ts
+async cancelUpgrade(
+  options: CancelUpgradeOptions,
+  adminKeypair: Keypair
+): Promise<TransactionResult>
+```
+Cancels an unexecuted pending scheduled contract upgrade (admin only).
+- **Parameters**:
+  - `options`: [`CancelUpgradeOptions`](#cancelupgradeoptions)
+  - `adminKeypair`: `Keypair`
+- **Returns**: `Promise<TransactionResult>`
+- **Errors**:
+  - Returns `{ status: 'failed', error: string }` if caller is not admin, no upgrade is pending, or contract is deactivated.
+
+##### `queryPendingUpgrade`
+```ts
+async queryPendingUpgrade(): Promise<PendingUpgrade | null>
+```
+Queries the details of any scheduled contract upgrade currently awaiting execution.
+- **Parameters**: None.
+- **Returns**: `Promise<PendingUpgrade | null>` — Details of the scheduled upgrade (`newWasmHash`, `executableAfterLedger`, `expiresAfterLedger`) or `null` if none is pending.
+- **Errors**:
+  - Throws `Error` on RPC simulation failure.
+
 ##### `fundCrosschain`
 ```ts
 async fundCrosschain(
@@ -402,6 +656,22 @@ Submits a cross-chain funding transaction verified with relayer signatures (rela
   - `options`: [`CrossChainFundOptions`](#crosschainfundoptions)
   - `relayerKeypair`: `Keypair`
 - **Returns**: `Promise<TransactionResult>`
+
+##### `executeMetaFund`
+```ts
+async executeMetaFund(
+  options: ExecuteMetaFundOptions,
+  relayerKeypair: Keypair
+): Promise<TransactionResult>
+```
+Executes a gasless meta-transaction funding operation signed by a source keypair and submitted by an authorized relayer.
+- **Parameters**:
+  - `options`: [`ExecuteMetaFundOptions`](#executemetafundoptions)
+  - `relayerKeypair`: `Keypair` — Relayer keypair paying the transaction fee.
+- **Returns**: `Promise<TransactionResult>`
+- **Errors**:
+  - Rejects if `params.source`, `params.target`, or `params.asset` addresses are malformed.
+  - Returns `{ status: 'failed', error: string }` if signature verification fails, deadline has expired, nonce is invalid, or the pubkey is not registered for the source.
 
 ##### `addRelayer`
 ```ts
@@ -969,6 +1239,183 @@ Input parameters for simple single-target funding operations.
 | `target` | `string` | Destination C-address. |
 | `asset` | `string` | Token contract address. |
 | `amount` | `string` | Amount in the token's smallest unit (e.g., stroops). |
+
+---
+
+### `FundCAddressWithReferralOptions`
+Options for funding a C-address with referral fee attribution via [`fundCAddressWithReferral`](#fundcaddresswithreferral). Extends [`FundCOptions`](#fundcoptions).
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `source` | `string` | G-address or C-address sending the funds. |
+| `target` | `string` | Destination C-address. |
+| `asset` | `string` | Token contract address. |
+| `amount` | `string` | Amount in the token's smallest unit. |
+| `referrer` | `string` | *Optional*. G-address of the referrer who receives a fee share. |
+| `nonce` | `string \| number \| bigint` | *Optional*. Monotonic sequence number for replay protection. |
+| `deadline` | `string \| number \| bigint` | *Optional*. Unix timestamp deadline after which the tx reverts. |
+
+---
+
+### `CommitFundOptions`
+Parameters for the commit step of a commit-reveal funding operation via [`commitFund`](#commitfund).
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `source` | `string` | G-address or C-address committing the funds. |
+| `target` | `string` | Destination C-address. |
+| `asset` | `string` | Token contract address. |
+| `amountHash` | `string` | 32-byte hex hash produced by `computeCommitmentHash`. |
+| `deadline` | `string \| number \| bigint` | Unix timestamp deadline before which the commitment must be revealed. |
+| `nonce` | `string \| number \| bigint` | *Optional*. Monotonic sequence number for replay protection. |
+
+---
+
+### `RevealFundOptions`
+Parameters for the reveal step of a commit-reveal funding operation via [`revealFund`](#revealfund). Extends [`FundCOptions`](#fundcoptions).
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `commitmentId` | `string \| number \| bigint` | Commitment ID returned by `commitFundAndWait`. |
+| `source` | `string` | G-address of the original committer. |
+| `target` | `string` | Destination C-address matching the commitment. |
+| `asset` | `string` | Token contract address matching the commitment. |
+| `amount` | `string` | Plaintext token amount matching the commitment hash. |
+| `nonce` | `string \| number \| bigint` | Secret blinding nonce used when generating `amountHash`. |
+| `deadline` | `string \| number \| bigint` | *Optional*. Transaction deadline. |
+
+---
+
+### `CommitmentEntry`
+Record representing an active or revealed on-chain commitment returned by [`queryCommitment`](#querycommitment).
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `source` | `string` | Account that created the commitment. |
+| `target` | `string` | Intended recipient C-address. |
+| `asset` | `string` | Token contract address. |
+| `amount_hash` | `unknown` | 32-byte commitment hash bytes. |
+| `deadline` | `string \| number \| bigint` | Unix timestamp expiry deadline for revelation. |
+| `committed_at_ledger` | `number` | Ledger sequence when the commitment was recorded. |
+| `revealed` | `boolean` | `true` if this commitment has already been revealed. |
+
+---
+
+### `FundCTimelockedOptions`
+Parameters for locking funds in escrow for a C-address via [`fundCAddressTimelocked`](#fundcaddresstimelocked). Extends [`FundCOptions`](#fundcoptions).
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `source` | `string` | G-address sending the funds. |
+| `target` | `string` | Destination C-address entitled to claim. |
+| `asset` | `string` | Token contract address. |
+| `amount` | `string` | Amount in the token's smallest unit. |
+| `releaseTime` | `number` | Unix timestamp in seconds after which target can claim funds. |
+| `cliffTime` | `number` | *Optional*. Cliff timestamp in seconds (must be `<= releaseTime`). |
+| `nonce` | `string \| number \| bigint` | *Optional*. Sequence number for replay protection. |
+| `deadline` | `string \| number \| bigint` | *Optional*. Ledger timestamp deadline. |
+
+---
+
+### `TimelockEntry`
+Escrow record returned by [`queryTimelocked`](#querytimelocked).
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `source` | `string` | G-address that funded the timelock. |
+| `target` | `string` | Destination C-address entitled to claim. |
+| `asset` | `string` | Token contract address. |
+| `amount` | `string` | Escrowed amount in base token units. |
+| `releaseTime` | `number` | Unix timestamp after which funds may be claimed. |
+| `cliffTime` | `number` | Cliff timestamp in seconds. |
+| `claimed` | `boolean` | `true` if the funds have already been claimed. |
+
+---
+
+### `FeeTier`
+Defines a volume-based fee rate bracket configured on the bridge.
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `min_volume` | `string \| number \| bigint` | Lower volume bound (inclusive) in asset base units. |
+| `max_volume` | `string \| number \| bigint` | Upper volume bound (inclusive) in asset base units. |
+| `fee_bps` | `number` | Protocol fee in basis points applied within this tier. |
+
+---
+
+### `LoyaltyToken`
+Configuration for protocol loyalty rewards returned by [`queryLoyaltyToken`](#queryloyaltytoken).
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `token` | `string` | Contract address of the loyalty token. |
+| `amount_per_fund` | `string \| number \| bigint` | Fixed token amount rewarded to callers per fund. |
+
+---
+
+### `ScheduleUpgradeOptions`
+Parameters for scheduling a timelocked contract upgrade via [`scheduleUpgrade`](#scheduleupgrade).
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `newWasmHash` | `string` | 32-byte hex hash of the uploaded new contract WASM code. |
+| `nonce` | `string \| number \| bigint` | *Optional*. Admin sequential nonce. |
+
+---
+
+### `ExecuteUpgradeOptions`
+Parameters for executing a scheduled contract upgrade via [`executeUpgrade`](#executeupgrade).
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `expectedHash` | `string` | 32-byte hex hash matching the pending scheduled upgrade. |
+| `nonce` | `string \| number \| bigint` | *Optional*. Admin sequential nonce. |
+
+---
+
+### `CancelUpgradeOptions`
+Parameters for cancelling a pending scheduled contract upgrade via [`cancelUpgrade`](#cancelupgrade).
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `nonce` | `string \| number \| bigint` | *Optional*. Admin sequential nonce. |
+
+---
+
+### `PendingUpgrade`
+Details of a scheduled contract upgrade returned by [`queryPendingUpgrade`](#querypendingupgrade).
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `newWasmHash` | `string` | 32-byte hex hash of the pending contract WASM. |
+| `executableAfterLedger` | `number` | Ledger sequence at or after which upgrade may execute. |
+| `expiresAfterLedger` | `number` | Ledger sequence after which scheduled upgrade expires. |
+
+---
+
+### `MetaFundParams`
+Core payload for gasless meta-transaction funding operations.
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `networkId` | `string` | 32-byte hex hash of the Stellar network passphrase. |
+| `source` | `string` | Account providing the funds. |
+| `target` | `string` | Destination C-address. |
+| `asset` | `string` | Token contract address. |
+| `amount` | `string \| number \| bigint` | Token amount in base units. |
+| `nonce` | `string \| number \| bigint` | Monotonic meta-transaction sequence number for `source`. |
+| `deadline` | `string \| number \| bigint` | Unix timestamp expiry deadline for the signature. |
+
+---
+
+### `ExecuteMetaFundOptions`
+Parameters passed to [`executeMetaFund`](#executemetafund) by an authorized relayer.
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `params` | [`MetaFundParams`](#metafundparams) | Signed funding parameters payload. |
+| `pubkey` | `string` | 32-byte hex Ed25519 public key registered for `params.source`. |
+| `signature` | `string` | 64-byte hex Ed25519 signature over the payload hash. |
 
 ---
 
