@@ -279,7 +279,8 @@ async fn list_events_by_type(
 async fn create_subscription(
     State(state): State<Arc<AppState>>,
     Json(req): Json<webhook::CreateSubscription>,
-) -> Result<(StatusCode, Json<webhook::CreatedSubscription>), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(StatusCode, Json<webhook::CreatedSubscription>), (StatusCode, Json<serde_json::Value>)>
+{
     // Validate the URL before persisting to prevent SSRF via webhook delivery.
     if let Err(e) = webhook::validate_webhook_url(&req.url).await {
         return Err((
@@ -366,6 +367,7 @@ pub struct DeliveryQuery {
     pub offset: Option<i64>,
 }
 
+#[allow(dead_code)]
 async fn list_deliveries(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<DeliveryQuery>,
@@ -382,6 +384,7 @@ async fn list_deliveries(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+#[allow(dead_code)]
 async fn retry_delivery(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -621,7 +624,10 @@ mod auth_tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.headers().get("Access-Control-Allow-Origin").unwrap(),
+            response
+                .headers()
+                .get("Access-Control-Allow-Origin")
+                .unwrap(),
             "*"
         );
     }
