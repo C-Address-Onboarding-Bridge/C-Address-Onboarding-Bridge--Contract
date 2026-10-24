@@ -849,6 +849,49 @@ export interface RelayerManagementOptions {
   nonce?: string | number | bigint;
 }
 
+/**
+ * Options for {@link OnboardingBridgeSDK.pause} and {@link OnboardingBridgeSDK.unpause}.
+ */
+export interface PauseOptions {
+  /** Optional sequential admin nonce for replay protection. */
+  nonce?: string | number | bigint;
+}
+
+/**
+ * Options for blocklist operations ({@link OnboardingBridgeSDK.addToBlocklist},
+ * {@link OnboardingBridgeSDK.removeFromBlocklist}).
+ */
+export interface BlocklistOptions {
+  /** Target G-address or C-address to block or unblock. */
+  address: string;
+
+  /** Optional sequential admin nonce for replay protection. */
+  nonce?: string | number | bigint;
+}
+
+/**
+ * Options for allowlist operations ({@link OnboardingBridgeSDK.addToAllowlist},
+ * {@link OnboardingBridgeSDK.removeFromAllowlist}).
+ */
+export interface AllowlistOptions {
+  /** Target G-address or C-address to allowlist or remove from allowlist. */
+  address: string;
+
+  /** Optional sequential admin nonce for replay protection. */
+  nonce?: string | number | bigint;
+}
+
+/**
+ * Options for {@link OnboardingBridgeSDK.setAllowlistMode}.
+ */
+export interface AllowlistModeOptions {
+  /** Whether allowlist mode is enabled (`true`) or disabled (`false`). */
+  enabled: boolean;
+
+  /** Optional sequential admin nonce for replay protection. */
+  nonce?: string | number | bigint;
+}
+
 // ---------------------------------------------------------------------------
 // C-address creation
 // ---------------------------------------------------------------------------
