@@ -421,9 +421,35 @@ Example:
 - v0.2.x: Bug fixes only
 - v0.1.x: No support
 
+## Indexer Event ID Migration & Re-index Guide (#885)
+
+In issue #885, `IndexedEvent.id` in `bridge-indexer` was updated to derive deterministically from the globally unique Soroban RPC event `id` (`<toid>-<event index>`), preventing duplicate event drops across pagination boundaries when single-transaction batches emit events spanning page limits.
+
+### Upgrade Impact
+Existing events indexed with the legacy composite hash (`sha256(ledger || tx_hash || event_type || first_topic || event_index)`) will have different IDs than newly indexed events. `migration 0003` adds an index on `events(tx_hash)` to optimize event retrieval.
+
+### Optional Re-Index Procedure
+If a deployment requires consistent event IDs across historical and new events, operators can trigger a full re-index:
+
+1. Stop the indexer daemon:
+   ```bash
+   kill -SIGTERM <indexer_pid>
+   ```
+2. Clear the events, deliveries, and state cursor:
+   ```sql
+   DELETE FROM webhook_deliveries;
+   DELETE FROM events;
+   DELETE FROM indexer_state WHERE key = 'last_ledger';
+   ```
+3. Restart the indexer to re-index all events using canonical RPC event IDs:
+   ```bash
+   cargo run --bin bridge-indexer
+   ```
+
 ## See Also
 
 - [DEVELOPER_SETUP.md](DEVELOPER_SETUP.md) — Development environment
 - [TESTING.md](TESTING.md) — Testing guide
 - [README.md](README.md) — Architecture and features
 - [Soroban Documentation](https://developers.stellar.org/learn/soroban)
+
