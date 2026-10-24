@@ -9,7 +9,6 @@
 //!
 //! Output columns: name, cpu_instructions, memory_bytes
 
-#![cfg(test)]
 extern crate std;
 use std::{format, println};
 
