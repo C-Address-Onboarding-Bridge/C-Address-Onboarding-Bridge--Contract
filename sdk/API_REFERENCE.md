@@ -510,6 +510,95 @@ lists the full allowlist.
   - `address`: `string`
 - **Returns**: `Promise<boolean>`
 
+##### `pause`
+```ts
+async pause(adminKeypair: Keypair, nonce?: string | number | bigint): Promise<TransactionResult>
+```
+Pauses the bridge contract (`pause` entry point, admin only).
+- **Parameters**:
+  - `adminKeypair`: `Keypair`
+  - `nonce`: `string | number | bigint` (optional `u64` replay-protection nonce)
+- **Returns**: `Promise<TransactionResult>`
+
+##### `unpause`
+```ts
+async unpause(adminKeypair: Keypair, nonce?: string | number | bigint): Promise<TransactionResult>
+```
+Unpauses the bridge contract (`unpause` entry point, admin only).
+- **Parameters**:
+  - `adminKeypair`: `Keypair`
+  - `nonce`: `string | number | bigint` (optional `u64` replay-protection nonce)
+- **Returns**: `Promise<TransactionResult>`
+
+##### `isPaused`
+```ts
+async isPaused(): Promise<boolean>
+```
+Queries whether the bridge contract is currently paused (`query_is_paused`).
+- **Returns**: `Promise<boolean>`
+
+##### `addToBlocklist`
+```ts
+async addToBlocklist(adminKeypair: Keypair, address: string, nonce?: string | number | bigint): Promise<TransactionResult>
+```
+Adds `address` to the on-chain blocklist (`add_to_blocklist`, admin only).
+- **Parameters**:
+  - `adminKeypair`: `Keypair`
+  - `address`: `string`
+  - `nonce`: `string | number | bigint` (optional `u64` replay-protection nonce)
+- **Returns**: `Promise<TransactionResult>`
+
+##### `removeFromBlocklist`
+```ts
+async removeFromBlocklist(adminKeypair: Keypair, address: string, nonce?: string | number | bigint): Promise<TransactionResult>
+```
+Removes `address` from the on-chain blocklist (`remove_from_blocklist`, admin only).
+- **Parameters**:
+  - `adminKeypair`: `Keypair`
+  - `address`: `string`
+  - `nonce`: `string | number | bigint` (optional `u64` replay-protection nonce)
+- **Returns**: `Promise<TransactionResult>`
+
+##### `addToAllowlist`
+```ts
+async addToAllowlist(adminKeypair: Keypair, address: string, nonce?: string | number | bigint): Promise<TransactionResult>
+```
+Adds `address` to the on-chain allowlist (`add_to_allowlist`, admin only).
+- **Parameters**:
+  - `adminKeypair`: `Keypair`
+  - `address`: `string`
+  - `nonce`: `string | number | bigint` (optional `u64` replay-protection nonce)
+- **Returns**: `Promise<TransactionResult>`
+
+##### `removeFromAllowlist`
+```ts
+async removeFromAllowlist(adminKeypair: Keypair, address: string, nonce?: string | number | bigint): Promise<TransactionResult>
+```
+Removes `address` from the on-chain allowlist (`remove_from_allowlist`, admin only).
+- **Parameters**:
+  - `adminKeypair`: `Keypair`
+  - `address`: `string`
+  - `nonce`: `string | number | bigint` (optional `u64` replay-protection nonce)
+- **Returns**: `Promise<TransactionResult>`
+
+##### `setAllowlistMode`
+```ts
+async setAllowlistMode(adminKeypair: Keypair, enabled: boolean, nonce?: string | number | bigint): Promise<TransactionResult>
+```
+Enables or disables allowlist mode on the contract (`set_allowlist_mode`, admin only).
+- **Parameters**:
+  - `adminKeypair`: `Keypair`
+  - `enabled`: `boolean`
+  - `nonce`: `string | number | bigint` (optional `u64` replay-protection nonce)
+- **Returns**: `Promise<TransactionResult>`
+
+##### `getAllowlistMode`
+```ts
+async getAllowlistMode(): Promise<boolean>
+```
+Queries whether allowlist mode is currently enabled (`query_allowlist_mode`).
+- **Returns**: `Promise<boolean>`
+
 ##### `estimateCost`
 ```ts
 async estimateCost(options: FundCOptions): Promise<CostEstimate>
