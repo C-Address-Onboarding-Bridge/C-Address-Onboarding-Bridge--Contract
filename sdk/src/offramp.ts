@@ -43,11 +43,13 @@ import { assertAccountAddress, assertContractAddress } from './validate';
  * ```
  */
 export function signUrl(url: string, secretKey: string): string {
-  const queryIndex = url.indexOf('?');
-  const query = queryIndex === -1 ? '' : url.slice(queryIndex + 1);
-  const signature = createHmac('sha256', secretKey).update(query).digest('base64');
-  const separator = queryIndex === -1 ? '?' : '&';
-  return `${url}${separator}signature=${encodeURIComponent(signature)}`;
+  const parsed = new URL(url);
+  parsed.searchParams.delete('signature');
+  const signature = createHmac('sha256', secretKey)
+    .update(parsed.search)
+    .digest('base64');
+  parsed.searchParams.set('signature', signature);
+  return parsed.toString();
 }
 
 /**
