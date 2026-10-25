@@ -959,7 +959,9 @@ mod tests {
             db,
             rpc_url: "http://localhost".to_string(),
             contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
             webhook_client: reqwest::Client::new(),
+            api_key_hash: "test-hash".to_string(),
             lookback_ledgers: 0,
         };
 

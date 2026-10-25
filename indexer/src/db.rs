@@ -36,6 +36,13 @@ pub struct Database {
     pub(crate) pool: SqlitePool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryResult {
+    Success,
+    NotFound,
+    Conflict,
+}
+
 impl Database {
     pub async fn new(url: &str) -> Self {
         let options = SqliteConnectOptions::from_str(url)
@@ -153,7 +160,7 @@ impl Database {
             "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, secret, created_at
              FROM subscriptions WHERE active = 1",
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await?;
 
         let now = chrono::Utc::now().to_rfc3339();
@@ -186,7 +193,7 @@ impl Database {
             .bind(&sub_id)
             .bind(&event.id)
             .bind(&now)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
         Ok(())
@@ -548,19 +555,36 @@ impl Database {
             .collect())
     }
 
-    pub async fn retry_delivery(&self, id: &str) -> Result<bool, sqlx::Error> {
+
+    pub async fn retry_delivery(&self, id: &str) -> Result<RetryResult, sqlx::Error> {
+        let current: Option<(String,)> = sqlx::query_as(
+            "SELECT status FROM webhook_deliveries WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let (status,) = match current {
+            Some(row) => row,
+            None => return Ok(RetryResult::NotFound),
+        };
+
+        if status != "dead" {
+            return Ok(RetryResult::Conflict);
+        }
+
         let now = chrono::Utc::now().to_rfc3339();
-        let result = sqlx::query(
+        sqlx::query(
             "UPDATE webhook_deliveries
              SET status = 'pending', next_retry_at = ?2, attempts = 0
-             WHERE id = ?1",
+             WHERE id = ?1 AND status = 'dead'",
         )
         .bind(id)
         .bind(&now)
         .execute(&self.pool)
         .await?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(RetryResult::Success)
     }
 
     pub async fn get_stats(&self) -> Result<serde_json::Value, sqlx::Error> {

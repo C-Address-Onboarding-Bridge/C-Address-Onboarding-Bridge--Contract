@@ -67,6 +67,8 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         )
         .route("/api/subscriptions/:id", delete(delete_subscription))
         .route("/api/replay", post(replay_events))
+        .route("/api/deliveries", get(list_deliveries))
+        .route("/api/deliveries/:id/retry", post(retry_delivery))
 }
 
 pub fn build_app(state: Arc<AppState>) -> Router {
@@ -374,8 +376,8 @@ async fn list_deliveries(
         .db
         .list_deliveries(
             params.status.as_deref(),
-            params.limit.unwrap_or(50),
-            params.offset.unwrap_or(0),
+            events::clamp_limit(params.limit, 50),
+            events::clamp_offset(params.offset),
         )
         .await
         .map(Json)
@@ -387,8 +389,9 @@ async fn retry_delivery(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     match state.db.retry_delivery(&id).await {
-        Ok(true) => Ok(StatusCode::OK),
-        Ok(false) => Err(StatusCode::NOT_FOUND),
+        Ok(db::RetryResult::Success) => Ok(StatusCode::OK),
+        Ok(db::RetryResult::NotFound) => Err(StatusCode::NOT_FOUND),
+        Ok(db::RetryResult::Conflict) => Err(StatusCode::CONFLICT),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -581,6 +584,50 @@ mod auth_tests {
     }
 
     #[tokio::test]
+    async fn test_unauthenticated_get_deliveries_is_rejected() {
+        let app = test_app("secret-key").await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/deliveries")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "GET /api/deliveries without token must return 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_post_delivery_retry_is_rejected() {
+        let app = test_app("secret-key").await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/deliveries/deliv-1/retry")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "POST /api/deliveries/:id/retry without token must return 401"
+        );
+    }
+
+    #[tokio::test]
     async fn test_public_routes_do_not_require_auth() {
         let app = test_app("secret-key").await;
 
@@ -702,6 +749,170 @@ mod route_tests {
             response.status(),
             StatusCode::OK,
             "GET /api/subscriptions must be routed under protected_routes"
+        );
+    }
+
+    async fn insert_test_event_and_sub(db: &db::Database, event_id: &str, sub_id: &str) {
+        let event = events::IndexedEvent {
+            id: event_id.to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 10,
+            contract_id: "C_TEST".to_string(),
+            tx_hash: "abcd".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({}),
+        };
+        db.insert_event(&event).await.unwrap();
+
+        sqlx::query(
+            "INSERT OR IGNORE INTO subscriptions (id, url, created_at, secret) VALUES (?1, 'http://example.com', '2024-01-01T00:00:00Z', 'sec')",
+        )
+        .bind(sub_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_deliveries_is_in_protected_routes() {
+        let state = mock_app_state().await;
+        let app = protected_routes().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/deliveries")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "GET /api/deliveries must be routed under protected_routes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_retry_delivery_is_in_protected_routes() {
+        let state = mock_app_state().await;
+        let app = protected_routes().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/deliveries/non-existent-id/retry")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "POST /api/deliveries/:id/retry must be routed under protected_routes (returning 404 for unknown id)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_delivered_row_returns_409() {
+        let state = mock_app_state().await;
+        insert_test_event_and_sub(&state.db, "evt-1", "sub-1").await;
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
+             VALUES ('deliv-1', 'sub-1', 'evt-1', 'delivered', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+
+        let app = protected_routes().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/deliveries/deliv-1/retry")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "POST /api/deliveries/:id/retry for already-delivered row must return 409 CONFLICT"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_dead_row_succeeds() {
+        let state = mock_app_state().await;
+        insert_test_event_and_sub(&state.db, "evt-dead", "sub-dead").await;
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
+             VALUES ('deliv-dead', 'sub-dead', 'evt-dead', 'dead', 5, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&state.db.pool)
+        .await
+        .unwrap();
+
+        let app = protected_routes().with_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/deliveries/deliv-dead/retry")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "POST /api/deliveries/:id/retry for dead row must return 200 OK"
+        );
+
+        let (status, attempts): (String, i64) = sqlx::query_as(
+            "SELECT status, attempts FROM webhook_deliveries WHERE id = 'deliv-dead'",
+        )
+        .fetch_one(&state.db.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(status, "pending");
+        assert_eq!(attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_deliveries_clamps_query_params() {
+        let state = mock_app_state().await;
+        let app = protected_routes().with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/deliveries?limit=-10&offset=-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "GET /api/deliveries with negative limit/offset must clamp and return 200"
         );
     }
 }
