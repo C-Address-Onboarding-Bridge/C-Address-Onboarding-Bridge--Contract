@@ -25,8 +25,6 @@ This document provides a comprehensive API reference for all exported classes, i
    - [ConfirmedTransactionResult](#confirmedtransactionresult)
    - [FundCAddressWithSwapOptions](#fundcaddresswithswapoptions)
    - [CrossChainFundOptions](#crosschainfundoptions)
-   - [CreateCOptions](#createcoptions)
-   - [CreateCAddressResult](#createcaddressresult)
    - [PaginatedResult](#paginatedresult)
    - [PaginationOptions](#paginationoptions)
    - [CostEstimate](#costestimate)
@@ -110,7 +108,7 @@ Funds a single C-address from a source account. The source account must have pre
 ```ts
 async fundCAddressWithSwap(
   options: FundCAddressWithSwapOptions,
-  sourceKeypair: any
+  sourceKeypair: Keypair
 ): Promise<TransactionResult>
 ```
 Funds a C-address by first swapping a source asset to a target asset via DEX pools, deducting the fee, and forwarding the remaining net amount.
@@ -454,17 +452,6 @@ async queryRelayerThreshold(): Promise<number>
 ```
 Queries the current signature threshold for cross-chain transactions.
 - **Returns**: `Promise<number>`
-
-##### `createCAddress`
-```ts
-async createCAddress(
-  options: CreateCOptions
-): Promise<CreateCAddressResult>
-```
-Deploys a new C-address contract deterministically and optionally funds it immediately.
-- **Parameters**:
-  - `options`: [`CreateCOptions`](#createcoptions)
-- **Returns**: `Promise<CreateCAddressResult>`
 
 ##### `queryIsRelayer`
 ```ts
@@ -965,10 +952,12 @@ Input parameters for simple single-target funding operations.
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `source` | `string` | G-address or C-address sending the funds. |
+| `source` | `string` | G-address sending the funds. |
 | `target` | `string` | Destination C-address. |
 | `asset` | `string` | Token contract address. |
 | `amount` | `string` | Amount in the token's smallest unit (e.g., stroops). |
+| `nonce` | `string \| number \| bigint` | *Optional*. Sequential nonce for replay protection. |
+| `deadline` | `string \| number \| bigint` | *Optional*. Unix timestamp (seconds) after which the transaction expires. |
 
 ---
 
@@ -981,6 +970,8 @@ Input parameters for multi-target batch funding operations.
 | `targets` | `string[]` | Array of destination C-addresses. |
 | `amounts` | `string[]` | Array of amounts corresponding to each target address. |
 | `asset` | `string` | Token contract address. |
+| `nonce` | `string \| number \| bigint` | *Optional*. Sequential nonce for replay protection. |
+| `deadline` | `string \| number \| bigint` | *Optional*. Unix timestamp (seconds) after which the transaction expires. |
 
 ---
 
@@ -991,6 +982,7 @@ Parameters for fee collection.
 | :--- | :--- | :--- |
 | `asset` | `string` | Token contract address to collect. |
 | `amount` | `string` | Amount in smallest unit. |
+| `nonce` | `string \| number \| bigint` | *Optional*. Sequential nonce for replay protection. |
 
 ---
 
@@ -1058,27 +1050,6 @@ Parameters for bridge relay submissions.
 | `asset` | `string` | Whitelisted token contract on Soroban. |
 | `amount` | `string` | Total gross amount. |
 | `sigs` | `RelayerSig[]` | Attestations signed by authorized relayers. |
-
----
-
-### `CreateCOptions`
-Options to deploy a new C-address contract deterministically.
-
-| Field | Type | Description |
-| :--- | :--- | :--- |
-| `deployerKeypair` | `any` | Deployer's keypair. |
-| `salt` | `string` | *Optional*. 32-byte hex salt for address derivation. |
-| `initialFunds` | `{ asset: string, amount: string }` | *Optional*. Initial transfer details. |
-
----
-
-### `CreateCAddressResult`
-The return value of C-address deployment.
-
-| Field | Type | Description |
-| :--- | :--- | :--- |
-| `cAddress` | `string` | Deployed contract C-address. |
-| `txHash` | `string` | Transaction hash. |
 
 ---
 
