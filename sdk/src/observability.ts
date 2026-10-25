@@ -287,18 +287,27 @@ export async function withRpcHook<T>(
  * [bridge-sdk] tx:ok     fundCAddress {"hash":"abc...","status":"pending"} 185ms
  * ```
  */
+
+/**
+ * Replacer for JSON.stringify that converts BigInt values to string
+ * to prevent TypeError: Do not know how to serialize a BigInt.
+ */
+function bigintReplacer(_key: string, value: unknown): unknown {
+  return typeof value === 'bigint' ? value.toString() : value;
+}
+
 export const ConsoleLogger: ObservabilityHooks = {
   onTransactionStart(method: string, params: unknown): void {
     console.log(
       `[bridge-sdk] tx:start  ${method}`,
-      JSON.stringify(params, null, 0),
+      JSON.stringify(params, bigintReplacer, 0),
     );
   },
 
   onTransactionSuccess(method: string, result: unknown, durationMs: number): void {
     console.log(
       `[bridge-sdk] tx:ok     ${method}`,
-      JSON.stringify(result, null, 0),
+      JSON.stringify(result, bigintReplacer, 0),
       `${durationMs}ms`,
     );
   },
@@ -314,7 +323,7 @@ export const ConsoleLogger: ObservabilityHooks = {
   onRpcCall(method: string, params: unknown, durationMs: number): void {
     console.log(
       `[bridge-sdk] rpc:call  ${method}`,
-      JSON.stringify(params, null, 0),
+      JSON.stringify(params, bigintReplacer, 0),
       `${durationMs}ms`,
     );
   },
@@ -427,7 +436,7 @@ export function createOpenTelemetryHooks(
       span.setAttribute('bridge.method', method);
       // Safely stringify params (may contain non-serialisable values)
       try {
-        span.setAttribute('bridge.params', JSON.stringify(params));
+        span.setAttribute('bridge.params', JSON.stringify(params, bigintReplacer));
       } catch {
         span.setAttribute('bridge.params', '[unserializable]');
       }
@@ -479,7 +488,7 @@ export function createOpenTelemetryHooks(
       span.setAttribute('rpc.method', method);
       span.setAttribute('rpc.duration_ms', durationMs);
       try {
-        span.setAttribute('rpc.params', JSON.stringify(params));
+        span.setAttribute('rpc.params', JSON.stringify(params, bigintReplacer));
       } catch {
         span.setAttribute('rpc.params', '[unserializable]');
       }
