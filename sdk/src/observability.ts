@@ -86,10 +86,9 @@ export interface ObservabilityHooks {
   onTransactionStart?: (method: string, params: unknown) => void;
 
   /**
-   * Called when a mutating SDK method completes without throwing.
-   * Note: `status: 'failed'` results still trigger this hook; check
-   * `result.status` if you want to distinguish submission failures from
-   * network errors.
+   * Called when a mutating SDK method completes successfully.
+   * Results with `status: 'failed'` (or array results with any failed elements)
+   * are routed to `onTransactionError` instead.
    *
    * @param method     - The SDK method name.
    * @param result     - The {@link TransactionResult} (or array of results for batch calls).
@@ -98,13 +97,12 @@ export interface ObservabilityHooks {
   onTransactionSuccess?: (method: string, result: unknown, durationMs: number) => void;
 
   /**
-   * Called when a mutating SDK method throws an unexpected exception.
-   * Normal `status: 'failed'` returns do NOT trigger this; only unhandled
-   * exceptions propagated out of the method do.
+   * Called when a mutating SDK method fails, either by throwing an exception
+   * or by returning a failed result (`status: 'failed'` or array with failed items).
    *
    * @param method     - The SDK method name.
-   * @param error      - The caught exception.
-   * @param durationMs - Wall-clock milliseconds elapsed before the throw.
+   * @param error      - The error (caught exception or error from failed result).
+   * @param durationMs - Wall-clock milliseconds elapsed before failure.
    */
   onTransactionError?: (method: string, error: Error, durationMs: number) => void;
 
@@ -117,8 +115,16 @@ export interface ObservabilityHooks {
    *                     `'getAccount'`, `'sendTransaction'`).
    * @param params     - Relevant call parameters for correlation (e.g. contract method name).
    * @param durationMs - Wall-clock milliseconds the call took.
+   * @param success    - Whether the RPC call completed successfully (`true`) or threw (`false`).
+   * @param error      - The Error if the RPC call threw an exception, or undefined on success.
    */
-  onRpcCall?: (method: string, params: unknown, durationMs: number) => void;
+  onRpcCall?: (
+    method: string,
+    params: unknown,
+    durationMs: number,
+    success?: boolean,
+    error?: Error,
+  ) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -197,9 +203,11 @@ export function fireRpcCall(
   method: string,
   params: unknown,
   durationMs: number,
+  success = true,
+  error?: Error,
 ): void {
   if (hooks?.onRpcCall) {
-    safeInvoke('onRpcCall', () => hooks.onRpcCall!(method, params, durationMs));
+    safeInvoke('onRpcCall', () => hooks.onRpcCall!(method, params, durationMs, success, error));
   }
 }
 
@@ -207,7 +215,8 @@ export function fireRpcCall(
  * Helper that wraps an async function with transaction lifecycle hooks.
  *
  * Records `onTransactionStart` before execution, `onTransactionSuccess` on
- * return, and `onTransactionError` if the function throws.
+ * return for successful transactions, and `onTransactionError` if the function
+ * throws or returns a failed status (`status === 'failed'`).
  *
  * @internal
  */
@@ -221,7 +230,25 @@ export async function withTransactionHooks<T>(
   const start = Date.now();
   try {
     const result = await fn();
-    fireTransactionSuccess(hooks, method, result, Date.now() - start);
+    const duration = Date.now() - start;
+
+    let failureError: Error | null = null;
+    if (Array.isArray(result)) {
+      const failed = result.find(
+        (r: any) => r && typeof r === 'object' && r.status === 'failed',
+      );
+      if (failed) {
+        failureError = new Error((failed as any).error || 'One or more transactions failed');
+      }
+    } else if (result && typeof result === 'object' && (result as any).status === 'failed') {
+      failureError = new Error((result as any).error || 'Transaction failed');
+    }
+
+    if (failureError) {
+      fireTransactionError(hooks, method, failureError, duration);
+    } else {
+      fireTransactionSuccess(hooks, method, result, duration);
+    }
     return result;
   } catch (err: any) {
     fireTransactionError(
@@ -236,7 +263,7 @@ export async function withTransactionHooks<T>(
 
 /**
  * Helper that wraps an async RPC call and fires `onRpcCall` when it completes
- * (whether successfully or not).
+ * (whether successfully or not), indicating success status and any caught error.
  *
  * @internal
  */
@@ -248,9 +275,13 @@ export async function withRpcHook<T>(
 ): Promise<T> {
   const start = Date.now();
   try {
-    return await fn();
-  } finally {
-    fireRpcCall(hooks, rpcMethod, params, Date.now() - start);
+    const result = await fn();
+    fireRpcCall(hooks, rpcMethod, params, Date.now() - start, true);
+    return result;
+  } catch (err: any) {
+    const error = err instanceof Error ? err : new Error(String(err));
+    fireRpcCall(hooks, rpcMethod, params, Date.now() - start, false, error);
+    throw err;
   }
 }
 
@@ -311,12 +342,27 @@ export const ConsoleLogger: ObservabilityHooks = {
     );
   },
 
-  onRpcCall(method: string, params: unknown, durationMs: number): void {
-    console.log(
-      `[bridge-sdk] rpc:call  ${method}`,
-      JSON.stringify(params, null, 0),
-      `${durationMs}ms`,
-    );
+  onRpcCall(
+    method: string,
+    params: unknown,
+    durationMs: number,
+    success = true,
+    error?: Error,
+  ): void {
+    if (!success || error) {
+      console.error(
+        `[bridge-sdk] rpc:error ${method}`,
+        error ? error.message : 'failed',
+        JSON.stringify(params, null, 0),
+        `${durationMs}ms`,
+      );
+    } else {
+      console.log(
+        `[bridge-sdk] rpc:call  ${method}`,
+        JSON.stringify(params, null, 0),
+        `${durationMs}ms`,
+      );
+    }
   },
 };
 
@@ -351,9 +397,9 @@ interface OtelTracer {
  * SpanStatusCode enum values as numeric constants so this file compiles
  * without a hard dependency on `@opentelemetry/api`.
  * - `0` = UNSET, `1` = OK, `2` = ERROR
- * @internal
  */
-const SpanStatusCode = { UNSET: 0, OK: 1, ERROR: 2 } as const;
+export const SpanStatusCode = { UNSET: 0, OK: 1, ERROR: 2 } as const;
+export type SpanStatusCode = (typeof SpanStatusCode)[keyof typeof SpanStatusCode];
 
 /**
  * Options for {@link createOpenTelemetryHooks}.
@@ -441,6 +487,9 @@ export function createOpenTelemetryHooks(
 
       span.setAttribute('bridge.duration_ms', durationMs);
 
+      let isFailure = false;
+      let failureMessage: string | undefined;
+
       // Extract hash and status from TransactionResult (or array of results)
       if (Array.isArray(result)) {
         const hashes = result
@@ -448,16 +497,34 @@ export function createOpenTelemetryHooks(
           .filter(Boolean)
           .join(',');
         span.setAttribute('bridge.tx.hashes', hashes);
-        const anyFailed = result.some((r: any) => r?.status === 'failed');
-        span.setAttribute('bridge.tx.status', anyFailed ? 'partial_failure' : 'pending');
+        const failedItem = result.find((r: any) => r?.status === 'failed');
+        if (failedItem) {
+          isFailure = true;
+          failureMessage = failedItem.error || 'Batch transaction partial failure';
+          span.setAttribute('bridge.tx.status', 'partial_failure');
+          if (failedItem.error) span.setAttribute('bridge.tx.error', failedItem.error);
+        } else {
+          span.setAttribute('bridge.tx.status', 'pending');
+        }
       } else if (result && typeof result === 'object') {
         const r = result as any;
         if (r.hash != null) span.setAttribute('bridge.tx.hash', r.hash);
         if (r.status != null) span.setAttribute('bridge.tx.status', r.status);
         if (r.error != null) span.setAttribute('bridge.tx.error', r.error);
+        if (r.status === 'failed' || r.error != null) {
+          isFailure = true;
+          failureMessage = r.error || 'Transaction failed';
+        }
       }
 
-      span.setStatus({ code: SpanStatusCode.OK });
+      if (isFailure) {
+        span.setStatus({
+          code: SpanStatusCode.ERROR,
+          ...(failureMessage ? { message: failureMessage } : {}),
+        });
+      } else {
+        span.setStatus({ code: SpanStatusCode.OK });
+      }
       span.end();
     },
 
@@ -472,7 +539,13 @@ export function createOpenTelemetryHooks(
       span.end();
     },
 
-    onRpcCall(method: string, params: unknown, durationMs: number): void {
+    onRpcCall(
+      method: string,
+      params: unknown,
+      durationMs: number,
+      success?: boolean,
+      error?: Error,
+    ): void {
       if (!traceRpcCalls) return;
 
       const span = tracer.startSpan(`${spanPrefix}/rpc/${method}`);
@@ -483,7 +556,17 @@ export function createOpenTelemetryHooks(
       } catch {
         span.setAttribute('rpc.params', '[unserializable]');
       }
-      span.setStatus({ code: SpanStatusCode.OK });
+      if (success === false || error) {
+        span.setStatus({
+          code: SpanStatusCode.ERROR,
+          ...(error ? { message: error.message } : {}),
+        });
+        if (error) {
+          span.recordException(error);
+        }
+      } else {
+        span.setStatus({ code: SpanStatusCode.OK });
+      }
       span.end();
     },
   };
@@ -535,10 +618,12 @@ export function composeHooks(...hooks: ObservabilityHooks[]): ObservabilityHooks
         }
       }
     },
-    onRpcCall(method, params, durationMs) {
+    onRpcCall(method, params, durationMs, success, error) {
       for (const h of hooks) {
         if (h.onRpcCall) {
-          safeInvoke('onRpcCall', () => h.onRpcCall!(method, params, durationMs));
+          safeInvoke('onRpcCall', () =>
+            h.onRpcCall!(method, params, durationMs, success, error),
+          );
         }
       }
     },

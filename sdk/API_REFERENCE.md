@@ -1183,9 +1183,9 @@ Instrumentation callbacks, passed as `BridgeConfig.hooks`. Supply any subset. Ex
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `onTransactionStart` | `(method: string, params: unknown) => void` | *Optional*. Fires before a mutating method runs. `params` excludes keypairs. |
-| `onTransactionSuccess` | `(method: string, result: unknown, durationMs: number) => void` | *Optional*. Fires when a mutating method returns without throwing — including `status: 'failed'` results. |
-| `onTransactionError` | `(method: string, error: Error, durationMs: number) => void` | *Optional*. Fires only on an unhandled exception, not on a `'failed'` result. |
-| `onRpcCall` | `(method: string, params: unknown, durationMs: number) => void` | *Optional*. Fires after every internal RPC call, whether it succeeded or failed. |
+| `onTransactionSuccess` | `(method: string, result: unknown, durationMs: number) => void` | *Optional*. Fires when a mutating method succeeds. Results with `status: 'failed'` (or array results with any failed elements) are routed to `onTransactionError`. |
+| `onTransactionError` | `(method: string, error: Error, durationMs: number) => void` | *Optional*. Fires when a mutating method throws an exception or returns a failed result (`status: 'failed'`). |
+| `onRpcCall` | `(method: string, params: unknown, durationMs: number, success?: boolean, error?: Error) => void` | *Optional*. Fires after every internal RPC call, reporting duration, `success` flag, and any thrown `error`. |
 
 ---
 

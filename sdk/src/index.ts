@@ -77,7 +77,7 @@ export type {
 } from './retry';
 
 // Issue #214: Observability hooks + OpenTelemetry integration
-export { ConsoleLogger, createOpenTelemetryHooks, composeHooks } from './observability';
+export { ConsoleLogger, createOpenTelemetryHooks, composeHooks, SpanStatusCode } from './observability';
 export type { ObservabilityHooks, OpenTelemetryHooksOptions } from './observability';
 
 // Issue #57: Event subscription
