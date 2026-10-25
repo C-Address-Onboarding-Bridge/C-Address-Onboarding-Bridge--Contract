@@ -3,7 +3,7 @@ use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -29,14 +29,13 @@ pub enum UrlValidationError {
 impl std::fmt::Display for UrlValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidUrl(s) => write!(f, "invalid URL: {}", s),
+            Self::InvalidUrl(s) => write!(f, "invalid URL: {s}"),
             Self::ForbiddenScheme(s) => write!(
                 f,
-                "forbidden scheme '{}': only http and https are allowed",
-                s
+                "forbidden scheme '{s}': only http and https are allowed"
             ),
-            Self::PrivateOrReservedHost(s) => write!(f, "private/reserved host rejected: {}", s),
-            Self::UnresolvableHost(s) => write!(f, "host could not be resolved: {}", s),
+            Self::PrivateOrReservedHost(s) => write!(f, "private/reserved host rejected: {s}"),
+            Self::UnresolvableHost(s) => write!(f, "host could not be resolved: {s}"),
         }
     }
 }
@@ -44,6 +43,7 @@ impl std::fmt::Display for UrlValidationError {
 /// Returns `true` if the IP address falls in a private, loopback, link-local,
 /// or otherwise reserved range that must not be reachable from the indexer.
 fn is_private_or_reserved(ip: IpAddr) -> bool {
+    let ip = unwrap_ipv4_mapped_or_compatible(ip);
     match ip {
         IpAddr::V4(v4) => {
             v4.is_loopback()           // 127.0.0.0/8
@@ -72,16 +72,44 @@ fn is_private_or_reserved(ip: IpAddr) -> bool {
                 || ((v6.segments()[0] & 0xFE00) == 0xFC00)
                 // fe80::/10 — link-local
                 || ((v6.segments()[0] & 0xFFC0) == 0xFE80)
+                // fec0::/10 — deprecated site-local
+                || ((v6.segments()[0] & 0xFFC0) == 0xFEC0)
+                // 2001:db8::/32 — documentation prefix
+                || (v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0DB8)
+                // 100::/64 — discard-only prefix (RFC 6666)
+                || (v6.segments()[0] == 0x0100
+                    && v6.segments()[1] == 0
+                    && v6.segments()[2] == 0
+                    && v6.segments()[3] == 0)
         }
     }
 }
 
-/// Check if an IPv6 address is IPv4-mapped or compatible, and if so, return the
-/// embedded IPv4 address. Otherwise return the original IPv6 address.
+/// Check if an IPv6 address is IPv4-mapped, IPv4-compatible, NAT64, or 6to4, and if so,
+/// return the embedded IPv4 address. Otherwise return the original IPv6 address.
 fn unwrap_ipv4_mapped_or_compatible(ip: IpAddr) -> IpAddr {
     if let IpAddr::V6(v6) = ip {
+        // 1. IPv4-mapped (::ffff:a.b.c.d)
         if let Some(v4) = v6.to_ipv4_mapped() {
             return IpAddr::V4(v4);
+        }
+
+        let oct = v6.octets();
+        let seg = v6.segments();
+
+        // 2. IPv4-compatible (::a.b.c.d) — 96 leading zero bits
+        if seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
+            return IpAddr::V4(Ipv4Addr::new(oct[12], oct[13], oct[14], oct[15]));
+        }
+
+        // 3. NAT64 Well-Known Prefix (64:ff9b::/96)
+        if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
+            return IpAddr::V4(Ipv4Addr::new(oct[12], oct[13], oct[14], oct[15]));
+        }
+
+        // 4. 6to4 prefix (2002::/16) — embedded IPv4 in octets 2..6 (segments 1 and 2)
+        if seg[0] == 0x2002 {
+            return IpAddr::V4(Ipv4Addr::new(oct[2], oct[3], oct[4], oct[5]));
         }
     }
     ip
@@ -90,7 +118,7 @@ fn unwrap_ipv4_mapped_or_compatible(ip: IpAddr) -> IpAddr {
 /// Generate the signature for a webhook payload.
 /// Signature is: sha256=<hex(hmac_sha256(secret, timestamp + "." + body))>
 fn generate_signature(secret: &str, timestamp: &str, body: &str) -> String {
-    let message = format!("{}.{}", timestamp, body);
+    let message = format!("{timestamp}.{body}");
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
         .expect("HMAC can take key of any size");
     mac.update(message.as_bytes());
@@ -608,6 +636,72 @@ mod tests {
     async fn test_ipv4_zero_range_is_rejected() {
         // 0.0.0.1 is in 0.0.0.0/8
         let err = validate_webhook_url("http://0.0.0.1/hook").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nat64_mapped_ipv4_metadata_is_rejected() {
+        // 64:ff9b::a9fe:a9fe embeds 169.254.169.254 (EC2 metadata)
+        let err = validate_webhook_url("http://[64:ff9b::a9fe:a9fe]/").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_6to4_mapped_ipv4_loopback_is_rejected() {
+        // 2002:7f00:1:: embeds 127.0.0.1 (loopback)
+        let err = validate_webhook_url("http://[2002:7f00:1::]/").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ipv4_compatible_loopback_is_rejected() {
+        // ::7f00:1 embeds 127.0.0.1 (loopback)
+        let err = validate_webhook_url("http://[::7f00:1]/").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_site_local_ipv6_is_rejected() {
+        // fec0::1 is deprecated site-local
+        let err = validate_webhook_url("http://[fec0::1]/").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_documentation_ipv6_is_rejected() {
+        // 2001:db8::1 is documentation prefix
+        let err = validate_webhook_url("http://[2001:db8::1]/").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_discard_prefix_ipv6_is_rejected() {
+        // 100::1 is discard-only prefix
+        let err = validate_webhook_url("http://[100::1]/").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
