@@ -28,6 +28,7 @@ use soroban_sdk::{
 pub enum BTDataKey {
     Admin,
     Balance,
+    Allowance,
 }
 
 #[contract]
@@ -65,6 +66,47 @@ impl BenchToken {
         e.storage()
             .persistent()
             .set(&(BTDataKey::Balance, to), &(tb + amount));
+    }
+    pub fn approve(e: Env, from: Address, spender: Address, amount: i128, _expiration_ledger: u32) {
+        from.require_auth();
+        if amount < 0 {
+            panic!("negative allowance");
+        }
+        e.storage()
+            .persistent()
+            .set(&(BTDataKey::Allowance, from, spender), &amount);
+    }
+    pub fn allowance(e: Env, from: Address, spender: Address) -> i128 {
+        e.storage()
+            .persistent()
+            .get(&(BTDataKey::Allowance, from, spender))
+            .unwrap_or(0)
+    }
+    pub fn transfer_from(e: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        spender.require_auth();
+        if amount < 0 {
+            panic!("negative amount");
+        }
+        let current_allowance = Self::allowance(e.clone(), from.clone(), spender.clone());
+        if current_allowance < amount {
+            panic!("insufficient allowance");
+        }
+        let fb = Self::balance(e.clone(), from.clone());
+        if fb < amount {
+            panic!("insufficient balance");
+        }
+        e.storage()
+            .persistent()
+            .set(&(BTDataKey::Allowance, from.clone(), spender), &(current_allowance - amount));
+        if from != to {
+            let tb = Self::balance(e.clone(), to.clone());
+            e.storage()
+                .persistent()
+                .set(&(BTDataKey::Balance, from), &(fb - amount));
+            e.storage()
+                .persistent()
+                .set(&(BTDataKey::Balance, to), &(tb + amount));
+        }
     }
 }
 
@@ -641,7 +683,6 @@ fn bench_fund_c_address_with_swap() {
 
 // ── execute_meta_fund ─────────────────────────────────────────────────────────
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn bench_execute_meta_fund() {
     let (env, bridge_id, token_id, _admin, _fee_collector) = initialized_setup();
@@ -651,8 +692,8 @@ fn bench_execute_meta_fund() {
     let target = Address::generate(&env);
     let amount = 10_000i128;
 
-    // Fund the bridge so it can transfer to target.
-    mint(&env, &token_id, &bridge_id, amount);
+    // Fund the source so it can be transferred by the bridge via transfer_from.
+    mint(&env, &token_id, &source, amount);
 
     // Generate a keypair and register it as the meta signer for source.
     let secret: [u8; 32] = [7u8; 32];

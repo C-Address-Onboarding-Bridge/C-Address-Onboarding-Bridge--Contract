@@ -64,6 +64,7 @@
 // Narrowing them means changing the public contract ABI, which is not a cleanup.
 #![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
+#![allow(clippy::duplicated_attributes)]
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use soroban_sdk::{
@@ -80,7 +81,7 @@ use soroban_sdk::{
 /// Every public function that can fail returns `Result<_, BridgeError>`.
 /// Callers should match on these variants to distinguish recoverable from
 /// unrecoverable conditions.
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BridgeError {
     /// Contract has not been initialized yet. Call `initialize` first.
@@ -4284,7 +4285,8 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        if is_relayer(&env, &pubkey) {
+        let was_registered = is_relayer(&env, &pubkey);
+        if was_registered {
             let count = relayer_count(&env);
             if count <= 1 || count.saturating_sub(1) < relayer_threshold(&env) {
                 return Err(BridgeError::BelowThreshold);

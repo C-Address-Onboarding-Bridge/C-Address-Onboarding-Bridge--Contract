@@ -1818,6 +1818,7 @@ pub enum TDataKey {
     Symbol,
     Initialized,
     Balance,
+    Allowance,
 }
 
 #[contract]
@@ -1871,6 +1872,50 @@ impl TestToken {
         e.storage()
             .persistent()
             .set(&(TDataKey::Balance, to), &(to_bal + amount));
+    }
+
+    pub fn approve(e: Env, from: Address, spender: Address, amount: i128, _expiration_ledger: u32) {
+        from.require_auth();
+        if amount < 0 {
+            panic!("negative allowance");
+        }
+        e.storage()
+            .persistent()
+            .set(&(TDataKey::Allowance, from, spender), &amount);
+    }
+
+    pub fn allowance(e: Env, from: Address, spender: Address) -> i128 {
+        e.storage()
+            .persistent()
+            .get(&(TDataKey::Allowance, from, spender))
+            .unwrap_or(0)
+    }
+
+    pub fn transfer_from(e: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        spender.require_auth();
+        if amount < 0 {
+            panic!("negative amount");
+        }
+        let current_allowance = Self::allowance(e.clone(), from.clone(), spender.clone());
+        if current_allowance < amount {
+            panic!("insufficient allowance");
+        }
+        let from_bal = Self::balance(e.clone(), from.clone());
+        if from_bal < amount {
+            panic!("insufficient balance");
+        }
+        e.storage()
+            .persistent()
+            .set(&(TDataKey::Allowance, from.clone(), spender), &(current_allowance - amount));
+        if from != to {
+            let to_bal = Self::balance(e.clone(), to.clone());
+            e.storage()
+                .persistent()
+                .set(&(TDataKey::Balance, from), &(from_bal - amount));
+            e.storage()
+                .persistent()
+                .set(&(TDataKey::Balance, to), &(to_bal + amount));
+        }
     }
 }
 
@@ -4087,7 +4132,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([7u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x77; 32]);
@@ -4336,7 +4381,7 @@ mod crosschain_tests {
         bridge.add_relayer(&relayer, &None);
 
         assert_eq!(
-            bridge.try_set_relayer_threshold(&0u32),
+            bridge.try_set_relayer_threshold(&0u32, &None),
             Err(Ok(BridgeError::ThresholdExceedsRelayers))
         );
         assert_eq!(bridge.query_relayer_threshold(), 1);
@@ -4367,7 +4412,7 @@ mod crosschain_tests {
             make_signing_key([7u8; 32]).verifying_key().as_bytes(),
         );
         bridge.add_relayer(&relayer, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x82; 32]);
@@ -4403,7 +4448,7 @@ mod crosschain_tests {
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert_eq!(
-            bridge.try_remove_relayer(&relayer),
+            bridge.try_remove_relayer(&relayer, &None),
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert!(bridge.query_is_relayer(&relayer));
@@ -4441,7 +4486,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([8u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         for (chain_id, hash_byte) in [(1u32, 0x31u8), (2u32, 0x32u8)] {
             let target = soroban_sdk::Address::generate(&env);
@@ -4546,7 +4591,7 @@ fn test_loyalty_rewards_preserve_bridged_asset_reserves() {
     let target = Address::generate(&env);
 
     bridge.set_fee_bps(&1_000u32, &None);
-    bridge.set_loyalty_token(&asset, &200i128);
+    bridge.set_loyalty_token(&asset, &200i128, &None);
     mint_tokens(&env, &asset, &bridge_id, 300i128);
 
     bridge.fund_c_address_timelocked(
@@ -5848,6 +5893,68 @@ fn test_meta_fund_accepts_documented_payload_layout() {
 }
 
 #[test]
+fn test_meta_fund_happy_path() {
+    test_meta_fund_accepts_documented_payload_layout();
+}
+
+#[test]
+#[should_panic]
+fn test_meta_fund_without_allowance_fails() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let network_id = env.ledger().network_id();
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+
+    let seed = [0x42u8; 32];
+    let signing_key = SigningKey::from_bytes(&seed);
+    let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+    bridge.register_meta_signer(&user, &pubkey);
+
+    let amount: i128 = 500;
+    let nonce: u64 = 0;
+    let deadline: u64 = 2_000_000;
+
+    let contract_hash = hash_meta_fund_address(&env, &bridge_id);
+    let source_hash = hash_meta_fund_address(&env, &user);
+    let target_hash = hash_meta_fund_address(&env, &target);
+    let asset_hash = hash_meta_fund_address(&env, &token_id);
+
+    let mut payload = Bytes::from_slice(&env, b"meta_fund");
+    payload.append(&network_id.clone().into());
+    payload.append(&contract_hash.into());
+    payload.append(&source_hash.into());
+    payload.append(&target_hash.into());
+    payload.append(&asset_hash.into());
+    payload.extend_from_array(&amount.to_be_bytes());
+    payload.extend_from_array(&nonce.to_be_bytes());
+    payload.extend_from_array(&deadline.to_be_bytes());
+
+    let payload_hash: BytesN<32> = env.crypto().sha256(&payload).into();
+    let signature = sign_meta_fund_payload(&env, &signing_key, &payload_hash);
+
+    let params = MetaFundParams {
+        network_id,
+        source: user.clone(),
+        target,
+        asset: token_id.clone(),
+        amount,
+        nonce,
+        deadline,
+    };
+
+    // Deliberately omit token approval: transfer_from will panic with insufficient allowance
+    bridge.execute_meta_fund(&params, &pubkey, &signature);
+}
+
+#[test]
 fn test_meta_fund_expired_deadline_fails() {
     let env = Env::default();
     env.ledger().set_timestamp(2_000);
@@ -5901,7 +6008,6 @@ fn test_meta_fund_expired_deadline_fails() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_meta_fund_nonce_replay_rejected() {
     let env = Env::default();
