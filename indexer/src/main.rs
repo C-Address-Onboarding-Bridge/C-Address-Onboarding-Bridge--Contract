@@ -1,4 +1,5 @@
 #![deny(unreachable_patterns)]
+#![allow(clippy::uninlined_format_args)]
 
 mod db;
 mod events;

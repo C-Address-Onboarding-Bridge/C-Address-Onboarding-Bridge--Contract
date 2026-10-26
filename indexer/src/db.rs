@@ -380,10 +380,17 @@ impl Database {
         let now = chrono::Utc::now().to_rfc3339();
         let rows: Vec<WebhookDeliveryRow> =
             sqlx::query_as(
-                "SELECT id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at
-                 FROM webhook_deliveries
-                 WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?1)
-                 ORDER BY created_at ASC LIMIT 100",
+                "SELECT d1.id, d1.subscription_id, d1.event_id, d1.status, d1.attempts, d1.next_retry_at, d1.last_error, d1.created_at
+                 FROM webhook_deliveries d1
+                 WHERE d1.status = 'pending' AND (d1.next_retry_at IS NULL OR d1.next_retry_at <= ?1)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM webhook_deliveries d2
+                       WHERE d2.subscription_id = d1.subscription_id
+                         AND d2.status = 'pending'
+                         AND (d2.created_at < d1.created_at OR (d2.created_at = d1.created_at AND d2.id < d1.id))
+                         AND d2.next_retry_at > ?1
+                   )
+                 ORDER BY d1.created_at ASC LIMIT 100",
             )
             .bind(&now)
             .fetch_all(&self.pool)

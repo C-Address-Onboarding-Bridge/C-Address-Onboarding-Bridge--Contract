@@ -299,26 +299,44 @@ pub async fn deliver_pending(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    Delivered,
+    Retrying,
+    Dead,
+}
+
 async fn deliver_subscription_queue(state: &AppState, deliveries: Vec<WebhookDelivery>) {
     for delivery in deliveries {
-        if let Err(e) = deliver_single(state, &delivery).await {
-            tracing::error!(
-                "Failed to process delivery {} for subscription {}: {}",
-                delivery.id,
-                delivery.subscription_id,
-                e
-            );
-            // On error delivering to this subscription, abort remaining queued deliveries
-            // for this subscription in this poll cycle to preserve FIFO ordering.
-            break;
+        match deliver_single(state, &delivery).await {
+            Ok(DeliveryOutcome::Delivered) | Ok(DeliveryOutcome::Dead) => {}
+            Ok(DeliveryOutcome::Retrying) => {
+                tracing::debug!(
+                    "Delivery {} for subscription {} entered retry; stopping subscription queue",
+                    delivery.id,
+                    delivery.subscription_id
+                );
+                break;
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to process delivery {} for subscription {}: {}",
+                    delivery.id,
+                    delivery.subscription_id,
+                    e
+                );
+                // On error delivering to this subscription, abort remaining queued deliveries
+                // for this subscription in this poll cycle to preserve FIFO ordering.
+                break;
+            }
         }
     }
 }
 
-async fn deliver_single(
+pub(crate) async fn deliver_single(
     state: &AppState,
     delivery: &WebhookDelivery,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<DeliveryOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let url = match state
         .db
         .get_subscription_url(&delivery.subscription_id)
@@ -330,7 +348,7 @@ async fn deliver_single(
                 .db
                 .mark_delivery_dead(&delivery.id, "subscription not found or inactive")
                 .await?;
-            return Ok(());
+            return Ok(DeliveryOutcome::Dead);
         }
     };
 
@@ -341,7 +359,7 @@ async fn deliver_single(
                 .db
                 .mark_delivery_dead(&delivery.id, "event not found")
                 .await?;
-            return Ok(());
+            return Ok(DeliveryOutcome::Dead);
         }
     };
 
@@ -376,24 +394,23 @@ async fn deliver_single(
         Ok(resp) if resp.status().is_success() => {
             state.db.mark_delivery_success(&delivery.id).await?;
             tracing::debug!("Delivered webhook {} to {}", delivery.id, url);
+            Ok(DeliveryOutcome::Delivered)
         }
         Ok(resp) => {
             let error = format!("HTTP {}", resp.status());
-            handle_retry(state, delivery, &error).await?;
+            handle_retry(state, delivery, &error).await
         }
         Err(e) => {
-            handle_retry(state, delivery, &e.to_string()).await?;
+            handle_retry(state, delivery, &e.to_string()).await
         }
     }
-
-    Ok(())
 }
 
 async fn handle_retry(
     state: &AppState,
     delivery: &WebhookDelivery,
     error: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<DeliveryOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let attempt = delivery.attempts + 1;
     if attempt >= MAX_RETRIES {
         state.db.mark_delivery_dead(&delivery.id, error).await?;
@@ -403,6 +420,7 @@ async fn handle_retry(
             attempt,
             error
         );
+        Ok(DeliveryOutcome::Dead)
     } else {
         let backoff_secs = (2i64).pow(attempt as u32);
         let next_retry =
@@ -418,8 +436,8 @@ async fn handle_retry(
             backoff_secs,
             error
         );
+        Ok(DeliveryOutcome::Retrying)
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -977,6 +995,231 @@ mod tests {
             elapsed.as_millis() < 800,
             "Deliveries must run concurrently: took {:?}",
             elapsed
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #876 - Stop subscription queue on HTTP failure to preserve FIFO
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_failed_first_delivery_stops_queue_and_second_is_not_delivered() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let second_received = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let req_count_clone = Arc::clone(&request_count);
+        let second_received_clone = Arc::clone(&second_received);
+
+        let test_router = axum::Router::new().route(
+            "/webhook",
+            post(move |body: axum::extract::Json<serde_json::Value>| {
+                let req_count = Arc::clone(&req_count_clone);
+                let second_received = Arc::clone(&second_received_clone);
+                async move {
+                    let count = req_count.fetch_add(1, Ordering::SeqCst);
+                    if let Some(event_id) = body.get("event_id").and_then(|v| v.as_str()) {
+                        if event_id == "evt-002" {
+                            second_received.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    if count == 0 {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        axum::http::StatusCode::OK
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, test_router).await.unwrap();
+        });
+
+        let db = setup_db().await;
+        let sub = db
+            .create_subscription(CreateSubscription {
+                url: format!("http://127.0.0.1:{}/webhook", port),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .unwrap();
+
+        let event1 = IndexedEvent {
+            id: "evt-001".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 1,
+            contract_id: "C_TEST".to_string(),
+            tx_hash: "hash1".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({}),
+        };
+        let event2 = IndexedEvent {
+            id: "evt-002".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 2,
+            contract_id: "C_TEST".to_string(),
+            tx_hash: "hash2".to_string(),
+            timestamp: "2024-01-01T00:00:01Z".to_string(),
+            data: serde_json::json!({}),
+        };
+        db.insert_event(&event1).await.unwrap();
+        db.insert_event(&event2).await.unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
+             VALUES ('del-001', ?1, ?2, 'pending', 0, ?3, '2024-01-01T00:00:00Z')",
+        )
+        .bind(&sub.id)
+        .bind(&event1.id)
+        .bind(&now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
+             VALUES ('del-002', ?1, ?2, 'pending', 0, ?3, '2024-01-01T00:00:01Z')",
+        )
+        .bind(&sub.id)
+        .bind(&event2.id)
+        .bind(&now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let state = AppState {
+            db: db.clone(),
+            rpc_url: "http://localhost".to_string(),
+            contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::new(),
+            api_key_hash: String::new(),
+            lookback_ledgers: 0,
+        };
+
+        deliver_pending(&state).await.unwrap();
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "Only the first delivery should have been attempted"
+        );
+        assert!(
+            !second_received.load(Ordering::SeqCst),
+            "Second event must not be delivered before first"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_later_delivery_held_back_when_head_has_future_next_retry() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let req_count_clone = Arc::clone(&request_count);
+
+        let test_router = axum::Router::new().route(
+            "/webhook2",
+            post(move || {
+                let req_count = Arc::clone(&req_count_clone);
+                async move {
+                    req_count.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, test_router).await.unwrap();
+        });
+
+        let db = setup_db().await;
+        let sub = db
+            .create_subscription(CreateSubscription {
+                url: format!("http://127.0.0.1:{}/webhook2", port),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .unwrap();
+
+        let event1 = IndexedEvent {
+            id: "evt-hold-001".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 1,
+            contract_id: "C_TEST".to_string(),
+            tx_hash: "hash1".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({}),
+        };
+        let event2 = IndexedEvent {
+            id: "evt-hold-002".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 2,
+            contract_id: "C_TEST".to_string(),
+            tx_hash: "hash2".to_string(),
+            timestamp: "2024-01-01T00:00:01Z".to_string(),
+            data: serde_json::json!({}),
+        };
+        db.insert_event(&event1).await.unwrap();
+        db.insert_event(&event2).await.unwrap();
+
+        let future_retry = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Head delivery failed once and is scheduled for 1 hour in the future
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
+             VALUES ('del-hold-001', ?1, ?2, 'pending', 1, ?3, '2024-01-01T00:00:00Z')",
+        )
+        .bind(&sub.id)
+        .bind(&event1.id)
+        .bind(&future_retry)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Second delivery was just queued and has next_retry_at ready now
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
+             VALUES ('del-hold-002', ?1, ?2, 'pending', 0, ?3, '2024-01-01T00:00:01Z')",
+        )
+        .bind(&sub.id)
+        .bind(&event2.id)
+        .bind(&now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let state = AppState {
+            db: db.clone(),
+            rpc_url: "http://localhost".to_string(),
+            contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::new(),
+            api_key_hash: String::new(),
+            lookback_ledgers: 0,
+        };
+
+        deliver_pending(&state).await.unwrap();
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            0,
+            "No delivery should be sent while head is waiting on retry"
         );
     }
 }
