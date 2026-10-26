@@ -2763,17 +2763,25 @@ fn setup_batch(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, Addres
 
 /// Helper: count events from bridge with a given topic string prefix.
 fn count_events_with_topic(env: &Env, bridge_id: &Address, topic: &str) -> u32 {
-    use soroban_sdk::{IntoVal, String as SStr, TryFromVal, Val};
+    use soroban_sdk::{IntoVal, String as SStr, Symbol, TryFromVal, Val};
     let topic_val: Val = topic.into_val(env);
-    let topic_str: SStr = SStr::try_from_val(env, &topic_val).unwrap();
+    let topic_str: Option<SStr> = SStr::try_from_val(env, &topic_val).ok();
+    let topic_sym: Option<Symbol> = Symbol::try_from_val(env, &topic_val).ok();
     let mut count = 0u32;
     for event in env.events().all().iter() {
         let (cid, topics, _) = event;
         if cid == *bridge_id && !topics.is_empty() {
             if let Some(t) = topics.get(0) {
-                if let Ok(s) = SStr::try_from_val(env, &t) {
-                    if s == topic_str {
+                if let (Some(exp), Ok(s)) = (&topic_str, SStr::try_from_val(env, &t)) {
+                    if s == *exp {
                         count += 1;
+                        continue;
+                    }
+                }
+                if let (Some(exp), Ok(s)) = (&topic_sym, Symbol::try_from_val(env, &t)) {
+                    if s == *exp {
+                        count += 1;
+                        continue;
                     }
                 }
             }
@@ -4087,7 +4095,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([7u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x77; 32]);
@@ -4336,7 +4344,7 @@ mod crosschain_tests {
         bridge.add_relayer(&relayer, &None);
 
         assert_eq!(
-            bridge.try_set_relayer_threshold(&0u32),
+            bridge.try_set_relayer_threshold(&0u32, &None),
             Err(Ok(BridgeError::ThresholdExceedsRelayers))
         );
         assert_eq!(bridge.query_relayer_threshold(), 1);
@@ -4367,7 +4375,7 @@ mod crosschain_tests {
             make_signing_key([7u8; 32]).verifying_key().as_bytes(),
         );
         bridge.add_relayer(&relayer, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x82; 32]);
@@ -4403,7 +4411,7 @@ mod crosschain_tests {
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert_eq!(
-            bridge.try_remove_relayer(&relayer),
+            bridge.try_remove_relayer(&relayer, &None),
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert!(bridge.query_is_relayer(&relayer));
@@ -4441,7 +4449,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([8u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         for (chain_id, hash_byte) in [(1u32, 0x31u8), (2u32, 0x32u8)] {
             let target = soroban_sdk::Address::generate(&env);
@@ -4546,7 +4554,7 @@ fn test_loyalty_rewards_preserve_bridged_asset_reserves() {
     let target = Address::generate(&env);
 
     bridge.set_fee_bps(&1_000u32, &None);
-    bridge.set_loyalty_token(&asset, &200i128);
+    bridge.set_loyalty_token(&asset, &200i128, &None);
     mint_tokens(&env, &asset, &bridge_id, 300i128);
 
     bridge.fund_c_address_timelocked(
@@ -6212,7 +6220,6 @@ fn test_extend_instance_ttl_extends_instance_storage() {
     assert!(ttl >= 200_000);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_extend_persistent_ttl_extends_asset_keys() {
     let env = Env::default();
@@ -6236,12 +6243,13 @@ fn test_extend_persistent_ttl_extends_asset_keys() {
     );
     bridge.set_asset_fee_cap(&token_id, &1000u32, &None);
 
-    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    env.ledger().set_sequence_number(100);
     bridge.extend_persistent_ttl(&token_id, &200_000u32, &None);
 
     let expected_keys = [
         DataKey::AssetStats(token_id.clone()),
         DataKey::CrossChainReserve(token_id.clone()),
+        DataKey::AssetFeeCap(token_id.clone()),
     ];
     for key in expected_keys.iter() {
         let ttl = env.as_contract(&bridge_id, || env.storage().persistent().get_ttl(key));
@@ -6251,7 +6259,6 @@ fn test_extend_persistent_ttl_extends_asset_keys() {
 
 /********** extend_source_persistent_ttl tests **********/
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_extend_source_persistent_ttl_extends_source_keys() {
     let env = Env::default();
@@ -6280,8 +6287,13 @@ fn test_extend_source_persistent_ttl_extends_source_keys() {
     // `check_daily_limit` derives it internally.
     let day = env.ledger().timestamp() / 86_400;
 
-    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    env.ledger().set_sequence_number(100);
     bridge.extend_source_persistent_ttl(&user, &token_id, &200_000u32, &None);
+
+    assert_eq!(
+        count_events_with_topic(&env, &bridge_id, "SourcePersistentTtlExtended"),
+        1
+    );
 
     let expected_keys = [
         DataKey::SourceDailyLimit(user.clone(), token_id.clone()),
@@ -6295,11 +6307,6 @@ fn test_extend_source_persistent_ttl_extends_source_keys() {
         let ttl = env.as_contract(&bridge_id, || env.storage().persistent().get_ttl(key));
         assert!(ttl >= 200_000);
     }
-
-    assert_eq!(
-        count_events_with_topic(&env, &bridge_id, "SourcePersistentTtlExtended"),
-        1
-    );
 }
 
 #[test]
@@ -6333,7 +6340,6 @@ fn test_extend_source_persistent_ttl_skips_missing_keys() {
     bridge.extend_source_persistent_ttl(&source, &asset, &200_000u32, &None);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_extend_source_persistent_ttl_caps_at_max_allowed_ttl() {
     let env = Env::default();
@@ -6354,7 +6360,7 @@ fn test_extend_source_persistent_ttl_caps_at_max_allowed_ttl() {
         &None,
     );
 
-    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    env.ledger().set_sequence_number(100);
     // Requesting far beyond the hard ceiling must silently clamp to
     // `MAX_ALLOWED_TTL` rather than erroring or exceeding it.
     bridge.extend_source_persistent_ttl(&user, &token_id, &(MAX_ALLOWED_TTL * 10), &None);
