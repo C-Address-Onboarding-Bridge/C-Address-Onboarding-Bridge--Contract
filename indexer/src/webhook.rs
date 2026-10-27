@@ -363,6 +363,98 @@ pub(crate) async fn deliver_single(
         }
     };
 
+    // --- Delivery-time SSRF validation & connection pinning ---
+    let parsed_url = match url::Url::parse(&url) {
+        Ok(u) => u,
+        Err(e) => {
+            return handle_retry(state, delivery, &format!("invalid webhook URL: {}", e)).await;
+        }
+    };
+
+    let scheme = parsed_url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return handle_retry(
+            state,
+            delivery,
+            &format!("forbidden scheme '{}': only http and https are allowed", scheme),
+        )
+        .await;
+    }
+
+    let host = match parsed_url.host_str() {
+        Some(h) => h,
+        None => {
+            return handle_retry(state, delivery, "webhook URL has no host").await;
+        }
+    };
+
+    let port = parsed_url.port_or_known_default().unwrap_or(80);
+
+    let (is_private, vetted_addr) = if host.eq_ignore_ascii_case("localhost") {
+        (true, None)
+    } else if let Ok(ip) = host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+        let unwrapped = unwrap_ipv4_mapped_or_compatible(ip);
+        (
+            is_private_or_reserved(unwrapped),
+            Some(std::net::SocketAddr::new(unwrapped, port)),
+        )
+    } else {
+        match tokio::net::lookup_host((host, port)).await {
+            Ok(addrs) => {
+                let addrs_vec: Vec<std::net::SocketAddr> = addrs.collect();
+                if addrs_vec.is_empty() {
+                    return handle_retry(
+                        state,
+                        delivery,
+                        &format!("host could not be resolved: {}", host),
+                    )
+                    .await;
+                }
+                let mut any_private = false;
+                for addr in &addrs_vec {
+                    let unwrapped = unwrap_ipv4_mapped_or_compatible(addr.ip());
+                    if is_private_or_reserved(unwrapped) {
+                        any_private = true;
+                        break;
+                    }
+                }
+                (any_private, Some(addrs_vec[0]))
+            }
+            Err(e) => {
+                return handle_retry(
+                    state,
+                    delivery,
+                    &format!("host could not be resolved: {}", e),
+                )
+                .await;
+            }
+        }
+    };
+
+    if is_private && !state.allow_local_webhooks {
+        return handle_retry(
+            state,
+            delivery,
+            &format!("private/reserved host rejected: {}", host),
+        )
+        .await;
+    }
+
+    let client = if let Some(vetted) = vetted_addr {
+        if host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>().is_err() {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .resolve(host, vetted)
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| state.webhook_client.clone())
+        } else {
+            state.webhook_client.clone()
+        }
+    } else {
+        state.webhook_client.clone()
+    };
+
     let payload = WebhookPayload {
         delivery_id: delivery.id.clone(),
         attempt: delivery.attempts + 1,
@@ -380,8 +472,7 @@ pub(crate) async fn deliver_single(
         .ok_or_else(|| sqlx::Error::Protocol("subscription secret not found".into()))?;
     let signature = generate_signature(&secret, &timestamp, &body);
 
-    match state
-        .webhook_client
+    match client
         .post(&url)
         .header("X-Webhook-Timestamp", &timestamp)
         .header("X-Webhook-Signature", signature)
@@ -978,9 +1069,13 @@ mod tests {
             rpc_url: "http://localhost".to_string(),
             contract_id: "C_TEST".to_string(),
             rpc_client: reqwest::Client::new(),
-            webhook_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
             api_key_hash: String::new(),
             lookback_ledgers: 0,
+            allow_local_webhooks: true,
         };
 
         let start = Instant::now();
@@ -1101,9 +1196,13 @@ mod tests {
             rpc_url: "http://localhost".to_string(),
             contract_id: "C_TEST".to_string(),
             rpc_client: reqwest::Client::new(),
-            webhook_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
             api_key_hash: String::new(),
             lookback_ledgers: 0,
+            allow_local_webhooks: true,
         };
 
         deliver_pending(&state).await.unwrap();
@@ -1209,9 +1308,13 @@ mod tests {
             rpc_url: "http://localhost".to_string(),
             contract_id: "C_TEST".to_string(),
             rpc_client: reqwest::Client::new(),
-            webhook_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
             api_key_hash: String::new(),
             lookback_ledgers: 0,
+            allow_local_webhooks: true,
         };
 
         deliver_pending(&state).await.unwrap();
@@ -1220,6 +1323,185 @@ mod tests {
             request_count.load(Ordering::SeqCst),
             0,
             "No delivery should be sent while head is waiting on retry"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #870 - SSRF: redirect prevention and delivery-time IP validation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_webhook_delivery_does_not_follow_redirect_to_loopback() {
+        use axum::http::{header, StatusCode};
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let target_hit = Arc::new(AtomicBool::new(false));
+        let target_hit_clone = Arc::clone(&target_hit);
+
+        let listener_target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = listener_target.local_addr().unwrap().port();
+
+        let target_router = axum::Router::new().route(
+            "/target",
+            post(move || {
+                target_hit_clone.store(true, Ordering::SeqCst);
+                async { StatusCode::OK }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener_target, target_router).await.unwrap();
+        });
+
+        let target_url = format!("http://127.0.0.1:{}/target", target_port);
+
+        let redirect_router = axum::Router::new().route(
+            "/redirect",
+            post(move || {
+                let location = target_url.clone();
+                async move {
+                    (StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, location)])
+                }
+            }),
+        );
+
+        let listener_redirect = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_port = listener_redirect.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener_redirect, redirect_router).await.unwrap();
+        });
+
+        let db = setup_db().await;
+        let sub = db
+            .create_subscription(CreateSubscription {
+                url: format!("http://127.0.0.1:{}/redirect", redirect_port),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .unwrap();
+
+        let event = IndexedEvent {
+            id: "evt-ssrf-redirect".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 1,
+            contract_id: "C_TEST".to_string(),
+            tx_hash: "tx1".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({}),
+        };
+        db.insert_event(&event).await.unwrap();
+
+        let delivery = WebhookDelivery {
+            id: "del-ssrf-redirect".to_string(),
+            subscription_id: sub.id,
+            event_id: event.id,
+            status: "pending".to_string(),
+            attempts: 0,
+            last_error: None,
+            next_retry_at: Some(chrono::Utc::now().to_rfc3339()),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        let state = AppState {
+            db: db.clone(),
+            rpc_url: "http://localhost".to_string(),
+            contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            api_key_hash: String::new(),
+            lookback_ledgers: 0,
+            allow_local_webhooks: true,
+        };
+
+        deliver_single(&state, &delivery).await.unwrap();
+
+        assert!(
+            !target_hit.load(Ordering::SeqCst),
+            "Webhook delivery followed redirect to loopback target!"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_webhook_delivery_rejects_private_host_at_delivery_time() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let hook_hit = Arc::new(AtomicBool::new(false));
+        let hook_hit_clone = Arc::clone(&hook_hit);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let router = axum::Router::new().route(
+            "/hook",
+            post(move || {
+                hook_hit_clone.store(true, Ordering::SeqCst);
+                async { axum::http::StatusCode::OK }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let db = setup_db().await;
+        let sub_id = "sub-rebinding";
+        sqlx::query(
+            "INSERT INTO subscriptions (id, url, secret, active, created_at)
+             VALUES (?1, ?2, 'secret', 1, '2024-01-01T00:00:00Z')",
+        )
+        .bind(sub_id)
+        .bind(format!("http://127.0.0.1:{}/hook", port))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let event = IndexedEvent {
+            id: "evt-rebind".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 1,
+            contract_id: "C_TEST".to_string(),
+            tx_hash: "tx1".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({}),
+        };
+        db.insert_event(&event).await.unwrap();
+
+        let delivery = WebhookDelivery {
+            id: "del-rebind".to_string(),
+            subscription_id: sub_id.to_string(),
+            event_id: event.id,
+            status: "pending".to_string(),
+            attempts: 0,
+            last_error: None,
+            next_retry_at: Some(chrono::Utc::now().to_rfc3339()),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+
+        let state = AppState {
+            db: db.clone(),
+            rpc_url: "http://localhost".to_string(),
+            contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            api_key_hash: String::new(),
+            lookback_ledgers: 0,
+            allow_local_webhooks: false,
+        };
+
+        deliver_single(&state, &delivery).await.unwrap();
+
+        assert!(
+            !hook_hit.load(Ordering::SeqCst),
+            "Delivery must reject loopback / private IP at delivery time!"
         );
     }
 }

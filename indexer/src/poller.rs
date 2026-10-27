@@ -973,6 +973,7 @@ mod tests {
             webhook_client: reqwest::Client::new(),
             api_key_hash: String::new(),
             lookback_ledgers: 720,
+            allow_local_webhooks: false,
         });
         let token = CancellationToken::new();
         let worker_token = token.clone();
@@ -1029,6 +1030,7 @@ mod tests {
             webhook_client: reqwest::Client::new(),
             api_key_hash: String::new(),
             lookback_ledgers: 720,
+            allow_local_webhooks: false,
         };
 
         let result = tokio::time::timeout(
@@ -1140,6 +1142,7 @@ mod tests {
             webhook_client: reqwest::Client::new(),
             api_key_hash: String::new(),
             lookback_ledgers: 720,
+            allow_local_webhooks: false,
         };
 
         let result = tokio::time::timeout(

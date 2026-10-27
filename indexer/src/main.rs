@@ -52,6 +52,8 @@ pub struct AppState {
     /// Note: `POST /api/replay` **only re-delivers already-indexed events**
     /// to webhooks — it does not fetch new history from the chain.
     pub lookback_ledgers: i64,
+    /// When true, allow webhooks to connect to local / private IP addresses (for integration testing).
+    pub allow_local_webhooks: bool,
 }
 
 pub fn public_routes() -> Router<Arc<AppState>> {
@@ -127,14 +129,24 @@ async fn main() {
         .build()
         .expect("failed to build RPC HTTP client");
 
+    let webhook_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build webhook HTTP client");
+
+    let allow_local_webhooks = std::env::var("ALLOW_LOCAL_WEBHOOKS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     let state = Arc::new(AppState {
         db: database,
         rpc_url,
         contract_id,
         rpc_client,
-        webhook_client: reqwest::Client::new(),
+        webhook_client,
         api_key_hash,
         lookback_ledgers,
+        allow_local_webhooks,
     });
 
     // Cancellation token shared across all background tasks. When triggered,
@@ -434,9 +446,13 @@ mod auth_tests {
             rpc_url: "http://localhost".to_string(),
             contract_id: "C_TEST".to_string(),
             rpc_client: reqwest::Client::new(),
-            webhook_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
             api_key_hash: sha256_hex(api_key),
             lookback_ledgers: poller::DEFAULT_LOOKBACK_LEDGERS,
+            allow_local_webhooks: false,
         });
 
         build_app(state)
@@ -662,6 +678,7 @@ mod route_tests {
             webhook_client: reqwest::Client::new(),
             api_key_hash: sha256_hex("test"),
             lookback_ledgers: 0,
+            allow_local_webhooks: false,
         })
     }
 
