@@ -15,7 +15,7 @@
   "keywords": ["stellar", "soroban", "c-address", "onboarding", "bridge"],
   "license": "MIT",
   "dependencies": {
-    "@stellar/stellar-sdk": "^13.0.0",
+    "@stellar/stellar-sdk": "^17.3.0",
     "buffer": "^6.0.3"
   },
   "peerDependencies": {
