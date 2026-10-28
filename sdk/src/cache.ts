@@ -51,6 +51,13 @@ export class InMemoryCache implements ICacheProvider {
     this.sweepIntervalMs = options.sweepIntervalMs ?? 1000;
   }
 
+  /**
+   * Current number of entries retained in the cache.
+   */
+  get size(): number {
+    return this.store.size;
+  }
+
   async get<T>(key: string): Promise<T | undefined> {
     const entry = this.store.get(key);
     if (!entry) {
