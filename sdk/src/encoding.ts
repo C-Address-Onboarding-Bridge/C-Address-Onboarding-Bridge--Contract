@@ -53,6 +53,10 @@ export interface TypedArg {
  * @returns The encoded `xdr.ScVal`.
  */
 export function toSingleScVal(arg: any): xdr.ScVal {
+  if (arg && typeof (xdr as any)?.ScVal === 'function' && arg instanceof xdr.ScVal) {
+    return arg;
+  }
+
   if (arg !== null && typeof arg === 'object' && 'value' in arg) {
     const { value, type } = arg as TypedArg;
     if (value === null || value === undefined) {
