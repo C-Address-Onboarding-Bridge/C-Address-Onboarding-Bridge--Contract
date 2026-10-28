@@ -3211,6 +3211,560 @@ export class OnboardingBridgeSDK {
   }
 
   /**
+   * Pause the bridge contract, disabling all mutating operations (admin only).
+   *
+   * @param adminKeypair - Keypair of the current admin account.
+   * @param nonce        - Optional sequential admin nonce for replay protection.
+   * @returns A {@link TransactionResult}.
+   */
+  async pause(
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'pause',
+      { nonce },
+      async () => {
+        try {
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const nonceScVal = nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(nonce), { type: 'u64' });
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call('pause', nonceScVal),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'pause' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'pause' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Unpause the bridge contract, resuming normal operations (admin only).
+   *
+   * @param adminKeypair - Keypair of the current admin account.
+   * @param nonce        - Optional sequential admin nonce for replay protection.
+   * @returns A {@link TransactionResult}.
+   */
+  async unpause(
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'unpause',
+      { nonce },
+      async () => {
+        try {
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const nonceScVal = nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(nonce), { type: 'u64' });
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call('unpause', nonceScVal),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'unpause' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'unpause' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Check whether the contract is currently paused.
+   *
+   * @returns `true` if paused, `false` otherwise.
+   * @throws {Error} On RPC failure.
+   */
+  async isPaused(): Promise<boolean> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_is_paused' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_is_paused', []),
+      ),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query paused status: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? Boolean(scValToNative(scVal)) : false;
+  }
+
+  /**
+   * Add an address to the blocklist, preventing it from receiving funds (admin only).
+   *
+   * @param address      - The address to block.
+   * @param adminKeypair - Keypair of the current admin account.
+   * @param nonce        - Optional sequential admin nonce for replay protection.
+   * @returns A {@link TransactionResult}.
+   */
+  async addToBlocklist(
+    address: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'addToBlocklist',
+      { address, nonce },
+      async () => {
+        try {
+          assertAddress(address, 'address');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const nonceScVal = nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(nonce), { type: 'u64' });
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'add_to_blocklist',
+                new Address(address).toScVal(),
+                nonceScVal,
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'add_to_blocklist' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'add_to_blocklist' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Remove an address from the blocklist, restoring its ability to receive funds (admin only).
+   *
+   * @param address      - The address to unblock.
+   * @param adminKeypair - Keypair of the current admin account.
+   * @param nonce        - Optional sequential admin nonce for replay protection.
+   * @returns A {@link TransactionResult}.
+   */
+  async removeFromBlocklist(
+    address: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'removeFromBlocklist',
+      { address, nonce },
+      async () => {
+        try {
+          assertAddress(address, 'address');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const nonceScVal = nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(nonce), { type: 'u64' });
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'remove_from_blocklist',
+                new Address(address).toScVal(),
+                nonceScVal,
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'remove_from_blocklist' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'remove_from_blocklist' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Add an address to the allowlist (admin only).
+   *
+   * @param address      - The address to allowlist.
+   * @param adminKeypair - Keypair of the current admin account.
+   * @param nonce        - Optional sequential admin nonce for replay protection.
+   * @returns A {@link TransactionResult}.
+   */
+  async addToAllowlist(
+    address: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'addToAllowlist',
+      { address, nonce },
+      async () => {
+        try {
+          assertAddress(address, 'address');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const nonceScVal = nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(nonce), { type: 'u64' });
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'add_to_allowlist',
+                new Address(address).toScVal(),
+                nonceScVal,
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'add_to_allowlist' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'add_to_allowlist' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Remove an address from the allowlist (admin only).
+   *
+   * @param address      - The address to remove from allowlist.
+   * @param adminKeypair - Keypair of the current admin account.
+   * @param nonce        - Optional sequential admin nonce for replay protection.
+   * @returns A {@link TransactionResult}.
+   */
+  async removeFromAllowlist(
+    address: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'removeFromAllowlist',
+      { address, nonce },
+      async () => {
+        try {
+          assertAddress(address, 'address');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const nonceScVal = nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(nonce), { type: 'u64' });
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'remove_from_allowlist',
+                new Address(address).toScVal(),
+                nonceScVal,
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'remove_from_allowlist' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'remove_from_allowlist' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Enable or disable allowlist mode (admin only).
+   *
+   * @param enabled      - `true` to enable allowlist mode, `false` to disable.
+   * @param adminKeypair - Keypair of the current admin account.
+   * @param nonce        - Optional sequential admin nonce for replay protection.
+   * @returns A {@link TransactionResult}.
+   */
+  async setAllowlistMode(
+    enabled: boolean,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'setAllowlistMode',
+      { enabled, nonce },
+      async () => {
+        try {
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const nonceScVal = nonce === undefined
+            ? xdr.ScVal.scvVoid()
+            : nativeToScVal(BigInt(nonce), { type: 'u64' });
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'set_allowlist_mode',
+                xdr.ScVal.scvBool(Boolean(enabled)),
+                nonceScVal,
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'set_allowlist_mode' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'set_allowlist_mode' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Query whether allowlist mode is currently enabled on the contract.
+   *
+   * @returns `true` if allowlist mode is enabled, `false` otherwise.
+   * @throws {Error} On RPC failure.
+   */
+  async getAllowlistMode(): Promise<boolean> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_allowlist_mode' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_allowlist_mode', []),
+      ),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query allowlist mode: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? Boolean(scValToNative(scVal)) : false;
+  }
+
+  /**
    * Estimate the transaction cost for a `fundCAddress` call without submitting
    * it to the network.
    *
