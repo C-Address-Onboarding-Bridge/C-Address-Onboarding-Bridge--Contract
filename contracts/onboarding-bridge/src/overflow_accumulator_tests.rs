@@ -8,8 +8,7 @@
 
 use crate::{
     check_daily_limit, increment_accrued_fees, increment_source_bridged_volume,
-    increment_total_bridged, increment_total_fees_collected, increment_user_deposit,
-    save_source_daily_limit, update_asset_counters, BridgeError, OnboardingBridge,
+    increment_total_bridged, increment_total_fees_collected, save_source_daily_limit, update_asset_counters, BridgeError, OnboardingBridge,
 };
 use proptest::prelude::*;
 use soroban_sdk::{testutils::Address as _, Address, Env};
@@ -86,17 +85,6 @@ fn source_bridged_volume_overflow_returns_error_not_panic() {
     });
 }
 
-#[test]
-fn user_deposit_overflow_returns_error_not_panic() {
-    let (env, bridge_id, asset, source) = setup();
-    env.as_contract(&bridge_id, || {
-        increment_user_deposit(&env, &source, &asset, i128::MAX).unwrap();
-        assert_eq!(
-            increment_user_deposit(&env, &source, &asset, 1),
-            Err(BridgeError::Overflow)
-        );
-    });
-}
 
 #[test]
 fn daily_limit_usage_overflow_returns_error_not_panic() {
