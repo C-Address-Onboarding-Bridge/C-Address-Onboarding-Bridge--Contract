@@ -77,6 +77,32 @@ impl Database {
         Ok(())
     }
 
+    pub async fn get_last_cursor(&self) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM indexer_state WHERE key = 'last_cursor'")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(v,)| v))
+    }
+
+    pub async fn set_last_cursor(&self, cursor: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO indexer_state (key, value) VALUES ('last_cursor', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = ?1",
+        )
+        .bind(cursor)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn clear_last_cursor(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM indexer_state WHERE key = 'last_cursor'")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Insert an event, ignoring it if its id was already indexed.
     ///
     /// Returns `true` when a new row was written and `false` when the event was
@@ -153,14 +179,23 @@ impl Database {
             "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, secret, created_at
              FROM subscriptions WHERE active = 1",
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await?;
 
         let now = chrono::Utc::now().to_rfc3339();
         let data = &event.data;
 
-        for (sub_id, _url, event_type, asset_filter, source_filter, target_filter, _active, _secret, _created_at) in
-            subs
+        for (
+            sub_id,
+            _url,
+            event_type,
+            asset_filter,
+            source_filter,
+            target_filter,
+            _active,
+            _secret,
+            _created_at,
+        ) in subs
         {
             if let Some(ref et) = event_type {
                 if et != &event.event_type {
@@ -168,25 +203,39 @@ impl Database {
                 }
             }
             if let Some(ref af) = asset_filter {
-                match data.get("asset").and_then(|v| v.as_str()) { Some(asset) if asset == af => {}, _ => continue }
+                match data.get("asset").and_then(|v| v.as_str()) {
+                    Some(asset) if asset == af => {}
+                    _ => continue,
+                }
             }
             if let Some(ref sf) = source_filter {
-                match data.get("source").and_then(|v| v.as_str()) { Some(source) if source == sf => {}, _ => continue }
+                match data.get("source").and_then(|v| v.as_str()) {
+                    Some(source) if source == sf => {}
+                    _ => continue,
+                }
             }
             if let Some(ref tf) = target_filter {
-                match data.get("target").and_then(|v| v.as_str()) { Some(target) if target == tf => {}, _ => continue }
+                match data.get("target").and_then(|v| v.as_str()) {
+                    Some(target) if target == tf => {}
+                    _ => continue,
+                }
             }
 
             let delivery_id = uuid::Uuid::new_v4().to_string();
             sqlx::query(
                 "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
-                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)",
+                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)
+                 ON CONFLICT(subscription_id, event_id) DO UPDATE SET
+                     status = 'pending',
+                     next_retry_at = excluded.next_retry_at,
+                     attempts = 0,
+                     last_error = NULL",
             )
             .bind(&delivery_id)
             .bind(&sub_id)
             .bind(&event.id)
             .bind(&now)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
         Ok(())
@@ -364,7 +413,12 @@ impl Database {
             let delivery_id = uuid::Uuid::new_v4().to_string();
             sqlx::query(
                 "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
-                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)",
+                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)
+                 ON CONFLICT(subscription_id, event_id) DO UPDATE SET
+                     status = 'pending',
+                     next_retry_at = excluded.next_retry_at,
+                     attempts = 0,
+                     last_error = NULL",
             )
             .bind(&delivery_id)
             .bind(&sub.id)
@@ -889,6 +943,80 @@ mod tests {
         assert!(
             !secret.0.is_empty(),
             "a subscription created before migration 0002 must be backfilled with a secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_replaying_twice_leaves_one_delivery_row_and_preserves_delivery_id() {
+        let db = setup_db().await;
+
+        let _sub_id = db
+            .create_subscription(CreateSubscription {
+                url: "http://example.com/webhook".to_string(),
+                event_type: Some("CAddressFunded".to_string()),
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .expect("create subscription");
+
+        let event = crate::poller::parse_contract_event_for_test(
+            &serde_json::json!({
+                "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
+                "ledger": 100,
+                "txHash": "deadbeef",
+                "createdAt": "2024-01-01T00:00:00Z"
+            }),
+            "C_CONTRACT",
+        )
+        .expect("parse event");
+
+        db.insert_event(&event).await.expect("insert event");
+
+        // First queue/replay
+        db.queue_webhook_deliveries(&event).await.expect("first queue");
+        let initial_deliveries = db.get_pending_deliveries().await.expect("pending deliveries");
+        assert_eq!(initial_deliveries.len(), 1);
+        let first_id = initial_deliveries[0].id.clone();
+
+        // Second queue/replay of the same event
+        db.queue_webhook_deliveries(&event).await.expect("second queue");
+        let deliveries_after_replay = db.get_pending_deliveries().await.expect("pending deliveries");
+        assert_eq!(
+            deliveries_after_replay.len(),
+            1,
+            "replaying the same range twice must leave exactly one delivery row per (subscription, event)"
+        );
+        assert_eq!(
+            deliveries_after_replay[0].id,
+            first_id,
+            "replaying must preserve the existing delivery_id for client-side deduplication"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migration_0003_creates_unique_sub_event_index_and_fk_indexes() {
+        let db = setup_db().await;
+        let indexes: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='webhook_deliveries'",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("fetch index names");
+
+        let names: Vec<String> = indexes.into_iter().map(|(n,)| n).collect();
+        assert!(
+            names.contains(&"idx_webhook_deliveries_sub_event".to_string()),
+            "unique (subscription_id, event_id) index must exist"
+        );
+        assert!(
+            names.contains(&"idx_webhook_deliveries_subscription_id".to_string()),
+            "FK index on subscription_id must exist"
+        );
+        assert!(
+            names.contains(&"idx_webhook_deliveries_event_id".to_string()),
+            "FK index on event_id must exist"
         );
     }
 }
