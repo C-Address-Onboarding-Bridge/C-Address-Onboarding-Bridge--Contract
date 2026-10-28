@@ -50,6 +50,7 @@
 //!    Soroban authorization-entry reuse.
 
 #![no_std]
+#![allow(clippy::duplicated_attributes)]
 // TODO(next-bounty): both allows below cover a backlog left by the first bounty
 // programme, not a decision to stop linting. CI runs clippy with `-D warnings`,
 // so without these the whole job fails on known, pre-existing findings and never
@@ -80,7 +81,7 @@ use soroban_sdk::{
 /// Every public function that can fail returns `Result<_, BridgeError>`.
 /// Callers should match on these variants to distinguish recoverable from
 /// unrecoverable conditions.
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BridgeError {
     /// Contract has not been initialized yet. Call `initialize` first.
@@ -189,7 +190,9 @@ pub enum BridgeError {
     TooManyFeeTiers = 51,
     /// Cross-chain payouts exceed the admin-funded liquidity reserve.
     InsufficientCrossChainReserve = 52,
-    // Next free discriminant: 53. Always take the next unused value here and
+    /// The number of registered relayers has reached the maximum allowed (`MAX_RELAYERS`).
+    TooManyRelayers = 53,
+    // Next free discriminant: 54. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
 
@@ -275,6 +278,7 @@ const MAX_BATCH_SIZE: u32 = 100;
 /// / `find_current_tier` scan the full tier list linearly on every funding
 /// call, so this bounds the per-call cost of that scan.
 const MAX_FEE_TIERS: u32 = 50;
+const MAX_RELAYERS: u32 = 50;
 const MAX_ALLOWED_TTL: u32 = 3_110_400; // ~1 year in ledgers (5s/ledger)
 /// Minimum configurable value for `MaxInstanceTtl` / `MaxPersistentTtl`.
 ///
@@ -798,7 +802,12 @@ fn save_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
 }
 
 fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError> {
-    if !read_whitelist(env).get(asset.clone()).unwrap_or(false) {
+    let is_whitelisted = env
+        .storage()
+        .persistent()
+        .get(&DataKey::AssetWhitelistEntry(asset.clone()))
+        .unwrap_or_else(|| read_whitelist(env).get(asset.clone()).unwrap_or(false));
+    if !is_whitelisted {
         return Err(BridgeError::AssetNotWhitelisted);
     }
     Ok(())
@@ -822,7 +831,12 @@ fn save_pool_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
 }
 
 fn check_pool_whitelisted(env: &Env, pool: &Address) -> Result<(), BridgeError> {
-    if !read_pool_whitelist(env).get(pool.clone()).unwrap_or(false) {
+    let is_whitelisted = env
+        .storage()
+        .persistent()
+        .get(&DataKey::PoolWhitelistEntry(pool.clone()))
+        .unwrap_or_else(|| read_pool_whitelist(env).get(pool.clone()).unwrap_or(false));
+    if !is_whitelisted {
         return Err(BridgeError::PoolNotWhitelisted);
     }
     Ok(())
@@ -1102,8 +1116,11 @@ fn is_relayer(env: &Env, pubkey: &BytesN<32>) -> bool {
         .unwrap_or(false)
 }
 
-fn add_relayer(env: &Env, pubkey: &BytesN<32>) {
+fn add_relayer(env: &Env, pubkey: &BytesN<32>) -> Result<(), BridgeError> {
     if !is_relayer(env, pubkey) {
+        if relayer_count(env) >= MAX_RELAYERS {
+            return Err(BridgeError::TooManyRelayers);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::Relayer(pubkey.clone()), &true);
@@ -1116,6 +1133,7 @@ fn add_relayer(env: &Env, pubkey: &BytesN<32>) {
             .instance()
             .set(&DataKey::RelayerCount, &(relayer_count(env) + 1));
     }
+    Ok(())
 }
 
 fn read_relayer_set(env: &Env) -> Vec<BytesN<32>> {
@@ -1785,7 +1803,7 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
 
         if targets.len() > MAX_BATCH_SIZE {
-            return Err(BridgeError::TooManyFeeTiers);
+            return Err(BridgeError::BatchTooLarge);
         }
         // #594: reject empty batches — a zero-length call transfers nothing but
         // would still emit BatchCompleted and mint loyalty rewards.
@@ -2409,6 +2427,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         if amount < 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -3607,7 +3626,18 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         let mut whitelist = read_whitelist(&env);
-        let was_whitelisted = whitelist.get(asset.clone()).unwrap_or(false);
+        let was_whitelisted = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssetWhitelistEntry(asset.clone()))
+            .unwrap_or_else(|| whitelist.get(asset.clone()).unwrap_or(false));
+        env.storage()
+            .persistent()
+            .set(&DataKey::AssetWhitelistEntry(asset.clone()), &true);
+        let max_ttl = read_max_persistent_ttl(&env);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::AssetWhitelistEntry(asset.clone()), max_ttl, max_ttl);
         whitelist.set(asset.clone(), true);
         save_whitelist(&env, &whitelist);
         env.events()
@@ -3642,7 +3672,14 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         let mut whitelist = read_whitelist(&env);
-        let was_present = whitelist.get(asset.clone()).unwrap_or(false);
+        let was_present = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssetWhitelistEntry(asset.clone()))
+            .unwrap_or_else(|| whitelist.get(asset.clone()).unwrap_or(false));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AssetWhitelistEntry(asset.clone()));
         whitelist.remove(asset.clone());
         save_whitelist(&env, &whitelist);
         env.events().publish(("AssetRemoved",), (admin, asset, was_present));
@@ -3656,7 +3693,11 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_is_asset_whitelisted(env: Env, asset: Address) -> Result<bool, BridgeError> {
         check_initialized(&env)?;
-        Ok(read_whitelist(&env).get(asset).unwrap_or(false))
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssetWhitelistEntry(asset.clone()))
+            .unwrap_or_else(|| read_whitelist(&env).get(asset).unwrap_or(false)))
     }
 
     /// Returns a page of currently whitelisted asset addresses.
@@ -3729,7 +3770,18 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         let mut whitelist = read_pool_whitelist(&env);
-        let was_present = whitelist.get(pool.clone()).unwrap_or(false);
+        let was_present = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolWhitelistEntry(pool.clone()))
+            .unwrap_or_else(|| whitelist.get(pool.clone()).unwrap_or(false));
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolWhitelistEntry(pool.clone()), &true);
+        let max_ttl = read_max_persistent_ttl(&env);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::PoolWhitelistEntry(pool.clone()), max_ttl, max_ttl);
         whitelist.set(pool.clone(), true);
         save_pool_whitelist(&env, &whitelist);
         env.events().publish(("SwapPoolAdded",), (admin, pool, was_present));
@@ -3766,7 +3818,14 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         let mut whitelist = read_pool_whitelist(&env);
-        let was_present = whitelist.get(pool.clone()).unwrap_or(false);
+        let was_present = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolWhitelistEntry(pool.clone()))
+            .unwrap_or_else(|| whitelist.get(pool.clone()).unwrap_or(false));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PoolWhitelistEntry(pool.clone()));
         whitelist.remove(pool.clone());
         save_pool_whitelist(&env, &whitelist);
         env.events().publish(("SwapPoolRemoved",), (admin, pool, was_present));
@@ -3780,7 +3839,11 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_is_pool_whitelisted(env: Env, pool: Address) -> Result<bool, BridgeError> {
         check_initialized(&env)?;
-        Ok(read_pool_whitelist(&env).get(pool).unwrap_or(false))
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolWhitelistEntry(pool.clone()))
+            .unwrap_or_else(|| read_pool_whitelist(&env).get(pool).unwrap_or(false)))
     }
 
     // -----------------------------------------------------------------------
@@ -4252,7 +4315,7 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
-        add_relayer(&env, &pubkey);
+        add_relayer(&env, &pubkey)?;
         env.events().publish(("RelayerAdded",), (admin, pubkey));
         Ok(())
     }
@@ -4284,7 +4347,8 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        if is_relayer(&env, &pubkey) {
+        let was_registered = is_relayer(&env, &pubkey);
+        if was_registered {
             let count = relayer_count(&env);
             if count <= 1 || count.saturating_sub(1) < relayer_threshold(&env) {
                 return Err(BridgeError::BelowThreshold);
