@@ -50,19 +50,9 @@
 //!    Soroban authorization-entry reuse.
 
 #![no_std]
-// TODO(next-bounty): both allows below cover a backlog left by the first bounty
-// programme, not a decision to stop linting. CI runs clippy with `-D warnings`,
-// so without these the whole job fails on known, pre-existing findings and never
-// reaches anything new.
-//
-// `dead_code`: ~24 storage helpers, constants and one struct field (fee tiers,
-// timelock entries, relayer thresholds, auth nonces, pool whitelist, loyalty
-// tokens) were written but never wired into a public contract function. They are
-// the unfinished half of those features -- implement the callers, then drop this.
-//
-// `clippy::too_many_arguments`: three funding entry points take 8-10 arguments.
+#![allow(clippy::duplicated_attributes)]
+// clippy::too_many_arguments: three funding entry points take 8-10 arguments.
 // Narrowing them means changing the public contract ABI, which is not a cleanup.
-#![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
 
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -80,7 +70,7 @@ use soroban_sdk::{
 /// Every public function that can fail returns `Result<_, BridgeError>`.
 /// Callers should match on these variants to distinguish recoverable from
 /// unrecoverable conditions.
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BridgeError {
     /// Contract has not been initialized yet. Call `initialize` first.
@@ -214,7 +204,6 @@ pub enum DataKey {
     Nonce(Address),
     ReferralRate,
     // Extended variants used throughout the contract
-    Config,
     AssetStats(Address),
     Relayer(BytesN<32>),
     RelayerCount,
@@ -258,8 +247,6 @@ pub enum DataKey {
     Deactivated,
     // Admin-managed whitelist of DEX pool addresses usable in `swap_route`.
     PoolWhitelist,
-    AssetWhitelistEntry(Address),
-    PoolWhitelistEntry(Address),
     RelayerSet,
     CrossChainReserve(Address),
 }
@@ -903,13 +890,6 @@ fn decrement_crosschain_reserve(
     Ok(())
 }
 
-fn increment_accrued_fees(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
-    let mut c = read_asset_counters(env, asset);
-    c.accrued_fees = safe_math::safe_add(c.accrued_fees, amount)?;
-    save_asset_counters(env, asset, &c);
-    Ok(())
-}
-
 fn decrement_accrued_fees(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
     let mut c = read_asset_counters(env, asset);
     c.accrued_fees = safe_math::safe_sub(c.accrued_fees, amount)?;
@@ -921,26 +901,8 @@ fn read_total_bridged(env: &Env, asset: &Address) -> i128 {
     read_asset_counters(env, asset).total_bridged
 }
 
-fn increment_total_bridged(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
-    let mut c = read_asset_counters(env, asset);
-    c.total_bridged = safe_math::safe_add(c.total_bridged, amount)?;
-    save_asset_counters(env, asset, &c);
-    Ok(())
-}
-
 fn read_total_fees_collected(env: &Env, asset: &Address) -> i128 {
     read_asset_counters(env, asset).total_fees_collected
-}
-
-fn increment_total_fees_collected(
-    env: &Env,
-    asset: &Address,
-    amount: i128,
-) -> Result<(), BridgeError> {
-    let mut c = read_asset_counters(env, asset);
-    c.total_fees_collected = safe_math::safe_add(c.total_fees_collected, amount)?;
-    save_asset_counters(env, asset, &c);
-    Ok(())
 }
 
 /// Atomically update all three counters in a single storage read+write
@@ -1785,7 +1747,7 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
 
         if targets.len() > MAX_BATCH_SIZE {
-            return Err(BridgeError::TooManyFeeTiers);
+            return Err(BridgeError::BatchTooLarge);
         }
         // #594: reject empty batches — a zero-length call transfers nothing but
         // would still emit BatchCompleted and mint loyalty rewards.
@@ -2409,6 +2371,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         if amount < 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -4284,7 +4247,8 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        if is_relayer(&env, &pubkey) {
+        let was_registered = is_relayer(&env, &pubkey);
+        if was_registered {
             let count = relayer_count(&env);
             if count <= 1 || count.saturating_sub(1) < relayer_threshold(&env) {
                 return Err(BridgeError::BelowThreshold);
