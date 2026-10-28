@@ -50,6 +50,7 @@
 //!    Soroban authorization-entry reuse.
 
 #![no_std]
+#![allow(clippy::duplicated_attributes)]
 // TODO(next-bounty): both allows below cover a backlog left by the first bounty
 // programme, not a decision to stop linting. CI runs clippy with `-D warnings`,
 // so without these the whole job fails on known, pre-existing findings and never
@@ -80,7 +81,7 @@ use soroban_sdk::{
 /// Every public function that can fail returns `Result<_, BridgeError>`.
 /// Callers should match on these variants to distinguish recoverable from
 /// unrecoverable conditions.
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BridgeError {
     /// Contract has not been initialized yet. Call `initialize` first.
@@ -512,24 +513,38 @@ fn read_max_withdraw_per_tx(env: &Env) -> i128 {
 }
 
 fn read_bridge_config(env: &Env) -> BridgeConfigData {
-    env.storage()
-        .instance()
-        .get(&DataKey::BridgeConfig)
-        .unwrap_or_else(|| BridgeConfigData {
-            admin: env
-                .storage()
-                .instance()
-                .get(&DataKey::Admin)
-                .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized)),
-            fee_collector: env
-                .storage()
-                .instance()
-                .get(&DataKey::FeeCollector)
-                .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized)),
-            fee_bps: env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0),
+    if let Some(cfg) = env.storage().instance().get(&DataKey::BridgeConfig) {
+        return cfg;
+    }
+
+    // One-time migration path for contracts deployed with legacy keys only
+    if env.storage().instance().has(&DataKey::Admin) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized));
+        let fee_collector: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeCollector)
+            .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized));
+        let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+        let cfg = BridgeConfigData {
+            admin,
+            fee_collector,
+            fee_bps,
             paused: false,
             allowlist_mode: false,
-        })
+        };
+        save_bridge_config(env, &cfg);
+        env.storage().instance().remove(&DataKey::Admin);
+        env.storage().instance().remove(&DataKey::FeeCollector);
+        env.storage().instance().remove(&DataKey::FeeBps);
+        return cfg;
+    }
+
+    panic_with_error!(env, BridgeError::NotInitialized)
 }
 
 fn save_bridge_config(env: &Env, cfg: &BridgeConfigData) {
@@ -601,48 +616,26 @@ fn increment_user_deposit(
 
 #[inline(never)]
 fn save_admin(env: &Env, admin: &Address) {
-    env.storage().instance().set(&DataKey::Admin, admin);
-    if let Some(mut config) = env
-        .storage()
-        .instance()
-        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
-    {
-        config.admin = admin.clone();
-        save_bridge_config(env, &config);
-    }
+    let mut config = read_bridge_config(env);
+    config.admin = admin.clone();
+    save_bridge_config(env, &config);
 }
 
 #[inline(never)]
 fn read_admin(env: &Env) -> Address {
-    env.storage()
-        .instance()
-        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
-        .map(|config| config.admin)
-        .or_else(|| env.storage().instance().get(&DataKey::Admin))
-        .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized))
+    read_bridge_config(env).admin
 }
 
 #[inline(never)]
 fn save_fee_collector(env: &Env, addr: &Address) {
-    env.storage().instance().set(&DataKey::FeeCollector, addr);
-    if let Some(mut config) = env
-        .storage()
-        .instance()
-        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
-    {
-        config.fee_collector = addr.clone();
-        save_bridge_config(env, &config);
-    }
+    let mut config = read_bridge_config(env);
+    config.fee_collector = addr.clone();
+    save_bridge_config(env, &config);
 }
 
 #[inline(never)]
 fn read_fee_collector(env: &Env) -> Address {
-    env.storage()
-        .instance()
-        .get::<_, BridgeConfigData>(&DataKey::BridgeConfig)
-        .map(|config| config.fee_collector)
-        .or_else(|| env.storage().instance().get(&DataKey::FeeCollector))
-        .unwrap_or_else(|| panic_with_error!(env, BridgeError::NotInitialized))
+    read_bridge_config(env).fee_collector
 }
 
 fn read_config(env: &Env) -> BridgeConfig {
@@ -1582,11 +1575,6 @@ impl OnboardingBridge {
                 allowlist_mode: false,
             },
         );
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeCollector, &fee_collector);
-        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
         save_current_wasm_hash(&env, &wasm_hash);
         mark_initialized(&env);
         extend_instance_ttl(&env);
@@ -1785,7 +1773,7 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
 
         if targets.len() > MAX_BATCH_SIZE {
-            return Err(BridgeError::TooManyFeeTiers);
+            return Err(BridgeError::BatchTooLarge);
         }
         // #594: reject empty batches — a zero-length call transfers nothing but
         // would still emit BatchCompleted and mint loyalty rewards.
@@ -2139,9 +2127,6 @@ impl OnboardingBridge {
         extend_instance_ttl(&env);
         let old_collector = read_fee_collector(&env);
         save_fee_collector(&env, &new_fee_collector);
-        let mut config = read_bridge_config(&env);
-        config.fee_collector = new_fee_collector.clone();
-        save_bridge_config(&env, &config);
         env.events().publish(
             ("FeeCollectorChanged", old_collector, new_fee_collector),
             (admin,),
@@ -2182,9 +2167,6 @@ impl OnboardingBridge {
         extend_instance_ttl(&env);
         let old_collector = read_fee_collector(&env);
         save_fee_collector(&env, &pending);
-        let mut config = read_bridge_config(&env);
-        config.fee_collector = pending.clone();
-        save_bridge_config(&env, &config);
         remove_pending_fee_collector(&env);
         env.events()
             .publish(("FeeCollectorTransferred", old_collector, pending), ());
@@ -2204,9 +2186,6 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         save_admin(&env, &new_admin);
-        let mut config = read_bridge_config(&env);
-        config.admin = new_admin.clone();
-        save_bridge_config(&env, &config);
         env.events().publish(("AdminChanged", admin, new_admin), ());
         Ok(())
     }
@@ -2243,9 +2222,6 @@ impl OnboardingBridge {
         extend_instance_ttl(&env);
         let old_admin = read_admin(&env);
         save_admin(&env, &pending);
-        let mut config = read_bridge_config(&env);
-        config.admin = pending.clone();
-        save_bridge_config(&env, &config);
         remove_pending_admin(&env);
         env.events()
             .publish(("AdminTransferred", old_admin, pending), ());
@@ -2409,6 +2385,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         if amount < 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -4284,7 +4261,8 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        if is_relayer(&env, &pubkey) {
+        let was_registered = is_relayer(&env, &pubkey);
+        if was_registered {
             let count = relayer_count(&env);
             if count <= 1 || count.saturating_sub(1) < relayer_threshold(&env) {
                 return Err(BridgeError::BelowThreshold);
