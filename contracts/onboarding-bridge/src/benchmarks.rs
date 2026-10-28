@@ -66,6 +66,26 @@ impl BenchToken {
             .persistent()
             .set(&(BTDataKey::Balance, to), &(tb + amount));
     }
+    pub fn approve(e: Env, from: Address, spender: Address, amount: i128, live_until_ledger: u32) {
+        let _ = (e, from, spender, amount, live_until_ledger);
+    }
+    pub fn transfer_from(e: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        spender.require_auth();
+        if from == to {
+            return;
+        }
+        let fb = Self::balance(e.clone(), from.clone());
+        if fb < amount {
+            panic!("insufficient balance");
+        }
+        let tb = Self::balance(e.clone(), to.clone());
+        e.storage()
+            .persistent()
+            .set(&(BTDataKey::Balance, from), &(fb - amount));
+        e.storage()
+            .persistent()
+            .set(&(BTDataKey::Balance, to), &(tb + amount));
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -147,17 +167,14 @@ fn bench_fund_amount(amount: i128) {
     });
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn bench_fund_c_address_small() {
     bench_fund_amount(100);
 }
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn bench_fund_c_address_medium() {
     bench_fund_amount(1_000_000);
 }
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn bench_fund_c_address_large() {
     bench_fund_amount(1_000_000_000);
@@ -219,17 +236,14 @@ fn bench_withdraw(amount: i128) {
     let _ = (admin, fee_collector);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn bench_withdraw_fees_small() {
     bench_withdraw(10);
 }
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn bench_withdraw_fees_medium() {
     bench_withdraw(500);
 }
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn bench_withdraw_fees_large() {
     bench_withdraw(5_000);
@@ -237,7 +251,6 @@ fn bench_withdraw_fees_large() {
 
 // ── view functions ─────────────────────────────────────────────────────────────
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn bench_views() {
     let (env, bridge_id, token_id, _admin, _fee_collector) = initialized_setup();
@@ -299,7 +312,6 @@ fn bench_views() {
 
 // ── admin setters ──────────────────────────────────────────────────────────────
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn bench_admin_setters() {
     let (env, bridge_id, token_id, _admin, _fee_collector) = initialized_setup();
@@ -320,9 +332,6 @@ fn bench_admin_setters() {
     });
     measure(&env, "add_asset", || {
         bridge.add_asset(&token_id, &None);
-    });
-    measure(&env, "remove_asset", || {
-        bridge.remove_asset(&token_id, &None);
     });
     measure(&env, "add_to_blocklist", || {
         bridge.add_to_blocklist(&new_addr, &None);
@@ -354,6 +363,9 @@ fn bench_admin_setters() {
     measure(&env, "set_asset_fee_cap", || {
         bridge.set_asset_fee_cap(&token_id, &50u32, &None);
     });
+    measure(&env, "remove_asset", || {
+        bridge.remove_asset(&token_id, &None);
+    });
 }
 
 #[test]
@@ -373,7 +385,6 @@ fn bench_reentrancy_guard_overhead() {
 
 // ── fund_c_address_timelocked / claim_timelocked ──────────────────────────────
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn bench_fund_c_address_timelocked() {
     let (env, bridge_id, token_id, _admin, _fee_collector) = initialized_setup();
@@ -398,7 +409,6 @@ fn bench_fund_c_address_timelocked() {
     });
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn bench_claim_timelocked() {
     let (env, bridge_id, token_id, _admin, _fee_collector) = initialized_setup();
@@ -429,7 +439,6 @@ fn bench_claim_timelocked() {
 
 // ═══ fund_c_address_crosschain ═════════════════════════════════════════════
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn bench_fund_c_address_crosschain() {
     let (env, bridge_id, token_id, admin, _fee_collector) = initialized_setup();
@@ -597,7 +606,6 @@ fn bench_reveal_fund() {
 
 // ── fund_c_address_with_swap ──────────────────────────────────────────────────
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn bench_fund_c_address_with_swap() {
     let (env, bridge_id, _token_id, admin, _fee_collector) = initialized_setup();
@@ -611,6 +619,7 @@ fn bench_fund_c_address_with_swap() {
     BenchTokenClient::new(&env, &src_token_id).initialize(&admin);
     BenchTokenClient::new(&env, &dst_token_id).initialize(&admin);
     mint(&env, &src_token_id, &user, 10_000i128);
+    bridge.add_asset(&src_token_id, &None);
     bridge.add_asset(&dst_token_id, &None);
 
     // Deploy a minimal swap pool.
@@ -641,7 +650,6 @@ fn bench_fund_c_address_with_swap() {
 
 // ── execute_meta_fund ─────────────────────────────────────────────────────────
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn bench_execute_meta_fund() {
     let (env, bridge_id, token_id, _admin, _fee_collector) = initialized_setup();
@@ -651,7 +659,8 @@ fn bench_execute_meta_fund() {
     let target = Address::generate(&env);
     let amount = 10_000i128;
 
-    // Fund the bridge so it can transfer to target.
+    // Fund source and the bridge so source has balance and bridge can transfer.
+    mint(&env, &token_id, &source, amount);
     mint(&env, &token_id, &bridge_id, amount);
 
     // Generate a keypair and register it as the meta signer for source.
@@ -706,7 +715,6 @@ fn bench_execute_meta_fund() {
 
 // ── Tiered fee lookups ────────────────────────────────────────────────────────
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn bench_tiered_fee_lookup() {
     let (env, bridge_id, token_id, admin, fee_collector) = initialized_setup();
