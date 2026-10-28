@@ -245,7 +245,7 @@ export class EventSubscriber {
   private listeners: Map<string, Set<BridgeEventCallback<any>>>;
 
   /** NodeJS/browser timeout handle for the self-scheduling poll loop. */
-  private intervalHandle: ReturnType<typeof setInterval> | null = null;
+  private intervalHandle: ReturnType<typeof setTimeout> | null = null;
 
   /** Whether a fetch is currently in flight (guards against overlap). */
   private polling = false;
@@ -422,6 +422,7 @@ export class EventSubscriber {
     } else {
       const latest = await this.server.getLatestLedger();
       params.startLedger = latest.sequence;
+      this.cursor = latest.sequence;
     }
 
     const response = await this.server.getEvents(params);
