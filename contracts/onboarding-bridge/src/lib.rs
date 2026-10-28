@@ -45,11 +45,12 @@
 //! 1. **Sequential nonce** (`DataKey::Nonce`) — optional `nonce: Option<u64>` parameter
 //!    on every mutating function. Pass `None` to skip (standard Stellar transaction
 //!    replay protection applies). Pass `Some(n)` to enforce strict ordering.
-//! 2. **Auth-entry nonce** (`DataKey::UsedAuthNonce`) — used by `verify_auth_entry` to
-//!    permanently burn a `(source, nonce)` pair within a ledger-sequence window, preventing
-//!    Soroban authorization-entry reuse.
+//! 2. **Auth-entry nonce** (`DataKey::AuthNonce`) — used by `verify_auth_entry` to
+//!    burn a sequential `nonce` counter per source within a ledger-sequence window, preventing
+//!    Soroban authorization-entry reuse without per-call storage growth.
 
 #![no_std]
+#![allow(clippy::duplicated_attributes)]
 // TODO(next-bounty): both allows below cover a backlog left by the first bounty
 // programme, not a decision to stop linting. CI runs clippy with `-D warnings`,
 // so without these the whole job fails on known, pre-existing findings and never
@@ -80,7 +81,7 @@ use soroban_sdk::{
 /// Every public function that can fail returns `Result<_, BridgeError>`.
 /// Callers should match on these variants to distinguish recoverable from
 /// unrecoverable conditions.
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BridgeError {
     /// Contract has not been initialized yet. Call `initialize` first.
@@ -231,9 +232,8 @@ pub enum DataKey {
     MaxInstanceTtl,
     MaxPersistentTtl,
     BridgeConfig,
-    // Issue #95: per-address auth nonce counter and used-nonce set
+    // Issue #95: per-address auth nonce counter
     AuthNonce(Address),
-    UsedAuthNonce(Address, u64),
     // Issue #72: timelocked upgrade path
     PendingUpgrade,
     CurrentWasmHash,
@@ -1010,25 +1010,14 @@ fn read_auth_nonce(env: &Env, source: &Address) -> u64 {
 }
 
 fn is_auth_nonce_used(env: &Env, source: &Address, nonce: u64) -> bool {
-    env.storage()
-        .persistent()
-        .get(&DataKey::UsedAuthNonce(source.clone(), nonce))
-        .unwrap_or(false)
+    nonce < read_auth_nonce(env, source)
 }
 
 fn mark_auth_nonce_used(env: &Env, source: &Address, nonce: u64) -> Result<(), BridgeError> {
+    let next = nonce.checked_add(1).ok_or(BridgeError::Overflow)?;
     env.storage()
         .persistent()
-        .set(&DataKey::UsedAuthNonce(source.clone(), nonce), &true);
-    // Advance the per-address counter so clients can always discover the next
-    // expected nonce without scanning storage.
-    let current = read_auth_nonce(env, source);
-    if nonce >= current {
-        let next = nonce.checked_add(1).ok_or(BridgeError::Overflow)?;
-        env.storage()
-            .persistent()
-            .set(&DataKey::AuthNonce(source.clone()), &next);
-    }
+        .set(&DataKey::AuthNonce(source.clone()), &next);
     Ok(())
 }
 
@@ -1054,20 +1043,21 @@ fn consume_auth_nonce(
         return Err(BridgeError::AuthNonceExpired);
     }
 
-    // 2. Enforce monotonic sequencing before checking the used-nonce set.
-    if nonce != read_auth_nonce(env, source) {
-        return Err(BridgeError::DuplicateNonce);
+    // 2. Used-nonce check (prevents exact replay of this (source, nonce) pair) (#898)
+    let expected = read_auth_nonce(env, source);
+    if nonce < expected {
+        return Err(BridgeError::AuthNonceAlreadyUsed);
     }
 
-    // 3. Used-nonce check (prevents exact replay of this (source, nonce) pair)
-    if is_auth_nonce_used(env, source, nonce) {
-        return Err(BridgeError::AuthNonceAlreadyUsed);
+    // 3. Monotonic sequencing check (nonce > expected means a skipped nonce)
+    if nonce > expected {
+        return Err(BridgeError::DuplicateNonce);
     }
 
     // 4. Mark as used and advance the per-address counter
     mark_auth_nonce_used(env, source, nonce)?;
 
-    // 4. Emit AuthUsed event for off-chain indexers
+    // 5. Emit AuthUsed event for off-chain indexers
     env.events().publish(("AuthUsed", source.clone()), (nonce,));
 
     Ok(())
@@ -1785,7 +1775,7 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
 
         if targets.len() > MAX_BATCH_SIZE {
-            return Err(BridgeError::TooManyFeeTiers);
+            return Err(BridgeError::BatchTooLarge);
         }
         // #594: reject empty batches — a zero-length call transfers nothing but
         // would still emit BatchCompleted and mint loyalty rewards.
@@ -2409,6 +2399,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         if amount < 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -4284,7 +4275,8 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        if is_relayer(&env, &pubkey) {
+        let was_registered = is_relayer(&env, &pubkey);
+        if was_registered {
             let count = relayer_count(&env);
             if count <= 1 || count.saturating_sub(1) < relayer_threshold(&env) {
                 return Err(BridgeError::BelowThreshold);
