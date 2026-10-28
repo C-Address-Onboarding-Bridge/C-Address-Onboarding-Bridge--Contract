@@ -124,8 +124,7 @@ fn assert_funding_invariants(amount: i128, fee_bps: u32) -> Result<(), TestCaseE
 proptest! {
     #![proptest_config(ProptestConfig { cases: 256, .. ProptestConfig::default() })]
 
-    #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
-    #[test]
+        #[test]
     fn fund_c_address_fee_invariants_hold_for_random_amounts(
         amount in 1i128..=1_000_000_000_000i128,
         fee_bps in 0u32..=MAX_FEE_BPS,
@@ -134,7 +133,6 @@ proptest! {
     }
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn fund_c_address_fee_invariants_hold_for_explicit_edges() {
     let cases = [
