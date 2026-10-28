@@ -70,7 +70,7 @@ describe('EventSubscriber', () => {
     mockGetEvents.mockReset();
     mockGetEvents.mockResolvedValue({ events: [] });
     mockGetLatestLedger.mockReset();
-    mockGetLatestLedger.mockResolvedValue({ sequence: 100 });
+    mockGetLatestLedger.mockResolvedValue({ sequence: 999 });
     subscriber = makeSubscriber();
   });
 
@@ -107,13 +107,13 @@ describe('EventSubscriber', () => {
   });
 
   describe('polling loop', () => {
-    it('starts polling on the first listener and stops when the last unsubscribes', () => {
+    it('starts polling on the first listener and stops when the last unsubscribes', async () => {
       const unsub = subscriber.on('CAddressFunded', jest.fn());
-      jest.advanceTimersByTime(3_000);
+      await jest.advanceTimersByTimeAsync(3_000);
       expect(mockGetEvents).toHaveBeenCalledTimes(3);
 
       unsub();
-      jest.advanceTimersByTime(3_000);
+      await jest.advanceTimersByTimeAsync(3_000);
       expect(mockGetEvents).toHaveBeenCalledTimes(3);
     });
 
@@ -121,9 +121,9 @@ describe('EventSubscriber', () => {
       mockGetEvents.mockRejectedValueOnce(new Error('rpc down'));
       subscriber.on('CAddressFunded', jest.fn());
 
-      jest.advanceTimersByTime(1_000);
+      await jest.advanceTimersByTimeAsync(1_000);
       await Promise.resolve();
-      jest.advanceTimersByTime(1_000);
+      await jest.advanceTimersByTimeAsync(1_000);
       expect(mockGetEvents).toHaveBeenCalledTimes(2);
     });
 
@@ -142,7 +142,7 @@ describe('EventSubscriber', () => {
       subscriber.on('*', jest.fn());
 
       // Advance well past several intervals while the first fetch is in flight.
-      jest.advanceTimersByTime(10_000);
+      await jest.advanceTimersByTimeAsync(10_000);
       await Promise.resolve();
 
       // Only one fetch may ever be in flight at a time.
@@ -160,7 +160,7 @@ describe('EventSubscriber', () => {
         return fundedEventResponse('tok-1');
       });
 
-      jest.advanceTimersByTime(10_000);
+      await jest.advanceTimersByTimeAsync(3_500);
       await Promise.resolve();
 
       expect(received).toHaveLength(1);
@@ -276,9 +276,9 @@ describe('EventSubscriber', () => {
       mockGetEvents.mockRejectedValueOnce(new Error('rpc down'));
       subscriber.on('error', jest.fn());
 
-      jest.advanceTimersByTime(1_000);
+      await jest.advanceTimersByTimeAsync(1_000);
       // The existing test pattern: just verify the loop stays alive (call count)
-      jest.advanceTimersByTime(1_000);
+      await jest.advanceTimersByTimeAsync(1_000);
       expect(mockGetEvents).toHaveBeenCalledTimes(2);
     });
 

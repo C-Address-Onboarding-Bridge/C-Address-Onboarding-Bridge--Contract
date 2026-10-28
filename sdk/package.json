@@ -9,6 +9,7 @@
     "build": "tsc",
     "prepublishOnly": "npm run build",
     "test": "jest",
+    "typecheck": "tsc --noEmit",
     "lint": "eslint src/",
     "docs": "typedoc --out docs src/index.ts --name \"C-Address Onboarding Bridge SDK\" --includeVersion"
   },
