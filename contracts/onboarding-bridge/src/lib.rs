@@ -50,6 +50,7 @@
 //!    Soroban authorization-entry reuse.
 
 #![no_std]
+#![allow(clippy::duplicated_attributes)]
 // TODO(next-bounty): both allows below cover a backlog left by the first bounty
 // programme, not a decision to stop linting. CI runs clippy with `-D warnings`,
 // so without these the whole job fails on known, pre-existing findings and never
@@ -1785,7 +1786,7 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
 
         if targets.len() > MAX_BATCH_SIZE {
-            return Err(BridgeError::TooManyFeeTiers);
+            return Err(BridgeError::BatchTooLarge);
         }
         // #594: reject empty batches — a zero-length call transfers nothing but
         // would still emit BatchCompleted and mint loyalty rewards.
@@ -2409,6 +2410,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_paused(&env)?;
         if amount < 0 {
             return Err(BridgeError::InvalidAmount);
         }
