@@ -7,8 +7,7 @@
 #![cfg(test)]
 
 use crate::{
-    check_daily_limit, increment_accrued_fees, increment_source_bridged_volume,
-    increment_total_bridged, increment_total_fees_collected, increment_user_deposit,
+    check_daily_limit, increment_source_bridged_volume, increment_user_deposit,
     save_source_daily_limit, update_asset_counters, BridgeError, OnboardingBridge,
 };
 use proptest::prelude::*;
@@ -23,36 +22,24 @@ fn setup() -> (Env, Address, Address, Address) {
 }
 
 #[test]
-fn accrued_fees_overflow_returns_error_not_panic() {
+fn update_asset_counters_accrued_fees_overflow_returns_error() {
     let (env, bridge_id, asset, _source) = setup();
     env.as_contract(&bridge_id, || {
-        increment_accrued_fees(&env, &asset, i128::MAX).unwrap();
+        update_asset_counters(&env, &asset, i128::MAX, 0).unwrap();
         assert_eq!(
-            increment_accrued_fees(&env, &asset, 1),
+            update_asset_counters(&env, &asset, 1, 0),
             Err(BridgeError::Overflow)
         );
     });
 }
 
 #[test]
-fn total_bridged_overflow_returns_error_not_panic() {
+fn update_asset_counters_total_bridged_overflow_returns_error() {
     let (env, bridge_id, asset, _source) = setup();
     env.as_contract(&bridge_id, || {
-        increment_total_bridged(&env, &asset, i128::MAX).unwrap();
+        update_asset_counters(&env, &asset, 0, i128::MAX).unwrap();
         assert_eq!(
-            increment_total_bridged(&env, &asset, 1),
-            Err(BridgeError::Overflow)
-        );
-    });
-}
-
-#[test]
-fn total_fees_collected_overflow_returns_error_not_panic() {
-    let (env, bridge_id, asset, _source) = setup();
-    env.as_contract(&bridge_id, || {
-        increment_total_fees_collected(&env, &asset, i128::MAX).unwrap();
-        assert_eq!(
-            increment_total_fees_collected(&env, &asset, 1),
+            update_asset_counters(&env, &asset, 0, 1),
             Err(BridgeError::Overflow)
         );
     });
@@ -125,8 +112,8 @@ proptest! {
     ) {
         let (env, bridge_id, asset, _source) = setup();
         env.as_contract(&bridge_id, || {
-            increment_accrued_fees(&env, &asset, base).unwrap();
-            let result = increment_accrued_fees(&env, &asset, delta);
+            update_asset_counters(&env, &asset, base, 0).unwrap();
+            let result = update_asset_counters(&env, &asset, delta, 0);
             let expected_overflow = base.checked_add(delta).is_none();
             prop_assert_eq!(result.is_err(), expected_overflow);
             if let Err(e) = result {
