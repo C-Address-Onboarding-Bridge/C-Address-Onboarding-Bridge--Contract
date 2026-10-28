@@ -360,6 +360,7 @@ async fn replay_events(
     Ok(Json(serde_json::json!({ "replayed": count })))
 }
 
+#[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 pub struct DeliveryQuery {
     pub status: Option<String>,
@@ -367,6 +368,7 @@ pub struct DeliveryQuery {
     pub offset: Option<i64>,
 }
 
+#[allow(dead_code)]
 async fn list_deliveries(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<DeliveryQuery>,
@@ -383,6 +385,7 @@ async fn list_deliveries(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+#[allow(dead_code)]
 async fn retry_delivery(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
