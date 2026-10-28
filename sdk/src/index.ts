@@ -30,10 +30,17 @@
  * |---|---|
  * | {@link OnboardingBridgeSDK} | Main SDK class — wraps all contract calls |
  * | {@link OffRampIntegration} | Moonpay / Transak / Ramp / Banxa URL builder + CEX memo helpers |
- * | `signUrl` | Signs a MoonPay URL with HMAC-SHA256 (replaces any existing signature) |
+ * | {@link CachedContractClient} | Contract client wrapper with read caching |
+ * | {@link InMemoryCache} | Default in-memory cache provider |
+ * | {@link EventSubscriber} | Subscribes to bridge contract events |
  * | `assertAccountAddress` | Validates a G-address; throws on invalid input |
  * | `assertAddress` | Validates a G-address or C-address; throws on invalid input |
  * | `assertContractAddress` | Validates a C-address; throws on invalid input |
+ * | `assertRelayerPubkey` | Validates a relayer public key; throws on invalid input |
+ * | `toScVals` | Converts typed args into Soroban `scVal`s |
+ * | `buildSimulationTx` | Builds a transaction for simulation of arbitrary contract calls |
+ * | `withTransactionHooks` | Wraps a transaction function with observability hooks |
+ * | `withRpcHook` | Wraps an RPC call with observability hooks |
  * | `withRetry` | Low-level retry wrapper for arbitrary async functions |
  * | `withRpcRetry` | Wraps an `rpc.Server` with automatic retries |
  * | `isRetryableRpcError` | Classifies an error as transient (worth retrying) |
@@ -55,12 +62,14 @@
 
 export { OnboardingBridgeSDK, BATCH_TX_LIMIT, BASE_RESERVE_STROOPS, computeCommitmentHash } from './bridge';
 export type { CommitmentHashOptions } from './bridge';
-export { OffRampIntegration, signUrl } from './offramp';
-export { assertAccountAddress, assertAddress, assertContractAddress } from './validate';
+export { OffRampIntegration } from './offramp';
+export { assertAccountAddress, assertAddress, assertContractAddress, assertRelayerPubkey } from './validate';
 export { CachedContractClient } from './cachedBridge';
 export type { CacheOptions, CacheKey } from './cachedBridge';
 export { InMemoryCache } from './cache';
-export type { ICacheProvider } from './cache';
+export type { ICacheProvider, InMemoryCacheOptions } from './cache';
+export { toScVals, buildSimulationTx } from './encoding';
+export type { TypedArg } from './encoding';
 export {
   withRetry,
   withRpcRetry,
@@ -78,7 +87,13 @@ export type {
 } from './retry';
 
 // Issue #214: Observability hooks + OpenTelemetry integration
-export { ConsoleLogger, createOpenTelemetryHooks, composeHooks } from './observability';
+export {
+  ConsoleLogger,
+  createOpenTelemetryHooks,
+  composeHooks,
+  withTransactionHooks,
+  withRpcHook,
+} from './observability';
 export type { ObservabilityHooks, OpenTelemetryHooksOptions } from './observability';
 
 // Issue #57: Event subscription
