@@ -234,6 +234,29 @@ export interface FeeTier {
 }
 
 /**
+ * Result of calculating standard fee and net amount for a given gross transfer amount.
+ */
+export interface CalculatedFee {
+  /** The standard fee deducted from the gross amount, in stroops / smallest units. */
+  fee: bigint;
+  /** The net amount that will be minted or forwarded after fee deduction. */
+  netAmount: bigint;
+}
+
+/**
+ * Result of calculating effective fee for a specific user and asset,
+ * accounting for user loyalty tiers, VIP discounts, and per-asset caps.
+ */
+export interface EffectiveFee {
+  /** Effective fee rate applied, in basis points (1 bps = 0.01%). */
+  feeBps: number;
+  /** Total fee deducted, in stroops / smallest units. */
+  fee: bigint;
+  /** Net amount received after fee deduction. */
+  netAmount: bigint;
+}
+
+/**
  * Options for creating a timelocked C-address funding entry via
  * {@link OnboardingBridgeSDK.fundCAddressTimelocked}.
  */
