@@ -15,7 +15,26 @@ import {
   Account,
   Contract,
   TransactionBuilder,
+  StrKey,
 } from '@stellar/stellar-sdk';
+
+// Support muxed (M...) addresses in Address by extracting the underlying Ed25519 public key
+const origIsValidEd25519 = StrKey.isValidEd25519PublicKey;
+const origDecodeEd25519 = StrKey.decodeEd25519PublicKey;
+
+StrKey.isValidEd25519PublicKey = function (addr: string): boolean {
+  if (typeof addr === 'string' && StrKey.isValidMed25519PublicKey(addr)) {
+    return true;
+  }
+  return origIsValidEd25519.call(this, addr);
+};
+
+StrKey.decodeEd25519PublicKey = function (addr: string): Buffer {
+  if (typeof addr === 'string' && StrKey.isValidMed25519PublicKey(addr)) {
+    return StrKey.decodeMed25519PublicKey(addr).subarray(0, 32);
+  }
+  return origDecodeEd25519.call(this, addr);
+};
 
 /**
  * Account ID used for simulation-only transactions.
@@ -40,43 +59,97 @@ export interface TypedArg {
    * encoded with `nativeToScVal`'s default inference (no string heuristics).
    */
   type?: string;
+  /** Element type for composite types like vec or option. */
+  elementType?: any;
 }
 
 /**
  * Convert a single JavaScript value to its Soroban `ScVal` representation.
  *
- * Encoding is explicit: when a {@link TypedArg} is supplied the value is
- * encoded with the declared ABI `type`; otherwise `nativeToScVal`'s default
- * inference is used. No type is ever guessed from the string contents.
+ * Encoding is explicit: when a {@link TypedArg} is supplied (or when options
+ * are provided) the value is encoded with the declared ABI `type`; otherwise
+ * `nativeToScVal`'s default inference is used. No type is ever guessed from
+ * the string contents.
  *
  * @param arg - A JavaScript value, or a `{ value, type }` pair.
+ * @param options - Optional ABI type information.
  * @returns The encoded `xdr.ScVal`.
  */
-export function toSingleScVal(arg: any): xdr.ScVal {
-  if (arg !== null && typeof arg === 'object' && 'value' in arg) {
-    const { value, type } = arg as TypedArg;
-    if (value === null || value === undefined) {
-      return xdr.ScVal.scvVoid();
+export function toSingleScVal(
+  arg: any,
+  options?: { type?: string; elementType?: any },
+): xdr.ScVal {
+  let value = arg;
+  let type = options?.type;
+  let elementType = options?.elementType;
+
+  if (arg !== null && typeof arg === 'object' && 'value' in arg && !options) {
+    const typed = arg as TypedArg;
+    value = typed.value;
+    type = typed.type;
+    elementType = typed.elementType;
+  }
+
+  if (value === null || value === undefined) {
+    return xdr.ScVal.scvVoid();
+  }
+
+  if (value instanceof Address) {
+    return value.toScVal();
+  }
+
+  if (type === 'address') {
+    if (typeof value === 'string') {
+      return new Address(value).toScVal();
     }
     if (value instanceof Address) {
       return value.toScVal();
     }
-    if (Array.isArray(value)) {
-      return xdr.ScVal.scvVec(value.map((item) => toSingleScVal(item)));
-    }
-    return type ? nativeToScVal(value, { type }) : nativeToScVal(value);
   }
 
-  if (arg === null || arg === undefined) {
-    return xdr.ScVal.scvVoid();
+  if (type === 'bool') {
+    const boolVal = typeof value === 'string' ? value === 'true' : Boolean(value);
+    return nativeToScVal(boolVal, { type: 'bool' });
   }
-  if (arg instanceof Address) {
-    return arg.toScVal();
+
+  if (type === 'bytes') {
+    const buf = typeof value === 'string' ? Buffer.from(value, 'hex') : value;
+    return nativeToScVal(buf, { type: 'bytes' });
   }
-  if (Array.isArray(arg)) {
-    return xdr.ScVal.scvVec(arg.map((item) => toSingleScVal(item)));
+
+  if (type === 'timepoint') {
+    return xdr.ScVal.scvTimepoint(new xdr.Uint64(BigInt(value)));
   }
-  return nativeToScVal(arg);
+
+  if (type === 'duration') {
+    return xdr.ScVal.scvDuration(new xdr.Uint64(BigInt(value)));
+  }
+
+  if (type === 'option') {
+    if (value === null || value === undefined) {
+      return xdr.ScVal.scvVoid();
+    }
+    if (elementType) {
+      return toSingleScVal(value, elementType);
+    }
+    return toSingleScVal(value);
+  }
+
+  if (type === 'vec') {
+    if (Array.isArray(value)) {
+      return xdr.ScVal.scvVec(
+        value.map((item) =>
+          elementType ? toSingleScVal(item, elementType) : toSingleScVal(item),
+        ),
+      );
+    }
+  }
+
+  if (Array.isArray(value)) {
+    return xdr.ScVal.scvVec(value.map((item) => toSingleScVal(item)));
+  }
+
+  return type ? nativeToScVal(value, { type }) : nativeToScVal(value);
 }
 
 /**
