@@ -377,6 +377,10 @@ jobs:
         working-directory: .
         run: node scripts/check-migration-sdk-docs.js
 
+      - name: Check SDK API reference completeness
+        working-directory: .
+        run: node scripts/check-api-reference.js
+
       - name: Build SDK
         run: npm run build
 
