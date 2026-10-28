@@ -1,0 +1,21 @@
+-- Migration 0003: Event ID Soroban RPC Alignment & Re-index Path (#885)
+--
+-- Starting with issue #885, IndexedEvent.id is derived from the globally unique
+-- Soroban RPC event id (`<toid>-<event index>`), preventing duplicate ID collisions
+-- across pagination boundaries when a single transaction emits multiple events.
+--
+-- NOTE FOR OPERATORS RE-INDEXING EXISTING DATABASES:
+-- Since event IDs are now derived from the upstream RPC event ID rather than
+-- an in-memory per-page counter, newly indexed events will have different IDs
+-- from previously indexed events.
+--
+-- To execute a clean re-index from ledger N or the beginning of retention:
+--   1. Stop the indexer daemon.
+--   2. Truncate existing events and deliveries:
+--        DELETE FROM webhook_deliveries;
+--        DELETE FROM events;
+--   3. Reset the last indexed ledger to your target starting ledger (or remove to use lookback):
+--        DELETE FROM indexer_state WHERE key = 'last_ledger';
+--   4. Start the indexer daemon to re-populate events with globally unique RPC IDs.
+
+CREATE INDEX IF NOT EXISTS idx_events_tx_hash ON events(tx_hash);
