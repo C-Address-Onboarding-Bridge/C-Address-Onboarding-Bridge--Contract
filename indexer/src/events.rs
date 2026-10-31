@@ -68,6 +68,12 @@ pub enum BridgeEventType {
     ContractUpgraded,
     EmergencyMigrated,
     ReferralRateChanged,
+    SwapAndFunded,
+    CommitRevealFunded,
+    MetaFundExecuted,
+    ReferralPaid,
+    CommitFund,
+    BatchTransferFailed,
 }
 
 impl BridgeEventType {
@@ -104,6 +110,12 @@ impl BridgeEventType {
             "ContractUpgraded" => Some(Self::ContractUpgraded),
             "EmergencyMigrated" => Some(Self::EmergencyMigrated),
             "ReferralRateChanged" => Some(Self::ReferralRateChanged),
+            "SwapAndFunded" => Some(Self::SwapAndFunded),
+            "CommitRevealFunded" => Some(Self::CommitRevealFunded),
+            "MetaFundExecuted" => Some(Self::MetaFundExecuted),
+            "ReferralPaid" => Some(Self::ReferralPaid),
+            "CommitFund" => Some(Self::CommitFund),
+            "BatchTransferFailed" => Some(Self::BatchTransferFailed),
             _ => None,
         }
     }
@@ -141,6 +153,12 @@ impl BridgeEventType {
             Self::ContractUpgraded => "ContractUpgraded",
             Self::EmergencyMigrated => "EmergencyMigrated",
             Self::ReferralRateChanged => "ReferralRateChanged",
+            Self::SwapAndFunded => "SwapAndFunded",
+            Self::CommitRevealFunded => "CommitRevealFunded",
+            Self::MetaFundExecuted => "MetaFundExecuted",
+            Self::ReferralPaid => "ReferralPaid",
+            Self::CommitFund => "CommitFund",
+            Self::BatchTransferFailed => "BatchTransferFailed",
         }
     }
 }
@@ -162,7 +180,10 @@ mod tests {
             // #641: contract emits these four role-change topics, not AdminChanged / FeeCollectorChanged
             ("AdminProposed", "AdminProposed"),
             ("AdminTransferred", "AdminTransferred"),
-            ("FeeCollectorTransferProposed", "FeeCollectorTransferProposed"),
+            (
+                "FeeCollectorTransferProposed",
+                "FeeCollectorTransferProposed",
+            ),
             ("FeeCollectorTransferred", "FeeCollectorTransferred"),
             ("FeeBpsChanged", "FeeBpsChanged"),
             ("ContractPaused", "ContractPaused"),

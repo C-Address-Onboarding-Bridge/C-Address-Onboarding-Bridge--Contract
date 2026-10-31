@@ -91,8 +91,8 @@ fn unwrap_ipv4_mapped_or_compatible(ip: IpAddr) -> IpAddr {
 /// Signature is: sha256=<hex(hmac_sha256(secret, timestamp + "." + body))>
 fn generate_signature(secret: &str, timestamp: &str, body: &str) -> String {
     let message = format!("{}.{}", timestamp, body);
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(message.as_bytes());
     let result = mac.finalize();
     format!("sha256={}", hex::encode(result.into_bytes()))
@@ -129,7 +129,9 @@ pub async fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
     {
         let unwrapped_ip = unwrap_ipv4_mapped_or_compatible(ip);
         if is_private_or_reserved(unwrapped_ip) {
-            return Err(UrlValidationError::PrivateOrReservedHost(unwrapped_ip.to_string()));
+            return Err(UrlValidationError::PrivateOrReservedHost(
+                unwrapped_ip.to_string(),
+            ));
         }
         return Ok(());
     }
@@ -150,9 +152,7 @@ pub async fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
     for addr in addrs {
         let ip = unwrap_ipv4_mapped_or_compatible(addr.ip());
         if is_private_or_reserved(ip) {
-            return Err(UrlValidationError::PrivateOrReservedHost(
-                ip.to_string(),
-            ));
+            return Err(UrlValidationError::PrivateOrReservedHost(ip.to_string()));
         }
     }
 
@@ -358,7 +358,10 @@ async fn deliver_single(
     };
     let body = serde_json::to_string(&payload).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
     let timestamp = chrono::Utc::now().timestamp().to_string();
-    let secret = state.db.get_subscription_secret(&delivery.subscription_id).await?
+    let secret = state
+        .db
+        .get_subscription_secret(&delivery.subscription_id)
+        .await?
         .ok_or_else(|| sqlx::Error::Protocol("subscription secret not found".into()))?;
     let signature = generate_signature(&secret, &timestamp, &body);
 
@@ -441,17 +444,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_valid_https_url_is_accepted() {
-        assert!(validate_webhook_url("https://example.com/hook").await.is_ok());
+        assert!(validate_webhook_url("https://example.com/hook")
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
     async fn test_valid_http_url_is_accepted() {
-        assert!(validate_webhook_url("http://example.com/hook").await.is_ok());
+        assert!(validate_webhook_url("http://example.com/hook")
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
     async fn test_non_http_scheme_is_rejected() {
-        let err = validate_webhook_url("ftp://example.com/hook").await.unwrap_err();
+        let err = validate_webhook_url("ftp://example.com/hook")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UrlValidationError::ForbiddenScheme(_)),
             "got: {:?}",
@@ -461,7 +470,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_scheme_is_rejected() {
-        let err = validate_webhook_url("file:///etc/passwd").await.unwrap_err();
+        let err = validate_webhook_url("file:///etc/passwd")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UrlValidationError::ForbiddenScheme(_)),
             "got: {:?}",
@@ -471,7 +482,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_localhost_host_is_rejected() {
-        let err = validate_webhook_url("http://localhost/hook").await.unwrap_err();
+        let err = validate_webhook_url("http://localhost/hook")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -481,7 +494,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_loopback_ipv4_is_rejected() {
-        let err = validate_webhook_url("http://127.0.0.1/hook").await.unwrap_err();
+        let err = validate_webhook_url("http://127.0.0.1/hook")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -491,7 +506,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_private_10_block_is_rejected() {
-        let err = validate_webhook_url("http://10.0.0.1/hook").await.unwrap_err();
+        let err = validate_webhook_url("http://10.0.0.1/hook")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -501,7 +518,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_private_172_block_is_rejected() {
-        let err = validate_webhook_url("http://172.16.0.1/hook").await.unwrap_err();
+        let err = validate_webhook_url("http://172.16.0.1/hook")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -511,7 +530,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_private_192_168_block_is_rejected() {
-        let err = validate_webhook_url("http://192.168.1.1/hook").await.unwrap_err();
+        let err = validate_webhook_url("http://192.168.1.1/hook")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -522,7 +543,9 @@ mod tests {
     #[tokio::test]
     async fn test_link_local_metadata_ip_is_rejected() {
         // 169.254.169.254 is the EC2 / GCP instance metadata endpoint
-        let err = validate_webhook_url("http://169.254.169.254/latest/meta-data/").await.unwrap_err();
+        let err = validate_webhook_url("http://169.254.169.254/latest/meta-data/")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -532,7 +555,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_link_local_range_is_rejected() {
-        let err = validate_webhook_url("http://169.254.0.1/hook").await.unwrap_err();
+        let err = validate_webhook_url("http://169.254.0.1/hook")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -563,7 +588,9 @@ mod tests {
     #[tokio::test]
     async fn test_ipv4_mapped_ipv6_loopback_is_rejected() {
         // ::ffff:127.0.0.1 is IPv4-mapped loopback
-        let err = validate_webhook_url("http://[::ffff:127.0.0.1]/hook").await.unwrap_err();
+        let err = validate_webhook_url("http://[::ffff:127.0.0.1]/hook")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -574,7 +601,9 @@ mod tests {
     #[tokio::test]
     async fn test_ipv4_mapped_ipv6_metadata_is_rejected() {
         // ::ffff:169.254.169.254 is IPv4-mapped EC2 metadata endpoint
-        let err = validate_webhook_url("http://[::ffff:169.254.169.254]/hook").await.unwrap_err();
+        let err = validate_webhook_url("http://[::ffff:169.254.169.254]/hook")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -585,7 +614,9 @@ mod tests {
     #[tokio::test]
     async fn test_ipv6_multicast_is_rejected() {
         // ff02::1 is IPv6 multicast
-        let err = validate_webhook_url("http://[ff02::1]/hook").await.unwrap_err();
+        let err = validate_webhook_url("http://[ff02::1]/hook")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -596,7 +627,9 @@ mod tests {
     #[tokio::test]
     async fn test_ipv4_multicast_is_rejected() {
         // 224.0.0.1 is multicast
-        let err = validate_webhook_url("http://224.0.0.1/hook").await.unwrap_err();
+        let err = validate_webhook_url("http://224.0.0.1/hook")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -607,7 +640,9 @@ mod tests {
     #[tokio::test]
     async fn test_ipv4_zero_range_is_rejected() {
         // 0.0.0.1 is in 0.0.0.0/8
-        let err = validate_webhook_url("http://0.0.0.1/hook").await.unwrap_err();
+        let err = validate_webhook_url("http://0.0.0.1/hook")
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
@@ -959,7 +994,9 @@ mod tests {
             db,
             rpc_url: "http://localhost".to_string(),
             contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
             webhook_client: reqwest::Client::new(),
+            api_key_hash: String::new(),
             lookback_ledgers: 0,
         };
 
