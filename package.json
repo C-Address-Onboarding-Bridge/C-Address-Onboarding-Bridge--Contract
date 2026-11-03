@@ -29,7 +29,7 @@
     "@types/node": "^20.0.0",
     "commitlint": "^19.0.0",
     "husky": "^8.0.0",
-    "semantic-release": "^23.0.0",
+    "semantic-release": "^25.0.9",
     "ts-node": "^10.0.0",
     "typescript": "^5.0.0"
   }
