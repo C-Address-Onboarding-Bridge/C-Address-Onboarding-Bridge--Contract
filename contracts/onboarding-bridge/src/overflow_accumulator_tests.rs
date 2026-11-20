@@ -4,8 +4,6 @@
 //! must return `BridgeError::Overflow` instead of panicking/wrapping when the
 //! running total would exceed `i128::MAX`.
 
-#![cfg(test)]
-
 use crate::{
     check_daily_limit, increment_accrued_fees, increment_source_bridged_volume,
     increment_total_bridged, increment_total_fees_collected, increment_user_deposit,

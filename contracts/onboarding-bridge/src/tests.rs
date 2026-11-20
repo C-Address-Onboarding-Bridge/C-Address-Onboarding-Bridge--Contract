@@ -4087,7 +4087,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([7u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x77; 32]);
@@ -4336,7 +4336,7 @@ mod crosschain_tests {
         bridge.add_relayer(&relayer, &None);
 
         assert_eq!(
-            bridge.try_set_relayer_threshold(&0u32),
+            bridge.try_set_relayer_threshold(&0u32, &None),
             Err(Ok(BridgeError::ThresholdExceedsRelayers))
         );
         assert_eq!(bridge.query_relayer_threshold(), 1);
@@ -4367,7 +4367,7 @@ mod crosschain_tests {
             make_signing_key([7u8; 32]).verifying_key().as_bytes(),
         );
         bridge.add_relayer(&relayer, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         let target = soroban_sdk::Address::generate(&env);
         let tx_hash = BytesN::from_array(&env, &[0x82; 32]);
@@ -4403,7 +4403,7 @@ mod crosschain_tests {
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert_eq!(
-            bridge.try_remove_relayer(&relayer),
+            bridge.try_remove_relayer(&relayer, &None),
             Err(Ok(BridgeError::BelowThreshold))
         );
         assert!(bridge.query_is_relayer(&relayer));
@@ -4441,7 +4441,7 @@ mod crosschain_tests {
         let signing_key = make_signing_key([8u8; 32]);
         let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
         bridge.add_relayer(&pubkey, &None);
-        bridge.set_relayer_threshold(&1u32);
+        bridge.set_relayer_threshold(&1u32, &None);
 
         for (chain_id, hash_byte) in [(1u32, 0x31u8), (2u32, 0x32u8)] {
             let target = soroban_sdk::Address::generate(&env);
@@ -4546,7 +4546,7 @@ fn test_loyalty_rewards_preserve_bridged_asset_reserves() {
     let target = Address::generate(&env);
 
     bridge.set_fee_bps(&1_000u32, &None);
-    bridge.set_loyalty_token(&asset, &200i128);
+    bridge.set_loyalty_token(&asset, &200i128, &None);
     mint_tokens(&env, &asset, &bridge_id, 300i128);
 
     bridge.fund_c_address_timelocked(
@@ -6510,6 +6510,233 @@ fn test_daily_limit_resets_next_day() {
     let target2 = Address::generate(&env);
     bridge.fund_c_address(&user, &target2, &token_id, &500i128, &None, &None);
     assert_eq!(check_balance(&env, &token_id, &target2), 495i128);
+}
+
+/********** Contract-wide asset daily cap / default source limit **********/
+
+// Two unrelated sources each below the cap are fine individually, but the
+// second call is rejected once their combined gross flow exceeds the cap.
+#[test]
+fn test_asset_daily_cap_blocks_second_unrelated_source() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_asset_daily_limit(&token_id, &500i128, &None);
+
+    let source_a = Address::generate(&env);
+    let source_b = Address::generate(&env);
+    mint_tokens(&env, &token_id, &source_a, 1000i128);
+    mint_tokens(&env, &token_id, &source_b, 1000i128);
+
+    bridge.fund_c_address(
+        &source_a,
+        &Address::generate(&env),
+        &token_id,
+        &400i128,
+        &None,
+        &None,
+    );
+    assert_eq!(bridge.query_asset_daily_usage(&token_id), 400i128);
+
+    assert_eq!(
+        bridge.try_fund_c_address(
+            &source_b,
+            &Address::generate(&env),
+            &token_id,
+            &200i128,
+            &None,
+            &None
+        ),
+        Err(Ok(BridgeError::AssetDailyLimitExceeded))
+    );
+    assert_eq!(bridge.query_asset_daily_usage(&token_id), 400i128);
+    assert_eq!(check_balance(&env, &token_id, &source_b), 1000i128);
+}
+
+// The relayed cross-chain payout path must share the same asset-wide cap even
+// though it has no on-chain `source`.
+#[test]
+fn test_asset_daily_cap_covers_crosschain_payout() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_asset_daily_limit(&token_id, &100i128, &None);
+
+    let target = Address::generate(&env);
+    let tx_hash = BytesN::from_array(&env, &[0x11; 32]);
+    let sigs = Vec::new(&env);
+    assert_eq!(
+        bridge.try_fund_c_address_crosschain(&1u32, &tx_hash, &target, &token_id, &101i128, &sigs),
+        Err(Ok(BridgeError::AssetDailyLimitExceeded))
+    );
+
+    // A standard funding call still has quota left, proving the rejected
+    // payout did not consume any of the asset's daily allowance.
+    mint_tokens(&env, &token_id, &user, 100i128);
+    bridge.fund_c_address(&user, &target, &token_id, &100i128, &None, &None);
+    assert_eq!(bridge.query_asset_daily_usage(&token_id), 100i128);
+}
+
+// A source with no explicit entry is bound by the per-asset default, while an
+// explicit entry (including the documented `0` = disable) overrides it.
+#[test]
+fn test_default_source_daily_limit_binds_fresh_addresses() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_default_source_daily_limit(&token_id, &100i128, &None);
+    assert_eq!(bridge.query_default_source_daily_limit(&token_id), 100i128);
+    assert_eq!(
+        bridge.query_source_daily_limit(&Address::generate(&env), &token_id),
+        0i128
+    );
+
+    let fresh = Address::generate(&env);
+    mint_tokens(&env, &token_id, &fresh, 500i128);
+    bridge.fund_c_address(
+        &fresh,
+        &Address::generate(&env),
+        &token_id,
+        &100i128,
+        &None,
+        &None,
+    );
+    assert_eq!(
+        bridge.try_fund_c_address(
+            &fresh,
+            &Address::generate(&env),
+            &token_id,
+            &1i128,
+            &None,
+            &None
+        ),
+        Err(Ok(BridgeError::DailyLimitExceeded))
+    );
+
+    // Explicit limit wins over the default.
+    let explicit = Address::generate(&env);
+    bridge.set_source_daily_limit(&explicit, &token_id, &200i128, &None);
+    mint_tokens(&env, &token_id, &explicit, 500i128);
+    bridge.fund_c_address(
+        &explicit,
+        &Address::generate(&env),
+        &token_id,
+        &200i128,
+        &None,
+        &None,
+    );
+
+    // Explicit 0 disables the fallback for that source.
+    let disabled = Address::generate(&env);
+    bridge.set_source_daily_limit(&disabled, &token_id, &0i128, &None);
+    mint_tokens(&env, &token_id, &disabled, 500i128);
+    bridge.fund_c_address(
+        &disabled,
+        &Address::generate(&env),
+        &token_id,
+        &300i128,
+        &None,
+        &None,
+    );
+}
+
+#[test]
+fn test_asset_daily_cap_resets_next_day() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_asset_daily_limit(&token_id, &100i128, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    bridge.fund_c_address(
+        &user,
+        &Address::generate(&env),
+        &token_id,
+        &100i128,
+        &None,
+        &None,
+    );
+    assert_eq!(
+        bridge.try_fund_c_address(
+            &user,
+            &Address::generate(&env),
+            &token_id,
+            &1i128,
+            &None,
+            &None
+        ),
+        Err(Ok(BridgeError::AssetDailyLimitExceeded))
+    );
+
+    advance_ledger_time(&env, env.ledger().timestamp() + 86_400);
+    assert_eq!(bridge.query_asset_daily_usage(&token_id), 0i128);
+    bridge.fund_c_address(
+        &user,
+        &Address::generate(&env),
+        &token_id,
+        &100i128,
+        &None,
+        &None,
+    );
+}
+
+#[test]
+fn test_asset_daily_limit_setter_validation_and_event() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    assert_eq!(
+        bridge.try_set_asset_daily_limit(&token_id, &-1i128, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+    assert_eq!(
+        bridge.try_set_default_source_daily_limit(&token_id, &-1i128, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+    let other_asset = Address::generate(&env);
+    assert_eq!(
+        bridge.try_set_asset_daily_limit(&other_asset, &100i128, &None),
+        Err(Ok(BridgeError::AssetNotWhitelisted))
+    );
+
+    bridge.set_asset_daily_limit(&token_id, &1_000i128, &Some(0u64));
+
+    let events = env.events().all();
+    let (_contract_id, topics, _data) = &events.get(events.len() - 1).unwrap();
+    let expected: soroban_sdk::Val = "AssetDailyLimitChanged".into_val(&env);
+    assert!(topics.contains(expected));
+
+    assert_eq!(
+        bridge.try_set_asset_daily_limit(&token_id, &2_000i128, &Some(0u64)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+    assert_eq!(bridge.query_asset_daily_limit(&token_id), 1_000i128);
 }
 
 /********** Asset fee cap unit tests **********/
