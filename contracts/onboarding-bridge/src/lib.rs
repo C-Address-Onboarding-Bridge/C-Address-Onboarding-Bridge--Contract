@@ -80,7 +80,12 @@ use soroban_sdk::{
 /// Every public function that can fail returns `Result<_, BridgeError>`.
 /// Callers should match on these variants to distinguish recoverable from
 /// unrecoverable conditions.
-#[contracterror]
+// The Soroban spec format caps error enums at 50 cases (SCSpecUdtErrorEnumV0
+// `cases<50>`). This enum already carries 52 live on-chain codes whose numeric
+// values must stay stable, so exporting the spec would panic at macro time.
+// `export = false` keeps every discriminant and its TryFrom<Error> mapping
+// intact; only the unused spec entry is omitted.
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BridgeError {
     /// Contract has not been initialized yet. Call `initialize` first.
@@ -189,7 +194,9 @@ pub enum BridgeError {
     TooManyFeeTiers = 51,
     /// Cross-chain payouts exceed the admin-funded liquidity reserve.
     InsufficientCrossChainReserve = 52,
-    // Next free discriminant: 53. Always take the next unused value here and
+    /// The contract-wide daily outflow cap for an asset has been reached.
+    AssetDailyLimitExceeded = 53,
+    // Next free discriminant: 54. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
 
@@ -198,7 +205,11 @@ pub enum BridgeError {
 // ---------------------------------------------------------------------------
 
 /// Keys used to address every piece of contract state in Soroban storage.
-#[contracttype]
+// SCSpecUdtUnionV0 also caps exported enums at 50 cases; the storage schema is
+// internal and never consumed by the generated contract client, so skip the
+// spec entry rather than dropping live keys to make room for the daily-limit
+// keys. Rust-side conversions and tests are unaffected.
+#[contracttype(export = false)]
 pub enum DataKey {
     Admin,
     FeeCollector,
@@ -210,6 +221,10 @@ pub enum DataKey {
     AllowlistMode,
     AssetWhitelist,
     SourceDailyLimit(Address, Address),
+    /// Contract-wide daily outflow cap, keyed by asset only.
+    AssetDailyLimit(Address),
+    /// Fallback per-source daily cap for sources without an explicit entry.
+    DefaultSourceDailyLimit(Address),
     AssetFeeCap(Address),
     Nonce(Address),
     ReferralRate,
@@ -221,6 +236,8 @@ pub enum DataKey {
     RelayerThreshold,
     CrossChainNonce(BytesN<32>),
     DailyUsage(Address, Address, u64),
+    /// Cumulative gross outflow for an asset within the current UTC day.
+    AssetDailyUsage(Address, u64),
     FeeTiers,
     SourceBridgedVolume(Address, Address),
     LoyaltyToken,
@@ -350,6 +367,8 @@ pub struct MigrationAssetState {
     pub counters: AssetCounters,
     pub fee_cap_bps: u32,
     pub crosschain_reserve: i128,
+    pub asset_daily_limit: i128,
+    pub default_source_daily_limit: i128,
 }
 
 /// A volume-based fee tier.
@@ -1201,11 +1220,17 @@ fn mark_nonce_used(env: &Env, nonce: &BytesN<32>) {
 
 // --- Daily limit helpers ---
 
+fn extend_persistent_config_ttl(env: &Env, key: &DataKey) {
+    let max_ttl = read_max_persistent_ttl(env);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, max_ttl / 4, max_ttl);
+}
+
 fn save_source_daily_limit(env: &Env, source: &Address, asset: &Address, limit: i128) {
-    env.storage().persistent().set(
-        &DataKey::SourceDailyLimit(source.clone(), asset.clone()),
-        &limit,
-    );
+    let key = DataKey::SourceDailyLimit(source.clone(), asset.clone());
+    env.storage().persistent().set(&key, &limit);
+    extend_persistent_config_ttl(env, &key);
 }
 
 fn read_source_daily_limit(env: &Env, source: &Address, asset: &Address) -> i128 {
@@ -1215,8 +1240,99 @@ fn read_source_daily_limit(env: &Env, source: &Address, asset: &Address) -> i128
         .unwrap_or(0)
 }
 
+fn has_source_daily_limit(env: &Env, source: &Address, asset: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .has(&DataKey::SourceDailyLimit(source.clone(), asset.clone()))
+}
+
+fn save_asset_daily_limit(env: &Env, asset: &Address, limit: i128) {
+    let key = DataKey::AssetDailyLimit(asset.clone());
+    env.storage().persistent().set(&key, &limit);
+    extend_persistent_config_ttl(env, &key);
+}
+
+fn read_asset_daily_limit(env: &Env, asset: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AssetDailyLimit(asset.clone()))
+        .unwrap_or(0)
+}
+
+fn save_default_source_daily_limit(env: &Env, asset: &Address, limit: i128) {
+    let key = DataKey::DefaultSourceDailyLimit(asset.clone());
+    env.storage().persistent().set(&key, &limit);
+    extend_persistent_config_ttl(env, &key);
+}
+
+fn read_default_source_daily_limit(env: &Env, asset: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::DefaultSourceDailyLimit(asset.clone()))
+        .unwrap_or(0)
+}
+
+fn effective_source_daily_limit(env: &Env, source: &Address, asset: &Address) -> i128 {
+    if has_source_daily_limit(env, source, asset) {
+        read_source_daily_limit(env, source, asset)
+    } else {
+        read_default_source_daily_limit(env, asset)
+    }
+}
+
 fn current_day(env: &Env) -> u64 {
     env.ledger().timestamp() / 86_400
+}
+
+fn read_asset_daily_usage(env: &Env, asset: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AssetDailyUsage(asset.clone(), current_day(env)))
+        .unwrap_or(0)
+}
+
+fn read_source_daily_usage(env: &Env, source: &Address, asset: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::DailyUsage(
+            source.clone(),
+            asset.clone(),
+            current_day(env),
+        ))
+        .unwrap_or(0)
+}
+
+fn limit_update(
+    env: &Env,
+    key: DataKey,
+    limit: i128,
+    amount: i128,
+    error: BridgeError,
+) -> Result<Option<(DataKey, i128)>, BridgeError> {
+    if limit == 0 {
+        return Ok(None);
+    }
+    let used: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+    let updated = safe_math::safe_add(used, amount)?;
+    if updated > limit {
+        return Err(error);
+    }
+    Ok(Some((key, updated)))
+}
+
+fn check_asset_daily_limit(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
+    let limit = read_asset_daily_limit(env, asset);
+    let key = DataKey::AssetDailyUsage(asset.clone(), current_day(env));
+    if let Some((key, updated)) = limit_update(
+        env,
+        key,
+        limit,
+        amount,
+        BridgeError::AssetDailyLimitExceeded,
+    )? {
+        env.storage().persistent().set(&key, &updated);
+    }
+    Ok(())
 }
 
 fn check_daily_limit(
@@ -1225,18 +1341,24 @@ fn check_daily_limit(
     asset: &Address,
     amount: i128,
 ) -> Result<(), BridgeError> {
-    let limit = read_source_daily_limit(env, source, asset);
-    if limit == 0 {
-        return Ok(()); // no limit set
-    }
     let day = current_day(env);
-    let key = DataKey::DailyUsage(source.clone(), asset.clone(), day);
-    let used: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-    let updated = safe_math::safe_add(used, amount)?;
-    if updated > limit {
-        return Err(BridgeError::DailyLimitExceeded);
+    let source_update = limit_update(
+        env,
+        DataKey::DailyUsage(source.clone(), asset.clone(), day),
+        effective_source_daily_limit(env, source, asset),
+        amount,
+        BridgeError::DailyLimitExceeded,
+    )?;
+    let asset_update = limit_update(
+        env,
+        DataKey::AssetDailyUsage(asset.clone(), day),
+        read_asset_daily_limit(env, asset),
+        amount,
+        BridgeError::AssetDailyLimitExceeded,
+    )?;
+    for (key, updated) in [source_update, asset_update].into_iter().flatten() {
+        env.storage().persistent().set(&key, &updated);
     }
-    env.storage().persistent().set(&key, &updated);
     Ok(())
 }
 
@@ -2024,6 +2146,143 @@ impl OnboardingBridge {
     ) -> Result<i128, BridgeError> {
         check_initialized(&env)?;
         Ok(read_source_daily_limit(&env, &source, &asset))
+    }
+
+    /// Returns the current UTC-day cumulative volume for a `(source, asset)` pair.
+    pub fn query_source_daily_usage(
+        env: Env,
+        source: Address,
+        asset: Address,
+    ) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_source_daily_usage(&env, &source, &asset))
+    }
+
+    /// Sets a contract-wide daily outflow cap for `asset`.
+    ///
+    /// Every funding path — including the relayed cross-chain payout path —
+    /// counts its gross amount against this cap. It therefore bounds the total
+    /// flow through the bridge even when sources are fresh sybil addresses with
+    /// no explicit per-source limit. Set `limit_amount` to `0` to disable.
+    ///
+    /// # Arguments
+    ///
+    /// * `asset` (`Address`) — The asset whose daily outflow is being capped.
+    /// * `limit_amount` (`i128`) — Maximum gross tokens per UTC day; `0` disables.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::InvalidAmount`] — `limit_amount` is negative.
+    /// * [`BridgeError::AssetNotWhitelisted`] — `asset` was not added with `add_asset`.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("AssetDailyLimitChanged", old, new)` — data: `(admin, asset)`
+    pub fn set_asset_daily_limit(
+        env: Env,
+        asset: Address,
+        limit_amount: i128,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        if limit_amount < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        check_asset_whitelisted(&env, &asset)?;
+
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+
+        let old_limit = read_asset_daily_limit(&env, &asset);
+        save_asset_daily_limit(&env, &asset, limit_amount);
+        extend_instance_ttl(&env);
+        env.events().publish(
+            ("AssetDailyLimitChanged", old_limit, limit_amount),
+            (admin, asset),
+        );
+        Ok(())
+    }
+
+    /// Returns the contract-wide daily outflow cap for `asset` (`0` = unlimited).
+    pub fn query_asset_daily_limit(env: Env, asset: Address) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_asset_daily_limit(&env, &asset))
+    }
+
+    /// Returns the current UTC-day cumulative contract-wide outflow for `asset`.
+    pub fn query_asset_daily_usage(env: Env, asset: Address) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_asset_daily_usage(&env, &asset))
+    }
+
+    /// Sets a fallback daily limit per source for `asset`, used only when the
+    /// source has no explicit [`Self::set_source_daily_limit`] entry.
+    ///
+    /// An explicit `(source, asset)` entry always wins, including an explicit
+    /// value of `0`, which keeps the documented "disable this source" meaning.
+    /// Set `limit_amount` to `0` to leave sources without an explicit entry
+    /// unrestricted by this fallback.
+    ///
+    /// # Arguments
+    ///
+    /// * `asset` (`Address`) — The asset the fallback applies to.
+    /// * `limit_amount` (`i128`) — Maximum gross tokens per source per UTC day.
+    /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()`.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::InvalidAmount`] — `limit_amount` is negative.
+    /// * [`BridgeError::AssetNotWhitelisted`] — `asset` was not added with `add_asset`.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("DefaultSourceDailyLimitChanged", old, new)` — data: `(admin, asset)`
+    pub fn set_default_source_daily_limit(
+        env: Env,
+        asset: Address,
+        limit_amount: i128,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        if limit_amount < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        check_asset_whitelisted(&env, &asset)?;
+
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+
+        let old_limit = read_default_source_daily_limit(&env, &asset);
+        save_default_source_daily_limit(&env, &asset, limit_amount);
+        extend_instance_ttl(&env);
+        env.events().publish(
+            ("DefaultSourceDailyLimitChanged", old_limit, limit_amount),
+            (admin, asset),
+        );
+        Ok(())
+    }
+
+    /// Returns the fallback per-source daily limit for `asset` (`0` = none).
+    pub fn query_default_source_daily_limit(env: Env, asset: Address) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_default_source_daily_limit(&env, &asset))
     }
 
     /// Sets a per-asset maximum fee cap in basis points.
@@ -3259,6 +3518,8 @@ impl OnboardingBridge {
                         counters: read_asset_counters(&env, &asset),
                         fee_cap_bps: read_asset_fee_cap(&env, &asset),
                         crosschain_reserve: read_crosschain_reserve(&env, &asset),
+                        asset_daily_limit: read_asset_daily_limit(&env, &asset),
+                        default_source_daily_limit: read_default_source_daily_limit(&env, &asset),
                     });
                 }
             }
@@ -4099,6 +4360,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::InvalidAddress`] — A strkey exceeds `MAX_STRKEY_LEN` (64) bytes.
     /// * [`BridgeError::InsufficientCrossChainReserve`] — The reserve cannot
     ///   cover `net_amount`.
+    /// * [`BridgeError::AssetDailyLimitExceeded`] — The payout would exceed
+    ///   the asset's contract-wide daily cap.
     ///
     /// # Events
     ///
@@ -4133,6 +4396,7 @@ impl OnboardingBridge {
         }
         check_access(&env, &target)?;
         check_asset_whitelisted(&env, &asset)?;
+        check_asset_daily_limit(&env, &asset, amount)?;
         let threshold = relayer_threshold(&env);
         if threshold == 0 || relayer_count(&env) == 0 {
             return Err(BridgeError::BelowThreshold);
@@ -4284,7 +4548,8 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        if is_relayer(&env, &pubkey) {
+        let was_registered = is_relayer(&env, &pubkey);
+        if was_registered {
             let count = relayer_count(&env);
             if count <= 1 || count.saturating_sub(1) < relayer_threshold(&env) {
                 return Err(BridgeError::BelowThreshold);
@@ -4292,7 +4557,9 @@ impl OnboardingBridge {
         }
         remove_relayer(&env, &pubkey);
         extend_instance_ttl(&env);
-        if was_registered { env.events().publish(("RelayerRemoved",), (admin, pubkey)); }
+        if was_registered {
+            env.events().publish(("RelayerRemoved",), (admin, pubkey));
+        }
         Ok(())
     }
 
@@ -4608,8 +4875,9 @@ impl OnboardingBridge {
         Ok(())
     }
 
-    /// Extends the persistent-storage TTL for the per-asset counters and
-    /// cross-chain reserve entry associated with `key_asset`.
+    /// Extends the persistent-storage TTL for the per-asset counters, fee cap,
+    /// daily-limit config/usage and cross-chain reserve entries associated with
+    /// `key_asset`.
     ///
     /// Only keys that already exist in storage are extended; missing keys are
     /// silently skipped.
@@ -4659,6 +4927,17 @@ impl OnboardingBridge {
         let fee_cap_key = DataKey::AssetFeeCap(key_asset.clone());
         if env.storage().persistent().has(&fee_cap_key) {
             env.storage().persistent().extend_ttl(&fee_cap_key, threshold, max_ttl);
+        }
+        for key in [
+            DataKey::AssetDailyLimit(key_asset.clone()),
+            DataKey::DefaultSourceDailyLimit(key_asset.clone()),
+            DataKey::AssetDailyUsage(key_asset.clone(), current_day(&env)),
+        ] {
+            if env.storage().persistent().has(&key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, threshold, max_ttl);
+            }
         }
         env.events()
             .publish(("PersistentTtlExtended",), (admin, key_asset, max_ttl));

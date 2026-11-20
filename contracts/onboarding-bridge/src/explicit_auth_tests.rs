@@ -9,8 +9,6 @@
 //! Each test uses explicit authentication with mock_auths() instead of
 //! mock_all_auths(), and uses a real Soroban token contract instead of TestToken.
 
-#![cfg(test)]
-
 use soroban_sdk::{
     testutils::{Address as _, MockAuth, MockAuthInvoke},
     Address, Env, IntoVal,

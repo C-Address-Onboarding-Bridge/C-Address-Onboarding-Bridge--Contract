@@ -50,6 +50,12 @@ graph TD
 | Fees and limits | `set_fee_bps` | Update the global fee rate |
 | Fees and limits | `set_source_daily_limit` | Configure a source address's per-asset daily funding limit |
 | Fees and limits | `query_source_daily_limit` | Read a source address's daily limit state for an asset |
+| Fees and limits | `set_asset_daily_limit` | Configure a contract-wide daily outflow cap per asset (all funding paths, including cross-chain payouts) |
+| Fees and limits | `query_asset_daily_limit` | Read an asset's contract-wide daily outflow cap |
+| Fees and limits | `query_asset_daily_usage` | Read today's cumulative contract-wide outflow for an asset |
+| Fees and limits | `set_default_source_daily_limit` | Configure the fallback per-source daily cap used when a source has no explicit limit |
+| Fees and limits | `query_default_source_daily_limit` | Read the fallback per-source daily cap for an asset |
+| Fees and limits | `query_source_daily_usage` | Read today's cumulative volume for a `(source, asset)` pair |
 | Fees and limits | `set_asset_fee_cap` | Configure a per-asset maximum effective fee |
 | Fees and limits | `query_asset_fee_cap` | Read the fee cap for an asset |
 | Fees and limits | `set_minimum_amount` | Configure the minimum allowed funding amount |
@@ -143,6 +149,24 @@ graph TD
 | Meta-transactions | `query_meta_signer` | Read the meta-transaction signer for a source |
 | Meta-transactions | `execute_meta_fund` | Execute a signed funding request submitted by a relayer (requires a token allowance to the bridge) |
 | Meta-transactions | `query_meta_tx_nonce_used` | Check whether a meta-transaction nonce has been used |
+
+#### Daily limits
+
+Three independent daily caps are enforced on the **gross** funded amount, with
+counters keyed by UTC day (`ledger timestamp / 86_400`):
+
+1. **Per-asset contract-wide cap** (`set_asset_daily_limit`) — bounds total
+   outflow for that asset across *all* sources, including fresh addresses with
+   no configuration and the relayed `fund_c_address_crosschain` payout path.
+2. **Explicit per-source cap** (`set_source_daily_limit`) — an existing
+   `(source, asset)` entry always wins over the fallback; an explicit `0`
+   disables the limit for that source.
+3. **Default per-source cap** (`set_default_source_daily_limit`) — applied only
+   when no explicit entry exists, so new/sybil addresses are not unlimited.
+
+A value of `0` means "no cap" for any of the three. All funding paths check
+every applicable cap before recording usage; a rejected transfer consumes no
+quota. The limits are included in the `emergency_migrate` per-asset snapshot.
 
 ### Transaction Flow
 
