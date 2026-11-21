@@ -5368,7 +5368,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
     /// * [`BridgeError::InvalidAmount`] — `source_amount` or `min_target_amount` ≤ 0,
-    ///   or `source_amount` is below the configured minimum.
+    ///   `source_amount` is below the configured minimum, or `source_asset`
+    ///   equals `target_asset` (a same-asset swap is rejected).
     /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode is on and `target` is not listed.
     /// * [`BridgeError::AssetNotWhitelisted`] — `source_asset` or `target_asset`
@@ -5427,6 +5428,11 @@ impl OnboardingBridge {
             return Err(BridgeError::InvalidAmount);
         }
         if source_amount < read_minimum_amount(&env) {
+            return Err(BridgeError::InvalidAmount);
+        }
+        // A swap into the same asset is a no-op that would still charge the
+        // bridge fee and consume a nonce; reject it before `require_auth`.
+        if source_asset == target_asset {
             return Err(BridgeError::InvalidAmount);
         }
 

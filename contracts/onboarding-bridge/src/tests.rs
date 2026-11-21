@@ -2042,6 +2042,36 @@ fn test_swap_rejects_non_whitelisted_source_asset() {
 }
 
 #[test]
+fn test_swap_rejects_same_source_and_target_asset() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, _target_token_id) = setup_swap(&env);
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &source_token_id, &1i128);
+    mint_tokens(&env, &source_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target,
+            &source_token_id,
+            &source_token_id,
+            &500i128,
+            &400i128,
+            &swap_route,
+            &None,
+            &None,
+        ),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+    assert_eq!(check_balance(&env, &source_token_id, &user), 1_000i128);
+    assert_eq!(check_balance(&env, &source_token_id, &target), 0i128);
+}
+
+#[test]
 fn test_swap_rejects_source_daily_limit_exceeded() {
     let env = Env::default();
     let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
