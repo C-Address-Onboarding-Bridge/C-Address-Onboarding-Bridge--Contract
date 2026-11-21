@@ -4580,6 +4580,28 @@ fn test_loyalty_rewards_preserve_bridged_asset_reserves() {
 
 }
 
+#[test]
+fn test_loyalty_rewards_do_not_drain_crosschain_reserve() {
+    let env = Env::default();
+    let (bridge, user, asset, admin) = setup_bridge(&env);
+    let bridge_id = bridge.address.clone();
+    let target = Address::generate(&env);
+
+    bridge.set_loyalty_token(&asset, &200i128);
+    mint_tokens(&env, &asset, &admin, 1_000i128);
+    bridge.fund_crosschain_reserve(&asset, &1_000i128);
+    assert_eq!(bridge.query_crosschain_reserve(&asset), 1_000i128);
+
+    bridge.fund_c_address(&user, &target, &asset, &100i128, &None, &None);
+
+    assert!(
+        count_events_with_topic(&env, &bridge_id, "LoyaltyMintSkipped") > 0,
+        "loyalty mint must be skipped when only the cross-chain reserve remains"
+    );
+    assert_eq!(bridge.query_crosschain_reserve(&asset), 1_000i128);
+    assert_eq!(check_balance(&env, &asset, &bridge_id), 1_100i128);
+}
+
 #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_batch_fund_all_blocked_mints_no_loyalty() {

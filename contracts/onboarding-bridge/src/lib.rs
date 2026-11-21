@@ -871,6 +871,20 @@ fn read_crosschain_reserve(env: &Env, asset: &Address) -> i128 {
         .unwrap_or(0)
 }
 
+/// Balance of `asset` held by the contract that is not ring-fenced for
+/// accrued fees, timelocked deposits, or the cross-chain liquidity reserve.
+fn reserved_balance(env: &Env, asset: &Address) -> Result<i128, BridgeError> {
+    let balance = token::Client::new(env, asset).balance(&env.current_contract_address());
+    let counters = read_asset_counters(env, asset);
+    safe_math::safe_sub(
+        safe_math::safe_sub(
+            safe_math::safe_sub(balance, counters.accrued_fees)?,
+            counters.locked_timelock,
+        )?,
+        read_crosschain_reserve(env, asset),
+    )
+}
+
 fn write_crosschain_reserve(env: &Env, asset: &Address, amount: i128) {
     let key = DataKey::CrossChainReserve(asset.clone());
     env.storage().persistent().set(&key, &amount);
@@ -1362,21 +1376,18 @@ fn read_loyalty_amount_per_fund(env: &Env) -> i128 {
 /// Mints (transfers) the configured loyalty reward to `recipient`, unless the
 /// contract's loyalty-token reserve is insufficient.
 ///
-/// The contract's loyalty-token balance, less any accrued fees and timelocked
-/// deposits for that asset, is checked before attempting the transfer. If the
-/// available reserve is depleted, minting is skipped and a `LoyaltyMintSkipped`
-/// event is emitted instead of letting the underlying token transfer trap.
+/// The contract's loyalty-token balance, less any accrued fees, timelocked
+/// deposits, and cross-chain liquidity reserve for that asset, is checked
+/// before attempting the transfer. If the available reserve is depleted,
+/// minting is skipped and a `LoyaltyMintSkipped` event is emitted instead of
+/// letting the underlying token transfer trap.
 fn mint_loyalty_tokens(env: &Env, recipient: &Address) {
     if let Some(loyalty_token) = read_loyalty_token(env) {
         let amount = read_loyalty_amount_per_fund(env);
         if amount > 0 {
             let token_client = token::Client::new(env, &loyalty_token);
             let contract_addr = env.current_contract_address();
-            let balance = token_client.balance(&contract_addr);
-            let counters = read_asset_counters(env, &loyalty_token);
-            let reserve = balance
-                .saturating_sub(counters.accrued_fees)
-                .saturating_sub(counters.locked_timelock);
+            let reserve = reserved_balance(env, &loyalty_token).unwrap_or(0);
             if reserve < amount {
                 env.events()
                     .publish(("LoyaltyMintSkipped", recipient.clone()), (amount, reserve));
@@ -3556,15 +3567,7 @@ impl OnboardingBridge {
         extend_instance_ttl(&env);
 
         let token_client = token::Client::new(&env, &asset);
-        let contract_balance = token_client.balance(&env.current_contract_address());
-        let counters = read_asset_counters(&env, &asset);
-        let reclaimable = safe_math::safe_sub(
-            safe_math::safe_sub(
-                safe_math::safe_sub(contract_balance, counters.accrued_fees)?,
-                counters.locked_timelock,
-            )?,
-            read_crosschain_reserve(&env, &asset),
-        )?;
+        let reclaimable = reserved_balance(&env, &asset)?;
 
         if reclaimable < amount {
             return Err(BridgeError::InsufficientReclaimable);
