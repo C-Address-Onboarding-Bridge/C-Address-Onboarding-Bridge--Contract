@@ -102,6 +102,72 @@ fn measure(env: &Env, name: &str, f: impl FnOnce()) {
     let mem = env.cost_estimate().budget().memory_bytes_cost();
     // Tab-separated so CI can parse it with `column -t`
     println!("BENCH\t{name}\t{cpu}\t{mem}");
+    record(name, cpu, mem);
+}
+
+/// Collected `(name, cpu, mem)` rows, emitted as JSON by `run_all_benchmarks`.
+static RESULTS: std::sync::Mutex<Vec<(std::string::String, u64, u64)>> =
+    std::sync::Mutex::new(std::vec::Vec::new());
+
+fn record(name: &str, cpu: u64, mem: u64) {
+    if let Ok(mut rows) = RESULTS.lock() {
+        rows.push((std::string::String::from(name), cpu, mem));
+    }
+}
+
+/// Split a benchmark name into the `function`/`variant` pair the CI comparison
+/// script expects (`fund_c_address/amount=100` -> `fund_c_address`, `amount=100`).
+fn split_name(name: &str) -> (&str, &str) {
+    match name.split_once('/') {
+        Some((function, variant)) => (function, variant),
+        None => (name, "default"),
+    }
+}
+
+/// Print the collected rows between the marker lines `benchmark.yml` parses.
+fn print_benchmark_json() {
+    let rows = match RESULTS.lock() {
+        Ok(rows) => rows.clone(),
+        Err(_) => return,
+    };
+    let mut out = std::string::String::from("{\"benchmark_results\":[");
+    for (i, (name, cpu, mem)) in rows.iter().enumerate() {
+        let (function, variant) = split_name(name);
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"function\":\"{function}\",\"variant\":\"{variant}\",\"cpu_insns\":{cpu},\"mem_bytes\":{mem}}}"
+        ));
+    }
+    out.push_str("]}");
+    println!("===BENCHMARK_JSON_BEGIN===");
+    println!("{out}");
+    println!("===BENCHMARK_JSON_END===");
+}
+
+/// Builds the commitment hash with the same domain-separated preimage that
+/// `reveal_fund` verifies on-chain.
+fn commitment_hash(
+    env: &Env,
+    bridge: &Address,
+    source: &Address,
+    target: &Address,
+    asset: &Address,
+    amount: i128,
+    nonce: u64,
+) -> BytesN<32> {
+    let mut preimage = Bytes::new(env);
+    preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
+    crate::append_address_to_bytes(env, &mut preimage, bridge);
+    let network_id: Bytes = env.ledger().network_id().into();
+    preimage.append(&network_id);
+    crate::append_address_to_bytes(env, &mut preimage, source);
+    crate::append_address_to_bytes(env, &mut preimage, target);
+    crate::append_address_to_bytes(env, &mut preimage, asset);
+    preimage.extend_from_array(&amount.to_be_bytes());
+    preimage.extend_from_array(&nonce.to_be_bytes());
+    env.crypto().sha256(&preimage).into()
 }
 
 // ── initialize ─────────────────────────────────────────────────────────────────
@@ -531,17 +597,7 @@ fn bench_commit_fund() {
     let user = Address::generate(&env);
     let target = Address::generate(&env);
 
-    use soroban_sdk::Bytes;
-    let mut preimage = Bytes::new(&env);
-    preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
-    crate::append_address_to_bytes(&env, &mut preimage, &bridge_id);
-    preimage.append(&env.ledger().network_id().into());
-    crate::append_address_to_bytes(&env, &mut preimage, &user);
-    crate::append_address_to_bytes(&env, &mut preimage, &target);
-    crate::append_address_to_bytes(&env, &mut preimage, &token_id);
-    preimage.extend_from_array(&10_000i128.to_be_bytes());
-    preimage.extend_from_array(&1u64.to_be_bytes());
-    let amount_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+    let amount_hash = commitment_hash(&env, &bridge_id, &user, &target, &token_id, 10_000i128, 1u64);
     let deadline = env.ledger().timestamp() + 86_400;
 
     measure(&env, "commit_fund", || {
@@ -560,17 +616,7 @@ fn bench_reveal_fund() {
 
     mint(&env, &token_id, &user, amount * 2);
 
-    use soroban_sdk::Bytes;
-    let mut preimage = Bytes::new(&env);
-    preimage.extend_from_array(b"onboarding_bridge_commitment_v1");
-    crate::append_address_to_bytes(&env, &mut preimage, &bridge_id);
-    preimage.append(&env.ledger().network_id().into());
-    crate::append_address_to_bytes(&env, &mut preimage, &user);
-    crate::append_address_to_bytes(&env, &mut preimage, &target);
-    crate::append_address_to_bytes(&env, &mut preimage, &token_id);
-    preimage.extend_from_array(&amount.to_be_bytes());
-    preimage.extend_from_array(&nonce.to_be_bytes());
-    let amount_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+    let amount_hash = commitment_hash(&env, &bridge_id, &user, &target, &token_id, amount, nonce);
     let deadline = env.ledger().timestamp() + 86_400;
 
     let id = bridge.commit_fund(&user, &target, &token_id, &amount_hash, &deadline);
