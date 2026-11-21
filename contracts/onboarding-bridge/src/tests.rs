@@ -3868,6 +3868,59 @@ mod commit_reveal_tests {
     }
 
     #[test]
+    fn test_reveal_at_deadline_fails() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(
+            &env,
+            &bridge.address,
+            &user,
+            &target,
+            &token_id,
+            500i128,
+            10u64,
+        );
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &1_500u64);
+
+        advance_past_min_delay(&env);
+        env.ledger().set_timestamp(1_500);
+
+        assert_eq!(
+            bridge.try_reveal_fund(&id, &user, &target, &token_id, &500i128, &10u64),
+            Err(Ok(BridgeError::CommitmentExpired))
+        );
+        assert_eq!(check_balance(&env, &token_id, &target), 0i128);
+    }
+
+    #[test]
+    fn test_reveal_just_before_deadline_succeeds() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(
+            &env,
+            &bridge.address,
+            &user,
+            &target,
+            &token_id,
+            500i128,
+            12u64,
+        );
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &1_500u64);
+
+        advance_past_min_delay(&env);
+        env.ledger().set_timestamp(1_499);
+
+        bridge.reveal_fund(&id, &user, &target, &token_id, &500i128, &12u64);
+        assert_eq!(check_balance(&env, &token_id, &target), 495i128);
+    }
+
+    #[test]
     fn test_reveal_twice_fails() {
         let env = Env::default();
         env.ledger().set_timestamp(1_000);

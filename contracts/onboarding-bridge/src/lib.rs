@@ -5189,7 +5189,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
     /// * [`BridgeError::CommitmentNotFound`] — No entry for `commitment_id`.
     /// * [`BridgeError::CommitmentAlreadyRevealed`] — Already revealed.
-    /// * [`BridgeError::CommitmentExpired`] — Past the reveal deadline.
+    /// * [`BridgeError::CommitmentExpired`] — At or past the reveal deadline.
     /// * [`BridgeError::CommitmentNotMatured`] — Minimum delay not yet elapsed.
     /// * [`BridgeError::Unauthorized`] — `source`, `target`, or `asset` do not
     ///   match the commitment.
@@ -5221,7 +5221,7 @@ impl OnboardingBridge {
             return Err(BridgeError::CommitmentAlreadyRevealed);
         }
 
-        if env.ledger().timestamp() > entry.deadline {
+        if env.ledger().timestamp() >= entry.deadline {
             return Err(BridgeError::CommitmentExpired);
         }
 
