@@ -4418,6 +4418,8 @@ impl OnboardingBridge {
     /// The fee rate applied is the rate at **claim time**, not deposit time.
     /// If the global fee rate changes between deposit and claim, the net amount
     /// received by `target` may differ from the amount at deposit time.
+    /// The deposit credits `source`'s bridged volume for `asset`, so the
+    /// volume fee tier in effect at claim time applies to the claim.
     pub fn fund_c_address_timelocked(
         env: Env,
         source: Address,
@@ -4472,6 +4474,9 @@ impl OnboardingBridge {
         );
         increment_locked_timelock(&env, &asset, amount)?;
         increment_user_deposit(&env, &source, &asset, amount)?;
+        // Volume is credited at deposit time (when `source` is known and
+        // authorises the call) so the tier applies to the claim.
+        increment_source_bridged_volume(&env, &source, &asset, amount)?;
         mint_loyalty_tokens(&env, &source);
         extend_instance_ttl(&env);
 
@@ -4513,7 +4518,8 @@ impl OnboardingBridge {
     /// The `claimed` flag is persisted before the token transfer. Because
     /// Soroban execution is single-threaded within a ledger, this effectively
     /// prevents re-entrancy. The fee rate is the **current** global rate at
-    /// claim time, which may differ from the rate at deposit time.
+    /// claim time, which may differ from the rate at deposit time, reduced by
+    /// `entry.source`'s volume fee tier (if any) and capped by the asset fee cap.
     /// Claims remain available after emergency deactivation so existing
     /// timelock deposits are not stranded.
     pub fn claim_timelocked(env: Env, id: u64) -> Result<(), BridgeError> {
@@ -4534,7 +4540,8 @@ impl OnboardingBridge {
         save_timelock_entry(&env, id, &entry);
 
         let global_fee_bps = read_fee_bps(&env);
-        let effective_fee_bps = get_effective_fee_bps(&env, &entry.asset, global_fee_bps);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &entry.source, &entry.asset, global_fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &entry.asset, tiered_fee_bps);
         let fee = calculate_fee(entry.amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(entry.amount, fee)?;
 
