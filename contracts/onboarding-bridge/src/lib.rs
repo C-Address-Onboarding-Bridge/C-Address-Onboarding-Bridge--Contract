@@ -189,7 +189,9 @@ pub enum BridgeError {
     TooManyFeeTiers = 51,
     /// Cross-chain payouts exceed the admin-funded liquidity reserve.
     InsufficientCrossChainReserve = 52,
-    // Next free discriminant: 53. Always take the next unused value here and
+    /// The supplied 32-byte value is not a valid (non-weak) Ed25519 public key.
+    InvalidPubkey = 53,
+    // Next free discriminant: 54. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
 
@@ -1102,7 +1104,18 @@ fn is_relayer(env: &Env, pubkey: &BytesN<32>) -> bool {
         .unwrap_or(false)
 }
 
-fn add_relayer(env: &Env, pubkey: &BytesN<32>) {
+/// Rejects 32-byte values that are not valid, non-weak Ed25519 public keys.
+fn validate_pubkey(pubkey: &BytesN<32>) -> Result<(), BridgeError> {
+    let verifying_key =
+        VerifyingKey::from_bytes(&pubkey.to_array()).map_err(|_| BridgeError::InvalidPubkey)?;
+    if verifying_key.is_weak() {
+        return Err(BridgeError::InvalidPubkey);
+    }
+    Ok(())
+}
+
+fn add_relayer(env: &Env, pubkey: &BytesN<32>) -> Result<(), BridgeError> {
+    validate_pubkey(pubkey)?;
     if !is_relayer(env, pubkey) {
         env.storage()
             .persistent()
@@ -1116,6 +1129,7 @@ fn add_relayer(env: &Env, pubkey: &BytesN<32>) {
             .instance()
             .set(&DataKey::RelayerCount, &(relayer_count(env) + 1));
     }
+    Ok(())
 }
 
 fn read_relayer_set(env: &Env) -> Vec<BytesN<32>> {
@@ -4247,6 +4261,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` does not match the stored
     ///   admin nonce.
+    /// * [`BridgeError::InvalidPubkey`] — `pubkey` is not a valid, non-weak
+    ///   Ed25519 public key.
     ///
     /// # Events
     ///
@@ -4262,7 +4278,7 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
-        add_relayer(&env, &pubkey);
+        add_relayer(&env, &pubkey)?;
         env.events().publish(("RelayerAdded",), (admin, pubkey));
         Ok(())
     }
@@ -5556,6 +5572,8 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::InvalidPubkey`] — `pubkey` is not a valid, non-weak
+    ///   Ed25519 public key.
     ///
     /// # Events
     ///
@@ -5569,6 +5587,7 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         check_not_paused(&env)?;
         source.require_auth();
+        validate_pubkey(&pubkey)?;
         save_meta_signer(&env, &source, &pubkey);
         env.events()
             .publish(("MetaSignerRegistered", source), (pubkey,));

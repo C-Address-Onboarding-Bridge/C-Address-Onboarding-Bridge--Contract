@@ -576,7 +576,7 @@ fn test_add_relayer_paused() {
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
     bridge.pause(&None);
-    let pubkey = BytesN::from_array(&env, &[7u8; 32]);
+    let pubkey = BytesN::from_array(&env, &SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes());
     bridge.add_relayer(&pubkey, &None);
     assert!(bridge.query_is_relayer(&pubkey));
 }
@@ -589,8 +589,8 @@ fn test_add_relayer_nonce_replay_rejected() {
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
-    let first = BytesN::from_array(&env, &[7u8; 32]);
-    let second = BytesN::from_array(&env, &[8u8; 32]);
+    let first = BytesN::from_array(&env, &SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes());
+    let second = BytesN::from_array(&env, &SigningKey::from_bytes(&[8u8; 32]).verifying_key().to_bytes());
     bridge.add_relayer(&first, &Some(0u64));
     assert_eq!(
         bridge.try_add_relayer(&second, &Some(0u64)),
@@ -606,8 +606,8 @@ fn test_admin_mutators_reject_replayed_nonces() {
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
-    let first_relayer = BytesN::from_array(&env, &[7u8; 32]);
-    let second_relayer = BytesN::from_array(&env, &[8u8; 32]);
+    let first_relayer = BytesN::from_array(&env, &SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes());
+    let second_relayer = BytesN::from_array(&env, &SigningKey::from_bytes(&[8u8; 32]).verifying_key().to_bytes());
     bridge.add_relayer(&first_relayer, &None);
     bridge.add_relayer(&second_relayer, &None);
 
@@ -5763,7 +5763,7 @@ fn test_meta_fund_rejects_pubkey_source_mismatch() {
     let target = Address::generate(&env);
 
     // `user` registers pubkey_a as their meta-tx signer.
-    let pubkey_a = BytesN::from_array(&env, &[0xAAu8; 32]);
+    let pubkey_a = BytesN::from_array(&env, &SigningKey::from_bytes(&[0xAAu8; 32]).verifying_key().to_bytes());
     bridge.register_meta_signer(&user, &pubkey_a);
 
     // A relayer attempts to submit a meta-tx for `user` using an unrelated
@@ -5810,7 +5810,6 @@ fn test_meta_fund_rejects_unregistered_source() {
     let target = Address::generate(&env);
     let pubkey = BytesN::from_array(&env, &[0xCCu8; 32]);
     let bogus_signature = BytesN::from_array(&env, &[0u8; 64]);
-
     let params = MetaFundParams {
         network_id: network_id.clone(),
         source: user.clone(),
@@ -5835,11 +5834,62 @@ fn test_meta_signer_can_be_unregistered() {
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
-    let pubkey = BytesN::from_array(&env, &[0xCCu8; 32]);
+    let pubkey = BytesN::from_array(&env, &SigningKey::from_bytes(&[0xCCu8; 32]).verifying_key().to_bytes());
     bridge.register_meta_signer(&user, &pubkey);
     assert_eq!(bridge.query_meta_signer(&user), Some(pubkey));
 
     bridge.unregister_meta_signer(&user);
+    assert_eq!(bridge.query_meta_signer(&user), None);
+}
+
+#[test]
+fn test_add_relayer_rejects_invalid_pubkey() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // All-zero bytes are a small-order (weak) point.
+    let small_order = BytesN::from_array(&env, &[0u8; 32]);
+    assert_eq!(
+        bridge.try_add_relayer(&small_order, &None),
+        Err(Ok(BridgeError::InvalidPubkey))
+    );
+
+    // 0xFF..FF is not a valid compressed Edwards point.
+    let non_decompressing = BytesN::from_array(&env, &[0xFFu8; 32]);
+    assert_eq!(
+        bridge.try_add_relayer(&non_decompressing, &None),
+        Err(Ok(BridgeError::InvalidPubkey))
+    );
+
+    assert!(!bridge.query_is_relayer(&small_order));
+    assert!(!bridge.query_is_relayer(&non_decompressing));
+}
+
+#[test]
+fn test_register_meta_signer_rejects_invalid_pubkey() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let small_order = BytesN::from_array(&env, &[0u8; 32]);
+    assert_eq!(
+        bridge.try_register_meta_signer(&user, &small_order),
+        Err(Ok(BridgeError::InvalidPubkey))
+    );
+
+    let non_decompressing = BytesN::from_array(&env, &[0xFFu8; 32]);
+    assert_eq!(
+        bridge.try_register_meta_signer(&user, &non_decompressing),
+        Err(Ok(BridgeError::InvalidPubkey))
+    );
+
     assert_eq!(bridge.query_meta_signer(&user), None);
 }
 
