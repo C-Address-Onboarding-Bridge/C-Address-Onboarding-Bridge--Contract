@@ -494,15 +494,73 @@ fn decode_scval(bytes: &[u8]) -> Result<serde_json::Value, &'static str> {
         }
         18 => {
             let address_kind = read_u32(bytes, &mut cursor)?;
-            let address = read_bytes(bytes, &mut cursor, 32)?;
-            Ok(serde_json::Value::String(format!(
-                "scaddress:{}:{}",
-                address_kind,
-                hex::encode(address)
-            )))
+            match address_kind {
+                // SC_ADDRESS_TYPE_ACCOUNT: the PublicKey union follows, whose
+                // first field is the PUBLIC_KEY_TYPE_ED25519 discriminant.
+                0 => {
+                    let key_type = read_u32(bytes, &mut cursor)?;
+                    if key_type != 0 {
+                        return Err("unsupported PublicKey type");
+                    }
+                    let key = read_bytes(bytes, &mut cursor, 32)?;
+                    Ok(serde_json::Value::String(encode_strkey(6 << 3, key)))
+                }
+                // SC_ADDRESS_TYPE_CONTRACT: raw 32-byte contract id.
+                1 => {
+                    let key = read_bytes(bytes, &mut cursor, 32)?;
+                    Ok(serde_json::Value::String(encode_strkey(2 << 3, key)))
+                }
+                _ => Err("unsupported ScAddress type"),
+            }
         }
         _ => Err("unsupported ScVal type"),
     }
+}
+
+/// Encode a 32-byte key as a Stellar strkey: version byte + payload + CRC16
+/// XModem (little-endian), RFC 4648 base32 without padding. Version bytes are
+/// `6 << 3` for ed25519 public keys (G...) and `2 << 3` for contracts (C...).
+fn encode_strkey(version_byte: u8, payload: &[u8]) -> String {
+    let mut data = Vec::with_capacity(1 + payload.len() + 2);
+    data.push(version_byte);
+    data.extend_from_slice(payload);
+    let checksum = crc16_xmodem(&data);
+    data.extend_from_slice(&checksum.to_le_bytes());
+    base32_encode(&data)
+}
+
+fn crc16_xmodem(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+    for byte in data {
+        crc ^= (*byte as u16) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+fn base32_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = String::with_capacity((data.len() * 8).div_ceil(5));
+    let mut buffer: u32 = 0;
+    let mut bits: u32 = 0;
+    for byte in data {
+        buffer = (buffer << 8) | *byte as u32;
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(ALPHABET[((buffer >> bits) & 0x1f) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(ALPHABET[((buffer << (5 - bits)) & 0x1f) as usize] as char);
+    }
+    out
 }
 
 fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, &'static str> {
@@ -963,6 +1021,66 @@ mod tests {
         let id1 = parse_contract_event(&raw1, "C1", 0).unwrap().id;
         let id2 = parse_contract_event(&raw2, "C1", 0).unwrap().id;
         assert_ne!(id1, id2, "different tx_hash must produce different IDs");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #879 - ScAddress decoding to Stellar strkeys
+    // -----------------------------------------------------------------------
+
+    /// Build the XDR bytes of `ScVal::Address` for the given address type and
+    /// 32-byte key, as returned by Soroban RPC (base64 of these bytes).
+    fn scval_address(address_type: u32, key: [u8; 32]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&18u32.to_be_bytes()); // ScVal::Address
+        bytes.extend_from_slice(&address_type.to_be_bytes());
+        if address_type == 0 {
+            bytes.extend_from_slice(&0u32.to_be_bytes()); // PUBLIC_KEY_TYPE_ED25519
+        }
+        bytes.extend_from_slice(&key);
+        bytes
+    }
+
+    /// Account addresses must skip the PublicKey discriminant and encode as a
+    /// G... strkey (version byte 6 << 3, CRC16-XModem, base32).
+    #[test]
+    fn test_decode_scval_account_address_encodes_g_strkey() {
+        let bytes = scval_address(0, [1u8; 32]);
+        let decoded = decode_scval(&bytes).expect("must decode account address");
+        let strkey = decoded.as_str().expect("must be a string");
+        assert!(strkey.starts_with('G'), "account strkey must start with G");
+        assert_eq!(strkey.len(), 56, "strkey must be 56 chars");
+        assert_eq!(
+            strkey,
+            encode_strkey(6 << 3, &[1u8; 32]),
+            "must use the ed25519 public key version byte"
+        );
+    }
+
+    /// Contract addresses encode as a C... strkey (version byte 2 << 3).
+    #[test]
+    fn test_decode_scval_contract_address_encodes_c_strkey() {
+        let bytes = scval_address(1, [2u8; 32]);
+        let decoded = decode_scval(&bytes).expect("must decode contract address");
+        let strkey = decoded.as_str().expect("must be a string");
+        assert!(strkey.starts_with('C'), "contract strkey must start with C");
+        assert_eq!(strkey.len(), 56, "strkey must be 56 chars");
+        assert_eq!(strkey, encode_strkey(2 << 3, &[2u8; 32]));
+    }
+
+    /// A target_filter must match the decoded strkey of a real XDR topic.
+    #[test]
+    fn test_target_filter_matches_decoded_strkey() {
+        let target = encode_strkey(2 << 3, &[3u8; 32]);
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(scval_address(1, [3u8; 32]));
+        let raw = raw_event(serde_json::json!([
+            "CAddressFunded",
+            "CASSETADDR",
+            "GSOURCEADDR",
+            encoded
+        ]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert_eq!(event.data["target"].as_str(), Some(target.as_str()));
     }
 
     // -----------------------------------------------------------------------
