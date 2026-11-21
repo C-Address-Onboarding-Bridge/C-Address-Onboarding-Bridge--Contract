@@ -68,7 +68,7 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
-    BytesN, Env, IntoVal, Map, Vec,
+    BytesN, Env, IntoVal, Map, Val, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -595,7 +595,7 @@ fn increment_user_deposit(
     let key = DataKey::UserDeposit(source.clone(), asset.clone());
     let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
     let updated = safe_math::safe_add(current, amount)?;
-    env.storage().persistent().set(&key, &updated);
+    persist(env, &key, &updated);
     Ok(())
 }
 
@@ -855,9 +855,7 @@ fn decrement_locked_timelock(env: &Env, asset: &Address, amount: i128) -> Result
 }
 
 fn save_asset_counters(env: &Env, asset: &Address, counters: &AssetCounters) {
-    env.storage()
-        .persistent()
-        .set(&DataKey::AssetStats(asset.clone()), counters);
+    persist(env, &DataKey::AssetStats(asset.clone()), counters);
 }
 
 fn read_accrued_fees(env: &Env, asset: &Address) -> i128 {
@@ -871,13 +869,17 @@ fn read_crosschain_reserve(env: &Env, asset: &Address) -> i128 {
         .unwrap_or(0)
 }
 
-fn write_crosschain_reserve(env: &Env, asset: &Address, amount: i128) {
-    let key = DataKey::CrossChainReserve(asset.clone());
-    env.storage().persistent().set(&key, &amount);
+/// Persist a hot entry and bump its TTL so it never expires under activity.
+fn persist<V: IntoVal<Env, Val>>(env: &Env, key: &DataKey, value: &V) {
+    env.storage().persistent().set(key, value);
     let max_ttl = read_max_persistent_ttl(env);
     env.storage()
         .persistent()
-        .extend_ttl(&key, max_ttl / 4, max_ttl);
+        .extend_ttl(key, max_ttl / 4, max_ttl);
+}
+
+fn write_crosschain_reserve(env: &Env, asset: &Address, amount: i128) {
+    persist(env, &DataKey::CrossChainReserve(asset.clone()), &amount);
 }
 
 fn increment_crosschain_reserve(
@@ -983,9 +985,7 @@ fn consume_nonce(env: &Env, caller: &Address, nonce: Option<u64>) -> Result<(), 
         if n != stored {
             return Err(BridgeError::DuplicateNonce);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::Nonce(caller.clone()), &(stored + 1));
+        persist(env, &DataKey::Nonce(caller.clone()), &(stored + 1));
     }
     Ok(())
 }
@@ -1290,7 +1290,8 @@ fn increment_source_bridged_volume(
 ) -> Result<(), BridgeError> {
     let current = read_source_bridged_volume(env, source, asset);
     let updated = safe_math::safe_add(current, amount)?;
-    env.storage().persistent().set(
+    persist(
+        env,
         &DataKey::SourceBridgedVolume(source.clone(), asset.clone()),
         &updated,
     );
