@@ -401,13 +401,37 @@ pub struct TimelockEntry {
     pub amount: i128,
     /// Unix timestamp (seconds) after which `claim_timelocked` may be called.
     pub release_time: u64,
-    /// Optional cliff timestamp; informational only in the current implementation.
+    /// Unix timestamp (seconds) before which nothing may be claimed. `0` means
+    /// no cliff: vesting starts at deposit time.
     pub cliff_time: u64,
-    /// Set to `true` once `claim_timelocked` has been successfully called.
+    /// Gross amount already released by previous `claim_timelocked` calls.
+    pub claimed_amount: i128,
+    /// Set to `true` once the full `amount` has been released.
     pub claimed: bool,
     /// Set to `true` once `cancel_timelocked` or `reclaim_timelocked` has
     /// refunded the entry to `source`.
     pub cancelled: bool,
+}
+
+/// Gross amount of `entry` that has vested at `now`.
+///
+/// Vesting is linear between `cliff_time` (or the deposit time when
+/// `cliff_time == 0`) and `release_time`. Before the cliff nothing has vested;
+/// at or after `release_time` the whole amount has vested.
+fn vested_amount(entry: &TimelockEntry, now: u64) -> i128 {
+    if now >= entry.release_time {
+        return entry.amount;
+    }
+    let start = entry.cliff_time;
+    if start == 0 || now < start {
+        return 0;
+    }
+    let elapsed = (now - start) as i128;
+    let duration = (entry.release_time - start) as i128;
+    if duration <= 0 {
+        return entry.amount;
+    }
+    entry.amount * elapsed / duration
 }
 
 /// A scheduled WASM upgrade waiting for its timelock to elapse.
@@ -4385,12 +4409,19 @@ impl OnboardingBridge {
     /// * `amount` (`i128`) — Gross amount to lock. Must be > 0.
     /// * `release_time` (`u64`) — Unix timestamp (seconds) after which the
     ///   tokens may be claimed. Must be strictly in the future.
-    /// * `cliff_time` (`u64`) — Optional cliff timestamp. If > 0 it must be
-    ///   ≤ `release_time`. Currently informational only; not enforced by
-    ///   `claim_timelocked`.
+    /// * `cliff_time` (`u64`) — Unix timestamp (seconds) before which nothing
+    ///   may be claimed. Pass `0` for no cliff (vesting starts at deposit
+    ///   time). If > 0 it must be ≤ `release_time`.
     /// * `nonce` (`Option<u64>`) — Optional sequential nonce for `source`.
     /// * `deadline` (`Option<u64>`) — Optional Unix timestamp (seconds) after
     ///   which the call is rejected. Pass `None` for no expiry.
+    ///
+    /// # Vesting
+    ///
+    /// The gross `amount` vests linearly between `cliff_time` (or the deposit
+    /// timestamp when `cliff_time == 0`) and `release_time`. `claim_timelocked`
+    /// may be called repeatedly to release the vested portion; the fee is
+    /// charged on each released portion.
     ///
     /// # Authorization
     ///
@@ -4481,6 +4512,7 @@ impl OnboardingBridge {
                 amount,
                 release_time,
                 cliff_time,
+                claimed_amount: 0,
                 claimed: false,
                 cancelled: false,
             },
