@@ -48,6 +48,9 @@
 //! 2. **Auth-entry nonce** (`DataKey::UsedAuthNonce`) — used by `verify_auth_entry` to
 //!    permanently burn a `(source, nonce)` pair within a ledger-sequence window, preventing
 //!    Soroban authorization-entry reuse.
+//!
+//! Meta-transactions (`execute_meta_fund`) use a third, unordered scheme: any
+//! unused `(source, nonce)` pair is accepted and nonce ordering is not enforced.
 
 #![no_std]
 // TODO(next-bounty): both allows below cover a backlog left by the first bounty
@@ -5818,8 +5821,11 @@ impl OnboardingBridge {
     /// Returns `true` if the given meta-transaction nonce has already been used
     /// for `source`.
     ///
-    /// Call this before constructing a `MetaFundParams` to get the next safe nonce,
-    /// or to verify a pending meta-tx has not been replayed.
+    /// Nonces are *not* sequential: any unused `u64` is accepted for a source
+    /// and ordering is not enforced, so there is no "next nonce" to query.
+    /// Call this to check whether a specific nonce is still free before
+    /// constructing a `MetaFundParams`, or to verify a pending meta-tx has not
+    /// been replayed.
     ///
     /// # Arguments
     ///
@@ -5853,7 +5859,8 @@ pub struct MetaFundParams {
     pub asset: Address,
     /// Gross amount to transfer (fee deducted from this).
     pub amount: i128,
-    /// Monotonically-increasing per-user nonce; prevents replay.
+    /// Per-source replay-prevention nonce. Any unused `u64` is accepted;
+    /// ordering is not enforced (nonces need not be sequential or increasing).
     pub nonce: u64,
     /// Unix timestamp (seconds) after which this meta-tx is rejected.
     pub deadline: u64,
