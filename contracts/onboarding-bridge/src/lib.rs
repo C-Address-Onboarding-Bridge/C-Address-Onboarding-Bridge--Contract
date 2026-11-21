@@ -1219,6 +1219,15 @@ fn save_relayer_threshold(env: &Env, threshold: u32) {
         .set(&DataKey::RelayerThreshold, &threshold);
 }
 
+/// Derives the replay-protection nonce for a cross-chain event:
+/// `sha256(chain_id_be4 || tx_hash)`.
+fn derive_crosschain_nonce(env: &Env, chain_id: u32, tx_hash: &BytesN<32>) -> BytesN<32> {
+    let mut preimage = soroban_sdk::Bytes::new(env);
+    preimage.extend_from_array(&chain_id.to_be_bytes());
+    preimage.append(&tx_hash.clone().into());
+    env.crypto().sha256(&preimage).into()
+}
+
 fn is_nonce_used(env: &Env, nonce: &BytesN<32>) -> bool {
     env.storage()
         .persistent()
@@ -4173,10 +4182,7 @@ impl OnboardingBridge {
         }
 
         let tx_hash_bytes: soroban_sdk::Bytes = tx_hash.clone().into();
-        let mut nonce_pre = soroban_sdk::Bytes::new(&env);
-        nonce_pre.extend_from_array(&chain_id.to_be_bytes());
-        nonce_pre.append(&tx_hash_bytes);
-        let nonce: BytesN<32> = env.crypto().sha256(&nonce_pre).into();
+        let nonce = derive_crosschain_nonce(&env, chain_id, &tx_hash);
         if is_nonce_used(&env, &nonce) {
             return Err(BridgeError::ReplayedNonce);
         }
@@ -4250,6 +4256,35 @@ impl OnboardingBridge {
             (chain_id, tx_hash, amount, fee, asset),
         );
         Ok(())
+    }
+
+    /// Returns whether a cross-chain `(chain_id, tx_hash)` event has already
+    /// been processed by `fund_c_address_crosschain`.
+    ///
+    /// The nonce is derived exactly as in `fund_c_address_crosschain`:
+    /// `sha256(chain_id_be4 || tx_hash)`. Relayers can use this to skip
+    /// re-submitting an event that has already been credited.
+    ///
+    /// # Arguments
+    ///
+    /// * `chain_id` (`u32`) — Numeric source-chain ID.
+    /// * `tx_hash` (`BytesN<32>`) — The 32-byte hash of the source-chain transaction.
+    ///
+    /// # Authorization
+    ///
+    /// None — read-only.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    pub fn query_crosschain_processed(
+        env: Env,
+        chain_id: u32,
+        tx_hash: BytesN<32>,
+    ) -> Result<bool, BridgeError> {
+        check_initialized(&env)?;
+        let nonce = derive_crosschain_nonce(&env, chain_id, &tx_hash);
+        Ok(is_nonce_used(&env, &nonce))
     }
 
     /// Registers an Ed25519 public key as a trusted relayer.
