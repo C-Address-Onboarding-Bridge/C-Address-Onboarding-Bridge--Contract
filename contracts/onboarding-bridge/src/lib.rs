@@ -3044,9 +3044,14 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
+    /// * `("UpgradeCancelled",)` — data: `(cancelled_wasm_hash, admin)`, only
+    ///   if a scheduled upgrade was pending and has been cleared.
     /// * `("ContractUpgraded",)` — data: `(old_hash, new_wasm_hash, admin)`
     ///
     /// # Security Considerations
+    ///
+    /// Any pending scheduled upgrade is cleared, so a later `execute_upgrade`
+    /// cannot roll the code back to the previously scheduled hash.
     ///
     /// After this call the contract executes new code in the same transaction.
     /// The `old_hash` in the event lets off-chain monitors detect unexpected
@@ -3062,6 +3067,14 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
+
+        // Clear any scheduled upgrade so a later `execute_upgrade` cannot roll
+        // the code back to a previously scheduled hash.
+        if let Some(pending) = read_pending_upgrade(&env) {
+            clear_pending_upgrade(&env);
+            env.events()
+                .publish(("UpgradeCancelled",), (pending.new_wasm_hash, admin.clone()));
+        }
 
         let old_hash = read_current_wasm_hash(&env);
         save_current_wasm_hash(&env, &new_wasm_hash);
