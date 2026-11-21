@@ -5638,6 +5638,62 @@ fn test_emergency_migrate_non_admin_rejected() {
     bridge.emergency_migrate(&new_contract, &true, &None);
 }
 
+// Issue #1099: an asset removed from the whitelist while it still holds fees
+// and timelocked funds must still appear in the migration snapshot, flagged as
+// no longer whitelisted.
+#[test]
+fn test_emergency_migrate_exports_dewhitelisted_asset_with_balances() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let target = Address::generate(&env);
+    let new_contract = Address::generate(&env);
+
+    bridge.set_fee_bps(&1000u32, &None);
+    bridge.fund_c_address(&user, &target, &token_id, &500i128, &None, &None);
+    bridge.fund_c_address_timelocked(
+        &user, &target, &token_id, &500i128, &1_100u64, &0u64, &None, &None,
+    );
+    bridge.remove_asset(&token_id, &None);
+    assert!(!bridge.query_is_asset_whitelisted(&token_id));
+
+    bridge.emergency_migrate(&new_contract, &true, &None);
+
+    let events = env.events().all();
+    let mut found = false;
+    for i in 0..events.len() {
+        let (contract_id, topics, data) = events.get(i).unwrap();
+        if contract_id != bridge.address {
+            continue;
+        }
+        let topics: Vec<soroban_sdk::Val> = topics;
+        if topics.len() != 2 {
+            continue;
+        }
+        let kind: soroban_sdk::Symbol = topics.get(0).unwrap().into_val(&env);
+        let section: soroban_sdk::Symbol = topics.get(1).unwrap().into_val(&env);
+        if kind != soroban_sdk::Symbol::new(&env, "EmergencyMigrate")
+            || section != soroban_sdk::Symbol::new(&env, "assets")
+        {
+            continue;
+        }
+        let (_whitelist, _pools, assets): (
+            soroban_sdk::Map<Address, bool>,
+            soroban_sdk::Map<Address, bool>,
+            Vec<crate::MigrationAssetState>,
+        ) = data.into_val(&env);
+        for state in assets.iter() {
+            if state.asset == token_id {
+                found = true;
+                assert!(!state.whitelisted);
+                assert_eq!(state.counters.accrued_fees, 50i128);
+                assert_eq!(state.counters.locked_timelock, 500i128);
+            }
+        }
+    }
+    assert!(found, "de-whitelisted asset missing from migration snapshot");
+}
+
 /********** Meta-fund pubkey/source binding **********/
 
 // execute_meta_fund verified the Ed25519 signature but never checked that the

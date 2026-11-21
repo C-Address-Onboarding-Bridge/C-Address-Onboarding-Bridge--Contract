@@ -262,6 +262,9 @@ pub enum DataKey {
     PoolWhitelistEntry(Address),
     RelayerSet,
     CrossChainReserve(Address),
+    // Issue #1099: every asset that ever had counters or a cross-chain
+    // reserve, so `emergency_migrate` can export de-whitelisted assets.
+    KnownAssets,
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +358,8 @@ pub struct MigrationAssetState {
     pub counters: AssetCounters,
     pub fee_cap_bps: u32,
     pub crosschain_reserve: i128,
+    /// Whether the asset is still on the whitelist at migration time.
+    pub whitelisted: bool,
 }
 
 /// A volume-based fee tier.
@@ -863,6 +868,31 @@ fn save_asset_counters(env: &Env, asset: &Address, counters: &AssetCounters) {
     env.storage()
         .persistent()
         .set(&DataKey::AssetStats(asset.clone()), counters);
+    track_known_asset(env, asset);
+}
+
+/// Records `asset` in the `KnownAssets` set the first time it is seen.
+///
+/// `emergency_migrate` iterates this set so assets that were removed from the
+/// whitelist but still hold fees, timelocks or a cross-chain reserve are not
+/// dropped from the migration snapshot.
+fn track_known_asset(env: &Env, asset: &Address) {
+    let mut known: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&DataKey::KnownAssets)
+        .unwrap_or_else(|| Vec::new(env));
+    if !known.contains(asset.clone()) {
+        known.push_back(asset.clone());
+        env.storage().instance().set(&DataKey::KnownAssets, &known);
+    }
+}
+
+fn read_known_assets(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::KnownAssets)
+        .unwrap_or_else(|| Vec::new(env))
 }
 
 fn read_accrued_fees(env: &Env, asset: &Address) -> i128 {
@@ -893,6 +923,7 @@ fn reserved_balance(env: &Env, asset: &Address) -> Result<i128, BridgeError> {
 fn write_crosschain_reserve(env: &Env, asset: &Address, amount: i128) {
     let key = DataKey::CrossChainReserve(asset.clone());
     env.storage().persistent().set(&key, &amount);
+    track_known_asset(env, asset);
     let max_ttl = read_max_persistent_ttl(env);
     env.storage()
         .persistent()
@@ -3234,7 +3265,11 @@ impl OnboardingBridge {
     ///
     /// * `new_contract` (`Address`) — The address of the new contract.
     /// * `migrate_data` (`bool`) — If true, emits a complete snapshot of the
-    ///   supported configuration and accounting state as events.
+    ///   supported configuration and accounting state as events. The
+    ///   `("EmergencyMigrate", "assets")` event includes every asset that ever
+    ///   had counters or a cross-chain reserve, including assets that have
+    ///   since been removed from the whitelist, each flagged with its current
+    ///   whitelist status.
     /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
     ///
     /// # Authorization
@@ -3275,8 +3310,31 @@ impl OnboardingBridge {
                         counters: read_asset_counters(&env, &asset),
                         fee_cap_bps: read_asset_fee_cap(&env, &asset),
                         crosschain_reserve: read_crosschain_reserve(&env, &asset),
+                        whitelisted: true,
                     });
                 }
+            }
+            // Issue #1099: assets removed from the whitelist may still hold
+            // fees, timelocks or a cross-chain reserve, so export them too.
+            for asset in read_known_assets(&env).iter() {
+                if asset_whitelist.get(asset.clone()).unwrap_or(false) {
+                    continue;
+                }
+                let counters = read_asset_counters(&env, &asset);
+                let crosschain_reserve = read_crosschain_reserve(&env, &asset);
+                if counters.accrued_fees == 0
+                    && counters.locked_timelock == 0
+                    && crosschain_reserve == 0
+                {
+                    continue;
+                }
+                assets.push_back(MigrationAssetState {
+                    asset: asset.clone(),
+                    counters,
+                    fee_cap_bps: read_asset_fee_cap(&env, &asset),
+                    crosschain_reserve,
+                    whitelisted: false,
+                });
             }
             env.events().publish(
                 ("EmergencyMigrate", "assets"),
