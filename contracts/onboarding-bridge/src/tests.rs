@@ -1041,6 +1041,43 @@ fn test_execute_upgrade_duplicate_nonce_fails() {
     );
 }
 
+#[test]
+fn test_schedule_upgrade_twice_without_cancel_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let first_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let second_hash = BytesN::from_array(&env, &[2u8; 32]);
+    let executable_after_ledger = bridge.schedule_upgrade(&first_hash, &None);
+
+    // A second schedule must not silently replace the pending upgrade.
+    assert_eq!(
+        bridge.try_schedule_upgrade(&second_hash, &None),
+        Err(Ok(BridgeError::UpgradeAlreadyScheduled))
+    );
+    assert_eq!(
+        bridge.query_pending_upgrade(),
+        Some(crate::PendingUpgrade {
+            new_wasm_hash: first_hash,
+            executable_after_ledger,
+            expires_after_ledger: executable_after_ledger + 17_280,
+        })
+    );
+
+    // After cancelling, scheduling a replacement succeeds.
+    bridge.cancel_upgrade(&None);
+    assert_eq!(bridge.query_pending_upgrade(), None);
+    bridge.schedule_upgrade(&second_hash, &None);
+    assert_eq!(
+        bridge.query_pending_upgrade().map(|p| p.new_wasm_hash),
+        Some(second_hash)
+    );
+}
+
 // --------- Blocklist / Allowlist Tests ---------
 
 fn setup_bridge(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, Address, Address) {

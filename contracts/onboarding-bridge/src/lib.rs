@@ -189,7 +189,10 @@ pub enum BridgeError {
     TooManyFeeTiers = 51,
     /// Cross-chain payouts exceed the admin-funded liquidity reserve.
     InsufficientCrossChainReserve = 52,
-    // Next free discriminant: 53. Always take the next unused value here and
+    /// A pending upgrade already exists; call `cancel_upgrade` before
+    /// scheduling a replacement.
+    UpgradeAlreadyScheduled = 53,
+    // Next free discriminant: 54. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
 
@@ -3036,6 +3039,8 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    /// * [`BridgeError::UpgradeAlreadyScheduled`] — A pending upgrade already
+    ///   exists; call `cancel_upgrade` first.
     ///
     /// # Events
     ///
@@ -3132,6 +3137,10 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
+
+        if read_pending_upgrade(&env).is_some() {
+            return Err(BridgeError::UpgradeAlreadyScheduled);
+        }
 
         let executable_after_ledger = env
             .ledger()
