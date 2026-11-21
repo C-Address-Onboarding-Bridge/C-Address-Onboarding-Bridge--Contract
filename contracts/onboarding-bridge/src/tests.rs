@@ -1874,6 +1874,38 @@ impl TestToken {
     }
 }
 
+/// Loyalty token whose `transfer` always panics, used to verify that a failing
+/// loyalty transfer does not revert the surrounding funding call (#1097).
+#[contract]
+pub struct PanickingToken;
+
+#[contractimpl]
+impl PanickingToken {
+    pub fn initialize(e: Env, admin: Address) {
+        e.storage().instance().set(&TDataKey::Admin, &admin);
+    }
+
+    pub fn mint(e: Env, to: Address, amount: i128) {
+        let admin: Address = e.storage().instance().get(&TDataKey::Admin).unwrap();
+        admin.require_auth();
+        let bal = Self::balance(e.clone(), to.clone());
+        e.storage()
+            .persistent()
+            .set(&(TDataKey::Balance, to), &(bal + amount));
+    }
+
+    pub fn balance(e: Env, id: Address) -> i128 {
+        e.storage()
+            .persistent()
+            .get(&(TDataKey::Balance, id))
+            .unwrap_or(0)
+    }
+
+    pub fn transfer(_e: Env, _from: Address, _to: Address, _amount: i128) {
+        panic!("loyalty transfer failed");
+    }
+}
+
 pub(crate) mod swap_pool_contract {
     use super::*;
 
@@ -4610,6 +4642,28 @@ fn test_loyalty_rewards_do_not_drain_crosschain_reserve() {
     );
     assert_eq!(bridge.query_crosschain_reserve(&asset), 1_000i128);
     assert_eq!(check_balance(&env, &asset, &bridge_id), 1_100i128);
+}
+
+#[test]
+fn test_loyalty_transfer_failure_does_not_revert_funding() {
+    let env = Env::default();
+    let (bridge, user, asset, admin) = setup_bridge(&env);
+    let bridge_id = bridge.address.clone();
+    let target = Address::generate(&env);
+
+    let loyalty_token_id = env.register(PanickingToken, ());
+    PanickingTokenClient::new(&env, &loyalty_token_id).initialize(&admin);
+    mint_tokens(&env, &loyalty_token_id, &bridge_id, 1_000i128);
+
+    bridge.set_loyalty_token(&loyalty_token_id, &10i128);
+
+    bridge.fund_c_address(&user, &target, &asset, &100i128, &None, &None);
+
+    assert_eq!(check_balance(&env, &asset, &target), 100i128);
+    assert!(
+        count_events_with_topic(&env, &bridge_id, "LoyaltyMintFailed") > 0,
+        "a failing loyalty transfer must emit LoyaltyMintFailed, not revert"
+    );
 }
 
 #[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]

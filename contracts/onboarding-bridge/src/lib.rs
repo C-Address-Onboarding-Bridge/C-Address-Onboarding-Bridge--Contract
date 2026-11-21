@@ -1417,6 +1417,11 @@ fn read_loyalty_amount_per_fund(env: &Env) -> i128 {
 /// before attempting the transfer. If the available reserve is depleted,
 /// minting is skipped and a `LoyaltyMintSkipped` event is emitted instead of
 /// letting the underlying token transfer trap.
+///
+/// The transfer itself is attempted with `try_transfer`: if the loyalty token
+/// rejects the transfer (e.g. a failing or panicking token implementation), the
+/// error is swallowed and a `LoyaltyMintFailed` event is emitted, so the
+/// surrounding funding call still succeeds.
 fn mint_loyalty_tokens(env: &Env, recipient: &Address) {
     if let Some(loyalty_token) = read_loyalty_token(env) {
         let amount = read_loyalty_amount_per_fund(env);
@@ -1429,7 +1434,13 @@ fn mint_loyalty_tokens(env: &Env, recipient: &Address) {
                     .publish(("LoyaltyMintSkipped", recipient.clone()), (amount, reserve));
                 return;
             }
-            token_client.transfer(&contract_addr, recipient, &amount);
+            if token_client
+                .try_transfer(&contract_addr, recipient, &amount)
+                .is_err()
+            {
+                env.events()
+                    .publish(("LoyaltyMintFailed", recipient.clone()), amount);
+            }
         }
     }
 }
