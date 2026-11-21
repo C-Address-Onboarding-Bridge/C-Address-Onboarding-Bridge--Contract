@@ -241,6 +241,9 @@ pub enum DataKey {
     PendingAdmin,
     // Issue #22: two-phase fee collector transfer
     PendingFeeCollector,
+    // Issue #1093: admin that proposed the pending admin/fee-collector handoff
+    PendingAdminProposer,
+    PendingFeeCollectorProposer,
     // Issue #23: max withdraw per tx
     MaxWithdrawPerTx,
     // Issue #24: reentrancy guard flag
@@ -480,6 +483,19 @@ fn read_pending_admin(env: &Env) -> Option<Address> {
 
 fn remove_pending_admin(env: &Env) {
     env.storage().instance().remove(&DataKey::PendingAdmin);
+    env.storage()
+        .instance()
+        .remove(&DataKey::PendingAdminProposer);
+}
+
+fn save_pending_admin_proposer(env: &Env, addr: &Address) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingAdminProposer, addr);
+}
+
+fn read_pending_admin_proposer(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::PendingAdminProposer)
 }
 
 fn save_pending_fee_collector(env: &Env, addr: &Address) {
@@ -496,6 +512,21 @@ fn remove_pending_fee_collector(env: &Env) {
     env.storage()
         .instance()
         .remove(&DataKey::PendingFeeCollector);
+    env.storage()
+        .instance()
+        .remove(&DataKey::PendingFeeCollectorProposer);
+}
+
+fn save_pending_fee_collector_proposer(env: &Env, addr: &Address) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PendingFeeCollectorProposer, addr);
+}
+
+fn read_pending_fee_collector_proposer(env: &Env) -> Option<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::PendingFeeCollectorProposer)
 }
 
 fn save_max_withdraw_per_tx(env: &Env, amount: i128) {
@@ -2142,6 +2173,13 @@ impl OnboardingBridge {
         let mut config = read_bridge_config(&env);
         config.fee_collector = new_fee_collector.clone();
         save_bridge_config(&env, &config);
+        // Issue #1093: drop any stale pending handoff so it cannot override
+        // the collector set here.
+        if read_pending_fee_collector(&env).is_some() {
+            remove_pending_fee_collector(&env);
+            env.events()
+                .publish(("FeeCollectorTransferCancelled",), (admin.clone(),));
+        }
         env.events().publish(
             ("FeeCollectorChanged", old_collector, new_fee_collector),
             (admin,),
@@ -2167,6 +2205,7 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         save_pending_fee_collector(&env, &new_collector);
+        save_pending_fee_collector_proposer(&env, &admin);
         env.events()
             .publish(("FeeCollectorTransferProposed", admin, new_collector), ());
         Ok(())
@@ -2179,6 +2218,11 @@ impl OnboardingBridge {
         check_not_deactivated(&env)?;
         let pending = read_pending_fee_collector(&env).ok_or(BridgeError::Unauthorized)?;
         pending.require_auth();
+        // Issue #1093: a proposal made by a previous admin must not be honoured.
+        if read_pending_fee_collector_proposer(&env) != Some(read_admin(&env)) {
+            remove_pending_fee_collector(&env);
+            return Err(BridgeError::Unauthorized);
+        }
         extend_instance_ttl(&env);
         let old_collector = read_fee_collector(&env);
         save_fee_collector(&env, &pending);
@@ -2207,6 +2251,13 @@ impl OnboardingBridge {
         let mut config = read_bridge_config(&env);
         config.admin = new_admin.clone();
         save_bridge_config(&env, &config);
+        // Issue #1093: drop any stale pending handoff so it cannot override
+        // the admin set here.
+        if read_pending_admin(&env).is_some() {
+            remove_pending_admin(&env);
+            env.events()
+                .publish(("AdminTransferCancelled",), (admin.clone(),));
+        }
         env.events().publish(("AdminChanged", admin, new_admin), ());
         Ok(())
     }
@@ -2228,6 +2279,7 @@ impl OnboardingBridge {
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         save_pending_admin(&env, &new_admin);
+        save_pending_admin_proposer(&env, &admin);
         env.events()
             .publish(("AdminProposed", admin, new_admin), ());
         Ok(())
@@ -2240,6 +2292,11 @@ impl OnboardingBridge {
         check_not_deactivated(&env)?;
         let pending = read_pending_admin(&env).ok_or(BridgeError::Unauthorized)?;
         pending.require_auth();
+        // Issue #1093: a proposal made by a previous admin must not be honoured.
+        if read_pending_admin_proposer(&env) != Some(read_admin(&env)) {
+            remove_pending_admin(&env);
+            return Err(BridgeError::Unauthorized);
+        }
         extend_instance_ttl(&env);
         let old_admin = read_admin(&env);
         save_admin(&env, &pending);
