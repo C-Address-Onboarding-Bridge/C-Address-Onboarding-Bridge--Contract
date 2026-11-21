@@ -1717,8 +1717,8 @@ impl OnboardingBridge {
     /// the entire batch. A single `BatchCompleted` event summarises successes
     /// and failures at the end.
     ///
-    /// Transfers to the same target address are aggregated into a single token
-    /// transfer to reduce fee consumption.
+    /// Each entry is transferred and evented separately, even when several
+    /// entries share the same target address. The fee is computed per entry.
     ///
     /// # Arguments
     ///

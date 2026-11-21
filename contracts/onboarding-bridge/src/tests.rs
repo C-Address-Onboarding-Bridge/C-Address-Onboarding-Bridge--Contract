@@ -2828,8 +2828,8 @@ fn test_batch_single_target() {
     assert_eq!(check_balance(&env, &token_id, &user), 999_000i128);
 }
 
-/// Duplicate target addresses — each entry is processed independently.
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
+/// Duplicate target addresses — each entry is transferred and evented
+/// separately, with the fee computed per entry (no aggregation).
 #[test]
 fn test_batch_duplicate_targets() {
     let env = Env::default();
@@ -2851,6 +2851,9 @@ fn test_batch_duplicate_targets() {
     );
     // Net: 990 + 1980 + 2970 = 5940
     assert_eq!(check_balance(&env, &token_id, &target), 5940i128);
+    // Three separate transfers into the target: 990, 1980 and 2970.
+    assert_eq!(check_balance(&env, &token_id, &user), 994_000i128);
+    assert_eq!(check_balance(&env, &token_id, &bridge.address), 60i128);
 }
 
 /// Target is same as source — source receives net amount back (self-fund).
