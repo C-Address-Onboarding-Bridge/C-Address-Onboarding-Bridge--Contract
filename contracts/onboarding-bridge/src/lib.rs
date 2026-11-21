@@ -294,6 +294,11 @@ const COMMIT_REVEAL_MIN_DELAY_LEDGERS: u32 = 5;
 /// Size of the stack buffer used to hold an address's strkey while hashing it.
 /// Soroban strkeys are 56 bytes; anything longer is rejected rather than copied.
 const MAX_STRKEY_LEN: usize = 64;
+/// Domain tag prepended to the cross-chain relayer attestation payload.
+///
+/// Binds every signature to this payload format, so attestations produced for
+/// an older format (or another protocol) can never be replayed here.
+const CROSSCHAIN_DOMAIN_TAG: &[u8] = b"onboarding_bridge_crosschain_v2";
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -4057,13 +4062,22 @@ impl OnboardingBridge {
     ///
     /// ```text
     /// nonce   = sha256(chain_id_be4 || tx_hash)
-    /// payload = chain_id_be4
+    /// payload = b"onboarding_bridge_crosschain_v2"
+    ///        || network_id
+    ///        || sha256(contract_strkey_bytes)
+    ///        || chain_id_be4
     ///        || tx_hash
     ///        || sha256(target_strkey_bytes)
     ///        || sha256(asset_strkey_bytes)
     ///        || amount_be16
     ///        || nonce
     /// ```
+    ///
+    /// The leading domain tag, `network_id` (`env.ledger().network_id()`) and
+    /// the hash of this contract's own strkey bind the attestation to this
+    /// deployment: a signature produced for another bridge contract or another
+    /// Stellar network is rejected with
+    /// [`BridgeError::MetaTxInvalidSignature`].
     ///
     /// ## Parameters
     ///
@@ -4170,7 +4184,20 @@ impl OnboardingBridge {
         let ast_hash: soroban_sdk::Bytes = env.crypto().sha256(&ast_raw).into();
 
         let nonce_bytes: soroban_sdk::Bytes = nonce.clone().into();
+
+        let contract_str = env.current_contract_address().to_string();
+        let clen = contract_str.len() as usize;
+        if clen > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
+        contract_str.copy_into_slice(&mut addr_buf[..clen]);
+        let contract_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..clen]);
+        let contract_hash: soroban_sdk::Bytes = env.crypto().sha256(&contract_raw).into();
+
         let mut payload = soroban_sdk::Bytes::new(&env);
+        payload.extend_from_slice(CROSSCHAIN_DOMAIN_TAG);
+        payload.append(&env.ledger().network_id());
+        payload.append(&contract_hash);
         payload.extend_from_array(&chain_id.to_be_bytes());
         payload.append(&tx_hash_bytes);
         payload.append(&tgt_hash);

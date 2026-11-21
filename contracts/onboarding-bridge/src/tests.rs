@@ -3937,6 +3937,7 @@ mod crosschain_tests {
     /// Replicates the contract's payload hash for a given set of call arguments.
     fn build_payload_hash(
         env: &Env,
+        bridge_id: &soroban_sdk::Address,
         chain_id: u32,
         tx_hash: &BytesN<32>,
         target: &soroban_sdk::Address,
@@ -3953,6 +3954,12 @@ mod crosschain_tests {
 
         // Mirror the contract: hash each address's strkey bytes
         let mut addr_buf = [0u8; 64];
+        let contract_strkey = bridge_id.clone().to_string();
+        let clen = contract_strkey.len() as usize;
+        contract_strkey.copy_into_slice(&mut addr_buf[..clen]);
+        let contract_raw = Bytes::from_slice(env, &addr_buf[..clen]);
+        let contract_bytes: Bytes = env.crypto().sha256(&contract_raw).into();
+
         let target_strkey = target.clone().to_string();
         let tlen = target_strkey.len() as usize;
         target_strkey.copy_into_slice(&mut addr_buf[..tlen]);
@@ -3968,6 +3975,9 @@ mod crosschain_tests {
         let nonce_bytes: Bytes = nonce.into();
 
         let mut payload = Bytes::new(env);
+        payload.extend_from_slice(b"onboarding_bridge_crosschain_v2");
+        payload.append(&env.ledger().network_id());
+        payload.append(&contract_bytes);
         payload.extend_from_array(&chain_id.to_be_bytes());
         payload.append(&tx_hash_bytes);
         payload.append(&target_bytes);
