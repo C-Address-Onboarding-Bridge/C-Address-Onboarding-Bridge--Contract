@@ -124,7 +124,8 @@ pub enum BridgeError {
     TimelockNotFound = 19,
     /// The timelock's `release_time` has not been reached yet.
     TimelockNotMatured = 20,
-    /// `release_time` is in the past, or `cliff_time` is after `release_time`.
+    /// `release_time` is in the past, more than `MAX_TIMELOCK_DELAY_SECONDS`
+    /// in the future, or `cliff_time` is after `release_time`.
     InvalidReleaseTime = 21,
     /// The caller is not authorized to perform this action (e.g. double-claim).
     Unauthorized = 22,
@@ -294,6 +295,11 @@ const COMMIT_REVEAL_MIN_DELAY_LEDGERS: u32 = 5;
 /// Size of the stack buffer used to hold an address's strkey while hashing it.
 /// Soroban strkeys are 56 bytes; anything longer is rejected rather than copied.
 const MAX_STRKEY_LEN: usize = 64;
+/// Maximum delay between `now` and a timelock's `release_time` (~10 years).
+const MAX_TIMELOCK_DELAY_SECONDS: u64 = 10 * 365 * 86_400;
+/// Grace period after `release_time` during which only `target` may claim a
+/// timelock. Once it elapses, `source` may reclaim the unclaimed entry.
+const RECLAIM_GRACE_SECONDS: u64 = 365 * 86_400;
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -399,6 +405,9 @@ pub struct TimelockEntry {
     pub cliff_time: u64,
     /// Set to `true` once `claim_timelocked` has been successfully called.
     pub claimed: bool,
+    /// Set to `true` once `cancel_timelocked` or `reclaim_timelocked` has
+    /// refunded the entry to `source`.
+    pub cancelled: bool,
 }
 
 /// A scheduled WASM upgrade waiting for its timelock to elapse.
@@ -4402,7 +4411,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::DailyLimitExceeded`] — Transfer would exceed `source`'s
     ///   daily limit for this asset.
     /// * [`BridgeError::InvalidReleaseTime`] — `release_time` ≤ current timestamp,
-    ///   or `cliff_time > release_time`.
+    ///   `release_time` > current timestamp + `MAX_TIMELOCK_DELAY_SECONDS`
+    ///   (~10 years), or `cliff_time > release_time`.
     /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode on and `target`
     ///   is not allowlisted.
@@ -4442,7 +4452,10 @@ impl OnboardingBridge {
         if amount <= 0 || amount < read_minimum_amount(&env) {
             return Err(BridgeError::InvalidAmount);
         }
-        if release_time <= env.ledger().timestamp() || (cliff_time > 0 && cliff_time > release_time)
+        let now = env.ledger().timestamp();
+        if release_time <= now
+            || release_time > now.saturating_add(MAX_TIMELOCK_DELAY_SECONDS)
+            || (cliff_time > 0 && cliff_time > release_time)
         {
             return Err(BridgeError::InvalidReleaseTime);
         }
@@ -4469,6 +4482,7 @@ impl OnboardingBridge {
                 release_time,
                 cliff_time,
                 claimed: false,
+                cancelled: false,
             },
         );
         increment_locked_timelock(&env, &asset, amount)?;
@@ -4523,7 +4537,7 @@ impl OnboardingBridge {
         check_recovery_allowed(&env)?;
 
         let mut entry = read_timelock_entry(&env, id).ok_or(BridgeError::TimelockNotFound)?;
-        if entry.claimed {
+        if entry.claimed || entry.cancelled {
             return Err(BridgeError::Unauthorized);
         }
         if env.ledger().timestamp() < entry.release_time {
@@ -4550,6 +4564,112 @@ impl OnboardingBridge {
         env.events().publish(
             ("TimelockClaimed", entry.target.clone()),
             (id, net_amount, fee, entry.asset.clone()),
+        );
+        Ok(())
+    }
+
+    /// Cancels an unclaimed timelock entry before its `release_time` and
+    /// refunds the gross amount to `source`.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` (`u64`) — The timelock entry ID returned by `fund_c_address_timelocked`.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `source.require_auth()` (the depositor of the entry).
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused and not deactivated.
+    /// * [`BridgeError::TimelockNotFound`] — No entry exists for `id`.
+    /// * [`BridgeError::Unauthorized`] — The entry was already claimed or cancelled.
+    /// * [`BridgeError::TimelockNotMatured`] — `release_time` has already passed;
+    ///   use `reclaim_timelocked` after the grace period instead.
+    ///
+    /// # Events
+    ///
+    /// * `("TimelockCancelled", source)` — data: `(id, amount, asset)`
+    pub fn cancel_timelocked(env: Env, id: u64) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_recovery_allowed(&env)?;
+
+        let mut entry = read_timelock_entry(&env, id).ok_or(BridgeError::TimelockNotFound)?;
+        if entry.claimed || entry.cancelled {
+            return Err(BridgeError::Unauthorized);
+        }
+        if env.ledger().timestamp() >= entry.release_time {
+            return Err(BridgeError::TimelockNotMatured);
+        }
+        entry.source.require_auth();
+
+        entry.cancelled = true;
+        save_timelock_entry(&env, id, &entry);
+
+        decrement_locked_timelock(&env, &entry.asset, entry.amount)?;
+        let token_client = token::Client::new(&env, &entry.asset);
+        token_client.transfer(&env.current_contract_address(), &entry.source, &entry.amount);
+        extend_instance_ttl(&env);
+
+        env.events().publish(
+            ("TimelockCancelled", entry.source.clone()),
+            (id, entry.amount, entry.asset.clone()),
+        );
+        Ok(())
+    }
+
+    /// Reclaims an unclaimed timelock entry after `release_time + RECLAIM_GRACE_SECONDS`,
+    /// refunding the gross amount to `source`.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` (`u64`) — The timelock entry ID returned by `fund_c_address_timelocked`.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `source.require_auth()` (the depositor of the entry).
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused and not deactivated.
+    /// * [`BridgeError::TimelockNotFound`] — No entry exists for `id`.
+    /// * [`BridgeError::Unauthorized`] — The entry was already claimed or cancelled.
+    /// * [`BridgeError::TimelockNotMatured`] — The grace period has not elapsed yet.
+    ///
+    /// # Events
+    ///
+    /// * `("TimelockReclaimed", source)` — data: `(id, amount, asset)`
+    pub fn reclaim_timelocked(env: Env, id: u64) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_recovery_allowed(&env)?;
+
+        let mut entry = read_timelock_entry(&env, id).ok_or(BridgeError::TimelockNotFound)?;
+        if entry.claimed || entry.cancelled {
+            return Err(BridgeError::Unauthorized);
+        }
+        let reclaimable_at = entry
+            .release_time
+            .saturating_add(RECLAIM_GRACE_SECONDS);
+        if env.ledger().timestamp() < reclaimable_at {
+            return Err(BridgeError::TimelockNotMatured);
+        }
+        entry.source.require_auth();
+
+        entry.cancelled = true;
+        save_timelock_entry(&env, id, &entry);
+
+        decrement_locked_timelock(&env, &entry.asset, entry.amount)?;
+        let token_client = token::Client::new(&env, &entry.asset);
+        token_client.transfer(&env.current_contract_address(), &entry.source, &entry.amount);
+        extend_instance_ttl(&env);
+
+        env.events().publish(
+            ("TimelockReclaimed", entry.source.clone()),
+            (id, entry.amount, entry.asset.clone()),
         );
         Ok(())
     }
