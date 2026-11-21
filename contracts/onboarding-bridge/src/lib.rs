@@ -278,7 +278,9 @@ const MAX_BATCH_SIZE: u32 = 100;
 /// / `find_current_tier` scan the full tier list linearly on every funding
 /// call, so this bounds the per-call cost of that scan.
 const MAX_FEE_TIERS: u32 = 50;
-const MAX_ALLOWED_TTL: u32 = 3_110_400; // ~1 year in ledgers (5s/ledger)
+/// Maximum TTL in ledgers (~180 days at 5 s/ledger). Matches the network's
+/// `max_entry_ttl` limit.
+const MAX_ALLOWED_TTL: u32 = 3_110_400;
 /// Minimum configurable value for `MaxInstanceTtl` / `MaxPersistentTtl`.
 ///
 /// Without a floor, an admin setting either max to `0` would make
@@ -4582,7 +4584,8 @@ impl OnboardingBridge {
 
     /// Extends the instance-storage TTL to ensure contract state does not expire.
     ///
-    /// `ttl` is capped at `MAX_ALLOWED_TTL` (3 110 400 ledgers, ~1 year).
+    /// `ttl` is capped at `MAX_ALLOWED_TTL` (3 110 400 ledgers, ~180 days),
+    /// which matches the network's `max_entry_ttl`.
     /// The threshold used to trigger extension is `ttl / 4`.
     ///
     /// # Arguments
