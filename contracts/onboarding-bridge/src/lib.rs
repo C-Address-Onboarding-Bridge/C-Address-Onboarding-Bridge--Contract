@@ -5310,10 +5310,12 @@ impl OnboardingBridge {
     /// The committed source may cancel at any time, including after the
     /// reveal deadline has passed. This lets abandoned commitments be cleaned
     /// up without waiting for storage TTL expiry.
+    ///
+    /// Deliberately not gated on the pause flag: it only removes the caller's
+    /// own unrevealed record, so it stays available during a pause.
     pub fn cancel_commitment(env: Env, commitment_id: u64) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
 
         let entry = read_commitment(&env, commitment_id).ok_or(BridgeError::CommitmentNotFound)?;
         if entry.revealed {
@@ -5570,10 +5572,12 @@ impl OnboardingBridge {
     ///
     /// Requires `source.require_auth()`. Subsequent meta-transactions for the
     /// source are rejected until a new key is registered.
+    ///
+    /// Deliberately not gated on the pause flag: a leaked meta-tx key must be
+    /// revocable during a pause or after `emergency_migrate`.
     pub fn unregister_meta_signer(env: Env, source: Address) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
         source.require_auth();
         clear_meta_signer(&env, &source);
         env.events().publish(("MetaSignerUnregistered", source), ());
