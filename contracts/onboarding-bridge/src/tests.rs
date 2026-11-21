@@ -1214,6 +1214,57 @@ fn test_emergency_migration_keeps_reserved_tokens_recoverable() {
 }
 
 #[test]
+fn test_fund_crosschain_reserve_rejects_wrong_nonce() {
+    let env = Env::default();
+    let (bridge, _user, token_id, admin) = setup_bridge(&env);
+    mint_tokens(&env, &token_id, &admin, 1_000i128);
+
+    assert_eq!(
+        bridge.try_fund_crosschain_reserve(&token_id, &500i128, &Some(1u64)),
+        Err(Ok(crate::BridgeError::DuplicateNonce))
+    );
+    bridge.fund_crosschain_reserve(&token_id, &500i128, &Some(0u64));
+    assert_eq!(bridge.query_crosschain_reserve(&token_id), 500i128);
+    assert_eq!(
+        bridge.try_fund_crosschain_reserve(&token_id, &500i128, &Some(0u64)),
+        Err(Ok(crate::BridgeError::DuplicateNonce))
+    );
+}
+
+#[test]
+fn test_withdraw_crosschain_reserve_rejects_wrong_nonce() {
+    let env = Env::default();
+    let (bridge, _user, token_id, admin) = setup_bridge(&env);
+    mint_tokens(&env, &token_id, &admin, 1_000i128);
+    bridge.fund_crosschain_reserve(&token_id, &500i128, &None);
+
+    assert_eq!(
+        bridge.try_withdraw_crosschain_reserve(&token_id, &100i128, &Some(5u64)),
+        Err(Ok(crate::BridgeError::DuplicateNonce))
+    );
+    bridge.withdraw_crosschain_reserve(&token_id, &100i128, &Some(0u64));
+    assert_eq!(bridge.query_crosschain_reserve(&token_id), 400i128);
+}
+
+#[test]
+fn test_fund_crosschain_reserve_rejected_after_deactivation() {
+    let env = Env::default();
+    let (bridge, _user, token_id, admin) = setup_bridge(&env);
+    mint_tokens(&env, &token_id, &admin, 1_000i128);
+    bridge.fund_crosschain_reserve(&token_id, &500i128, &None);
+
+    bridge.emergency_migrate(&Address::generate(&env), &false, &None);
+
+    assert_eq!(
+        bridge.try_fund_crosschain_reserve(&token_id, &100i128, &None),
+        Err(Ok(crate::BridgeError::ContractDeactivated))
+    );
+    // Withdrawals remain available for recovery after deactivation.
+    bridge.withdraw_crosschain_reserve(&token_id, &500i128, &None);
+    assert_eq!(bridge.query_crosschain_reserve(&token_id), 0i128);
+}
+
+#[test]
 fn test_timelocked_funds_can_be_claimed_after_emergency_migration() {
     let env = Env::default();
     env.ledger().set_timestamp(1_000);
@@ -4105,7 +4156,7 @@ mod crosschain_tests {
 
         // Seed dedicated cross-chain liquidity via the admin deposit path.
         TestTokenClient::new(env, &token_id).mint(&admin, &10_000i128);
-        bridge.fund_crosschain_reserve(&token_id, &10_000i128);
+        bridge.fund_crosschain_reserve(&token_id, &10_000i128, &None);
 
         (bridge_id, token_id, admin, bridge)
     }
@@ -4587,7 +4638,7 @@ mod crosschain_tests {
                 <= bridge.query_contract_balance(&token_id)
         );
 
-        bridge.withdraw_crosschain_reserve(&token_id, &2_080i128);
+        bridge.withdraw_crosschain_reserve(&token_id, &2_080i128, &None);
         assert_eq!(bridge.query_crosschain_reserve(&token_id), 0i128);
         assert_eq!(bridge.query_contract_balance(&token_id), 5i128);
     }
@@ -6308,7 +6359,7 @@ fn test_extend_persistent_ttl_extends_asset_keys() {
     bridge.add_asset(&token_id, &None);
     mint_tokens(&env, &token_id, &user, 1000i128);
     mint_tokens(&env, &token_id, &admin, 1000i128);
-    bridge.fund_crosschain_reserve(&token_id, &1000i128);
+    bridge.fund_crosschain_reserve(&token_id, &1000i128, &None);
     bridge.fund_c_address(
         &user,
         &Address::generate(&env),

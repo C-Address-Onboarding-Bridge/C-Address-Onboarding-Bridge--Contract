@@ -3985,13 +3985,18 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
     /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
+    /// * [`BridgeError::ContractDeactivated`] — Contract has been deactivated.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` does not match the admin's
+    ///   current nonce.
     pub fn fund_crosschain_reserve(
         env: Env,
         asset: Address,
         amount: i128,
+        nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -3999,6 +4004,7 @@ impl OnboardingBridge {
 
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         let token_client = token::Client::new(&env, &asset);
         token_client.transfer(&admin, &env.current_contract_address(), &amount);
         increment_crosschain_reserve(&env, &asset, amount)?;
@@ -4017,10 +4023,13 @@ impl OnboardingBridge {
     /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
     /// * [`BridgeError::InsufficientCrossChainReserve`] — `amount` exceeds the
     ///   reserve balance.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` does not match the admin's
+    ///   current nonce.
     pub fn withdraw_crosschain_reserve(
         env: Env,
         asset: Address,
         amount: i128,
+        nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
@@ -4030,6 +4039,7 @@ impl OnboardingBridge {
 
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         decrement_crosschain_reserve(&env, &asset, amount)?;
         let token_client = token::Client::new(&env, &asset);
         token_client.transfer(&env.current_contract_address(), &admin, &amount);
