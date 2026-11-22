@@ -2342,7 +2342,6 @@ fn test_swap_deadline_in_future_passes() {
     assert_eq!(check_balance(&env, &target_token_id, &target), 500i128);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_swap_slippage_exceeded_fails() {
     let env = Env::default();
