@@ -7445,3 +7445,312 @@ fn test_try_accept_fee_collector_wrong_signer_rejected() {
     assert!(bridge.try_accept_fee_collector().is_err());
     assert_eq!(bridge.query_fee_collector(), fee_collector);
 }
+
+/********** initialize_with_wasm_hash tests **********/
+
+#[test]
+fn test_initialize_with_wasm_hash_stores_hash_and_rejects_second_call() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    let wasm_hash = BytesN::from_array(&env, &[0x11u8; 32]);
+    bridge.initialize_with_wasm_hash(&admin, &fee_collector, &100u32, &None, &wasm_hash);
+
+    assert_eq!(bridge.query_fee_bps(), 100u32);
+    assert_eq!(bridge.query_admin(), admin);
+
+    // A second initialization must be rejected.
+    assert_eq!(
+        bridge.try_initialize_with_wasm_hash(&admin, &fee_collector, &100u32, &None, &wasm_hash),
+        Err(Ok(BridgeError::AlreadyInitialized))
+    );
+}
+
+#[test]
+fn test_initialize_with_wasm_hash_rejects_fee_too_high() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    let wasm_hash = BytesN::from_array(&env, &[0x11u8; 32]);
+    assert_eq!(
+        bridge.try_initialize_with_wasm_hash(&admin, &fee_collector, &10_001u32, &None, &wasm_hash),
+        Err(Ok(BridgeError::FeeTooHigh))
+    );
+}
+
+#[test]
+fn test_upgrade_after_initialize_with_wasm_hash_emits_stored_old_hash() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    let stored_hash = BytesN::from_array(&env, &[0x22u8; 32]);
+    bridge.initialize_with_wasm_hash(&admin, &fee_collector, &50u32, &None, &stored_hash);
+
+    // Uploading a real compiled wasm costs far more than the default test
+    // budget allows; lift the limit so the test exercises logic, not gas.
+    env.cost_estimate().budget().reset_unlimited();
+    let wasm_bytes = Bytes::from_slice(&env, V2_WASM);
+    let new_hash: BytesN<32> = env.deployer().upload_contract_wasm(wasm_bytes);
+
+    bridge.upgrade(&new_hash, &None);
+
+    let mut found = false;
+    for event in env.events().all().iter() {
+        let (cid, topics, data) = event;
+        if cid != bridge_id || topics.is_empty() {
+            continue;
+        }
+        let topic: soroban_sdk::Symbol = topics.get(0).unwrap().into_val(&env);
+        if topic == soroban_sdk::Symbol::new(&env, "ContractUpgraded") {
+            let (old_hash, emitted_new_hash, _admin): (BytesN<32>, BytesN<32>, Address) =
+                data.into_val(&env);
+            assert_eq!(old_hash, stored_hash);
+            assert_eq!(emitted_new_hash, new_hash);
+            found = true;
+        }
+    }
+    assert!(found, "ContractUpgraded event not emitted");
+}
+
+/********** query_fee_tiers tests **********/
+
+#[test]
+fn test_query_fee_tiers_default_uses_current_fee_bps() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+
+    let tiers = bridge.query_fee_tiers();
+    assert_eq!(tiers.len(), 1);
+    let tier = tiers.get(0).unwrap();
+    assert_eq!(tier.min_volume, 0);
+    assert_eq!(tier.max_volume, i128::MAX);
+    assert_eq!(tier.fee_bps, 100u32);
+
+    // The synthetic default tier tracks the global fee rate.
+    bridge.set_fee_bps(&250u32, &None);
+    let tiers = bridge.query_fee_tiers();
+    assert_eq!(tiers.get(0).unwrap().fee_bps, 250u32);
+}
+
+#[test]
+fn test_query_fee_tiers_not_initialized_fails() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_query_fee_tiers(),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+/********** query_loyalty_token tests **********/
+
+#[test]
+fn test_query_loyalty_token_returns_configured_values() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.set_loyalty_token(&token_id, &25i128, &None);
+
+    assert_eq!(bridge.query_loyalty_token(), (token_id, 25i128));
+}
+
+#[test]
+fn test_query_loyalty_token_not_set_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+
+    assert_eq!(
+        bridge.try_query_loyalty_token(),
+        Err(Ok(BridgeError::LoyaltyTokenNotSet))
+    );
+}
+
+/********** query_is_pool_whitelisted tests **********/
+
+#[test]
+fn test_query_is_pool_whitelisted_reflects_add_and_remove() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    let pool = Address::generate(&env);
+
+    assert!(!bridge.query_is_pool_whitelisted(&pool));
+    bridge.add_swap_pool(&pool, &None);
+    assert!(bridge.query_is_pool_whitelisted(&pool));
+    bridge.remove_swap_pool(&pool, &None);
+    assert!(!bridge.query_is_pool_whitelisted(&pool));
+}
+
+#[test]
+fn test_query_is_pool_whitelisted_not_initialized_fails() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let pool = Address::generate(&env);
+
+    assert_eq!(
+        bridge.try_query_is_pool_whitelisted(&pool),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+/********** query_source_daily_limit tests **********/
+
+#[test]
+fn test_query_source_daily_limit_returns_configured_limit() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    assert_eq!(bridge.query_source_daily_limit(&user, &token_id), 0i128);
+    bridge.set_source_daily_limit(&user, &token_id, &5_000i128, &None);
+    assert_eq!(bridge.query_source_daily_limit(&user, &token_id), 5_000i128);
+}
+
+#[test]
+fn test_query_source_daily_limit_not_initialized_fails() {
+    let env = Env::default();
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let user = Address::generate(&env);
+
+    assert_eq!(
+        bridge.try_query_source_daily_limit(&user, &token_id),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+/********** auth nonce query tests **********/
+
+#[test]
+fn test_query_auth_nonce_advances_after_verify_auth_entry() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+
+    let seq = env.ledger().sequence();
+    assert_eq!(bridge.query_auth_nonce(&user), 0u64);
+    assert!(!bridge.query_auth_nonce_used(&user, &0u64));
+
+    bridge.verify_auth_entry(&user, &0u64, &seq, &(seq + 100));
+
+    assert_eq!(bridge.query_auth_nonce(&user), 1u64);
+    assert!(bridge.query_auth_nonce_used(&user, &0u64));
+    assert!(!bridge.query_auth_nonce_used(&user, &1u64));
+}
+
+#[test]
+fn test_verify_auth_entry_rejects_out_of_window_nonce() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+
+    let seq = env.ledger().sequence();
+    assert_eq!(
+        bridge.try_verify_auth_entry(&user, &0u64, &(seq + 10), &(seq + 20)),
+        Err(Ok(BridgeError::AuthNonceExpired))
+    );
+    // Nothing was consumed by the failed call.
+    assert_eq!(bridge.query_auth_nonce(&user), 0u64);
+    assert!(!bridge.query_auth_nonce_used(&user, &0u64));
+}
+
+/********** meta-tx nonce query tests **********/
+
+#[test]
+fn test_query_meta_tx_nonce_used_after_execute_meta_fund() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let network_id = env.ledger().network_id();
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let target = Address::generate(&env);
+
+    let seed = [0x42u8; 32];
+    let signing_key = SigningKey::from_bytes(&seed);
+    let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+    bridge.register_meta_signer(&user, &pubkey);
+
+    let amount: i128 = 500;
+    let nonce: u64 = 0;
+    let deadline: u64 = 2_000_000;
+
+    let payload_hash = build_meta_fund_payload_hash(
+        &env,
+        &bridge_id,
+        &network_id,
+        &user,
+        &target,
+        &token_id,
+        amount,
+        nonce,
+        deadline,
+    );
+    let signature = sign_meta_fund_payload(&env, &signing_key, &payload_hash);
+
+    let params = MetaFundParams {
+        network_id: network_id.clone(),
+        source: user.clone(),
+        target,
+        asset: token_id.clone(),
+        amount,
+        nonce,
+        deadline,
+    };
+
+    assert!(!bridge.query_meta_tx_nonce_used(&user, &nonce));
+
+    soroban_sdk::token::Client::new(&env, &token_id).approve(&user, &bridge_id, &amount, &100u32);
+    bridge.execute_meta_fund(&params, &pubkey, &signature);
+
+    assert!(bridge.query_meta_tx_nonce_used(&user, &nonce));
+    assert!(!bridge.query_meta_tx_nonce_used(&user, &(nonce + 1)));
+}
+
+#[test]
+fn test_query_meta_tx_nonce_used_false_for_unknown_source() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let unknown = Address::generate(&env);
+
+    assert!(!bridge.query_meta_tx_nonce_used(&unknown, &7u64));
+}
