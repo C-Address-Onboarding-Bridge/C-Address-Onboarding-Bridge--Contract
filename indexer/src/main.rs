@@ -345,8 +345,28 @@ async fn replay_events(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ReplayBody>,
 ) -> impl IntoResponse {
-    match state.db.enqueue_replay(&body.event_ids).await {
-        Ok(count) => Json(serde_json::json!({ "enqueued": count })).into_response(),
+    let has_ids = !body.event_ids.is_empty();
+    if !has_ids && body.from_ledger.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "provide event_ids or from_ledger",
+        )
+            .into_response();
+    }
+
+    let limit = events::clamp_limit(body.limit, 50);
+    match state
+        .db
+        .enqueue_replay(
+            &body.event_ids,
+            body.from_ledger,
+            limit,
+            body.subscription_id.as_deref(),
+        )
+        .await
+    {
+        Ok(Some(count)) => Json(serde_json::json!({ "enqueued": count })).into_response(),
+        Ok(None) => (StatusCode::BAD_REQUEST, "unknown event id").into_response(),
         Err(e) => {
             tracing::error!("failed to enqueue replay: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
@@ -369,5 +389,13 @@ struct CreateSubscriptionBody {
 
 #[derive(serde::Deserialize)]
 struct ReplayBody {
-    event_ids: Vec<i64>,
+    /// Hex event ids to re-deliver.
+    #[serde(default)]
+    event_ids: Vec<String>,
+    /// Re-deliver indexed events at or after this ledger (ascending).
+    from_ledger: Option<i64>,
+    /// Clamped like the list endpoints (1..=MAX_PAGE_LIMIT).
+    limit: Option<i64>,
+    /// Restrict re-delivery to a single subscription.
+    subscription_id: Option<String>,
 }

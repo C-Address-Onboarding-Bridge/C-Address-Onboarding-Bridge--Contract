@@ -134,7 +134,7 @@ impl Database {
         let inserted = result.rows_affected() > 0;
 
         if inserted {
-            Self::queue_webhook_deliveries_tx(&mut tx, event).await?;
+            Self::queue_webhook_deliveries_tx(&mut tx, event, None).await?;
         }
 
         tx.commit().await?;
@@ -145,10 +145,14 @@ impl Database {
     /// [`Database::queue_webhook_deliveries`], but run against an open
     /// transaction so callers can commit it atomically alongside another
     /// write (see [`Database::insert_event_and_queue_deliveries`]).
+    ///
+    /// `only_subscription` restricts matching to a single subscription id.
+    /// Returns the number of deliveries inserted.
     async fn queue_webhook_deliveries_tx(
         tx: &mut Transaction<'_, Sqlite>,
         event: &IndexedEvent,
-    ) -> Result<(), sqlx::Error> {
+        only_subscription: Option<&str>,
+    ) -> Result<u64, sqlx::Error> {
         let subs: Vec<SubscriptionRow> = sqlx::query_as(
             "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, secret, created_at
              FROM subscriptions WHERE active = 1",
@@ -158,10 +162,16 @@ impl Database {
 
         let now = chrono::Utc::now().to_rfc3339();
         let data = &event.data;
+        let mut enqueued = 0u64;
 
         for (sub_id, _url, event_type, asset_filter, source_filter, target_filter, _active, _secret, _created_at) in
             subs
         {
+            if let Some(only) = only_subscription {
+                if only != sub_id {
+                    continue;
+                }
+            }
             if let Some(ref et) = event_type {
                 if et != &event.event_type {
                     continue;
@@ -188,8 +198,9 @@ impl Database {
             .bind(&now)
             .execute(&mut *tx)
             .await?;
+            enqueued += 1;
         }
-        Ok(())
+        Ok(enqueued)
     }
 
     pub async fn list_events(
@@ -374,6 +385,65 @@ impl Database {
             .await?;
         }
         Ok(())
+    }
+
+    /// Re-queues webhook deliveries for already-indexed events.
+    ///
+    /// Selects events by id (`event_ids`) and/or by ledger range
+    /// (`from_ledger`, ascending, capped at `limit`), then inserts a fresh
+    /// `pending` delivery for every active subscription that matches each
+    /// event -- all inside one transaction. Matching uses the same
+    /// fail-closed filter rules as [`Database::queue_webhook_deliveries`].
+    ///
+    /// Returns the number of deliveries enqueued, or `None` when `event_ids`
+    /// was non-empty but some of those ids are not indexed (nothing is
+    /// written in that case).
+    pub async fn enqueue_replay(
+        &self,
+        event_ids: &[String],
+        from_ledger: Option<i64>,
+        limit: i64,
+        subscription_id: Option<&str>,
+    ) -> Result<Option<u64>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+
+        let mut events: Vec<IndexedEvent> = Vec::new();
+        if !event_ids.is_empty() {
+            for id in event_ids {
+                let row: Option<(String, String, i64, String, String, String, String)> =
+                    sqlx::query_as(
+                        "SELECT id, event_type, ledger_sequence, contract_id, tx_hash, timestamp, data
+                         FROM events WHERE id = ?1",
+                    )
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                match row {
+                    Some(row) => events.push(row_to_event(row)),
+                    None => return Ok(None),
+                }
+            }
+        } else if let Some(from_ledger) = from_ledger {
+            let rows: Vec<(String, String, i64, String, String, String, String)> =
+                sqlx::query_as(
+                    "SELECT id, event_type, ledger_sequence, contract_id, tx_hash, timestamp, data
+                     FROM events WHERE ledger_sequence >= ?1
+                     ORDER BY ledger_sequence ASC LIMIT ?2",
+                )
+                .bind(from_ledger)
+                .bind(limit)
+                .fetch_all(&mut *tx)
+                .await?;
+            events = rows.into_iter().map(row_to_event).collect();
+        }
+
+        let mut enqueued = 0u64;
+        for event in &events {
+            enqueued += Self::queue_webhook_deliveries_tx(&mut tx, event, subscription_id).await?;
+        }
+
+        tx.commit().await?;
+        Ok(Some(enqueued))
     }
 
     pub async fn get_pending_deliveries(&self) -> Result<Vec<WebhookDelivery>, sqlx::Error> {

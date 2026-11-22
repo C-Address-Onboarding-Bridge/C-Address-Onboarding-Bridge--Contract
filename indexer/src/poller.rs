@@ -106,8 +106,9 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(
                 "No persisted ledger cursor - starting from ledger {} \
                  (latest={} minus lookback={}). \
-                 Set LOOKBACK_LEDGERS=0 to start from the current tip, \
-                 or use POST /api/replay to backfill older history.",
+                 Set LOOKBACK_LEDGERS=0 to start from the current tip. \
+                 POST /api/replay only re-delivers already-indexed events \
+                 and cannot backfill older history.",
                 fallback,
                 latest,
                 lookback,
