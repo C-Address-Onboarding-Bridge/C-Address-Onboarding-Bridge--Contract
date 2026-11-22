@@ -703,6 +703,7 @@ mod tests {
         use crate::poller::parse_contract_event_for_test;
 
         let raw = serde_json::json!({
+            "id": "0000000042-0000000001",
             "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
             "ledger": 42,
             "txHash": "abcdef1234567890",
