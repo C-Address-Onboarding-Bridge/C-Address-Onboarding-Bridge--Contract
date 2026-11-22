@@ -3,6 +3,20 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+// Canonical payload signed for a release. Both sign-release.js and
+// verify-release.js must build it identically, so it lives here and is
+// re-exported for verification.
+function buildReleasePayload({ version, commit, wasm_hash }) {
+  return Buffer.from(
+    JSON.stringify({
+      version: String(version),
+      commit: String(commit),
+      wasm_hash: String(wasm_hash).toLowerCase(),
+    }),
+    'utf8'
+  );
+}
+
 async function main() {
   const version = process.env.VERSION || 'v0.0.0-dev';
   const commit = process.env.COMMIT_SHA || 'unknown';
@@ -50,8 +64,9 @@ async function main() {
     process.exit(1);
   }
 
-  // Sign the raw 32-byte hash
-  const signature = keypair.sign(wasmHash);
+  // Sign the canonical payload covering version, commit and wasm_hash
+  const payload = buildReleasePayload({ version, commit, wasm_hash: wasmHashHex });
+  const signature = keypair.sign(payload);
   const signatureHex = signature.toString('hex');
   const publicKey = keypair.publicKey();
 
@@ -97,7 +112,11 @@ async function main() {
   console.log(`Saved standalone verification metadata: ${releaseMetadataPath}`);
 }
 
-main().catch((err) => {
-  console.error('Fatal error in sign-release script:', err);
-  process.exit(1);
-});
+module.exports = { buildReleasePayload };
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('Fatal error in sign-release script:', err);
+    process.exit(1);
+  });
+}

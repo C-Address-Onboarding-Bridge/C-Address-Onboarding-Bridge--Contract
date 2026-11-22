@@ -2,6 +2,26 @@ const { Address, rpc, xdr, Keypair } = require('@stellar/stellar-sdk');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { buildReleasePayload } = require('./sign-release');
+
+// Trusted release signer public key(s). These are pinned here (outside the
+// registry) so a registry entry cannot vouch for itself: an entry signed by
+// any key not listed below is rejected. Override only for local testing via
+// --public-key, which is reported loudly.
+const TRUSTED_RELEASE_PUBLIC_KEYS = [
+  // TODO(release): replace with the production release signer public key
+  // (the public half of the RELEASE_SIGNING_KEY secret) before the first
+  // signed release. See WASM_VERIFICATION.md.
+  'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+];
+
+function getTrustedPublicKeys() {
+  const fromEnv = (process.env.TRUSTED_RELEASE_PUBLIC_KEYS || '')
+    .split(',')
+    .map((key) => key.trim())
+    .filter(Boolean);
+  return fromEnv.length > 0 ? fromEnv : TRUSTED_RELEASE_PUBLIC_KEYS;
+}
 
 function getArgValue(flag) {
   const index = process.argv.indexOf(flag);
@@ -24,7 +44,8 @@ Options:
   -w, --wasm <WASM_PATH>          Verify a local compiled WASM file
   -n, --network <network>         Stellar network: 'testnet', 'public', 'standalone' (default: 'testnet')
   --rpc-url <URL>                 Custom Soroban RPC URL
-  -k, --public-key <PUB_KEY>      Override/specify the expected release signer public key
+  -k, --public-key <PUB_KEY>      Override the trusted release signer public key (testing only)
+  --allow-transient               Allow verifying entries marked is_transient
   -h, --help                      Show this help message
   `);
 }
@@ -40,6 +61,7 @@ async function main() {
   const network = getArgValue('--network') || getArgValue('-n') || 'testnet';
   const rpcUrlOverride = getArgValue('--rpc-url');
   const expectedPublicKey = getArgValue('--public-key') || getArgValue('-k');
+  const allowTransient = hasFlag('--allow-transient');
 
   const registryPath = path.join(__dirname, '../registry/releases.json');
   if (!fs.existsSync(registryPath)) {
@@ -154,22 +176,41 @@ async function main() {
   console.log(`  Commit SHA:      ${registryEntry.commit}`);
   console.log(`  Timestamp:       ${registryEntry.timestamp}`);
 
-  // Verify the signature
-  const signerPubKey = expectedPublicKey || registryEntry.signer_public_key;
-  if (expectedPublicKey && expectedPublicKey !== registryEntry.signer_public_key) {
-    console.warn(`WARNING: Overriding registry signer public key with user-supplied key: ${expectedPublicKey}`);
+  // Verify the signature against the pinned trusted key(s), never against the
+  // key stored in the registry entry itself.
+  const trustedKeys = expectedPublicKey ? [expectedPublicKey] : getTrustedPublicKeys();
+  if (expectedPublicKey) {
+    console.warn(`WARNING: Using user-supplied signer public key instead of pinned trusted keys: ${expectedPublicKey}`);
+  }
+
+  if (registryEntry.is_transient && !allowTransient) {
+    console.log(`\n❌ VERIFICATION FAILED: Release ${registryEntry.version} is marked is_transient.`);
+    console.log(`Transient development releases are not trusted; pass --allow-transient to verify anyway.`);
+    process.exit(1);
+  }
+
+  const entrySigner = registryEntry.signer_public_key;
+  if (!trustedKeys.includes(entrySigner)) {
+    console.log(`\n❌ VERIFICATION FAILED: Registry signer key is not trusted.`);
+    console.log(`  Entry signer:  ${entrySigner}`);
+    console.log(`  Trusted keys:  ${trustedKeys.join(', ')}`);
+    process.exit(1);
   }
 
   try {
-    const keypair = Keypair.fromPublicKey(signerPubKey);
-    const hashBuffer = Buffer.from(hashToVerify, 'hex');
+    const keypair = Keypair.fromPublicKey(entrySigner);
+    const payload = buildReleasePayload({
+      version: registryEntry.version,
+      commit: registryEntry.commit,
+      wasm_hash: registryEntry.wasm_hash,
+    });
     const signatureBuffer = Buffer.from(registryEntry.signature, 'hex');
 
-    const isSignatureValid = keypair.verify(hashBuffer, signatureBuffer);
+    const isSignatureValid = keypair.verify(payload, signatureBuffer);
 
     if (isSignatureValid) {
       console.log(`✓ Cryptographic signature is VALID!`);
-      console.log(`  Signed by: ${signerPubKey}`);
+      console.log(`  Signed by: ${entrySigner}`);
       if (registryEntry.is_transient) {
         console.log(`\n⚠️ NOTE: This release was signed with a transient development key.`);
       } else {
@@ -177,7 +218,7 @@ async function main() {
       }
     } else {
       console.log(`\n❌ SIGNATURE VERIFICATION FAILED!`);
-      console.log(`The signature in the registry does not match the public key: ${signerPubKey}`);
+      console.log(`The signature in the registry does not match the public key: ${entrySigner}`);
       process.exit(1);
     }
   } catch (err) {
@@ -186,7 +227,11 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error('Fatal error during verification:', err);
-  process.exit(1);
-});
+module.exports = { TRUSTED_RELEASE_PUBLIC_KEYS, getTrustedPublicKeys };
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('Fatal error during verification:', err);
+    process.exit(1);
+  });
+}

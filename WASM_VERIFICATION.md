@@ -45,7 +45,15 @@ If you intentionally modify the contract or change the pinned toolchain, rebuild
 
 ## 3. Release Registry
 
-The [scripts/sign-release.js](scripts/sign-release.js) script signs the pinned WASM hash using `RELEASE_SIGNING_KEY` and writes release metadata to [registry/releases.json](registry/releases.json). This registry-signing step is separate from the GitHub Actions release workflows.
+The [scripts/sign-release.js](scripts/sign-release.js) script signs a canonical payload covering `version`, `commit` and `wasm_hash` using `RELEASE_SIGNING_KEY` and writes release metadata to [registry/releases.json](registry/releases.json). This registry-signing step is separate from the GitHub Actions release workflows.
+
+### Trusted signer keys
+
+Verification never trusts the `signer_public_key` stored in a registry entry. The trusted release public key(s) are pinned outside the registry in the `TRUSTED_RELEASE_PUBLIC_KEYS` constant at the top of [scripts/verify-release.js](scripts/verify-release.js) (or supplied via the `TRUSTED_RELEASE_PUBLIC_KEYS` environment variable as a comma-separated list). An entry whose `signer_public_key` is not in that list fails verification, even if the signature is internally consistent.
+
+The pinned key must be the public half of the `RELEASE_SIGNING_KEY` secret used by [release.yml](.github/workflows/release.yml). Rotate it by updating the constant in a reviewed PR.
+
+Entries marked `is_transient` are rejected unless `--allow-transient` is passed. The `--public-key` flag overrides the pinned keys for local testing only and prints a warning.
 
 ---
 
@@ -66,6 +74,9 @@ NODE_PATH=sdk/node_modules node scripts/verify-release.js --contract <CONTRACT_A
 
 # Verify contract on a custom RPC
 NODE_PATH=sdk/node_modules node scripts/verify-release.js --contract <CONTRACT_ADDRESS> --rpc-url https://your-rpc-endpoint.com
+
+# Verify a transient development release (rejected by default)
+NODE_PATH=sdk/node_modules node scripts/verify-release.js --contract <CONTRACT_ADDRESS> --allow-transient
 ```
 
 ### Verify a Local WASM File
