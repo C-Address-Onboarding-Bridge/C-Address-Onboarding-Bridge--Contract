@@ -1829,7 +1829,7 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
 
         if targets.len() > MAX_BATCH_SIZE {
-            return Err(BridgeError::TooManyFeeTiers);
+            return Err(BridgeError::BatchTooLarge);
         }
         // #594: reject empty batches — a zero-length call transfers nothing but
         // would still emit BatchCompleted and mint loyalty rewards.
@@ -4007,7 +4007,7 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         check_not_paused(&env)?;
         if tiers.len() > MAX_FEE_TIERS {
-            return Err(BridgeError::BatchTooLarge);
+            return Err(BridgeError::TooManyFeeTiers);
         }
         let mut previous_max: Option<i128> = None;
         for tier in tiers.iter() {
