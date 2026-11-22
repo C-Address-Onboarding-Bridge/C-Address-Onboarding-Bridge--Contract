@@ -22,7 +22,7 @@
  */
 
 import {
-  SorobanRpc,
+  rpc,
   Contract,
   TransactionBuilder,
   Operation,
@@ -188,14 +188,14 @@ function sleep(ms: number): Promise<void> {
  * never mistake a failed transaction for a confirmed one.
  */
 export async function poll(
-  provider: SorobanRpc.Server,
+  provider: rpc.Server,
   hash: string,
   retries = 20,
-): Promise<SorobanRpc.Api.GetTransactionResponse> {
+): Promise<rpc.Api.GetTransactionResponse> {
   for (let i = 0; i < retries; i++) {
     const r = await provider.getTransaction(hash);
     if (r.status === 'FAILED') {
-      const resultXdr = (r as SorobanRpc.Api.GetFailedTransactionResponse).resultXdr;
+      const resultXdr = (r as rpc.Api.GetFailedTransactionResponse).resultXdr;
       throw new Error(
         `Transaction ${hash} failed: ${resultXdr ? resultXdr.toXDR('base64') : 'no result XDR'}`,
       );
@@ -211,11 +211,11 @@ export async function poll(
  * Returns the confirmed transaction response.
  */
 async function submitAndConfirm(
-  provider: SorobanRpc.Server,
+  provider: rpc.Server,
   cfg: DeployConfig,
   admin: Keypair,
-  build: (account: SorobanRpc.Api.AccountResponse) => ReturnType<TransactionBuilder['build']>,
-): Promise<SorobanRpc.Api.GetTransactionResponse> {
+  build: (account: rpc.Api.AccountResponse) => ReturnType<TransactionBuilder['build']>,
+): Promise<rpc.Api.GetTransactionResponse> {
   const account = await provider.getAccount(admin.publicKey());
   const tx = build(account);
   const prepared = await provider.prepareTransaction(tx);
@@ -234,7 +234,7 @@ async function submitAndConfirm(
 // ---------------------------------------------------------------------------
 
 async function deployContract(
-  provider: SorobanRpc.Server,
+  provider: rpc.Server,
   cfg: DeployConfig,
   admin: Keypair,
   wasmHash: Buffer,
@@ -291,7 +291,7 @@ async function deployContract(
  * Extract the created contract ID from a createCustomContract result.
  * The contract address is returned as the operation's return value.
  */
-function extractContractId(result: SorobanRpc.Api.GetTransactionResponse): string | undefined {
+function extractContractId(result: rpc.Api.GetTransactionResponse): string | undefined {
   if (result.status !== 'SUCCESS') return undefined;
   const meta = result.resultMetaXdr;
   if (!meta) return undefined;
@@ -304,7 +304,7 @@ function extractContractId(result: SorobanRpc.Api.GetTransactionResponse): strin
 }
 
 async function initialize(
-  provider: SorobanRpc.Server,
+  provider: rpc.Server,
   cfg: DeployConfig,
   admin: Keypair,
   contractId: string,
@@ -360,7 +360,7 @@ async function main(): Promise<void> {
   }
 
   const admin = Keypair.fromSecret(cfg.adminSecretKey);
-  const provider = new SorobanRpc.Server(cfg.rpcUrl, { allowHttp: cfg.network === 'dev' });
+  const provider = new rpc.Server(cfg.rpcUrl, { allowHttp: cfg.network === 'dev' });
 
   console.log(`\n=== C-Address Onboarding Bridge Deployment ===`);
   console.log(`Network:  ${cfg.network}`);

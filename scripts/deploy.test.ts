@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { rpc } from '@stellar/stellar-sdk';
 import { poll } from './deploy';
 
 // Minimal fake server shape used by poll().
@@ -14,6 +15,12 @@ function makeServer(responses: Array<{ status: string; resultXdr?: { toXDR: (for
     getCallCount: () => call,
   };
 }
+
+describe('@stellar/stellar-sdk rpc export', () => {
+  it('exposes rpc.Server so deploy.ts does not rely on the removed SorobanRpc export', () => {
+    assert.equal(typeof rpc.Server, 'function');
+  });
+});
 
 describe('poll()', () => {
   it('resolves once the transaction is SUCCESS', async () => {
