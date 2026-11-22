@@ -261,6 +261,12 @@ pub enum DataKey {
     AssetWhitelistEntry(Address),
     PoolWhitelistEntry(Address),
     RelayerSet,
+    // Issue #897: paginated enumeration indexes and lengths for the per-key
+    // whitelist entries, plus the relayer set size cap.
+    AssetWhitelistIndex(u32),
+    AssetWhitelistLen,
+    PoolWhitelistIndex(u32),
+    PoolWhitelistLen,
     CrossChainReserve(Address),
 }
 
@@ -782,23 +788,78 @@ fn check_access(env: &Env, target: &Address) -> Result<(), BridgeError> {
     Ok(())
 }
 
-#[inline(never)]
-fn read_whitelist(env: &Env) -> Map<Address, bool> {
+// Issue #897: whitelists live in per-key persistent entries so that the cost of
+// a membership check is independent of how many assets/pools are whitelisted.
+// Enumeration is served by a paginated index (`*WhitelistIndex(i)`), and removal
+// is O(1) via swap-and-pop on that index.
+
+fn is_asset_whitelisted(env: &Env, asset: &Address) -> bool {
     env.storage()
-        .instance()
-        .get(&DataKey::AssetWhitelist)
-        .unwrap_or_else(|| Map::new(env))
+        .persistent()
+        .get(&DataKey::AssetWhitelistEntry(asset.clone()))
+        .unwrap_or(false)
 }
 
-#[inline(never)]
-fn save_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
+fn asset_whitelist_len(env: &Env) -> u32 {
     env.storage()
         .instance()
-        .set(&DataKey::AssetWhitelist, whitelist);
+        .get(&DataKey::AssetWhitelistLen)
+        .unwrap_or(0u32)
+}
+
+fn asset_whitelist_index(env: &Env, i: u32) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AssetWhitelistIndex(i))
+}
+
+fn set_asset_whitelisted(env: &Env, asset: &Address, present: bool) -> bool {
+    let was_present = is_asset_whitelisted(env, asset);
+    if present && !was_present {
+        let len = asset_whitelist_len(env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AssetWhitelistEntry(asset.clone()), &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AssetWhitelistIndex(len), asset);
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetWhitelistLen, &(len + 1));
+    } else if !present && was_present {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AssetWhitelistEntry(asset.clone()));
+        let len = asset_whitelist_len(env);
+        let mut found: Option<u32> = None;
+        for i in 0..len {
+            if asset_whitelist_index(env, i).as_ref() == Some(asset) {
+                found = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = found {
+            let last = len - 1;
+            if i != last {
+                if let Some(moved) = asset_whitelist_index(env, last) {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::AssetWhitelistIndex(i), &moved);
+                }
+            }
+            env.storage()
+                .persistent()
+                .remove(&DataKey::AssetWhitelistIndex(last));
+            env.storage()
+                .instance()
+                .set(&DataKey::AssetWhitelistLen, &last);
+        }
+    }
+    was_present
 }
 
 fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError> {
-    if !read_whitelist(env).get(asset.clone()).unwrap_or(false) {
+    if !is_asset_whitelisted(env, asset) {
         return Err(BridgeError::AssetNotWhitelisted);
     }
     Ok(())
@@ -806,23 +867,73 @@ fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError
 
 // fund_c_address_with_swap must not invoke arbitrary caller-supplied pool
 // addresses. Mirrors the asset whitelist pattern above.
-#[inline(never)]
-fn read_pool_whitelist(env: &Env) -> Map<Address, bool> {
+fn is_pool_whitelisted(env: &Env, pool: &Address) -> bool {
     env.storage()
-        .instance()
-        .get(&DataKey::PoolWhitelist)
-        .unwrap_or_else(|| Map::new(env))
+        .persistent()
+        .get(&DataKey::PoolWhitelistEntry(pool.clone()))
+        .unwrap_or(false)
 }
 
-#[inline(never)]
-fn save_pool_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
+fn pool_whitelist_len(env: &Env) -> u32 {
     env.storage()
         .instance()
-        .set(&DataKey::PoolWhitelist, whitelist);
+        .get(&DataKey::PoolWhitelistLen)
+        .unwrap_or(0u32)
+}
+
+fn pool_whitelist_index(env: &Env, i: u32) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PoolWhitelistIndex(i))
+}
+
+fn set_pool_whitelisted(env: &Env, pool: &Address, present: bool) -> bool {
+    let was_present = is_pool_whitelisted(env, pool);
+    if present && !was_present {
+        let len = pool_whitelist_len(env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolWhitelistEntry(pool.clone()), &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolWhitelistIndex(len), pool);
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolWhitelistLen, &(len + 1));
+    } else if !present && was_present {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PoolWhitelistEntry(pool.clone()));
+        let len = pool_whitelist_len(env);
+        let mut found: Option<u32> = None;
+        for i in 0..len {
+            if pool_whitelist_index(env, i).as_ref() == Some(pool) {
+                found = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = found {
+            let last = len - 1;
+            if i != last {
+                if let Some(moved) = pool_whitelist_index(env, last) {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::PoolWhitelistIndex(i), &moved);
+                }
+            }
+            env.storage()
+                .persistent()
+                .remove(&DataKey::PoolWhitelistIndex(last));
+            env.storage()
+                .instance()
+                .set(&DataKey::PoolWhitelistLen, &last);
+        }
+    }
+    was_present
 }
 
 fn check_pool_whitelisted(env: &Env, pool: &Address) -> Result<(), BridgeError> {
-    if !read_pool_whitelist(env).get(pool.clone()).unwrap_or(false) {
+    if !is_pool_whitelisted(env, pool) {
         return Err(BridgeError::PoolNotWhitelisted);
     }
     Ok(())
