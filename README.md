@@ -57,6 +57,8 @@ graph TD
 | Fees and limits | `withdraw_fees` | Withdraw accrued fees to the fee collector |
 | Fees and limits | `set_max_withdraw_per_tx` | Configure the maximum fee withdrawal per transaction |
 | Fees and limits | `query_max_withdraw_per_tx` | Read the maximum fee withdrawal per transaction |
+| Fees and limits | `set_max_withdraw_per_window` | Configure the maximum fee withdrawal per asset over a rolling 24h window |
+| Fees and limits | `query_max_withdraw_per_window` | Read the rolling 24h fee withdrawal cap |
 | Fees and limits | `query_fee_bps` | Read the global fee rate |
 | Fees and limits | `query_calculate_fee` | Calculate net amount and fee for a gross amount |
 | Fees and limits | `query_accrued_fees` | Read accrued fees for an asset |
