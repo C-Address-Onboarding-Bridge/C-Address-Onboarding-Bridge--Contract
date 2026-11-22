@@ -38,6 +38,8 @@ import {
   PaginationOptions,
   CostEstimate,
   TimelockEntry,
+  CalculatedFee,
+  EffectiveFee,
 } from './types';
 import {
   type ObservabilityHooks,
@@ -1322,6 +1324,193 @@ export class OnboardingBridgeSDK {
 
     const scVal = (result as any).results?.[0]?.retval;
     return scVal ? Number(scValToNative(scVal)) : 0;
+  }
+
+  /**
+   * Get the current sequential nonce for `address`.
+   *
+   * The returned value is the next nonce that must be passed to succeed when
+   * the caller opts into nonce checking. Addresses that never used a nonce
+   * return `0`.
+   *
+   * @param address - The G- or C-address whose nonce is queried.
+   * @returns The current nonce as a `number`.
+   *
+   * @throws {Error} On invalid address, RPC failure or contract error.
+   */
+  async getNonce(address: string): Promise<number> {
+    assertAddress(address, 'address');
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_nonce' },
+      () =>
+        this.provider.simulateTransaction(
+          this.buildSimulationTx('query_nonce', [new Address(address)]),
+        ),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get nonce: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? Number(scValToNative(scVal)) : 0;
+  }
+
+  /**
+   * Simulate the fee and net amount for `amount` at the current global fee
+   * rate (ignores per-asset caps and volume tiers).
+   *
+   * @param amount - The hypothetical gross transfer amount.
+   * @returns `{ fee, net }` decoded from the contract's `(i128, i128)` tuple.
+   *
+   * @throws {Error} On RPC failure or contract error.
+   */
+  async calculateFee(amount: string | number | bigint): Promise<CalculatedFee> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_calculate_fee' },
+      () =>
+        this.provider.simulateTransaction(
+          this.buildSimulationTxWithScVals('query_calculate_fee', [
+            nativeToScVal(BigInt(amount), { type: 'i128' }),
+          ]),
+        ),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to calculate fee: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    const [fee, net] = scVal ? (scValToNative(scVal) as [bigint, bigint]) : [0n, 0n];
+    return { fee: BigInt(fee), net: BigInt(net) };
+  }
+
+  /**
+   * Resolve the real effective fee for a `(source, asset, amount)` combination,
+   * applying the global rate, volume tiers and the per-asset fee cap.
+   *
+   * @returns `{ effectiveFeeBps, fee, net }` decoded from the contract's
+   * `(u32, i128, i128)` tuple.
+   *
+   * @throws {Error} On invalid address, RPC failure or contract error.
+   */
+  async getEffectiveFee(
+    source: string,
+    asset: string,
+    amount: string | number | bigint,
+  ): Promise<EffectiveFee> {
+    assertAddress(source, 'source');
+    assertContractAddress(asset, 'asset');
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_effective_fee' },
+      () =>
+        this.provider.simulateTransaction(
+          this.buildSimulationTxWithScVals('query_effective_fee', [
+            new Address(source).toScVal(),
+            new Address(asset).toScVal(),
+            nativeToScVal(BigInt(amount), { type: 'i128' }),
+          ]),
+        ),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get effective fee: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    const [bps, fee, net] = scVal
+      ? (scValToNative(scVal) as [number, bigint, bigint])
+      : [0, 0n, 0n];
+    return {
+      effectiveFeeBps: Number(bps),
+      fee: BigInt(fee),
+      net: BigInt(net),
+    };
+  }
+
+  /**
+   * Get the cumulative net amount of `asset` delivered to recipients.
+   *
+   * @param asset - The token contract address.
+   * @returns The total bridged amount as a `bigint`.
+   *
+   * @throws {Error} On invalid address, RPC failure or contract error.
+   */
+  async getTotalBridged(asset: string): Promise<bigint> {
+    return this.queryAssetTotal('query_total_bridged', asset, 'total bridged');
+  }
+
+  /**
+   * Get the cumulative gross fees collected for `asset` since deployment.
+   *
+   * @param asset - The token contract address.
+   * @returns The total fees collected as a `bigint`.
+   *
+   * @throws {Error} On invalid address, RPC failure or contract error.
+   */
+  async getTotalFeesCollected(asset: string): Promise<bigint> {
+    return this.queryAssetTotal(
+      'query_total_fees_collected',
+      asset,
+      'total fees collected',
+    );
+  }
+
+  /**
+   * Get the configured minimum transfer amount.
+   *
+   * @returns The minimum amount as a `bigint` (`0` when no minimum is set).
+   *
+   * @throws {Error} On RPC failure or contract error.
+   */
+  async getMinimumAmount(): Promise<bigint> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_minimum_amount' },
+      () =>
+        this.provider.simulateTransaction(
+          this.buildSimulationTx('query_minimum_amount', []),
+        ),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get minimum amount: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? BigInt(scValToNative(scVal)) : 0n;
+  }
+
+  /** Shared single-`i128` asset query used by the totals wrappers. */
+  private async queryAssetTotal(
+    method: string,
+    asset: string,
+    label: string,
+  ): Promise<bigint> {
+    assertContractAddress(asset, 'asset');
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: method },
+      () =>
+        this.provider.simulateTransaction(
+          this.buildSimulationTx(method, [new Address(asset)]),
+        ),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get ${label}: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? BigInt(scValToNative(scVal)) : 0n;
   }
 
   async queryReferralRate(): Promise<number> {

@@ -234,6 +234,30 @@ export interface FeeTier {
 }
 
 /**
+ * Result of {@link OnboardingBridgeSDK.calculateFee}: the flat-rate fee and
+ * net amount for a hypothetical gross transfer.
+ */
+export interface CalculatedFee {
+  /** Fee charged, in the asset's smallest unit. */
+  fee: bigint;
+  /** Amount delivered to the recipient after the fee. */
+  net: bigint;
+}
+
+/**
+ * Result of {@link OnboardingBridgeSDK.getEffectiveFee}: the resolved fee rate
+ * after volume tiers and the per-asset cap, plus the resulting fee and net.
+ */
+export interface EffectiveFee {
+  /** Resolved fee rate in basis points. */
+  effectiveFeeBps: number;
+  /** Fee charged, in the asset's smallest unit. */
+  fee: bigint;
+  /** Amount delivered to the recipient after the fee. */
+  net: bigint;
+}
+
+/**
  * Options for creating a timelocked C-address funding entry via
  * {@link OnboardingBridgeSDK.fundCAddressTimelocked}.
  */
