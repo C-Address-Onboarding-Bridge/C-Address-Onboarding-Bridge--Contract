@@ -545,6 +545,27 @@ impl Database {
         Ok(row.map(|(secret,)| secret))
     }
 
+    /// Replaces the signing secret of an active subscription and returns the
+    /// new secret. Returns `None` when no active subscription has that id.
+    pub async fn rotate_subscription_secret(
+        &self,
+        id: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let secret = uuid::Uuid::new_v4().to_string();
+        let result = sqlx::query(
+            "UPDATE subscriptions SET secret = ?2 WHERE id = ?1 AND active = 1",
+        )
+        .bind(id)
+        .bind(&secret)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(secret))
+    }
+
     pub async fn get_event_by_id(&self, id: &str) -> Result<Option<IndexedEvent>, sqlx::Error> {
         let row: Option<(String, String, i64, String, String, String, String)> = sqlx::query_as(
             "SELECT id, event_type, ledger_sequence, contract_id, tx_hash, timestamp, data

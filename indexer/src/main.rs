@@ -66,6 +66,10 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
             get(list_subscriptions).post(create_subscription),
         )
         .route("/api/subscriptions/:id", delete(delete_subscription))
+        .route(
+            "/api/subscriptions/:id/rotate-secret",
+            post(rotate_subscription_secret),
+        )
         .route("/api/replay", post(replay_events))
 }
 
@@ -319,7 +323,11 @@ async fn create_subscription(
         .create_subscription(&body.url, &body.event_types)
         .await
     {
-        Ok(sub) => (StatusCode::CREATED, Json(sub)).into_response(),
+        Ok(sub) => (
+            StatusCode::CREATED,
+            Json(webhook::CreatedSubscription::from(sub)),
+        )
+            .into_response(),
         Err(e) => {
             tracing::error!("failed to create subscription: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
@@ -336,6 +344,20 @@ async fn delete_subscription(
         Ok(false) => (StatusCode::NOT_FOUND, "not found").into_response(),
         Err(e) => {
             tracing::error!("failed to delete subscription: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+        }
+    }
+}
+
+async fn rotate_subscription_secret(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.db.rotate_subscription_secret(&id).await {
+        Ok(Some(secret)) => Json(serde_json::json!({ "id": id, "secret": secret })).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e) => {
+            tracing::error!("failed to rotate subscription secret: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
         }
     }

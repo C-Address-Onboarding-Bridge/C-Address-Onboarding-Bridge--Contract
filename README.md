@@ -283,6 +283,24 @@ endpoints are public; subscription creation/deletion and event replay require
 `Authorization: Bearer <API_KEY>`. CORS accepts requests from any origin, but
 does not replace API-key authentication.
 
+##### Webhook signature verification
+
+`POST /api/subscriptions` returns the subscription together with its signing
+`secret` (the only time it is returned; `GET /api/subscriptions` never includes
+it). `POST /api/subscriptions/:id/rotate-secret` (API-key protected) replaces
+the secret and returns the new one once.
+
+Every delivery carries:
+
+- `X-Webhook-Timestamp` — Unix seconds, as a string.
+- `X-Webhook-Signature` — `sha256=` + lowercase hex of
+  `HMAC_SHA256(secret, timestamp + "." + raw_request_body)`.
+
+Receivers must compute the HMAC over the **raw** body bytes (before JSON
+parsing), compare it in constant time, and reject deliveries whose timestamp
+is outside a small tolerance window (5 minutes is recommended) to prevent
+replay.
+
 #### Relayer (`relayer/`)
 
 A TypeScript, multi-signature cross-chain relay service that lets a user
