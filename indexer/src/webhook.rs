@@ -8,7 +8,15 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 pub const MAX_CONCURRENT_DELIVERIES: usize = 10;
-const MAX_RETRIES: i32 = 5;
+/// Total delivery attempts before a delivery is marked `dead`. With the
+/// backoff schedule below this spreads retries over roughly 24 hours.
+const MAX_RETRIES: i32 = 12;
+/// Base of the exponential backoff, in seconds.
+const BACKOFF_BASE_SECS: i64 = 2;
+/// Upper bound for a single backoff interval, in seconds (1 hour).
+const MAX_BACKOFF_SECS: i64 = 3600;
+/// Maximum random jitter added to a backoff interval, in seconds.
+const MAX_JITTER_SECS: i64 = 30;
 const DELIVERY_INTERVAL_MS: u64 = 2000;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -422,7 +430,7 @@ async fn handle_retry(
             error
         );
     } else {
-        let backoff_secs = (2i64).pow(attempt as u32);
+        let backoff_secs = backoff_secs(attempt);
         let next_retry =
             (chrono::Utc::now() + chrono::Duration::seconds(backoff_secs)).to_rfc3339();
         state
@@ -438,6 +446,19 @@ async fn handle_retry(
         );
     }
     Ok(())
+}
+
+/// Delay before the next attempt, in seconds: capped exponential backoff
+/// (`2^attempt`, capped at `MAX_BACKOFF_SECS`) plus random jitter of up to
+/// `MAX_JITTER_SECS` so that a fleet of failing deliveries does not retry in
+/// lockstep.
+fn backoff_secs(attempt: i32) -> i64 {
+    let exponent = attempt.clamp(0, 32) as u32;
+    let base = BACKOFF_BASE_SECS
+        .saturating_pow(exponent)
+        .min(MAX_BACKOFF_SECS);
+    let jitter = (uuid::Uuid::new_v4().as_u128() % (MAX_JITTER_SECS as u128 + 1)) as i64;
+    base + jitter
 }
 
 #[cfg(test)]
@@ -717,26 +738,51 @@ mod tests {
     // Issue 3 — Backoff formula
     // -----------------------------------------------------------------------
 
-    /// The backoff is `2^attempt` seconds.  Verify the first several values so
-    /// a change to the formula is caught immediately.
+    /// The backoff is capped exponential (`2^attempt`, max 1 h) plus jitter.
+    /// Verify the bounds so a change to the formula is caught immediately.
     #[test]
     fn test_backoff_formula_grows_exponentially() {
-        // Mirrors: let backoff_secs = (2i64).pow(attempt as u32);
         let expected: Vec<(i32, i64)> = vec![
-            (1, 2),  // attempt 1 → 2 s
-            (2, 4),  // attempt 2 → 4 s
-            (3, 8),  // attempt 3 → 8 s
-            (4, 16), // attempt 4 → 16 s
+            (1, 2),    // attempt 1 → 2 s
+            (2, 4),    // attempt 2 → 4 s
+            (3, 8),    // attempt 3 → 8 s
+            (4, 16),   // attempt 4 → 16 s
+            (5, 32),   // attempt 5 → 32 s
+            (10, 1024), // attempt 10 → 1024 s
         ];
 
-        for (attempt, want_secs) in expected {
-            let got = (2i64).pow(attempt as u32);
-            assert_eq!(
-                got, want_secs,
-                "backoff for attempt {} must be {} seconds, got {}",
-                attempt, want_secs, got
+        for (attempt, want_base) in expected {
+            let got = backoff_secs(attempt);
+            assert!(
+                got >= want_base && got <= want_base + MAX_JITTER_SECS,
+                "backoff for attempt {} must be in [{}, {}] seconds, got {}",
+                attempt,
+                want_base,
+                want_base + MAX_JITTER_SECS,
+                got
             );
         }
+
+        // The cap holds for large attempt counts.
+        let capped = backoff_secs(40);
+        assert!(
+            capped >= MAX_BACKOFF_SECS && capped <= MAX_BACKOFF_SECS + MAX_JITTER_SECS,
+            "backoff must be capped at {}s (+jitter), got {}",
+            MAX_BACKOFF_SECS,
+            capped
+        );
+    }
+
+    /// The full retry schedule must span hours, not seconds, so a receiver
+    /// that is down for a deploy or restart does not lose events.
+    #[test]
+    fn test_retry_schedule_spans_hours() {
+        let total: i64 = (1..MAX_RETRIES).map(backoff_secs).sum();
+        assert!(
+            total >= 6 * 3600,
+            "retry schedule must span at least 6 hours, got {}s",
+            total
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -783,9 +829,8 @@ mod tests {
         // Simulate MAX_RETRIES - 1 failed attempts so the next failure crosses
         // the threshold.  Each `mark_delivery_failed` increments `attempts`.
         for i in 0..(MAX_RETRIES - 1) {
-            let backoff_secs = (2i64).pow((i + 1) as u32);
             let next_retry =
-                (chrono::Utc::now() + chrono::Duration::seconds(backoff_secs)).to_rfc3339();
+                (chrono::Utc::now() + chrono::Duration::seconds(backoff_secs(i + 1))).to_rfc3339();
             db.mark_delivery_failed(&delivery_id, "transient error", &next_retry)
                 .await
                 .expect("mark failed");
@@ -853,8 +898,9 @@ mod tests {
         let deliveries = db.get_pending_deliveries().await.expect("get pending");
         let delivery_id = deliveries[0].id.clone();
 
-        // Fail once — still well below MAX_RETRIES (5).
-        let next_retry = (chrono::Utc::now() + chrono::Duration::seconds(2)).to_rfc3339();
+        // Fail once — still well below MAX_RETRIES.
+        let next_retry =
+            (chrono::Utc::now() + chrono::Duration::seconds(backoff_secs(1))).to_rfc3339();
         db.mark_delivery_failed(&delivery_id, "first error", &next_retry)
             .await
             .expect("mark failed");
@@ -865,6 +911,107 @@ mod tests {
             pending_count, 1,
             "delivery must stay pending after only one failure"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1066 — handle_retry drives the retry/dead transition
+    // -----------------------------------------------------------------------
+
+    /// Seed a subscription, an event and one pending delivery; returns the
+    /// delivery row as stored.
+    async fn seed_delivery(db: &Database, event_id: &str) -> WebhookDelivery {
+        let _sub = db
+            .create_subscription(CreateSubscription {
+                url: "http://example.com/hook-retry".to_string(),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .expect("create subscription");
+
+        let event = IndexedEvent {
+            id: event_id.to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 3,
+            contract_id: "C_TEST".to_string(),
+            tx_hash: "cafebabe".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({}),
+        };
+        db.insert_event(&event).await.expect("insert event");
+        db.queue_webhook_deliveries(&event)
+            .await
+            .expect("queue deliveries");
+
+        db.get_pending_deliveries()
+            .await
+            .expect("get pending")
+            .into_iter()
+            .next()
+            .expect("one delivery queued")
+    }
+
+    fn test_state(db: Database) -> AppState {
+        AppState {
+            db,
+            rpc_url: "http://localhost".to_string(),
+            contract_id: "C_TEST".to_string(),
+            webhook_client: reqwest::Client::new(),
+            lookback_ledgers: 0,
+        }
+    }
+
+    /// A failure below the retry limit must schedule a retry in the future
+    /// and keep the delivery pending.
+    #[tokio::test]
+    async fn test_handle_retry_schedules_retry_below_limit() {
+        let db = setup_db().await;
+        let delivery = seed_delivery(&db, "evt-retry-001").await;
+        let state = test_state(db);
+
+        handle_retry(&state, &delivery, "HTTP 503")
+            .await
+            .expect("handle retry");
+
+        let stats = state.db.get_stats().await.expect("stats");
+        assert_eq!(stats["pending_deliveries"].as_i64(), Some(1));
+        assert_eq!(stats["dead_deliveries"].as_i64(), Some(0));
+
+        // The retry must be scheduled in the future, so the delivery is not
+        // immediately re-fetched by the poller.
+        let pending = state.db.get_pending_deliveries().await.expect("pending");
+        assert!(
+            pending.is_empty(),
+            "delivery must not be due before its backoff elapses"
+        );
+
+        // The attempt counter must have been incremented by the retry.
+        let attempts: (i64,) =
+            sqlx::query_as("SELECT attempts FROM webhook_deliveries WHERE id = ?1")
+                .bind(&delivery.id)
+                .fetch_one(&state.db.pool)
+                .await
+                .expect("fetch attempts");
+        assert_eq!(attempts.0, 1, "attempts must be incremented on retry");
+    }
+
+    /// The final allowed attempt must mark the delivery dead.
+    #[tokio::test]
+    async fn test_handle_retry_marks_dead_at_limit() {
+        let db = setup_db().await;
+        let mut delivery = seed_delivery(&db, "evt-retry-002").await;
+        delivery.attempts = MAX_RETRIES - 1;
+        let state = test_state(db);
+
+        handle_retry(&state, &delivery, "HTTP 500")
+            .await
+            .expect("handle retry");
+
+        let stats = state.db.get_stats().await.expect("stats");
+        assert_eq!(stats["dead_deliveries"].as_i64(), Some(1));
+        assert_eq!(stats["pending_deliveries"].as_i64(), Some(0));
     }
 
     // -----------------------------------------------------------------------
