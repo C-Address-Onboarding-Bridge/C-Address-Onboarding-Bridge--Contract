@@ -308,17 +308,13 @@ async fn list_subscriptions(State(state): State<Arc<AppState>>) -> impl IntoResp
 
 async fn create_subscription(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateSubscriptionBody>,
+    Json(body): Json<webhook::CreateSubscription>,
 ) -> impl IntoResponse {
     if let Err(reason) = webhook::validate_webhook_url(&body.url).await {
-        return (StatusCode::BAD_REQUEST, reason).into_response();
+        return (StatusCode::BAD_REQUEST, reason.to_string()).into_response();
     }
 
-    match state
-        .db
-        .create_subscription(&body.url, &body.event_types)
-        .await
-    {
+    match state.db.create_subscription(body).await {
         Ok(sub) => (StatusCode::CREATED, Json(sub)).into_response(),
         Err(e) => {
             tracing::error!("failed to create subscription: {e}");
@@ -329,9 +325,9 @@ async fn create_subscription(
 
 async fn delete_subscription(
     State(state): State<Arc<AppState>>,
-    axum::extract::Path(id): axum::extract::Path<i64>,
+    axum::extract::Path(id): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    match state.db.delete_subscription(id).await {
+    match state.db.delete_subscription(&id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "not found").into_response(),
         Err(e) => {
@@ -354,17 +350,110 @@ async fn replay_events(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    const TEST_API_KEY: &str = "test-api-key";
+
+    async fn test_app() -> Router {
+        let db = db::Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        let state = Arc::new(AppState {
+            db,
+            rpc_url: "http://localhost".to_string(),
+            contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::new(),
+            api_key_hash: sha256_hex(TEST_API_KEY),
+            lookback_ledgers: 0,
+        });
+        build_app(state)
+    }
+
+    fn authed_request(method: Method, uri: &str, body: Option<&str>) -> Request<Body> {
+        let builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {}", TEST_API_KEY))
+            .header(header::CONTENT_TYPE, "application/json");
+        match body {
+            Some(body) => builder.body(Body::from(body.to_string())).unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_subscription_returns_201() {
+        let app = test_app().await;
+        let response = app
+            .oneshot(authed_request(
+                Method::POST,
+                "/api/subscriptions",
+                Some(r#"{"url":"https://example.com/hook","event_type":"fund"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_create_subscription_rejects_private_url() {
+        let app = test_app().await;
+        let response = app
+            .oneshot(authed_request(
+                Method::POST,
+                "/api/subscriptions",
+                Some(r#"{"url":"http://127.0.0.1/hook"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_delete_subscription_returns_204_then_404() {
+        let app = test_app().await;
+        let create = app
+            .clone()
+            .oneshot(authed_request(
+                Method::POST,
+                "/api/subscriptions",
+                Some(r#"{"url":"https://example.com/hook"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let bytes = axum::body::to_bytes(create.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+
+        let uri = format!("/api/subscriptions/{}", id);
+        let first = app
+            .clone()
+            .oneshot(authed_request(Method::DELETE, &uri, None))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::NO_CONTENT);
+
+        let second = app
+            .oneshot(authed_request(Method::DELETE, &uri, None))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::NOT_FOUND);
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct EventQuery {
     limit: Option<i64>,
     offset: Option<i64>,
-}
-
-#[derive(serde::Deserialize)]
-struct CreateSubscriptionBody {
-    url: String,
-    #[serde(default)]
-    event_types: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
