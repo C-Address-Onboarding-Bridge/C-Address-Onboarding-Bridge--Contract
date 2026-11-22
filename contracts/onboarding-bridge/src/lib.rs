@@ -787,6 +787,15 @@ fn check_access(env: &Env, target: &Address) -> Result<(), BridgeError> {
     Ok(())
 }
 
+/// Access check for the *source* side of a funding path.
+///
+/// The blocklist always gates sources. Allowlist mode gates sources too, so a
+/// non-allowlisted account cannot move funds through the bridge while the
+/// allowlist is enabled.
+fn check_party_access(env: &Env, party: &Address) -> Result<(), BridgeError> {
+    check_access(env, party)
+}
+
 #[inline(never)]
 fn read_whitelist(env: &Env) -> Map<Address, bool> {
     env.storage()
@@ -1723,6 +1732,7 @@ impl OnboardingBridge {
         }
 
         check_access(&env, &target)?;
+        check_party_access(&env, &source)?;
         check_asset_whitelisted(&env, &asset)?;
         check_daily_limit(&env, &source, &asset, amount)?;
 
@@ -1847,6 +1857,7 @@ impl OnboardingBridge {
             return Err(BridgeError::MismatchedArrays);
         }
 
+        check_party_access(&env, &source)?;
         check_asset_whitelisted(&env, &asset)?;
 
         // Validate every amount before any tokens move.
@@ -2623,6 +2634,7 @@ impl OnboardingBridge {
         }
 
         check_access(&env, &target)?;
+        check_party_access(&env, &source)?;
         if let Some(referrer_addr) = referrer.clone() {
             check_access(&env, &referrer_addr)?;
         }
