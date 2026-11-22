@@ -127,7 +127,8 @@ async fn main() {
     // Webhook client: never follow redirects (a 3xx is treated as a delivery
     // failure) so a validated URL cannot be bounced to an internal address
     // (#870).  Per-request DNS pinning to the vetted IP happens in
-    // `webhook::deliver`.
+    // `webhook::deliver_single`, which re-resolves the host and rejects
+    // private/reserved addresses before every attempt (#1067).
     let webhook_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()

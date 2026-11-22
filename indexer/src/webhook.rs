@@ -101,6 +101,32 @@ fn unwrap_ipv4_mapped_or_compatible(ip: IpAddr) -> IpAddr {
     ip
 }
 
+/// Resolves `host` and returns the first address that is safe to connect to.
+///
+/// Every resolved address is checked with [`is_private_or_reserved`]; if any
+/// address is private or reserved the whole host is rejected, because the
+/// caller cannot control which address the transport would pick. This is run
+/// again at delivery time so a DNS rebinding between subscription validation
+/// and delivery cannot reach an internal address (#1067).
+async fn resolve_public_ip(host: &str, port: u16) -> Result<IpAddr, UrlValidationError> {
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| UrlValidationError::UnresolvableHost(host.to_string()))?;
+
+    let mut chosen: Option<IpAddr> = None;
+    for addr in addrs {
+        let ip = unwrap_ipv4_mapped_or_compatible(addr.ip());
+        if is_private_or_reserved(ip) {
+            return Err(UrlValidationError::PrivateOrReservedHost(ip.to_string()));
+        }
+        if chosen.is_none() {
+            chosen = Some(ip);
+        }
+    }
+
+    chosen.ok_or_else(|| UrlValidationError::UnresolvableHost(host.to_string()))
+}
+
 /// Generate the signature for a webhook payload.
 /// Signature is: sha256=<hex(hmac_sha256(secret, timestamp + "." + body))>
 fn generate_signature(secret: &str, timestamp: &str, body: &str) -> String {
@@ -157,20 +183,7 @@ pub async fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
     }
 
     let port = parsed.port_or_known_default().unwrap_or(80);
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|_| UrlValidationError::UnresolvableHost(host.to_string()))?;
-
-    for addr in addrs {
-        let ip = unwrap_ipv4_mapped_or_compatible(addr.ip());
-        if is_private_or_reserved(ip) {
-            return Err(UrlValidationError::PrivateOrReservedHost(
-                ip.to_string(),
-            ));
-        }
-    }
-
-    Ok(())
+    resolve_public_ip(host, port).await.map(|_| ())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,6 +381,38 @@ async fn deliver_single(
     state: &AppState,
     delivery: &WebhookDelivery,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    deliver_single_with_resolver(state, delivery, |host, port| {
+        Box::pin(resolve_public_ip(host, port))
+    })
+    .await
+}
+
+/// Resolver used by [`deliver_single`]; injectable so tests can simulate a
+/// host that is rebound between validation and delivery (#1067).
+type DeliveryResolver<'a> = dyn Fn(
+        &'a str,
+        u16,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<IpAddr, UrlValidationError>>
+                + Send
+                + 'a,
+        >,
+    > + Send
+    + Sync
+    + 'a;
+
+async fn deliver_single_with_resolver(
+    state: &AppState,
+    delivery: &WebhookDelivery,
+    resolver: impl Fn(
+            &str,
+            u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<IpAddr, UrlValidationError>> + Send + '_>,
+        > + Send
+        + Sync,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let url = match state
         .db
         .get_subscription_url(&delivery.subscription_id)
@@ -411,9 +456,51 @@ async fn deliver_single(
         .ok_or_else(|| sqlx::Error::Protocol("subscription secret not found".into()))?;
     let signature = generate_signature(&secret, &timestamp, &body);
 
+    // Re-resolve and pin the address at delivery time (#1067). Validation at
+    // subscription time is not enough: a host can be rebound to a private
+    // address between registration and delivery.
+    let parsed = match url::Url::parse(&url) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            let error = format!("invalid webhook URL: {}", e);
+            state.db.mark_delivery_dead(&delivery.id, &error).await?;
+            tracing::warn!("Webhook delivery {} dead: {}", delivery.id, error);
+            return Ok(true);
+        }
+    };
+    let host = match parsed.host_str() {
+        Some(host) => host.to_string(),
+        None => {
+            let error = "invalid webhook URL: no host".to_string();
+            state.db.mark_delivery_dead(&delivery.id, &error).await?;
+            tracing::warn!("Webhook delivery {} dead: {}", delivery.id, error);
+            return Ok(true);
+        }
+    };
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let pinned_ip = match resolve_public_ip(&host, port).await {
+        Ok(ip) => ip,
+        Err(e) => {
+            let error = format!("SSRF check failed at delivery: {}", e);
+            state.db.mark_delivery_dead(&delivery.id, &error).await?;
+            tracing::warn!("Webhook delivery {} dead: {}", delivery.id, error);
+            return Ok(true);
+        }
+    };
+
+    // Connect to the vetted IP while keeping the original hostname for TLS SNI
+    // and the `Host` header, so virtual-hosted endpoints still work.
+    let mut pinned = parsed.clone();
+    let _ = pinned.set_host(Some(&pinned_ip.to_string()));
+    let host_header = match parsed.port() {
+        Some(p) => format!("{}:{}", host, p),
+        None => host.clone(),
+    };
+
     match state
         .webhook_client
-        .post(&url)
+        .post(pinned.as_str())
+        .header(reqwest::header::HOST, host_header)
         .header("X-Webhook-Timestamp", &timestamp)
         .header("X-Webhook-Signature", signature)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -1036,6 +1123,107 @@ mod tests {
         let stats = state.db.get_stats().await.expect("stats");
         assert_eq!(stats["dead_deliveries"].as_i64(), Some(1));
         assert_eq!(stats["pending_deliveries"].as_i64(), Some(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1067 — re-validate and pin the resolved IP at delivery time
+    // -----------------------------------------------------------------------
+
+    /// A host that resolves to a public address at validation time but to
+    /// loopback at delivery time (DNS rebinding) must be rejected before any
+    /// request is sent, and the delivery must be marked dead.
+    #[tokio::test]
+    async fn test_delivery_rejects_rebound_private_ip() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    hits_clone.fetch_add(1, Ordering::SeqCst);
+                    let _ = tokio::io::AsyncWriteExt::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
+                    )
+                    .await;
+                }
+            }
+        });
+
+        let db = setup_db().await;
+        let _sub = db
+            .create_subscription(CreateSubscription {
+                url: format!("http://rebind.test:{}/hook", port),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .expect("create subscription");
+
+        let event = IndexedEvent {
+            id: "evt-rebind-001".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 4,
+            contract_id: "C_TEST".to_string(),
+            tx_hash: "deadc0de".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({}),
+        };
+        db.insert_event(&event).await.expect("insert event");
+        db.queue_webhook_deliveries(&event)
+            .await
+            .expect("queue deliveries");
+
+        let delivery = db
+            .get_pending_deliveries(MAX_ROWS_PER_SUBSCRIPTION)
+            .await
+            .expect("get pending")
+            .into_iter()
+            .next()
+            .expect("one delivery queued");
+
+        let state = test_state(db);
+
+        // Resolver stub: public IP at validation, loopback at delivery.
+        let validation_ip: IpAddr = "93.184.216.34".parse().unwrap();
+        let delivery_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(!is_private_or_reserved(validation_ip));
+        assert!(is_private_or_reserved(delivery_ip));
+
+        let resolved = deliver_single_with_resolver(&state, &delivery, |_host, _port| {
+            Box::pin(async move { Ok(vec![delivery_ip]) })
+        })
+        .await
+        .expect("deliver single");
+        assert!(resolved, "rebound delivery must be terminally resolved");
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no request may reach the local listener"
+        );
+
+        let stats = state.db.get_stats().await.expect("stats");
+        assert_eq!(stats["dead_deliveries"].as_i64(), Some(1));
+        assert_eq!(stats["pending_deliveries"].as_i64(), Some(0));
+
+        let last_error: (Option<String>,) =
+            sqlx::query_as("SELECT last_error FROM webhook_deliveries WHERE id = ?1")
+                .bind(&delivery.id)
+                .fetch_one(&state.db.pool)
+                .await
+                .expect("fetch last_error");
+        let last_error = last_error.0.unwrap_or_default();
+        assert!(
+            last_error.contains("SSRF check failed at delivery"),
+            "unexpected error: {}",
+            last_error
+        );
     }
 
     // -----------------------------------------------------------------------
