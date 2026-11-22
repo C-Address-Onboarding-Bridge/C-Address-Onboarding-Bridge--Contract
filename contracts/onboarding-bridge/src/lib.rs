@@ -189,7 +189,9 @@ pub enum BridgeError {
     TooManyFeeTiers = 51,
     /// Cross-chain payouts exceed the admin-funded liquidity reserve.
     InsufficientCrossChainReserve = 52,
-    // Next free discriminant: 53. Always take the next unused value here and
+    /// A pending admin or fee-collector proposal has passed its expiry ledger.
+    PendingTransferExpired = 53,
+    // Next free discriminant: 54. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
 
@@ -299,6 +301,8 @@ const UPGRADE_TIMELOCK_LEDGERS: u32 = 17_280;
 const UPGRADE_EXECUTION_WINDOW_LEDGERS: u32 = UPGRADE_TIMELOCK_LEDGERS;
 /// Minimum ledgers between commit_fund and reveal_fund (~25 s at 5 s/ledger).
 const COMMIT_REVEAL_MIN_DELAY_LEDGERS: u32 = 5;
+/// Ledgers a pending admin / fee-collector proposal stays acceptable (~7 days at 5 s/ledger).
+const PENDING_TRANSFER_EXPIRY_LEDGERS: u32 = 120_960;
 /// Size of the stack buffer used to hold an address's strkey while hashing it.
 /// Soroban strkeys are 56 bytes; anything longer is rejected rather than copied.
 const MAX_STRKEY_LEN: usize = 64;
@@ -421,6 +425,16 @@ pub struct PendingUpgrade {
     pub expires_after_ledger: u32,
 }
 
+/// A pending admin or fee-collector handoff awaiting acceptance.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingTransfer {
+    /// Address that must accept the role.
+    pub address: Address,
+    /// Ledger sequence at or after which the proposal can no longer be accepted.
+    pub expires_after_ledger: u32,
+}
+
 /// A pending commit-reveal entry created by `commit_fund`.
 ///
 /// The `amount_hash` is a domain-separated hash of the commitment parties,
@@ -479,10 +493,17 @@ fn clear_pending_upgrade(env: &Env) {
 }
 
 fn save_pending_admin(env: &Env, addr: &Address) {
-    env.storage().instance().set(&DataKey::PendingAdmin, addr);
+    let pending = PendingTransfer {
+        address: addr.clone(),
+        expires_after_ledger: env
+            .ledger()
+            .sequence()
+            .saturating_add(PENDING_TRANSFER_EXPIRY_LEDGERS),
+    };
+    env.storage().instance().set(&DataKey::PendingAdmin, &pending);
 }
 
-fn read_pending_admin(env: &Env) -> Option<Address> {
+fn read_pending_admin(env: &Env) -> Option<PendingTransfer> {
     env.storage().instance().get(&DataKey::PendingAdmin)
 }
 
@@ -491,12 +512,19 @@ fn remove_pending_admin(env: &Env) {
 }
 
 fn save_pending_fee_collector(env: &Env, addr: &Address) {
+    let pending = PendingTransfer {
+        address: addr.clone(),
+        expires_after_ledger: env
+            .ledger()
+            .sequence()
+            .saturating_add(PENDING_TRANSFER_EXPIRY_LEDGERS),
+    };
     env.storage()
         .instance()
-        .set(&DataKey::PendingFeeCollector, addr);
+        .set(&DataKey::PendingFeeCollector, &pending);
 }
 
-fn read_pending_fee_collector(env: &Env) -> Option<Address> {
+fn read_pending_fee_collector(env: &Env) -> Option<PendingTransfer> {
     env.storage().instance().get(&DataKey::PendingFeeCollector)
 }
 
@@ -2230,20 +2258,26 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         check_not_deactivated(&env)?;
         let pending = read_pending_fee_collector(&env).ok_or(BridgeError::Unauthorized)?;
-        pending.require_auth();
+        if env.ledger().sequence() >= pending.expires_after_ledger {
+            return Err(BridgeError::PendingTransferExpired);
+        }
+        pending.address.require_auth();
         extend_instance_ttl(&env);
         let old_collector = read_fee_collector(&env);
-        save_fee_collector(&env, &pending);
+        save_fee_collector(&env, &pending.address);
         let mut config = read_bridge_config(&env);
-        config.fee_collector = pending.clone();
+        config.fee_collector = pending.address.clone();
         save_bridge_config(&env, &config);
         remove_pending_fee_collector(&env);
-        env.events()
-            .publish(("FeeCollectorTransferred", old_collector, pending), ());
+        env.events().publish(
+            ("FeeCollectorTransferred", old_collector, pending.address),
+            (),
+        );
         Ok(())
     }
 
-    pub fn query_pending_fee_collector(env: Env) -> Option<Address> {
+    /// Returns the pending fee-collector proposal, including its expiry ledger.
+    pub fn query_pending_fee_collector(env: Env) -> Option<PendingTransfer> {
         read_pending_fee_collector(&env)
     }
 
@@ -2307,20 +2341,24 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         check_not_deactivated(&env)?;
         let pending = read_pending_admin(&env).ok_or(BridgeError::Unauthorized)?;
-        pending.require_auth();
+        if env.ledger().sequence() >= pending.expires_after_ledger {
+            return Err(BridgeError::PendingTransferExpired);
+        }
+        pending.address.require_auth();
         extend_instance_ttl(&env);
         let old_admin = read_admin(&env);
-        save_admin(&env, &pending);
+        save_admin(&env, &pending.address);
         let mut config = read_bridge_config(&env);
-        config.admin = pending.clone();
+        config.admin = pending.address.clone();
         save_bridge_config(&env, &config);
         remove_pending_admin(&env);
         env.events()
-            .publish(("AdminTransferred", old_admin, pending), ());
+            .publish(("AdminTransferred", old_admin, pending.address), ());
         Ok(())
     }
 
-    pub fn query_pending_admin(env: Env) -> Option<Address> {
+    /// Returns the pending admin proposal, including its expiry ledger.
+    pub fn query_pending_admin(env: Env) -> Option<PendingTransfer> {
         read_pending_admin(&env)
     }
 

@@ -6858,6 +6858,93 @@ fn test_clear_pending_fee_collector_cancels_handoff() {
     assert_eq!(bridge.query_pending_fee_collector(), None);
 }
 
+/********** pending transfer expiry tests **********/
+
+#[test]
+fn test_accept_admin_within_window_succeeds() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_admin = Address::generate(&env);
+    bridge.propose_new_admin(&new_admin, &None);
+
+    let pending = bridge.query_pending_admin().unwrap();
+    assert_eq!(pending.address, new_admin);
+    assert!(pending.expires_after_ledger > env.ledger().sequence());
+
+    advance_ledger_sequence(&env, pending.expires_after_ledger - 1);
+    bridge.accept_admin();
+
+    assert_eq!(bridge.query_admin(), new_admin);
+    assert_eq!(bridge.query_pending_admin(), None);
+}
+
+#[test]
+fn test_accept_admin_after_window_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_admin = Address::generate(&env);
+    bridge.propose_new_admin(&new_admin, &None);
+
+    let pending = bridge.query_pending_admin().unwrap();
+    advance_ledger_sequence(&env, pending.expires_after_ledger);
+
+    assert_eq!(
+        bridge.try_accept_admin(),
+        Err(Ok(BridgeError::PendingTransferExpired))
+    );
+    assert_eq!(bridge.query_admin(), admin);
+}
+
+#[test]
+fn test_accept_fee_collector_within_window_succeeds() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_collector = Address::generate(&env);
+    bridge.propose_new_fee_collector(&new_collector, &None);
+
+    let pending = bridge.query_pending_fee_collector().unwrap();
+    assert_eq!(pending.address, new_collector);
+
+    advance_ledger_sequence(&env, pending.expires_after_ledger - 1);
+    bridge.accept_fee_collector();
+
+    assert_eq!(bridge.query_fee_collector(), new_collector);
+    assert_eq!(bridge.query_pending_fee_collector(), None);
+}
+
+#[test]
+fn test_accept_fee_collector_after_window_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_collector = Address::generate(&env);
+    bridge.propose_new_fee_collector(&new_collector, &None);
+
+    let pending = bridge.query_pending_fee_collector().unwrap();
+    advance_ledger_sequence(&env, pending.expires_after_ledger);
+
+    assert_eq!(
+        bridge.try_accept_fee_collector(),
+        Err(Ok(BridgeError::PendingTransferExpired))
+    );
+    assert_eq!(bridge.query_fee_collector(), fee_collector);
+}
+
 /********** extend_timelock_ttl tests **********/
 
 fn setup_extend_timelock(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, u64) {
