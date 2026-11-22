@@ -222,6 +222,8 @@ pub enum DataKey {
     CrossChainNonce(BytesN<32>),
     DailyUsage(Address, Address, u64),
     FeeTiers,
+    // Issue #1086: per-asset fee tiers, with `FeeTiers` as the global fallback.
+    FeeTiersFor(Address),
     SourceBridgedVolume(Address, Address),
     LoyaltyToken,
     LoyaltyAmountPerFund,
@@ -243,10 +245,16 @@ pub enum DataKey {
     PendingFeeCollector,
     // Issue #23: max withdraw per tx
     MaxWithdrawPerTx,
+    // Issue #1086: per-asset max withdraw per tx, `MaxWithdrawPerTx` is the
+    // global fallback.
+    MaxWithdrawPerTxFor(Address),
     // Issue #24: reentrancy guard flag
     Entered,
     // Minimum transfer amount for funded transfers
     MinimumAmount,
+    // Issue #1086: per-asset minimum transfer amount, `MinimumAmount` is the
+    // global fallback.
+    MinimumAmountFor(Address),
     // Issue #30: commit-reveal counter and entries
     CommitmentId,
     Commitment(u64),
@@ -511,6 +519,24 @@ fn read_max_withdraw_per_tx(env: &Env) -> i128 {
         .unwrap_or(0)
 }
 
+/// Stores the per-asset max withdraw per tx. `None` clears the override so the
+/// asset falls back to the global `MaxWithdrawPerTx` value.
+fn save_asset_max_withdraw_per_tx(env: &Env, asset: &Address, amount: Option<i128>) {
+    let key = DataKey::MaxWithdrawPerTxFor(asset.clone());
+    match amount {
+        Some(amount) => env.storage().instance().set(&key, &amount),
+        None => env.storage().instance().remove(&key),
+    }
+}
+
+/// Per-asset max withdraw per tx, falling back to the global value.
+fn read_asset_max_withdraw_per_tx(env: &Env, asset: &Address) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxWithdrawPerTxFor(asset.clone()))
+        .unwrap_or_else(|| read_max_withdraw_per_tx(env))
+}
+
 fn read_bridge_config(env: &Env) -> BridgeConfigData {
     env.storage()
         .instance()
@@ -693,6 +719,26 @@ fn read_minimum_amount(env: &Env) -> i128 {
         .instance()
         .get(&DataKey::MinimumAmount)
         .unwrap_or(0)
+}
+
+/// Stores the per-asset minimum amount. `None` clears the override so the asset
+/// falls back to the global `MinimumAmount` value.
+#[inline(never)]
+fn save_asset_minimum_amount(env: &Env, asset: &Address, amount: Option<i128>) {
+    let key = DataKey::MinimumAmountFor(asset.clone());
+    match amount {
+        Some(amount) => env.storage().instance().set(&key, &amount),
+        None => env.storage().instance().remove(&key),
+    }
+}
+
+/// Per-asset minimum amount, falling back to the global value.
+#[inline(never)]
+fn read_asset_minimum_amount(env: &Env, asset: &Address) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MinimumAmountFor(asset.clone()))
+        .unwrap_or_else(|| read_minimum_amount(env))
 }
 
 fn check_initialized(env: &Env) -> Result<(), BridgeError> {
