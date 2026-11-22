@@ -283,6 +283,9 @@ const MAX_ALLOWED_TTL: u32 = 3_110_400; // ~1 year in ledgers (5s/ledger)
 /// effectively disables TTL extension and risks near-term expiry of all
 /// instance (or persistent) data. Set to roughly one week of ledgers
 /// (5 s/ledger) — comfortably above `CRITICAL_ENTRY_TTL_THRESHOLD`.
+///
+/// The explicit public extenders always extend to the requested TTL, so this
+/// floor only bounds the configured maxima and the requested values.
 const MIN_ALLOWED_TTL: u32 = 120_960;
 const CRITICAL_ENTRY_TTL_THRESHOLD: u32 = 100_000;
 /// Minimum ledgers that must pass before a scheduled upgrade becomes executable (~24 h at 5 s/ledger).
@@ -550,12 +553,22 @@ fn read_max_persistent_ttl(env: &Env) -> u32 {
         .unwrap_or(MAX_ALLOWED_TTL)
 }
 
-fn persistent_ttl_request(ttl: u32, configured_max: u32) -> Result<(u32, u32), BridgeError> {
+/// Validates an explicit TTL request and returns the TTL to extend to.
+///
+/// Explicit extenders always extend to the requested TTL, so the extension
+/// threshold is the TTL itself (the entry is extended whenever its current
+/// TTL is below the requested value).
+fn persistent_ttl_request(ttl: u32, configured_max: u32) -> Result<u32, BridgeError> {
     if ttl < MIN_ALLOWED_TTL {
         return Err(BridgeError::InvalidTtl);
     }
-    let max_ttl = ttl.min(configured_max);
-    Ok((max_ttl, max_ttl / 4))
+    Ok(ttl.min(configured_max))
+}
+
+/// Extends `key` to `ttl` and returns the resulting TTL.
+fn extend_persistent_key(env: &Env, key: &DataKey, ttl: u32) -> u32 {
+    env.storage().persistent().extend_ttl(key, ttl, ttl);
+    env.storage().persistent().get_ttl(key)
 }
 
 fn extend_instance_ttl(env: &Env) {
@@ -4589,7 +4602,8 @@ impl OnboardingBridge {
     /// Extends the instance-storage TTL to ensure contract state does not expire.
     ///
     /// `ttl` is capped at `MAX_ALLOWED_TTL` (3 110 400 ledgers, ~1 year).
-    /// The threshold used to trigger extension is `ttl / 4`.
+    /// The instance entry is always extended to the requested TTL, and the
+    /// emitted `actual_ttl` is the resulting TTL read back from storage.
     ///
     /// # Arguments
     ///
@@ -4617,10 +4631,11 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_instance_ttl(&env))?;
-        env.storage().instance().extend_ttl(threshold, max_ttl);
+        let max_ttl = persistent_ttl_request(ttl, read_max_instance_ttl(&env))?;
+        env.storage().instance().extend_ttl(max_ttl, max_ttl);
+        let actual_ttl = env.storage().instance().get_ttl();
         env.events()
-            .publish(("InstanceTtlExtended",), (admin, max_ttl));
+            .publish(("InstanceTtlExtended",), (admin, actual_ttl));
         Ok(())
     }
 
@@ -4659,25 +4674,22 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
+        let max_ttl = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
         let key = DataKey::AssetStats(key_asset.clone());
+        let mut actual_ttl = max_ttl;
         if env.storage().persistent().has(&key) {
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, threshold, max_ttl);
+            actual_ttl = extend_persistent_key(&env, &key, max_ttl);
         }
         let reserve_key = DataKey::CrossChainReserve(key_asset.clone());
         if env.storage().persistent().has(&reserve_key) {
-            env.storage()
-                .persistent()
-                .extend_ttl(&reserve_key, threshold, max_ttl);
+            actual_ttl = extend_persistent_key(&env, &reserve_key, max_ttl);
         }
         let fee_cap_key = DataKey::AssetFeeCap(key_asset.clone());
         if env.storage().persistent().has(&fee_cap_key) {
-            env.storage().persistent().extend_ttl(&fee_cap_key, threshold, max_ttl);
+            actual_ttl = extend_persistent_key(&env, &fee_cap_key, max_ttl);
         }
         env.events()
-            .publish(("PersistentTtlExtended",), (admin, key_asset, max_ttl));
+            .publish(("PersistentTtlExtended",), (admin, key_asset, actual_ttl));
         Ok(())
     }
 
@@ -4717,12 +4729,10 @@ impl OnboardingBridge {
         if !env.storage().persistent().has(&key) {
             return Err(BridgeError::TimelockNotFound);
         }
-        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, threshold, max_ttl);
+        let max_ttl = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
+        let actual_ttl = extend_persistent_key(&env, &key, max_ttl);
         env.events()
-            .publish(("TimelockTtlExtended",), (id, max_ttl));
+            .publish(("TimelockTtlExtended",), (id, actual_ttl));
         Ok(())
     }
 
@@ -4753,12 +4763,10 @@ impl OnboardingBridge {
         if !env.storage().persistent().has(&key) {
             return Err(BridgeError::CommitmentNotFound);
         }
-        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, threshold, max_ttl);
+        let max_ttl = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
+        let actual_ttl = extend_persistent_key(&env, &key, max_ttl);
         env.events()
-            .publish(("CommitmentTtlExtended",), (id, max_ttl));
+            .publish(("CommitmentTtlExtended",), (id, actual_ttl));
         Ok(())
     }
 
@@ -4789,12 +4797,10 @@ impl OnboardingBridge {
         if !env.storage().persistent().has(&key) {
             return Err(BridgeError::NotRelayer);
         }
-        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, threshold, max_ttl);
+        let max_ttl = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
+        let actual_ttl = extend_persistent_key(&env, &key, max_ttl);
         env.events()
-            .publish(("RelayerTtlExtended",), (pubkey, max_ttl));
+            .publish(("RelayerTtlExtended",), (pubkey, actual_ttl));
         Ok(())
     }
 
@@ -4835,7 +4841,8 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
+        let max_ttl = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
+        let mut actual_ttl = max_ttl;
         for key in [
             DataKey::SourceDailyLimit(source.clone(), asset.clone()),
             DataKey::DailyUsage(source.clone(), asset.clone(), current_day(&env)),
@@ -4848,14 +4855,12 @@ impl OnboardingBridge {
             DataKey::MetaSigner(source.clone()),
         ] {
             if env.storage().persistent().has(&key) {
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&key, threshold, max_ttl);
+                actual_ttl = extend_persistent_key(&env, &key, max_ttl);
             }
         }
         env.events().publish(
             ("SourcePersistentTtlExtended",),
-            (admin, source, asset, max_ttl),
+            (admin, source, asset, actual_ttl),
         );
         Ok(())
     }
@@ -4864,13 +4869,12 @@ impl OnboardingBridge {
     /// `extend_instance_ttl` helper called on every mutating operation.
     ///
     /// Values above `MAX_ALLOWED_TTL` are silently capped. Values below
-    /// `MIN_ALLOWED_TTL` are rejected outright: `extend_instance_ttl` derives
-    /// its extension threshold as `max_ttl / 4`, so a max of `0` (or any very
-    /// small value) would make the threshold `0` too, effectively disabling
-    /// TTL extension and risking near-term expiry of all instance data.
+    /// `MIN_ALLOWED_TTL` are rejected outright: a max of `0` (or any very
+    /// small value) would make the internal extension threshold `0` too,
+    /// effectively disabling TTL extension and risking near-term expiry of all
+    /// instance data.
     ///
-    /// # Arguments
-    ///
+    /// # Arguments    ///
     /// * `ttl` (`u32`) — New maximum in ledgers. Must be ≥ `MIN_ALLOWED_TTL`.
     ///
     /// # Authorization
@@ -4912,8 +4916,8 @@ impl OnboardingBridge {
     ///
     /// Values above `MAX_ALLOWED_TTL` are silently capped. Values below
     /// `MIN_ALLOWED_TTL` are rejected for the same reason as
-    /// `set_max_instance_ttl`: a near-zero max would collapse the extension
-    /// threshold to zero and disable TTL extension entirely.
+    /// `set_max_instance_ttl`: a near-zero max would collapse the internal
+    /// extension threshold to zero and disable TTL extension entirely.
     ///
     /// # Arguments
     ///
