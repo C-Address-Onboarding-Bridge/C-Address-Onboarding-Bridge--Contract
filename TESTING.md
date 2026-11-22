@@ -22,7 +22,7 @@ Contract tests use Rust's `#[test]` attribute with the [soroban-sdk](https://doc
 - Mock ledger and blockchain context
 - Simulated contract registration and calls
 - Event inspection and assertion
-- Snapshot testing for storage state verification
+- Snapshot generation for storage state verification (local only, not committed)
 
 ### Key Testing Components
 
@@ -253,7 +253,7 @@ fn test_storage_snapshot() {
 }
 ```
 
-Snapshot files are stored in `test_snapshots/` directory and checked into git. Snapshots make it easy to review what changed when contract behavior changes.
+Snapshot files are written to `test_snapshots/` directories by `cargo test` and are **not** tracked in git: `.gitignore` excludes `test_snapshots/` and `**/test_snapshots/`. They are local, auto-generated artifacts — regenerate them by running the test suite from a clean checkout rather than committing them. If a snapshot diff looks wrong, delete the affected `test_snapshots/` directory and re-run the tests to regenerate it.
 
 ### Coverage Expectations
 
