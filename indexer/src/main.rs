@@ -253,10 +253,10 @@ async fn health() -> impl IntoResponse {
 
 async fn list_events(
     State(state): State<Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<EventQuery>,
+    axum::extract::Query(params): axum::extract::Query<events::EventQuery>,
 ) -> impl IntoResponse {
-    let limit = params.limit.unwrap_or(50).min(500);
-    let offset = params.offset.unwrap_or(0);
+    let limit = events::clamp_limit(params.limit, 50);
+    let offset = events::clamp_offset(params.offset);
     match state.db.list_events(limit, offset).await {
         Ok(events) => Json(events).into_response(),
         Err(e) => {
@@ -269,10 +269,10 @@ async fn list_events(
 async fn list_events_by_type(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(event_type): axum::extract::Path<String>,
-    axum::extract::Query(params): axum::extract::Query<EventQuery>,
+    axum::extract::Query(params): axum::extract::Query<events::EventQuery>,
 ) -> impl IntoResponse {
-    let limit = params.limit.unwrap_or(50).min(500);
-    let offset = params.offset.unwrap_or(0);
+    let limit = events::clamp_limit(params.limit, 50);
+    let offset = events::clamp_offset(params.offset);
     match state
         .db
         .list_events_by_type(&event_type, limit, offset)
@@ -374,10 +374,70 @@ async fn replay_events(
     }
 }
 
-#[derive(serde::Deserialize)]
-struct EventQuery {
-    limit: Option<i64>,
-    offset: Option<i64>,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    async fn test_app() -> Router {
+        let db = db::Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        for i in 0..3 {
+            db.insert_event(&events::IndexedEvent {
+                id: format!("evt-{i}"),
+                event_type: "CAddressFunded".to_string(),
+                ledger_sequence: i,
+                contract_id: "C...".to_string(),
+                tx_hash: format!("tx-{i}"),
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+                data: serde_json::json!({}),
+            })
+            .await
+            .expect("insert event");
+        }
+        build_app(Arc::new(AppState {
+            db,
+            rpc_url: String::new(),
+            contract_id: String::new(),
+            rpc_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::new(),
+            api_key_hash: String::new(),
+            lookback_ledgers: 0,
+        }))
+    }
+
+    async fn get_events(uri: &str) -> Vec<serde_json::Value> {
+        let response = test_app()
+            .await
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .expect("request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        serde_json::from_slice(&body).expect("json")
+    }
+
+    #[tokio::test]
+    async fn list_events_clamps_negative_limit() {
+        let events = get_events("/api/events?limit=-1").await;
+        assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_events_clamps_oversized_limit() {
+        let events = get_events("/api/events?limit=100000").await;
+        assert!(events.len() <= events::MAX_PAGE_LIMIT as usize);
+    }
+
+    #[tokio::test]
+    async fn list_events_clamps_negative_offset() {
+        let events = get_events("/api/events?offset=-5").await;
+        assert_eq!(events.len(), 3);
+    }
 }
 
 #[derive(serde::Deserialize)]
