@@ -65,23 +65,52 @@ fn is_private_or_reserved(ip: IpAddr) -> bool {
                 || (v4.octets()[0] >= 240)
         }
         IpAddr::V6(v6) => {
+            let segments = v6.segments();
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()   // ff00::/8
                 // fc00::/7 — unique local
-                || ((v6.segments()[0] & 0xFE00) == 0xFC00)
+                || ((segments[0] & 0xFE00) == 0xFC00)
                 // fe80::/10 — link-local
-                || ((v6.segments()[0] & 0xFFC0) == 0xFE80)
+                || ((segments[0] & 0xFFC0) == 0xFE80)
+                // fec0::/10 — deprecated site-local
+                || ((segments[0] & 0xFFC0) == 0xFEC0)
+                // 64:ff9b:1::/48 — local-use NAT64
+                || (segments[0] == 0x0064
+                    && segments[1] == 0xFF9B
+                    && segments[2] == 0x0001)
+                // 2001:db8::/32 — documentation
+                || (segments[0] == 0x2001 && segments[1] == 0x0DB8)
         }
     }
 }
 
-/// Check if an IPv6 address is IPv4-mapped or compatible, and if so, return the
-/// embedded IPv4 address. Otherwise return the original IPv6 address.
+/// Check if an IPv6 address embeds an IPv4 address (IPv4-mapped,
+/// IPv4-compatible, NAT64 or 6to4) and, if so, return the embedded IPv4
+/// address. Otherwise return the original IPv6 address.
 fn unwrap_ipv4_mapped_or_compatible(ip: IpAddr) -> IpAddr {
     if let IpAddr::V6(v6) = ip {
         if let Some(v4) = v6.to_ipv4_mapped() {
             return IpAddr::V4(v4);
+        }
+        let segments = v6.segments();
+        // ::a.b.c.d — IPv4-compatible, excluding :: and ::1
+        if segments[..6].iter().all(|&s| s == 0) && !v6.is_loopback() && !v6.is_unspecified() {
+            let o = v6.octets();
+            return IpAddr::V4(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+        }
+        // 64:ff9b::/96 — NAT64 well-known prefix
+        if segments[0] == 0x0064
+            && segments[1] == 0xFF9B
+            && segments[2..6].iter().all(|&s| s == 0)
+        {
+            let o = v6.octets();
+            return IpAddr::V4(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+        }
+        // 2002::/16 — 6to4, embedded IPv4 in segments 1 and 2
+        if segments[0] == 0x2002 {
+            let o = v6.octets();
+            return IpAddr::V4(std::net::Ipv4Addr::new(o[2], o[3], o[4], o[5]));
         }
     }
     ip
@@ -586,6 +615,72 @@ mod tests {
     async fn test_ipv6_multicast_is_rejected() {
         // ff02::1 is IPv6 multicast
         let err = validate_webhook_url("http://[ff02::1]/hook").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ipv4_compatible_ipv6_loopback_is_rejected() {
+        // ::127.0.0.1 is IPv4-compatible loopback
+        let err = validate_webhook_url("http://[::127.0.0.1]/hook").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nat64_private_ipv4_is_rejected() {
+        // 64:ff9b::10.0.0.1 embeds a private IPv4 address
+        let err = validate_webhook_url("http://[64:ff9b::10.0.0.1]/hook").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_6to4_private_ipv4_is_rejected() {
+        // 2002:0a00:0001:: embeds 10.0.0.1
+        let err = validate_webhook_url("http://[2002:a00:1::]/hook").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ipv6_site_local_is_rejected() {
+        // fec0::1 is in the deprecated fec0::/10 site-local range
+        let err = validate_webhook_url("http://[fec0::1]/hook").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nat64_local_use_prefix_is_rejected() {
+        // 64:ff9b:1::1 is in the local-use NAT64 prefix
+        let err = validate_webhook_url("http://[64:ff9b:1::1]/hook").await.unwrap_err();
+        assert!(
+            matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ipv6_documentation_range_is_rejected() {
+        // 2001:db8::1 is in the documentation range
+        let err = validate_webhook_url("http://[2001:db8::1]/hook").await.unwrap_err();
         assert!(
             matches!(err, UrlValidationError::PrivateOrReservedHost(_)),
             "got: {:?}",
