@@ -5614,6 +5614,26 @@ fn test_emergency_migrate_basic() {
 }
 
 #[test]
+fn test_query_is_deactivated_and_migrated_to() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert!(!bridge.query_is_deactivated());
+    assert_eq!(bridge.query_migrated_to(), None);
+
+    let new_contract = Address::generate(&env);
+    env.mock_all_auths();
+    bridge.emergency_migrate(&new_contract, &false, &None);
+
+    assert!(bridge.query_is_deactivated());
+    assert_eq!(bridge.query_migrated_to(), Some(new_contract));
+}
+
+#[test]
 fn test_emergency_migrate_extends_instance_ttl() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);

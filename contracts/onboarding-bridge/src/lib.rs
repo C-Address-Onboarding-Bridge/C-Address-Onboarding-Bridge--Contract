@@ -256,6 +256,8 @@ pub enum DataKey {
     // accept meta-transaction signatures from.
     MetaSigner(Address),
     Deactivated,
+    // Issue #1114: address the contract was emergency-migrated to.
+    MigratedTo,
     // Admin-managed whitelist of DEX pool addresses usable in `swap_route`.
     PoolWhitelist,
     AssetWhitelistEntry(Address),
@@ -727,6 +729,10 @@ fn set_paused(env: &Env, paused: bool) {
 
 fn is_deactivated(env: &Env) -> bool {
     env.storage().instance().has(&DataKey::Deactivated)
+}
+
+fn read_migrated_to(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::MigratedTo)
 }
 
 fn check_not_deactivated(env: &Env) -> Result<(), BridgeError> {
@@ -2269,6 +2275,17 @@ impl OnboardingBridge {
         read_pending_admin(&env)
     }
 
+    /// Returns `true` once the contract has been emergency-migrated and is
+    /// therefore deactivated.
+    pub fn query_is_deactivated(env: Env) -> bool {
+        is_deactivated(&env)
+    }
+
+    /// Returns the address the contract was emergency-migrated to, if any.
+    pub fn query_migrated_to(env: Env) -> Option<Address> {
+        read_migrated_to(&env)
+    }
+
     /// Cancels a pending admin handoff.
     pub fn clear_pending_admin(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
@@ -3297,6 +3314,9 @@ impl OnboardingBridge {
         }
 
         env.storage().instance().set(&DataKey::Deactivated, &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::MigratedTo, &new_contract);
         extend_instance_ttl(&env);
         env.events()
             .publish(("EmergencyMigrated", admin), (new_contract,));
