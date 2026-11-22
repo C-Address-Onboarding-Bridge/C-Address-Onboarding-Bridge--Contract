@@ -190,7 +190,9 @@ pub enum BridgeError {
     TooManyFeeTiers = 51,
     /// Cross-chain payouts exceed the admin-funded liquidity reserve.
     InsufficientCrossChainReserve = 52,
-    // Next free discriminant: 53. Always take the next unused value here and
+    /// The effective fee exceeds the caller-supplied `max_fee_bps` cap.
+    FeeExceedsMaxFeeBps = 53,
+    // Next free discriminant: 54. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
 
@@ -405,6 +407,10 @@ pub struct TimelockEntry {
     pub cliff_time: u64,
     /// Set to `true` once `claim_timelocked` has been successfully called.
     pub claimed: bool,
+    /// Effective fee rate (basis points) snapshotted at deposit time. Claims
+    /// charge `min(effective_fee_bps, current effective fee)` so a later
+    /// `set_fee_bps` increase cannot retroactively tax an existing deposit.
+    pub effective_fee_bps: u32,
 }
 
 /// A scheduled WASM upgrade waiting for its timelock to elapse.
