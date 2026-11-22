@@ -45,9 +45,10 @@
 //! 1. **Sequential nonce** (`DataKey::Nonce`) — optional `nonce: Option<u64>` parameter
 //!    on every mutating function. Pass `None` to skip (standard Stellar transaction
 //!    replay protection applies). Pass `Some(n)` to enforce strict ordering.
-//! 2. **Auth-entry nonce** (`DataKey::UsedAuthNonce`) — used by `verify_auth_entry` to
+//! 2. **Auth-entry nonce** (`DataKey::AuthNonce`) — used by `verify_auth_entry` to
 //!    permanently burn a `(source, nonce)` pair within a ledger-sequence window, preventing
-//!    Soroban authorization-entry reuse.
+//!    Soroban authorization-entry reuse. A single per-source counter records the next
+//!    expected nonce; every nonce below it is considered used.
 
 #![no_std]
 // TODO(next-bounty): both allows below cover a backlog left by the first bounty
@@ -231,8 +232,9 @@ pub enum DataKey {
     MaxInstanceTtl,
     MaxPersistentTtl,
     BridgeConfig,
-    // Issue #95: per-address auth nonce counter and used-nonce set
+    // Issue #95: per-address auth nonce counter (nonces below it are used)
     AuthNonce(Address),
+    // Deprecated: superseded by `AuthNonce`; kept so the enum layout is stable.
     UsedAuthNonce(Address, u64),
     // Issue #72: timelocked upgrade path
     PendingUpgrade,
@@ -1109,7 +1111,7 @@ fn consume_nonce(env: &Env, caller: &Address, nonce: Option<u64>) -> Result<(), 
 //   1. Binds the nonce to the current contract ID (implicitly — stored under this
 //      contract's own persistent storage, keyed by source address).
 //   2. Checks that the current ledger sequence is within the caller-supplied window.
-//   3. Records the (source, nonce) pair as used, preventing replay in any future
+//   3. Advances the per-source counter, preventing replay in any future
 //      transaction regardless of ledger sequence.
 //   4. Emits `AuthUsed(source, nonce)` so off-chain indexers can track usage.
 
@@ -1121,25 +1123,18 @@ fn read_auth_nonce(env: &Env, source: &Address) -> u64 {
 }
 
 fn is_auth_nonce_used(env: &Env, source: &Address, nonce: u64) -> bool {
-    env.storage()
-        .persistent()
-        .get(&DataKey::UsedAuthNonce(source.clone(), nonce))
-        .unwrap_or(false)
+    // The counter is the single source of truth: every nonce below it has been
+    // consumed, so no per-nonce entry needs to be stored.
+    nonce < read_auth_nonce(env, source)
 }
 
 fn mark_auth_nonce_used(env: &Env, source: &Address, nonce: u64) -> Result<(), BridgeError> {
-    env.storage()
-        .persistent()
-        .set(&DataKey::UsedAuthNonce(source.clone(), nonce), &true);
     // Advance the per-address counter so clients can always discover the next
     // expected nonce without scanning storage.
-    let current = read_auth_nonce(env, source);
-    if nonce >= current {
-        let next = nonce.checked_add(1).ok_or(BridgeError::Overflow)?;
-        env.storage()
-            .persistent()
-            .set(&DataKey::AuthNonce(source.clone()), &next);
-    }
+    let next = nonce.checked_add(1).ok_or(BridgeError::Overflow)?;
+    env.storage()
+        .persistent()
+        .set(&DataKey::AuthNonce(source.clone()), &next);
     Ok(())
 }
 
@@ -1165,17 +1160,17 @@ fn consume_auth_nonce(
         return Err(BridgeError::AuthNonceExpired);
     }
 
-    // 2. Enforce monotonic sequencing before checking the used-nonce set.
-    if nonce != read_auth_nonce(env, source) {
+    // 2. Enforce monotonic sequencing. A nonce below the counter has already
+    //    been consumed; a nonce above it skips ahead.
+    let current = read_auth_nonce(env, source);
+    if nonce < current {
+        return Err(BridgeError::AuthNonceAlreadyUsed);
+    }
+    if nonce > current {
         return Err(BridgeError::DuplicateNonce);
     }
 
-    // 3. Used-nonce check (prevents exact replay of this (source, nonce) pair)
-    if is_auth_nonce_used(env, source, nonce) {
-        return Err(BridgeError::AuthNonceAlreadyUsed);
-    }
-
-    // 4. Mark as used and advance the per-address counter
+    // 3. Mark as used by advancing the per-address counter
     mark_auth_nonce_used(env, source, nonce)?;
 
     // 4. Emit AuthUsed event for off-chain indexers
@@ -5082,8 +5077,8 @@ impl OnboardingBridge {
     ///
     /// 1. Requiring the current ledger sequence to be within
     ///    `[valid_after_ledger, valid_before_ledger)`.
-    /// 2. Checking that `(source, nonce)` has not been used before.
-    /// 3. Permanently marking the pair as used in persistent storage.
+    /// 2. Checking that `nonce` equals the source's current auth nonce counter.
+    /// 3. Advancing the counter, which permanently burns the pair.
     /// 4. Emitting `AuthUsed(source, nonce)` for off-chain tracking.
     ///
     /// The nonce is scoped to this contract's own persistent storage, so the
@@ -5092,7 +5087,7 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `source` (`Address`) — The address whose authorization entry is consumed.
-    /// * `nonce` (`u64`) — The nonce to burn. Must not have been used before.
+    /// * `nonce` (`u64`) — The nonce to burn. Must equal the current counter.
     /// * `valid_after_ledger` (`u32`) — Inclusive lower bound on the current
     ///   ledger sequence number.
     /// * `valid_before_ledger` (`u32`) — Exclusive upper bound on the current
@@ -5108,8 +5103,9 @@ impl OnboardingBridge {
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
     /// * [`BridgeError::AuthNonceExpired`] — Current ledger sequence is outside
     ///   the `[valid_after_ledger, valid_before_ledger)` window.
-    /// * [`BridgeError::AuthNonceAlreadyUsed`] — This `(source, nonce)` pair has
-    ///   already been consumed.
+    /// * [`BridgeError::AuthNonceAlreadyUsed`] — `nonce` is below the current
+    ///   counter, i.e. this `(source, nonce)` pair has already been consumed.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` is above the current counter.
     ///
     /// # Events
     ///
@@ -5162,6 +5158,9 @@ impl OnboardingBridge {
     }
 
     /// Returns `true` if a specific auth nonce has already been consumed for `source`.
+    ///
+    /// A nonce is considered used when it is below the source's current auth
+    /// nonce counter.
     ///
     /// # Arguments
     ///
