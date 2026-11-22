@@ -370,7 +370,10 @@ fn parse_contract_event(
             }
         }
         // ("AdminProposed", admin, new_admin) / ("AdminTransferred", old_admin, pending)
-        BridgeEventType::AdminProposed | BridgeEventType::AdminTransferred => {
+        // ("AdminChanged", old_admin, new_admin) - one-step set_admin path
+        BridgeEventType::AdminProposed
+        | BridgeEventType::AdminTransferred
+        | BridgeEventType::AdminChanged => {
             if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
                 data.insert(
                     "from".to_string(),
@@ -382,9 +385,11 @@ fn parse_contract_event(
             }
         }
         // ("FeeCollectorTransferProposed", admin, new_collector) /
-        // ("FeeCollectorTransferred", old, pending)
+        // ("FeeCollectorTransferred", old, pending) /
+        // ("FeeCollectorChanged", old_collector, new_collector)
         BridgeEventType::FeeCollectorTransferProposed
-        | BridgeEventType::FeeCollectorTransferred => {
+        | BridgeEventType::FeeCollectorTransferred
+        | BridgeEventType::FeeCollectorChanged => {
             if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
                 data.insert(
                     "from".to_string(),
@@ -395,6 +400,22 @@ fn parse_contract_event(
                 data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
             }
         }
+        // ("MetaSignerRegistered", source) / ("MetaSignerUnregistered", source)
+        BridgeEventType::MetaSignerRegistered | BridgeEventType::MetaSignerUnregistered => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "source");
+        }
+        // ("RelayerAdded",) - admin and pubkey carried in value, not topics
+        BridgeEventType::RelayerAdded => {}
+        // ("AdminTransferCancelled",) / ("FeeCollectorTransferCancelled",) /
+        // ("FeeTiersSet", admin) / ("LoyaltyTokenSet", admin) - admin in topics[1]
+        BridgeEventType::AdminTransferCancelled
+        | BridgeEventType::FeeCollectorTransferCancelled
+        | BridgeEventType::FeeTiersSet
+        | BridgeEventType::LoyaltyTokenSet => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "admin");
+        }
+        // ("CommitmentCancelled",) - commitment_id and source carried in value
+        BridgeEventType::CommitmentCancelled => {}
         _ => {
             // CommitFund, BatchTransferFailed, and the remaining admin/config
             // events all publish (name, source, target).
