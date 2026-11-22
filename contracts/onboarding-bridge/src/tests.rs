@@ -7137,3 +7137,311 @@ fn test_set_max_withdraw_per_tx_paused() {
         Err(Ok(BridgeError::ContractPaused))
     );
 }
+
+/********** extend_commitment_ttl tests **********/
+
+fn setup_commitment(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, u64) {
+    let (admin, user, fee_collector) = create_test_users(env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(env);
+    let bridge = create_bridge_client(env, &bridge_id);
+    init_token(env, &token_id, &admin);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    let target = Address::generate(env);
+    let id = bridge.commit_fund(
+        &user,
+        &target,
+        &token_id,
+        &BytesN::from_array(env, &[3u8; 32]),
+        &(env.ledger().timestamp() + 1_000),
+    );
+    (bridge, bridge_id, id)
+}
+
+#[test]
+fn test_extend_commitment_ttl_extends_persistent_entry() {
+    let env = Env::default();
+    let (bridge, bridge_id, id) = setup_commitment(&env);
+
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    bridge.extend_commitment_ttl(&id, &200_000u32);
+
+    let ttl = env.as_contract(&bridge_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Commitment(id))
+    });
+    assert!(ttl >= 200_000);
+    assert_eq!(
+        count_events_with_topic(&env, &bridge_id, "CommitmentTtlExtended"),
+        1
+    );
+}
+
+#[test]
+fn test_extend_commitment_ttl_caps_at_max_allowed_ttl() {
+    let env = Env::default();
+    let (bridge, bridge_id, id) = setup_commitment(&env);
+
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    bridge.extend_commitment_ttl(&id, &(MAX_ALLOWED_TTL * 2));
+
+    let ttl = env.as_contract(&bridge_id, || {
+        env.storage().persistent().get_ttl(&DataKey::Commitment(id))
+    });
+    assert!(ttl >= MAX_ALLOWED_TTL);
+    assert_eq!(
+        count_events_with_topic(&env, &bridge_id, "CommitmentTtlExtended"),
+        1
+    );
+}
+
+#[test]
+fn test_extend_commitment_ttl_not_initialized_fails() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_extend_commitment_ttl(&0u64, &200_000u32),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_extend_commitment_ttl_missing_commitment_fails() {
+    let env = Env::default();
+    let (bridge, bridge_id, _id) = setup_commitment(&env);
+
+    assert_eq!(
+        bridge.try_extend_commitment_ttl(&999u64, &200_000u32),
+        Err(Ok(BridgeError::CommitmentNotFound))
+    );
+    assert_eq!(
+        count_events_with_topic(&env, &bridge_id, "CommitmentTtlExtended"),
+        0
+    );
+}
+
+/********** extend_relayer_ttl tests **********/
+
+fn setup_relayer(env: &Env) -> (crate::OnboardingBridgeClient<'_>, Address, BytesN<32>) {
+    let (admin, _user, fee_collector) = create_test_users(env);
+    let (bridge_id, _) = register_all_contracts_mocked(env);
+    let bridge = create_bridge_client(env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let pubkey = BytesN::from_array(env, &[7u8; 32]);
+    bridge.add_relayer(&pubkey, &None);
+    (bridge, bridge_id, pubkey)
+}
+
+#[test]
+fn test_extend_relayer_ttl_extends_persistent_entry() {
+    let env = Env::default();
+    let (bridge, bridge_id, pubkey) = setup_relayer(&env);
+
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    bridge.extend_relayer_ttl(&pubkey, &200_000u32);
+
+    let ttl = env.as_contract(&bridge_id, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::Relayer(pubkey.clone()))
+    });
+    assert!(ttl >= 200_000);
+    assert_eq!(
+        count_events_with_topic(&env, &bridge_id, "RelayerTtlExtended"),
+        1
+    );
+}
+
+#[test]
+fn test_extend_relayer_ttl_caps_at_max_allowed_ttl() {
+    let env = Env::default();
+    let (bridge, bridge_id, pubkey) = setup_relayer(&env);
+
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    bridge.extend_relayer_ttl(&pubkey, &(MAX_ALLOWED_TTL * 2));
+
+    let ttl = env.as_contract(&bridge_id, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::Relayer(pubkey.clone()))
+    });
+    assert!(ttl >= MAX_ALLOWED_TTL);
+    assert_eq!(
+        count_events_with_topic(&env, &bridge_id, "RelayerTtlExtended"),
+        1
+    );
+}
+
+#[test]
+fn test_extend_relayer_ttl_not_initialized_fails() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_extend_relayer_ttl(&BytesN::from_array(&env, &[7u8; 32]), &200_000u32),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_extend_relayer_ttl_unknown_relayer_fails() {
+    let env = Env::default();
+    let (bridge, bridge_id, _pubkey) = setup_relayer(&env);
+
+    assert_eq!(
+        bridge.try_extend_relayer_ttl(&BytesN::from_array(&env, &[9u8; 32]), &200_000u32),
+        Err(Ok(BridgeError::NotRelayer))
+    );
+    assert_eq!(
+        count_events_with_topic(&env, &bridge_id, "RelayerTtlExtended"),
+        0
+    );
+}
+
+/********** cancel_upgrade tests **********/
+
+#[test]
+fn test_cancel_upgrade_clears_pending_and_blocks_execute() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let wasm_hash = BytesN::from_array(&env, &[1u8; 32]);
+    let executable_after_ledger = bridge.schedule_upgrade(&wasm_hash, &None);
+    assert!(bridge.query_pending_upgrade().is_some());
+
+    bridge.cancel_upgrade(&None);
+    assert_eq!(bridge.query_pending_upgrade(), None);
+    assert_eq!(
+        count_events_with_topic(&env, &bridge_id, "UpgradeCancelled"),
+        1
+    );
+
+    advance_ledger_sequence(&env, executable_after_ledger);
+    assert_eq!(
+        bridge.try_execute_upgrade(&wasm_hash, &None),
+        Err(Ok(BridgeError::UpgradeNotScheduled))
+    );
+}
+
+#[test]
+fn test_cancel_upgrade_not_initialized_fails() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_cancel_upgrade(&None),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_cancel_upgrade_nothing_pending_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert_eq!(
+        bridge.try_cancel_upgrade(&None),
+        Err(Ok(BridgeError::UpgradeNotScheduled))
+    );
+}
+
+#[test]
+fn test_cancel_upgrade_duplicate_nonce_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.schedule_upgrade(&BytesN::from_array(&env, &[1u8; 32]), &None);
+
+    // The admin's nonce is still 0; passing 1 must be rejected.
+    assert_eq!(
+        bridge.try_cancel_upgrade(&Some(1u64)),
+        Err(Ok(BridgeError::DuplicateNonce))
+    );
+    assert!(bridge.query_pending_upgrade().is_some());
+}
+
+#[test]
+fn test_cancel_upgrade_twice_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    bridge.schedule_upgrade(&BytesN::from_array(&env, &[1u8; 32]), &None);
+
+    bridge.cancel_upgrade(&None);
+    assert_eq!(
+        bridge.try_cancel_upgrade(&None),
+        Err(Ok(BridgeError::UpgradeNotScheduled))
+    );
+    assert_eq!(
+        count_events_with_topic(&env, &bridge_id, "UpgradeCancelled"),
+        1
+    );
+}
+
+/********** try_accept_fee_collector tests **********/
+
+#[test]
+fn test_try_accept_fee_collector_not_initialized_fails() {
+    let env = Env::default();
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert_eq!(
+        bridge.try_accept_fee_collector(),
+        Err(Ok(BridgeError::NotInitialized))
+    );
+}
+
+#[test]
+fn test_try_accept_fee_collector_nothing_pending_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert_eq!(
+        bridge.try_accept_fee_collector(),
+        Err(Ok(BridgeError::Unauthorized))
+    );
+}
+
+#[test]
+fn test_try_accept_fee_collector_wrong_signer_rejected() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let new_collector = Address::generate(&env);
+    bridge.propose_new_fee_collector(&new_collector, &None);
+
+    // Drop the mocked auths so the pending collector's require_auth() fails.
+    use soroban_sdk::xdr::SorobanAuthorizationEntry;
+    env.set_auths(&[] as &[SorobanAuthorizationEntry]);
+
+    assert!(bridge.try_accept_fee_collector().is_err());
+    assert_eq!(bridge.query_fee_collector(), fee_collector);
+}
