@@ -417,6 +417,9 @@ jobs:
       - name: Syntax-check JavaScript example
         run: node --check examples/javascript/full-integration.js
 
+      - name: Check JavaScript example imports resolve
+        run: node -e "const sdk = require('@stellar/stellar-sdk'); if (!sdk.rpc || !sdk.rpc.Server) { throw new Error('@stellar/stellar-sdk does not export rpc.Server'); } console.log('JS example imports resolve');"
+
   sdk-matrix:
     name: SDK Compatibility Matrix
     runs-on: ubuntu-latest
