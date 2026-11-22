@@ -2457,7 +2457,7 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
-    /// * `("ReferralRateChanged", bps)` — no additional data.
+    /// * `("ReferralRateChanged", old_bps, new_bps)` — data: `(admin,)`
     pub fn set_referral_rate(env: Env, bps: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
@@ -2467,8 +2467,10 @@ impl OnboardingBridge {
             return Err(BridgeError::FeeTooHigh);
         }
         extend_instance_ttl(&env);
+        let old_bps = read_referral_rate(&env);
         save_referral_rate(&env, bps);
-        env.events().publish(("ReferralRateChanged", bps), ());
+        env.events()
+            .publish(("ReferralRateChanged", old_bps, bps), (admin,));
         Ok(())
     }
 
@@ -3812,7 +3814,9 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
-    /// * `("LoyaltyTokenSet", admin)` — data: `(token, amount_per_fund)`
+    /// * `("LoyaltyTokenSet", old_token, new_token)` — data:
+    ///   `(admin, old_amount_per_fund, new_amount_per_fund)`. `old_token` is
+    ///   `None` when no loyalty token was configured before this call.
     pub fn set_loyalty_token(
         env: Env,
         token: Address,
@@ -3826,11 +3830,15 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
+        let old_token = read_loyalty_token(&env);
+        let old_amount_per_fund = read_loyalty_amount_per_fund(&env);
         save_loyalty_token(&env, &token);
         save_loyalty_amount_per_fund(&env, &amount_per_fund);
         extend_instance_ttl(&env);
-        env.events()
-            .publish(("LoyaltyTokenSet", admin), (token, amount_per_fund));
+        env.events().publish(
+            ("LoyaltyTokenSet", old_token, token),
+            (admin, old_amount_per_fund, amount_per_fund),
+        );
         Ok(())
     }
 
@@ -3888,7 +3896,8 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
-    /// * `("FeeTiersSet", admin)` — data: `(tiers.len(),)`
+    /// * `("FeeTiersSet", old_tier_count, new_tier_count)` — data:
+    ///   `(admin, tiers)` where `tiers` is the full `Vec<FeeTier>` now in force.
     pub fn set_fee_tiers(
         env: Env,
         tiers: Vec<FeeTier>,
@@ -3915,9 +3924,14 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
+        let old_tier_count = read_fee_tiers(&env).map_or(0, |old| old.len());
+        let new_tier_count = tiers.len();
         save_fee_tiers(&env, &tiers);
         extend_instance_ttl(&env);
-        env.events().publish(("FeeTiersSet", admin), (tiers.len(),));
+        env.events().publish(
+            ("FeeTiersSet", old_tier_count, new_tier_count),
+            (admin, tiers),
+        );
         Ok(())
     }
 
@@ -4328,7 +4342,8 @@ impl OnboardingBridge {
         let old_threshold = relayer_threshold(&env);
         save_relayer_threshold(&env, threshold);
         extend_instance_ttl(&env);
-        env.events().publish(("RelayerThresholdChanged",), (admin, old_threshold, threshold));
+        env.events()
+            .publish(("RelayerThresholdChanged", old_threshold, threshold), (admin,));
         Ok(())
     }
 
@@ -4887,7 +4902,8 @@ impl OnboardingBridge {
             .instance()
             .set(&DataKey::MaxInstanceTtl, &capped);
         extend_instance_ttl(&env);
-        env.events().publish(("MaxInstanceTtlChanged",), (admin, old_ttl, capped));
+        env.events()
+            .publish(("MaxInstanceTtlChanged", old_ttl, capped), (admin,));
         Ok(())
     }
 
