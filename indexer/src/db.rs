@@ -77,6 +77,36 @@ impl Database {
         Ok(())
     }
 
+    /// Read the persisted RPC pagination cursor (`indexer_state.last_cursor`).
+    pub async fn get_last_cursor(&self) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM indexer_state WHERE key = 'last_cursor'")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(v,)| v))
+    }
+
+    /// Persist the RPC pagination cursor so the next poll resumes from it.
+    pub async fn set_last_cursor(&self, cursor: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO indexer_state (key, value) VALUES ('last_cursor', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = ?1",
+        )
+        .bind(cursor)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Drop the persisted RPC cursor (e.g. after it expired server-side) so the
+    /// next poll falls back to `startLedger`.
+    pub async fn clear_last_cursor(&self) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM indexer_state WHERE key = 'last_cursor'")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Insert an event, ignoring it if its id was already indexed.
     ///
     /// Returns `true` when a new row was written and `false` when the event was

@@ -120,7 +120,11 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
     // MAX_EVENTS_PER_POLL events in a single poll window are never silently
     // dropped.  We persist the ledger position after each page completes so
     // the next poll resumes exactly where we left off.
-    let mut cursor: Option<String> = None;
+    //
+    // #882 - resume from the persisted RPC cursor when one exists.  The cursor
+    // and `startLedger` are mutually exclusive in `getEvents`, so only one of
+    // them is ever sent.
+    let mut cursor: Option<String> = state.db.get_last_cursor().await?;
     let mut max_ledger = start_ledger;
 
     loop {
@@ -167,6 +171,22 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
         // #637 - surface JSON-RPC errors instead of treating them as no events.
         if let Some(err) = body.get("error") {
             let message = err.to_string();
+
+            // #882 - a persisted cursor can expire server-side.  Drop it and
+            // let the next poll fall back to `startLedger`.
+            if cursor.is_some()
+                && (message.contains("cursor")
+                    || message.contains("Cursor")
+                    || message.contains("expired"))
+            {
+                tracing::warn!(
+                    "Persisted RPC cursor is no longer valid ({}). \
+                     Clearing it and falling back to startLedger.",
+                    message
+                );
+                state.db.clear_last_cursor().await?;
+                return Ok(());
+            }
 
             // #636 - recover to the latest ledger tip when the requested
             // start ledger is outside the RPC's retention window.  Only the
@@ -251,6 +271,12 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
         // page after a crash) safe and idempotent.
         if !events.is_empty() || max_ledger > start_ledger {
             state.db.set_last_ledger(max_ledger).await?;
+        }
+
+        // #882 - persist the RPC cursor alongside the ledger so the next poll
+        // resumes from the exact position instead of re-scanning the ledger.
+        if let Some(ref c) = next_cursor {
+            state.db.set_last_cursor(c).await?;
         }
 
         // #850 - break when the page wasn't full (no more events to page
@@ -1181,6 +1207,128 @@ mod tests {
             last_ledger,
             Some(249),
             "cursor must advance to the last event's ledger (200 + 49)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #882 - startLedger and pagination.cursor are mutually exclusive
+    // -----------------------------------------------------------------------
+
+    /// Mock RPC that rejects any `getEvents` request carrying both
+    /// `startLedger` and `pagination.cursor`, and serves 250 events over three
+    /// pages. All 250 events must be stored and the RPC cursor persisted.
+    #[tokio::test]
+    async fn test_poll_once_never_sends_start_ledger_with_cursor() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        fn make_event_json(ledger: i64, tx_hash: &str) -> serde_json::Value {
+            serde_json::json!({
+                "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
+                "ledger": ledger,
+                "txHash": tx_hash,
+                "createdAt": "2024-06-01T12:00:00Z",
+                "value": null,
+            })
+        }
+
+        let page1: Vec<_> = (0..MAX_EVENTS_PER_POLL)
+            .map(|i| make_event_json(100 + i as i64, &format!("tx-p1-{}", i)))
+            .collect();
+        let page2: Vec<_> = (0..MAX_EVENTS_PER_POLL)
+            .map(|i| make_event_json(200 + i as i64, &format!("tx-p2-{}", i)))
+            .collect();
+        let page3: Vec<_> = (0..50)
+            .map(|i| make_event_json(300 + i as i64, &format!("tx-p3-{}", i)))
+            .collect();
+
+        let responses = vec![
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": { "events": page1, "cursor": "cursor-page-2", "latestLedger": 400 }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": { "events": page2, "cursor": "cursor-page-3", "latestLedger": 400 }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": { "events": page3, "cursor": "cursor-page-4", "latestLedger": 400 }
+            }),
+        ];
+
+        let request_count = Arc::new(AtomicU32::new(0));
+        let request_count_clone = Arc::clone(&request_count);
+
+        let mock_router = axum::Router::new().route(
+            "/",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let count = request_count_clone.fetch_add(1, Ordering::SeqCst);
+                let params = body.get("params").cloned().unwrap_or_default();
+                let has_start = params.get("startLedger").is_some();
+                let has_cursor = params
+                    .get("pagination")
+                    .and_then(|p| p.get("cursor"))
+                    .is_some();
+                let response = if has_start && has_cursor {
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1,
+                        "error": { "code": -32602, "message": "startLedger and cursor are mutually exclusive" }
+                    })
+                } else {
+                    responses
+                        .get(count as usize)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            serde_json::json!({
+                                "jsonrpc": "2.0", "id": 1,
+                                "result": { "events": [], "cursor": "cursor-unused", "latestLedger": 400 }
+                            })
+                        })
+                };
+                async move { axum::Json(response) }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.unwrap();
+        });
+
+        let db = crate::db::Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        // Seed a ledger cursor so poll_once does NOT call fetch_latest_ledger.
+        db.set_last_ledger(99).await.unwrap();
+
+        let state = crate::AppState {
+            db: db.clone(),
+            rpc_url: format!("http://{}", addr),
+            contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::new(),
+            api_key_hash: String::new(),
+            lookback_ledgers: 720,
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), poll_once(&state))
+            .await
+            .expect("poll_once must terminate")
+            .expect("poll_once must succeed");
+
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            3,
+            "exactly three getEvents calls must be made (one per page)"
+        );
+
+        let events = db.list_events(1000, 0).await.expect("list events");
+        assert_eq!(events.len(), 250, "all 250 events must be stored");
+
+        assert_eq!(
+            db.get_last_cursor().await.expect("get_last_cursor"),
+            Some("cursor-page-4".to_string()),
+            "the RPC cursor must be persisted for the next poll"
         );
     }
 }
