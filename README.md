@@ -449,34 +449,33 @@ stellar contract install \
 
 This prints a `wasm_hash` — save it, you'll need it for instantiation and future upgrades.
 
-#### 3. Create a Contract Instance
+#### 3. Create and Initialize a Contract Instance
+
+The contract has a `__constructor`, so the instance is created and initialized
+atomically. Pass the constructor arguments in the order
+`admin, fee_collector, fee_bps, nonce, wasm_hash`:
 
 ```bash
 stellar contract deploy \
   --network mainnet \
   --source admin-keypair \
-  --wasm-hash <WASM_HASH_FROM_STEP_2>
-```
-
-This prints the contract's C-address. Save it as `CONTRACT_ID`.
-
-#### 4. Initialize the Contract
-
-```bash
-stellar contract invoke \
-  --network mainnet \
-  --source admin-keypair \
-  --id <CONTRACT_ID> \
-  -- initialize \
+  --wasm-hash <WASM_HASH_FROM_STEP_2> \
+  -- \
   --admin <ADMIN_G_ADDRESS> \
   --fee_collector <FEE_COLLECTOR_G_ADDRESS> \
-  --fee_bps 50
+  --fee_bps 50 \
+  --nonce null \
+  --wasm_hash <WASM_HASH_FROM_STEP_2>
 ```
 
 - `fee_bps`: fee in basis points (50 = 0.5%). Max allowed is 1000 (10%).
-- This can only be called once. The contract will reject a second `initialize` call.
+- `nonce`: optional sequential nonce for the admin; pass `null` to skip nonce enforcement.
+- `wasm_hash`: the hash from step 2, recorded as the `old_hash` of the first upgrade event.
 
-Alternatively, use the deploy script which handles steps 2–4 in one command:
+This prints the contract's C-address. Save it as `CONTRACT_ID`. No separate
+`initialize` call is needed — the constructor runs once, during deployment.
+
+Alternatively, use the deploy script which handles steps 2–3 in one command:
 
 ```bash
 # deploy-config.json (production)

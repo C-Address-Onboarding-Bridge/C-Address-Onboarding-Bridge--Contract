@@ -86,6 +86,24 @@ fn test_initialize() {
 }
 
 #[test]
+fn test_constructor_initializes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let wasm_hash = BytesN::from_array(&env, &[7u8; 32]);
+    let bridge_id = env.register(
+        OnboardingBridge,
+        (&admin, &fee_collector, 50u32, None::<u64>, wasm_hash),
+    );
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    assert!(bridge.query_is_initialized());
+    assert_eq!(bridge.query_admin(), admin);
+    assert_eq!(bridge.query_fee_bps(), 50u32);
+    assert_eq!(bridge.query_fee_collector(), fee_collector);
+}
+
+#[test]
 fn test_initialize_twice() {
     let env = Env::default();
     let (admin, _user, fee_collector) = create_test_users(&env);
@@ -149,6 +167,7 @@ fn test_fund_without_initialize() {
 
     let b2_id = env.register(OnboardingBridge, ());
     let b2 = crate::OnboardingBridgeClient::new(&env, &b2_id);
+    // Registered without constructor args, so the instance stays uninitialised.
     let target = Address::generate(&env);
     assert_eq!(
         b2.try_fund_c_address(&user, &target, &token_id, &100i128, &None, &None),
