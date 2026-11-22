@@ -3284,6 +3284,7 @@ impl OnboardingBridge {
         }
 
         env.storage().instance().set(&DataKey::Deactivated, &true);
+        extend_instance_ttl(&env);
         env.events()
             .publish(("EmergencyMigrated", admin), (new_contract,));
 
@@ -5044,13 +5045,17 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         check_not_paused(&env)?;
         source.require_auth();
-        consume_auth_nonce(
+        let result = consume_auth_nonce(
             &env,
             &source,
             nonce,
             valid_after_ledger,
             valid_before_ledger,
-        )
+        );
+        if result.is_ok() {
+            extend_instance_ttl(&env);
+        }
+        result
     }
 
     /// Returns the next unused auth nonce for `source`.
@@ -5333,6 +5338,7 @@ impl OnboardingBridge {
         env.storage()
             .persistent()
             .remove(&DataKey::Commitment(commitment_id));
+        extend_instance_ttl(&env);
         env.events()
             .publish(("CommitmentCancelled",), (commitment_id, entry.source));
         Ok(())
@@ -5570,6 +5576,7 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
         source.require_auth();
         save_meta_signer(&env, &source, &pubkey);
+        extend_instance_ttl(&env);
         env.events()
             .publish(("MetaSignerRegistered", source), (pubkey,));
         Ok(())
@@ -5585,6 +5592,7 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
         source.require_auth();
         clear_meta_signer(&env, &source);
+        extend_instance_ttl(&env);
         env.events().publish(("MetaSignerUnregistered", source), ());
         Ok(())
     }

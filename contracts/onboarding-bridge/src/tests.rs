@@ -3919,6 +3919,31 @@ mod commit_reveal_tests {
             Err(Ok(BridgeError::CommitmentNotFound))
         );
     }
+
+    #[test]
+    fn test_cancel_commitment_extends_instance_ttl() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(
+            &env,
+            &bridge.address,
+            &user,
+            &target,
+            &token_id,
+            500i128,
+            13u64,
+        );
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
+
+        env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+        bridge.cancel_commitment(&id);
+
+        let ttl = env.as_contract(&bridge.address, || env.storage().instance().get_ttl());
+        assert!(ttl >= MAX_ALLOWED_TTL);
+    }
 }
 
 /********** Cross-chain Onboarding Tests **********/
@@ -5589,6 +5614,23 @@ fn test_emergency_migrate_basic() {
 }
 
 #[test]
+fn test_emergency_migrate_extends_instance_ttl() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    env.mock_all_auths();
+
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    bridge.emergency_migrate(&Address::generate(&env), &false, &None);
+
+    let ttl = env.as_contract(&bridge_id, || env.storage().instance().get_ttl());
+    assert!(ttl >= MAX_ALLOWED_TTL);
+}
+
+#[test]
 #[should_panic]
 fn test_emergency_migrate_non_admin_rejected() {
     let env = Env::default();
@@ -5707,6 +5749,41 @@ fn test_meta_signer_can_be_unregistered() {
 
     bridge.unregister_meta_signer(&user);
     assert_eq!(bridge.query_meta_signer(&user), None);
+}
+
+#[test]
+fn test_register_meta_signer_extends_instance_ttl() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    let pubkey = BytesN::from_array(&env, &[0xCCu8; 32]);
+
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    bridge.register_meta_signer(&user, &pubkey);
+
+    let ttl = env.as_contract(&bridge_id, || env.storage().instance().get_ttl());
+    assert!(ttl >= MAX_ALLOWED_TTL);
+}
+
+#[test]
+fn test_unregister_meta_signer_extends_instance_ttl() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    let pubkey = BytesN::from_array(&env, &[0xCCu8; 32]);
+    bridge.register_meta_signer(&user, &pubkey);
+
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    bridge.unregister_meta_signer(&user);
+
+    let ttl = env.as_contract(&bridge_id, || env.storage().instance().get_ttl());
+    assert!(ttl >= MAX_ALLOWED_TTL);
 }
 
 /// Replicates the contract's payload-hash construction for `execute_meta_fund`
@@ -7076,6 +7153,22 @@ fn test_verify_auth_entry_success() {
         bridge.try_verify_auth_entry(&user, &0u64, &0u32, &(seq + 100)),
         Err(Ok(BridgeError::DuplicateNonce))
     );
+}
+
+#[test]
+fn test_verify_auth_entry_extends_instance_ttl() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
+    let seq = env.ledger().sequence();
+    bridge.verify_auth_entry(&user, &0u64, &0u32, &(seq + 100));
+
+    let ttl = env.as_contract(&bridge_id, || env.storage().instance().get_ttl());
+    assert!(ttl >= MAX_ALLOWED_TTL);
 }
 
 #[test]
