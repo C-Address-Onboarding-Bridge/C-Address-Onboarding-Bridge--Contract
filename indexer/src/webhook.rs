@@ -301,24 +301,41 @@ pub async fn deliver_pending(
 
 async fn deliver_subscription_queue(state: &AppState, deliveries: Vec<WebhookDelivery>) {
     for delivery in deliveries {
-        if let Err(e) = deliver_single(state, &delivery).await {
-            tracing::error!(
-                "Failed to process delivery {} for subscription {}: {}",
-                delivery.id,
-                delivery.subscription_id,
-                e
-            );
-            // On error delivering to this subscription, abort remaining queued deliveries
-            // for this subscription in this poll cycle to preserve FIFO ordering.
-            break;
+        match deliver_single(state, &delivery).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // Delivery failed (HTTP error, transport error, or retry scheduled).
+                // Stop this subscription's queue for the cycle so later events are
+                // not delivered ahead of the failed one (FIFO ordering).
+                tracing::debug!(
+                    "Delivery {} for subscription {} failed; holding back later deliveries",
+                    delivery.id,
+                    delivery.subscription_id
+                );
+                break;
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to process delivery {} for subscription {}: {}",
+                    delivery.id,
+                    delivery.subscription_id,
+                    e
+                );
+                // On error delivering to this subscription, abort remaining queued deliveries
+                // for this subscription in this poll cycle to preserve FIFO ordering.
+                break;
+            }
         }
     }
 }
 
+/// Attempts a single delivery. Returns `Ok(true)` when the delivery succeeded
+/// (or was terminally resolved as dead), and `Ok(false)` when it failed and was
+/// scheduled for retry, so the caller can stop the subscription's queue.
 async fn deliver_single(
     state: &AppState,
     delivery: &WebhookDelivery,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let url = match state
         .db
         .get_subscription_url(&delivery.subscription_id)
@@ -330,7 +347,7 @@ async fn deliver_single(
                 .db
                 .mark_delivery_dead(&delivery.id, "subscription not found or inactive")
                 .await?;
-            return Ok(());
+            return Ok(true);
         }
     };
 
@@ -341,7 +358,7 @@ async fn deliver_single(
                 .db
                 .mark_delivery_dead(&delivery.id, "event not found")
                 .await?;
-            return Ok(());
+            return Ok(true);
         }
     };
 
@@ -376,17 +393,18 @@ async fn deliver_single(
         Ok(resp) if resp.status().is_success() => {
             state.db.mark_delivery_success(&delivery.id).await?;
             tracing::debug!("Delivered webhook {} to {}", delivery.id, url);
+            Ok(true)
         }
         Ok(resp) => {
             let error = format!("HTTP {}", resp.status());
             handle_retry(state, delivery, &error).await?;
+            Ok(false)
         }
         Err(e) => {
             handle_retry(state, delivery, &e.to_string()).await?;
+            Ok(false)
         }
     }
-
-    Ok(())
 }
 
 async fn handle_retry(

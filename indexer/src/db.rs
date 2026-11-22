@@ -380,9 +380,20 @@ impl Database {
         let now = chrono::Utc::now().to_rfc3339();
         let rows: Vec<WebhookDeliveryRow> =
             sqlx::query_as(
+                // Per-subscription FIFO: only the oldest pending row of each
+                // subscription is eligible, and only once its backoff has
+                // elapsed. Later rows are held back until the head succeeds.
                 "SELECT id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at
-                 FROM webhook_deliveries
-                 WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?1)
+                 FROM (
+                     SELECT id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY subscription_id
+                                ORDER BY created_at ASC, id ASC
+                            ) AS rn
+                     FROM webhook_deliveries
+                     WHERE status = 'pending'
+                 )
+                 WHERE rn = 1 AND (next_retry_at IS NULL OR next_retry_at <= ?1)
                  ORDER BY created_at ASC LIMIT 100",
             )
             .bind(&now)
