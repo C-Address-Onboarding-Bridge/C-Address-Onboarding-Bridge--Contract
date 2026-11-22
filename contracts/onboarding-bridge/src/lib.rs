@@ -80,6 +80,23 @@ use soroban_sdk::{
 /// Every public function that can fail returns `Result<_, BridgeError>`.
 /// Callers should match on these variants to distinguish recoverable from
 /// unrecoverable conditions.
+///
+/// # 50-case limit
+///
+/// `#[contracterror]` expands to a `TryFrom<u32>` match over every variant and
+/// the Soroban spec caps that at 50 cases; exceeding it makes the macro panic
+/// with `LengthExceedsMax` and the crate stops building. Keep this enum at
+/// **50 variants or fewer** — `error_variant_count_is_within_spec_limit` in
+/// `tests.rs` fails with a readable message when the limit is exceeded.
+///
+/// # Retired discriminants (never reuse)
+///
+/// These values were removed to stay under the limit. They must never be
+/// assigned to a new variant, because clients match on the numeric code:
+///
+/// * `23` — `AuthNonceAlreadyUsed` (unreachable: `consume_auth_nonce` rejects a
+///   stale nonce with `DuplicateNonce` before the used-nonce set is consulted).
+/// * `24` — `AuthNonceExpired` (merged into `TransactionExpired`).
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BridgeError {
@@ -128,10 +145,8 @@ pub enum BridgeError {
     InvalidReleaseTime = 21,
     /// The caller is not authorized to perform this action (e.g. double-claim).
     Unauthorized = 22,
-    /// The auth-entry nonce supplied to `verify_auth_entry` has already been used.
-    AuthNonceAlreadyUsed = 23,
-    /// The current ledger sequence is outside the `[valid_after, valid_before)` window.
-    AuthNonceExpired = 24,
+    // Discriminants 23 (`AuthNonceAlreadyUsed`) and 24 (`AuthNonceExpired`) are
+    // retired — see the enum-level docs. Do not reuse them.
     /// `execute_upgrade` was called but no upgrade has been scheduled.
     UpgradeNotScheduled = 25,
     /// The `expected_hash` passed to `execute_upgrade` does not match the scheduled hash.
@@ -1051,7 +1066,7 @@ fn consume_auth_nonce(
     // 1. Ledger-sequence window check (guards against stale / premature replays)
     let seq = env.ledger().sequence();
     if seq < valid_after_ledger || seq >= valid_before_ledger {
-        return Err(BridgeError::AuthNonceExpired);
+        return Err(BridgeError::TransactionExpired);
     }
 
     // 2. Enforce monotonic sequencing before checking the used-nonce set.
@@ -1059,9 +1074,12 @@ fn consume_auth_nonce(
         return Err(BridgeError::DuplicateNonce);
     }
 
-    // 3. Used-nonce check (prevents exact replay of this (source, nonce) pair)
+    // 3. Used-nonce check (prevents exact replay of this (source, nonce) pair).
+    // Unreachable in practice: step 2 already rejects any nonce that is not the
+    // next expected one, so a used nonce can never get here. Kept as a
+    // defensive guard; `DuplicateNonce` is the code clients observe.
     if is_auth_nonce_used(env, source, nonce) {
-        return Err(BridgeError::AuthNonceAlreadyUsed);
+        return Err(BridgeError::DuplicateNonce);
     }
 
     // 4. Mark as used and advance the per-address counter
