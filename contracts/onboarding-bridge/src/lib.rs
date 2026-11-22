@@ -2107,7 +2107,9 @@ impl OnboardingBridge {
     ///
     /// # Authorization
     ///
-    /// Requires the current admin's `require_auth()`.
+    /// Requires the current admin's `require_auth()` **and** the new fee
+    /// collector's `require_auth()` in the same call (atomic two-party
+    /// handoff), so the incoming collector proves it controls its key.
     ///
     /// # Errors
     ///
@@ -2117,7 +2119,8 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
-    /// * `("FeeCollectorChanged", old_collector, new_fee_collector)` — data: `(admin,)`
+    /// * `("FeeCollectorTransferred", old_collector, new_fee_collector)` — data: `()`
+    ///   (same event as the two-step `accept_fee_collector` path)
     ///
     /// # Examples
     ///
@@ -2135,6 +2138,9 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        // Atomic two-party handoff: the incoming collector must prove it
+        // controls its key in the same call, so a typo cannot strand the role.
+        new_fee_collector.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         let old_collector = read_fee_collector(&env);
@@ -2143,8 +2149,8 @@ impl OnboardingBridge {
         config.fee_collector = new_fee_collector.clone();
         save_bridge_config(&env, &config);
         env.events().publish(
-            ("FeeCollectorChanged", old_collector, new_fee_collector),
-            (admin,),
+            ("FeeCollectorTransferred", old_collector, new_fee_collector),
+            (),
         );
         Ok(())
     }
@@ -2195,19 +2201,35 @@ impl OnboardingBridge {
         read_pending_fee_collector(&env)
     }
 
+    /// Changes the admin in a single call.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()` **and** the new admin's
+    /// `require_auth()` in the same call (atomic two-party handoff), so the
+    /// incoming admin proves it controls its key.
+    ///
+    /// # Events
+    ///
+    /// * `("AdminTransferred", old_admin, new_admin)` — data: `()`
+    ///   (same event as the two-step `accept_admin` path)
     pub fn set_admin(env: Env, new_admin: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        // Atomic two-party handoff: the incoming admin must prove it controls
+        // its key in the same call, so a typo cannot strand the role.
+        new_admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         save_admin(&env, &new_admin);
         let mut config = read_bridge_config(&env);
         config.admin = new_admin.clone();
         save_bridge_config(&env, &config);
-        env.events().publish(("AdminChanged", admin, new_admin), ());
+        env.events()
+            .publish(("AdminTransferred", admin, new_admin), ());
         Ok(())
     }
 
