@@ -524,9 +524,9 @@ console.log('Verified. Fee collector:', feeCollector);
 Subscribe to on-chain contract events to track all bridge activity:
 
 ```ts
-import { SorobanRpc, xdr, scValToNative } from '@stellar/stellar-sdk';
+import { rpc, xdr, scValToNative } from '@stellar/stellar-sdk';
 
-const server = new SorobanRpc.Server(process.env.RPC_URL!);
+const server = new rpc.Server(process.env.RPC_URL!);
 
 async function pollEvents(contractId: string, cursor = 'now') {
   const { events } = await server.getEvents({
@@ -850,9 +850,9 @@ if (!target) {
 ### Event Listening
 
 ```ts
-import { SorobanRpc, scValToNative } from '@stellar/stellar-sdk';
+import { rpc, scValToNative } from '@stellar/stellar-sdk';
 
-const server = new SorobanRpc.Server(process.env.RPC_URL!);
+const server = new rpc.Server(process.env.RPC_URL!);
 
 const { events } = await server.getEvents({
   startLedger: latestLedger,
@@ -877,7 +877,7 @@ for (const event of events) {
 ### Best Practices
 
 - **Amount precision**: all amounts are in the token's smallest unit. USDC uses 7 decimal places, so `1 USDC = 10_000_000`.
-- **Transaction confirmation**: `fundCAddress` returns `status: 'pending'` on submission. Poll `SorobanRpc.Server.getTransaction(hash)` to confirm finality before showing success to users.
+- **Transaction confirmation**: `fundCAddress` returns `status: 'pending'` on submission. Poll `rpc.Server.getTransaction(hash)` to confirm finality before showing success to users.
 - **Keypairs**: never instantiate keypairs from hardcoded secrets. Load from environment variables or a secrets manager at runtime.
 - **Network passphrase**: always use `Networks.PUBLIC` for mainnet and `Networks.TESTNET` for testnet. Mismatches cause immediate transaction rejection.
 - **RPC retries**: wrap SDK calls in retry logic for transient network failures. The SDK does not retry automatically.

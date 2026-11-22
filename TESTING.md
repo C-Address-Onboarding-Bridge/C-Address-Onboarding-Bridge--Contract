@@ -298,7 +298,7 @@ Tests are configured in `sdk/jest.config.js` and discovered automatically from f
 
 ```typescript
 import { OnboardingBridgeSDK } from '../bridge';
-import { SorobanRpc } from '@stellar/stellar-sdk';
+import { rpc } from '@stellar/stellar-sdk';
 
 jest.mock('@stellar/stellar-sdk', () => ({
   // Mock implementation of Stellar SDK
@@ -319,7 +319,7 @@ describe('OnboardingBridgeSDK', () => {
 
 ```typescript
 jest.mock('@stellar/stellar-sdk', () => ({
-  SorobanRpc: {
+  rpc: {
     Server: jest.fn().mockImplementation(() => mockProvider),
   },
   TransactionBuilder: jest.fn().mockImplementation(() => ({
