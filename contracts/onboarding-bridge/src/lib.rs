@@ -302,6 +302,10 @@ const MIN_ALLOWED_TTL: u32 = 120_960;
 const CRITICAL_ENTRY_TTL_THRESHOLD: u32 = 100_000;
 /// Minimum ledgers that must pass before a scheduled upgrade becomes executable (~24 h at 5 s/ledger).
 const UPGRADE_TIMELOCK_LEDGERS: u32 = 17_280;
+/// TTL applied to per-day `DailyUsage` temporary entries: one day of ledgers
+/// (17 280 at 5 s/ledger) plus a margin so the counter outlives the day it
+/// tracks and then expires naturally.
+const DAILY_USAGE_TTL_LEDGERS: u32 = 17_280 + 1_000;
 /// Maximum ledgers an upgrade remains executable after its timelock elapses (~24 h at 5 s/ledger).
 const UPGRADE_EXECUTION_WINDOW_LEDGERS: u32 = UPGRADE_TIMELOCK_LEDGERS;
 /// Minimum ledgers between commit_fund and reveal_fund (~25 s at 5 s/ledger).
@@ -1249,12 +1253,17 @@ fn check_daily_limit(
     }
     let day = current_day(env);
     let key = DataKey::DailyUsage(source.clone(), asset.clone(), day);
-    let used: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+    let used: i128 = env.storage().temporary().get(&key).unwrap_or(0);
     let updated = safe_math::safe_add(used, amount)?;
     if updated > limit {
         return Err(BridgeError::DailyLimitExceeded);
     }
-    env.storage().persistent().set(&key, &updated);
+    env.storage().temporary().set(&key, &updated);
+    // Temporary entries are not auto-extended; keep the counter alive for the
+    // remainder of the day (plus a margin) so it expires once the day rolls over.
+    env.storage()
+        .temporary()
+        .extend_ttl(&key, DAILY_USAGE_TTL_LEDGERS, DAILY_USAGE_TTL_LEDGERS);
     Ok(())
 }
 
@@ -4856,8 +4865,11 @@ impl OnboardingBridge {
 
     /// Extends the persistent-storage TTL for all per-`(source, asset)` and
     /// per-`source` keys used by the core funding paths: `SourceDailyLimit`,
-    /// the current day's `DailyUsage`, `UserDeposit`, `SourceBridgedVolume`,
-    /// the sequential `Nonce`, and the auth-entry `AuthNonce` counter.
+    /// `UserDeposit`, `SourceBridgedVolume`, the sequential `Nonce`, and the
+    /// auth-entry `AuthNonce` counter.
+    ///
+    /// `DailyUsage` is intentionally excluded: it lives in temporary storage
+    /// and expires on its own once the day it tracks has passed.
     ///
     /// Only keys that already exist in storage are extended; missing keys are
     /// silently skipped, mirroring `extend_persistent_ttl`.
@@ -4894,7 +4906,6 @@ impl OnboardingBridge {
         let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
         for key in [
             DataKey::SourceDailyLimit(source.clone(), asset.clone()),
-            DataKey::DailyUsage(source.clone(), asset.clone(), current_day(&env)),
             DataKey::UserDeposit(source.clone(), asset.clone()),
             DataKey::SourceBridgedVolume(source.clone(), asset.clone()),
             DataKey::Nonce(source.clone()),
