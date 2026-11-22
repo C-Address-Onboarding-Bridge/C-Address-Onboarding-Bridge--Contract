@@ -178,9 +178,15 @@ impl Database {
             }
 
             let delivery_id = uuid::Uuid::new_v4().to_string();
+            // A replay of an already-queued (subscription, event) pair re-arms
+            // the existing row instead of inserting a duplicate, keeping its
+            // delivery_id. See #894.
             sqlx::query(
                 "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
-                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)",
+                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)
+                 ON CONFLICT(subscription_id, event_id) DO UPDATE SET
+                     status = 'pending',
+                     next_retry_at = excluded.next_retry_at",
             )
             .bind(&delivery_id)
             .bind(&sub_id)
@@ -362,9 +368,15 @@ impl Database {
             }
 
             let delivery_id = uuid::Uuid::new_v4().to_string();
+            // A replay of an already-queued (subscription, event) pair re-arms
+            // the existing row instead of inserting a duplicate, keeping its
+            // delivery_id. See #894.
             sqlx::query(
                 "INSERT INTO webhook_deliveries (id, subscription_id, event_id, status, attempts, next_retry_at, created_at)
-                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)",
+                 VALUES (?1, ?2, ?3, 'pending', 0, ?4, ?4)
+                 ON CONFLICT(subscription_id, event_id) DO UPDATE SET
+                     status = 'pending',
+                     next_retry_at = excluded.next_retry_at",
             )
             .bind(&delivery_id)
             .bind(&sub.id)
@@ -890,5 +902,69 @@ mod tests {
             !secret.0.is_empty(),
             "a subscription created before migration 0002 must be backfilled with a secret"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #894 - one delivery row per (subscription, event)
+    // -----------------------------------------------------------------------
+
+    /// Replaying the same event for the same subscription must re-arm the
+    /// existing delivery row (same delivery_id) instead of inserting a second
+    /// one.
+    #[tokio::test]
+    async fn test_replay_leaves_one_delivery_per_subscription_and_event() {
+        let db = setup_db().await;
+        let sub = db
+            .create_subscription(CreateSubscription {
+                url: "http://example.com/hook".to_string(),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .expect("create subscription");
+        let event = make_event("evt-replay");
+        db.insert_event(&event).await.expect("insert event");
+
+        db.queue_webhook_deliveries(&event)
+            .await
+            .expect("first queue");
+        let first: (String,) = sqlx::query_as(
+            "SELECT id FROM webhook_deliveries WHERE subscription_id = ?1 AND event_id = ?2",
+        )
+        .bind(&sub.id)
+        .bind(&event.id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("first delivery row");
+
+        // Mark it delivered, then replay the same range.
+        sqlx::query("UPDATE webhook_deliveries SET status = 'delivered' WHERE id = ?1")
+            .bind(&first.0)
+            .execute(&db.pool)
+            .await
+            .expect("mark delivered");
+
+        db.queue_webhook_deliveries(&event)
+            .await
+            .expect("replay queue");
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, status FROM webhook_deliveries WHERE subscription_id = ?1 AND event_id = ?2",
+        )
+        .bind(&sub.id)
+        .bind(&event.id)
+        .fetch_all(&db.pool)
+        .await
+        .expect("list deliveries");
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "replaying the same range must leave one delivery row per (subscription, event)"
+        );
+        assert_eq!(rows[0].0, first.0, "replay must preserve the delivery_id");
+        assert_eq!(rows[0].1, "pending", "replay must re-arm the delivery");
     }
 }
