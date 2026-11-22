@@ -376,13 +376,19 @@ impl Database {
         Ok(())
     }
 
-    pub async fn get_pending_deliveries(&self) -> Result<Vec<WebhookDelivery>, sqlx::Error> {
+    /// Fetch the due deliveries for every subscription, fairly.
+    ///
+    /// Each subscription contributes at most `per_subscription` of its oldest
+    /// due rows (FIFO by `created_at`), so one subscription with a large
+    /// backlog can no longer consume a global `LIMIT` and starve the others
+    /// (#1065). Rows whose backoff has not elapsed are skipped.
+    pub async fn get_pending_deliveries(
+        &self,
+        per_subscription: i64,
+    ) -> Result<Vec<WebhookDelivery>, sqlx::Error> {
         let now = chrono::Utc::now().to_rfc3339();
         let rows: Vec<WebhookDeliveryRow> =
             sqlx::query_as(
-                // Per-subscription FIFO: only the oldest pending row of each
-                // subscription is eligible, and only once its backoff has
-                // elapsed. Later rows are held back until the head succeeds.
                 "SELECT id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at
                  FROM (
                      SELECT id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at,
@@ -392,11 +398,13 @@ impl Database {
                             ) AS rn
                      FROM webhook_deliveries
                      WHERE status = 'pending'
+                       AND (next_retry_at IS NULL OR next_retry_at <= ?1)
                  )
-                 WHERE rn = 1 AND (next_retry_at IS NULL OR next_retry_at <= ?1)
-                 ORDER BY created_at ASC LIMIT 100",
+                 WHERE rn <= ?2
+                 ORDER BY created_at ASC, id ASC",
             )
             .bind(&now)
+            .bind(per_subscription)
             .fetch_all(&self.pool)
             .await?;
 

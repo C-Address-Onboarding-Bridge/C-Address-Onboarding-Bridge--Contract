@@ -18,6 +18,12 @@ const MAX_BACKOFF_SECS: i64 = 3600;
 /// Maximum random jitter added to a backoff interval, in seconds.
 const MAX_JITTER_SECS: i64 = 30;
 const DELIVERY_INTERVAL_MS: u64 = 2000;
+/// Maximum number of due rows fetched per subscription per pass, so one
+/// subscription with a large backlog cannot monopolise a pass (#1065).
+const MAX_ROWS_PER_SUBSCRIPTION: i64 = 10;
+/// Maximum time a single subscription's queue may run within one pass. Once
+/// exceeded the queue yields its slot so other subscribers are not delayed.
+const MAX_QUEUE_PASS_DURATION: std::time::Duration = std::time::Duration::from_secs(5);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -269,10 +275,18 @@ pub async fn run_delivery_worker(state: Arc<AppState>, token: CancellationToken)
 /// (by `created_at`). Different subscriptions are delivered concurrently up to
 /// `MAX_CONCURRENT_DELIVERIES`, ensuring that a slow or hanging endpoint does
 /// not block or delay deliveries to other subscribers.
+///
+/// Fairness (#1065): the fetch is bounded per subscription rather than by a
+/// global `LIMIT`, and each queue is bounded in rows and wall-clock time per
+/// pass. A queue stops on its first failure so later events are never
+/// delivered ahead of a failed one.
 pub async fn deliver_pending(
     state: &AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let deliveries = state.db.get_pending_deliveries().await?;
+    let deliveries = state
+        .db
+        .get_pending_deliveries(MAX_ROWS_PER_SUBSCRIPTION)
+        .await?;
     if deliveries.is_empty() {
         return Ok(());
     }
@@ -298,6 +312,8 @@ pub async fn deliver_pending(
         .filter_map(|sub_id| sub_queues.remove(&sub_id))
         .collect();
 
+    // `buffer_unordered` refills a free slot as soon as any queue finishes, so
+    // a finished queue never waits for the slowest one in the pass.
     futures::stream::iter(queues)
         .map(|queue| deliver_subscription_queue(state, queue))
         .buffer_unordered(MAX_CONCURRENT_DELIVERIES)
@@ -308,7 +324,15 @@ pub async fn deliver_pending(
 }
 
 async fn deliver_subscription_queue(state: &AppState, deliveries: Vec<WebhookDelivery>) {
+    let deadline = tokio::time::Instant::now() + MAX_QUEUE_PASS_DURATION;
     for delivery in deliveries {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::debug!(
+                "Subscription {} hit its per-pass time budget; resuming next pass",
+                delivery.subscription_id
+            );
+            break;
+        }
         match deliver_single(state, &delivery).await {
             Ok(true) => {}
             Ok(false) => {
@@ -719,7 +743,7 @@ mod tests {
             .expect("mark failed");
 
         let retried = db
-            .get_pending_deliveries()
+            .get_pending_deliveries(MAX_ROWS_PER_SUBSCRIPTION)
             .await
             .expect("get pending after retry");
         let retried_id = if retried.is_empty() {
