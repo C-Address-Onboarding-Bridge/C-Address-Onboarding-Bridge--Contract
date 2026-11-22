@@ -769,6 +769,44 @@ fn test_unpause_emits_event() {
 }
 
 #[test]
+fn test_remove_relayer_emits_event() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let first = BytesN::from_array(&env, &[7u8; 32]);
+    let second = BytesN::from_array(&env, &[8u8; 32]);
+    bridge.add_relayer(&first, &None);
+    bridge.add_relayer(&second, &None);
+    bridge.remove_relayer(&first, &None);
+
+    assert!(!bridge.query_is_relayer(&first));
+    let events = env.events().all();
+    let (contract_id, topics, data) = events.get(events.len() - 1).unwrap();
+    assert_eq!(contract_id, bridge_id);
+    assert_eq!(topics, ("RelayerRemoved",).into_val(&env));
+    assert_eq!(data, (admin, first).into_val(&env));
+}
+
+#[test]
+fn test_remove_unknown_relayer_emits_nothing() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let unknown = BytesN::from_array(&env, &[9u8; 32]);
+    let events_before = env.events().all().len();
+    bridge.remove_relayer(&unknown, &None);
+
+    assert!(!bridge.query_is_relayer(&unknown));
+    assert_eq!(env.events().all().len(), events_before);
+}
+
+#[test]
 fn test_fund_works_after_unpause() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);

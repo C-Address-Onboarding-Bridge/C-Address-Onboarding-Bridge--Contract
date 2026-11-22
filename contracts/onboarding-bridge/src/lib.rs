@@ -4336,6 +4336,14 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::BelowThreshold`] — Removing this relayer would remove
     ///   the last relayer or drop the count below the required threshold.
+    ///
+    /// Removing a `pubkey` that is not a registered relayer is a no-op: it
+    /// succeeds and emits no event.
+    ///
+    /// # Events
+    ///
+    /// * `("RelayerRemoved",)` — data: `(admin, pubkey)`, emitted only when
+    ///   `pubkey` was a registered relayer.
     pub fn remove_relayer(
         env: Env,
         pubkey: BytesN<32>,
@@ -4345,7 +4353,8 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        if is_relayer(&env, &pubkey) {
+        let was_registered = is_relayer(&env, &pubkey);
+        if was_registered {
             let count = relayer_count(&env);
             if count <= 1 || count.saturating_sub(1) < relayer_threshold(&env) {
                 return Err(BridgeError::BelowThreshold);
@@ -4353,7 +4362,9 @@ impl OnboardingBridge {
         }
         remove_relayer(&env, &pubkey);
         extend_instance_ttl(&env);
-        if was_registered { env.events().publish(("RelayerRemoved",), (admin, pubkey)); }
+        if was_registered {
+            env.events().publish(("RelayerRemoved",), (admin, pubkey));
+        }
         Ok(())
     }
 
