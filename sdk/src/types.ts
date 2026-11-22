@@ -1026,3 +1026,55 @@ export interface CostEstimate {
    */
   executionTimeMs: number;
 }
+
+// ---------------------------------------------------------------------------
+// Issue #884: pause / blocklist / allowlist administration
+// ---------------------------------------------------------------------------
+
+/**
+ * Options shared by the administrative write methods (pause, unpause,
+ * blocklist and allowlist mutations).
+ */
+export interface AdminWriteOptions {
+  /**
+   * Optional replay-protection nonce forwarded to the contract as a `u64`.
+   * Omit (or pass `undefined`) to send `void` and let the contract decide.
+   */
+  nonce?: number | bigint;
+}
+
+/** Options for {@link OnboardingBridgeSDK.addToBlocklist}. */
+export interface BlocklistOptions extends AdminWriteOptions {
+  /** Address to add to the blocklist. */
+  address: string;
+}
+
+/** Options for {@link OnboardingBridgeSDK.removeFromBlocklist}. */
+export interface RemoveFromBlocklistOptions extends AdminWriteOptions {
+  /** Address to remove from the blocklist. */
+  address: string;
+}
+
+/** Options for {@link OnboardingBridgeSDK.addToAllowlist}. */
+export interface AllowlistOptions extends AdminWriteOptions {
+  /** Address to add to the allowlist. */
+  address: string;
+}
+
+/** Options for {@link OnboardingBridgeSDK.removeFromAllowlist}. */
+export interface RemoveFromAllowlistOptions extends AdminWriteOptions {
+  /** Address to remove from the allowlist. */
+  address: string;
+}
+
+/** Options for {@link OnboardingBridgeSDK.setAllowlistMode}. */
+export interface SetAllowlistModeOptions extends AdminWriteOptions {
+  /** `true` to enable allowlist enforcement, `false` to disable it. */
+  enabled: boolean;
+}
+
+/** Result of {@link OnboardingBridgeSDK.getAllowlistMode}. */
+export interface AllowlistMode {
+  /** `true` when the contract only accepts allowlisted addresses. */
+  enabled: boolean;
+}
