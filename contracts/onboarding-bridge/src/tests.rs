@@ -2183,6 +2183,37 @@ fn test_swap_uses_actual_target_tokens_received() {
 }
 
 #[test]
+fn test_swap_slippage_guard_applies_to_post_fee_net_amount() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+    bridge.set_fee_bps(&100u32, &None);
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &target_token_id, &1i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+    // Pool returns exactly 500, fee is 1% (5), so the target would receive 495.
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target,
+            &source_token_id,
+            &target_token_id,
+            &500i128,
+            &500i128,
+            &swap_route,
+            &None,
+            &None,
+        ),
+        Err(Ok(BridgeError::SlippageExceeded))
+    );
+    assert_eq!(check_balance(&env, &target_token_id, &target), 0i128);
+}
+
+#[test]
 fn test_swap_records_volume_in_target_asset_units() {
     let env = Env::default();
     let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);

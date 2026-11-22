@@ -1042,7 +1042,7 @@ Input details for swap-and-bridge operations.
 | `sourceAsset` | `string` | Token contract address held by the source. |
 | `targetAsset` | `string` | Token contract address the target receives. |
 | `sourceAmount` | `string` | Raw input amount of the source asset. |
-| `minTargetAmount` | `string` | Minimum acceptable amount of the target asset (slippage limit). |
+| `minTargetAmount` | `string` | Minimum acceptable amount of the target asset the target receives after the protocol fee (slippage limit). |
 | `swapRoute` | `string[]` | Ordered array of DEX pool contract addresses. |
 
 ---
@@ -1357,7 +1357,7 @@ useEffect(() => {
 
 #### 1. `SlippageExceeded` Reverts
 - **Scenario**: A swap-and-bridge transaction using `fundCAddressWithSwap` fails on-chain.
-- **Cause**: The price of the asset fluctuated on the DEX, causing the output of the swap to drop below `minTargetAmount`.
+- **Cause**: The price of the asset fluctuated on the DEX, causing the post-fee output of the swap to drop below `minTargetAmount`.
 - **Solution**: Increase the `minTargetAmount` tolerance slightly (higher slippage allowance) or execute the swap in a less volatile window.
 
 #### 2. `Invalid account address` / `Invalid contract address`

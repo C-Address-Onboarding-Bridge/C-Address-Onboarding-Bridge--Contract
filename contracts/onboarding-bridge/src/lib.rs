@@ -5426,10 +5426,9 @@ impl OnboardingBridge {
     /// 1. Pull `source_amount` of `source_asset` from `source` into the contract.
     /// 2. Invoke the single whitelisted pool in `swap_route` using the standard
     ///    two-token `swap(min_amount_out, to)` interface.
-    /// 3. Verify the increase in the bridge's `target_asset` balance is
-    ///    ≥ `min_target_amount`.
-    /// 4. Deduct the fee (in `target_asset`) and transfer the net amount to
-    ///    `target`.
+    /// 3. Deduct the fee (in `target_asset`) from the swap output.
+    /// 4. Verify the post-fee net amount is ≥ `min_target_amount`, then
+    ///    transfer it to `target`.
     ///
     /// # Arguments
     ///
@@ -5438,7 +5437,8 @@ impl OnboardingBridge {
     /// * `source_asset` — Token contract the source holds (e.g. USDC).
     /// * `target_asset` — Token contract the target should receive (e.g. XLM).
     /// * `source_amount` — Gross amount of `source_asset` to pull from source.
-    /// * `min_target_amount` — Slippage guard: revert if the swap yields less.
+    /// * `min_target_amount` — Slippage guard on the amount `target` actually
+    ///   receives: revert if the swap output minus the fee is less.
     /// * `swap_route` — Must contain exactly one DEX pool contract address,
     ///   and that address must be on the swap-pool whitelist (see
     ///   `add_swap_pool`). The pool must implement:
@@ -5466,7 +5466,8 @@ impl OnboardingBridge {
     ///   source's daily limit for `source_asset`.
     /// * [`BridgeError::SwapFailed`] — The pool returned zero tokens out or
     ///   transferred no target tokens.
-    /// * [`BridgeError::SlippageExceeded`] — Swap output < `min_target_amount`.
+    /// * [`BridgeError::SlippageExceeded`] — Post-fee net amount <
+    ///   `min_target_amount`.
     ///
     /// # Security Considerations
     ///
@@ -5569,17 +5570,17 @@ impl OnboardingBridge {
             return Err(BridgeError::SwapFailed);
         }
 
-        // Step 3: slippage check on final output.
-        if received_amount < min_target_amount {
-            return Err(BridgeError::SlippageExceeded);
-        }
-
-        // Step 4: deduct fee in target_asset and forward net to target.
+        // Step 3: deduct fee in target_asset and forward net to target.
         let global_fee_bps = read_fee_bps(&env);
         let tiered_fee_bps = get_tiered_fee_bps(&env, &source, &target_asset, global_fee_bps);
         let effective_fee_bps = get_effective_fee_bps(&env, &target_asset, tiered_fee_bps);
         let fee = calculate_fee(received_amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(received_amount, fee)?;
+
+        // Step 4: slippage check on the amount the target actually receives.
+        if net_amount < min_target_amount {
+            return Err(BridgeError::SlippageExceeded);
+        }
 
         if net_amount > 0 {
             target_token.transfer(&contract_addr, &target, &net_amount);
