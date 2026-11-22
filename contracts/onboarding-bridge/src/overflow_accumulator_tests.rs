@@ -102,8 +102,8 @@ fn user_deposit_overflow_returns_error_not_panic() {
 fn daily_limit_usage_overflow_returns_error_not_panic() {
     let (env, bridge_id, asset, source) = setup();
     env.as_contract(&bridge_id, || {
-        // A high limit so the overflow check (not the limit check) is what fires.
-        save_source_daily_limit(&env, &source, &asset, i128::MAX);
+        // No limit set, so the bucket accumulator's overflow check is what fires.
+        save_source_daily_limit(&env, &source, &asset, 0);
         check_daily_limit(&env, &source, &asset, i128::MAX).unwrap();
         assert_eq!(
             check_daily_limit(&env, &source, &asset, 1),

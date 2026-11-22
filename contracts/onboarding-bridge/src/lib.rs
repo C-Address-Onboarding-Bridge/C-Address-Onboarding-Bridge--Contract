@@ -1215,10 +1215,38 @@ fn read_source_daily_limit(env: &Env, source: &Address, asset: &Address) -> i128
         .unwrap_or(0)
 }
 
+/// Length of one rolling-window bucket, in seconds.
+const DAILY_WINDOW_BUCKET_SECS: u64 = 3_600;
+
+/// Number of hourly buckets that make up the rolling 24-hour window.
+const DAILY_WINDOW_BUCKETS: u64 = 24;
+
+/// Index of the hourly bucket containing `timestamp`.
 fn current_day(env: &Env) -> u64 {
-    env.ledger().timestamp() / 86_400
+    env.ledger().timestamp() / DAILY_WINDOW_BUCKET_SECS
 }
 
+/// Sums the usage recorded in the rolling 24-hour window ending at the current
+/// hourly bucket. At most [`DAILY_WINDOW_BUCKETS`] buckets are read, so the
+/// per-call cost stays bounded regardless of how long the pair has been active.
+fn rolling_window_usage(env: &Env, source: &Address, asset: &Address, bucket: u64) -> i128 {
+    let mut total: i128 = 0;
+    let first = bucket.saturating_sub(DAILY_WINDOW_BUCKETS - 1);
+    for b in first..=bucket {
+        let key = DataKey::DailyUsage(source.clone(), asset.clone(), b);
+        let used: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        total = total.saturating_add(used);
+    }
+    total
+}
+
+/// Enforces the rolling 24-hour daily limit for `(source, asset)` and records
+/// `amount` against the current hourly bucket.
+///
+/// Usage is recorded even when no limit is configured (`limit == 0`), so a
+/// limit set later in the window immediately accounts for volume already
+/// bridged. The extra writes are bounded (one bucket per call) and are pruned
+/// implicitly: buckets older than the window are never read again.
 fn check_daily_limit(
     env: &Env,
     source: &Address,
@@ -1226,15 +1254,16 @@ fn check_daily_limit(
     amount: i128,
 ) -> Result<(), BridgeError> {
     let limit = read_source_daily_limit(env, source, asset);
-    if limit == 0 {
-        return Ok(()); // no limit set
-    }
-    let day = current_day(env);
-    let key = DataKey::DailyUsage(source.clone(), asset.clone(), day);
+    let bucket = current_day(env);
+    let key = DataKey::DailyUsage(source.clone(), asset.clone(), bucket);
     let used: i128 = env.storage().persistent().get(&key).unwrap_or(0);
     let updated = safe_math::safe_add(used, amount)?;
-    if updated > limit {
-        return Err(BridgeError::DailyLimitExceeded);
+    if limit != 0 {
+        let window_used = rolling_window_usage(env, source, asset, bucket);
+        let projected = safe_math::safe_add(window_used, amount)?;
+        if projected > limit {
+            return Err(BridgeError::DailyLimitExceeded);
+        }
     }
     env.storage().persistent().set(&key, &updated);
     Ok(())
@@ -1636,7 +1665,7 @@ impl OnboardingBridge {
     ///   `target` is not allowlisted.
     /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
     /// * [`BridgeError::DailyLimitExceeded`] — Transfer would exceed `source`'s
-    ///   daily limit for this asset.
+    ///   rolling 24-hour limit for this asset.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     ///
     /// # Events
@@ -1950,15 +1979,25 @@ impl OnboardingBridge {
     /// Sets a maximum daily transfer limit for a specific `(source, asset)` pair.
     ///
     /// Once set, any `fund_c_address` call from `source` using `asset` that
-    /// would push the day's cumulative volume past `limit_amount` is rejected.
-    /// Set `limit_amount` to `0` to disable the limit entirely.
+    /// would push the cumulative volume of the trailing 24 hours past
+    /// `limit_amount` is rejected. Set `limit_amount` to `0` to disable the
+    /// limit entirely.
+    ///
+    /// The window is rolling, not calendar-based: usage is recorded in hourly
+    /// buckets and a call is measured against the current bucket plus the 23
+    /// preceding ones. A source therefore cannot move twice its limit within
+    /// seconds by straddling a UTC midnight boundary.
+    ///
+    /// Usage is recorded even while no limit is configured, so setting a limit
+    /// mid-window immediately counts volume already bridged in the trailing
+    /// 24 hours.
     ///
     /// # Arguments
     ///
     /// * `source` (`Address`) — The address whose daily throughput is being capped.
     /// * `asset` (`Address`) — The asset the limit applies to.
-    /// * `limit_amount` (`i128`) — Maximum gross tokens allowed per calendar day
-    ///   (UTC, measured in ledger timestamp / 86 400). Use `0` to disable.
+    /// * `limit_amount` (`i128`) — Maximum gross tokens allowed in any rolling
+    ///   24-hour window (hourly buckets of 3 600 seconds). Use `0` to disable.
     /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
     ///
     /// # Authorization
@@ -4784,8 +4823,9 @@ impl OnboardingBridge {
 
     /// Extends the persistent-storage TTL for all per-`(source, asset)` and
     /// per-`source` keys used by the core funding paths: `SourceDailyLimit`,
-    /// the current day's `DailyUsage`, `UserDeposit`, `SourceBridgedVolume`,
-    /// the sequential `Nonce`, and the auth-entry `AuthNonce` counter.
+    /// the current hourly `DailyUsage` bucket, `UserDeposit`,
+    /// `SourceBridgedVolume`, the sequential `Nonce`, and the auth-entry
+    /// `AuthNonce` counter.
     ///
     /// Only keys that already exist in storage are extended; missing keys are
     /// silently skipped, mirroring `extend_persistent_ttl`.

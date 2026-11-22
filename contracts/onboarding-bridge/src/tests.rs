@@ -6276,9 +6276,9 @@ fn test_extend_source_persistent_ttl_extends_source_keys() {
     let seq = env.ledger().sequence();
     bridge.verify_auth_entry(&user, &0u64, &0u32, &(seq + 100));
 
-    // The daily-usage key is scoped by calendar day, derived the same way
+    // The daily-usage key is scoped by hourly bucket, derived the same way
     // `check_daily_limit` derives it internally.
-    let day = env.ledger().timestamp() / 86_400;
+    let day = env.ledger().timestamp() / 3_600;
 
     env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
     bridge.extend_source_persistent_ttl(&user, &token_id, &200_000u32, &None);
@@ -6470,8 +6470,8 @@ fn test_daily_limit_blocks_excess_funding() {
     assert_eq!(check_balance(&env, &token_id, &bridge_id), 0i128);
 }
 
-// Verify that the daily limit counter resets on the next UTC day,
-// allowing transfers that would have been blocked the previous day.
+// Verify that usage leaves the rolling 24-hour window after a full day,
+// allowing transfers that would have been blocked earlier.
 #[test]
 fn test_daily_limit_resets_next_day() {
     let env = Env::default();
@@ -6503,13 +6503,106 @@ fn test_daily_limit_resets_next_day() {
         Err(Ok(BridgeError::DailyLimitExceeded))
     );
 
-    // Advance to the next UTC day (86 400 seconds later).
+    // Advance a full rolling window (86 400 seconds later).
     advance_ledger_time(&env, env.ledger().timestamp() + 86_400);
 
-    // After the day rolls over the limit should reset, allowing a fresh transfer.
+    // Once the earlier usage leaves the window the limit frees up again.
     let target2 = Address::generate(&env);
     bridge.fund_c_address(&user, &target2, &token_id, &500i128, &None, &None);
     assert_eq!(check_balance(&env, &token_id, &target2), 495i128);
+}
+
+// A source must not be able to move 2x its limit by straddling a UTC midnight
+// boundary: the window is rolling, not calendar-based.
+#[test]
+fn test_daily_limit_rolling_window_across_utc_midnight() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_source_daily_limit(&user, &token_id, &500i128, &None);
+
+    mint_tokens(&env, &token_id, &user, 2000i128);
+
+    // One second before a UTC day boundary: spend the whole limit.
+    advance_ledger_time(&env, 86_399);
+    bridge.fund_c_address(
+        &user,
+        &Address::generate(&env),
+        &token_id,
+        &500i128,
+        &None,
+        &None,
+    );
+
+    // Two seconds later (just after midnight) the earlier spend still counts.
+    advance_ledger_time(&env, 86_401);
+    assert_eq!(
+        bridge.try_fund_c_address(
+            &user,
+            &Address::generate(&env),
+            &token_id,
+            &500i128,
+            &None,
+            &None
+        ),
+        Err(Ok(BridgeError::DailyLimitExceeded))
+    );
+}
+
+// Usage is recorded even when no limit is configured, so a limit set later in
+// the same window immediately counts volume already bridged.
+#[test]
+fn test_daily_limit_set_after_funding_counts_earlier_usage() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    mint_tokens(&env, &token_id, &user, 2000i128);
+
+    // No limit configured yet: fund 400.
+    bridge.fund_c_address(
+        &user,
+        &Address::generate(&env),
+        &token_id,
+        &400i128,
+        &None,
+        &None,
+    );
+
+    // Limit of 500 set afterwards; the earlier 400 already counts.
+    bridge.set_source_daily_limit(&user, &token_id, &500i128, &None);
+
+    assert_eq!(
+        bridge.try_fund_c_address(
+            &user,
+            &Address::generate(&env),
+            &token_id,
+            &101i128,
+            &None,
+            &None
+        ),
+        Err(Ok(BridgeError::DailyLimitExceeded))
+    );
+
+    // 100 more fits exactly within the remaining capacity.
+    bridge.fund_c_address(
+        &user,
+        &Address::generate(&env),
+        &token_id,
+        &100i128,
+        &None,
+        &None,
+    );
 }
 
 /********** Asset fee cap unit tests **********/
