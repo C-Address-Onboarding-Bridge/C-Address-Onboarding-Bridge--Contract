@@ -2015,6 +2015,16 @@ impl OnboardingBridge {
     /// would push the day's cumulative volume past `limit_amount` is rejected.
     /// Set `limit_amount` to `0` to disable the limit entirely.
     ///
+    /// # Which amount counts
+    ///
+    /// * `fund_c_address` — the gross amount pulled from `source`.
+    /// * `fund_c_address_with_swap` — two limits are enforced: the gross
+    ///   `source_amount` against the `(source, source_asset)` limit, and the
+    ///   gross `received_amount` produced by the swap (before the fee is
+    ///   deducted) against the `(source, target_asset)` limit. Net-of-fee
+    ///   amounts are never used, so a `target_asset` limit cannot be bypassed
+    ///   by swapping into it.
+    ///
     /// # Arguments
     ///
     /// * `source` (`Address`) — The address whose daily throughput is being capped.
@@ -5463,7 +5473,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::PoolNotWhitelisted`] — The pool in `swap_route` is not
     ///   on the swap-pool whitelist.
     /// * [`BridgeError::DailyLimitExceeded`] — `source_amount` exceeds the
-    ///   source's daily limit for `source_asset`.
+    ///   source's daily limit for `source_asset`, or the gross amount received
+    ///   from the swap exceeds the source's daily limit for `target_asset`.
     /// * [`BridgeError::SwapFailed`] — The pool returned zero tokens out or
     ///   transferred no target tokens.
     /// * [`BridgeError::SlippageExceeded`] — Post-fee net amount <
@@ -5569,6 +5580,11 @@ impl OnboardingBridge {
         if received_amount <= 0 {
             return Err(BridgeError::SwapFailed);
         }
+
+        // Enforce the (source, target_asset) daily limit on the gross amount
+        // received from the swap, so a target_asset limit cannot be bypassed
+        // by swapping into it. The source_asset check above still applies.
+        check_daily_limit(&env, &source, &target_asset, received_amount)?;
 
         // Step 3: deduct fee in target_asset and forward net to target.
         let global_fee_bps = read_fee_bps(&env);
