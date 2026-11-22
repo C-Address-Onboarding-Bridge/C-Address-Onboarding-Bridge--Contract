@@ -3221,6 +3221,17 @@ impl OnboardingBridge {
     ///   supported configuration and accounting state as events.
     /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
     ///
+    /// # Events
+    ///
+    /// When `migrate_data` is true, publishes `("EmergencyMigrate", "config")`,
+    /// `("EmergencyMigrate", "collector")`, `("EmergencyMigrate", "assets")`,
+    /// `("EmergencyMigrate", "fees")`, `("EmergencyMigrate", "relayers")`,
+    /// `("EmergencyMigrate", "limits")` (minimum amount, max withdraw per tx,
+    /// max instance TTL, max persistent TTL), `("EmergencyMigrate", "roles")`
+    /// (admin, pending admin, pending fee collector, current wasm hash) and
+    /// `("EmergencyMigrate", "counters")` (TimelockId, CommitmentId).
+    /// Always publishes `("EmergencyMigrated", admin)`.
+    ///
     /// # Authorization
     ///
     /// Requires the current admin's `require_auth()`.
@@ -3278,6 +3289,38 @@ impl OnboardingBridge {
             env.events().publish(
                 ("EmergencyMigrate", "relayers"),
                 (read_relayer_set(&env), relayer_threshold(&env)),
+            );
+            env.events().publish(
+                ("EmergencyMigrate", "limits"),
+                (
+                    read_minimum_amount(&env),
+                    read_max_withdraw_per_tx(&env),
+                    read_max_instance_ttl(&env),
+                    read_max_persistent_ttl(&env),
+                ),
+            );
+            env.events().publish(
+                ("EmergencyMigrate", "roles"),
+                (
+                    admin.clone(),
+                    read_pending_admin(&env),
+                    read_pending_fee_collector(&env),
+                    read_current_wasm_hash(&env),
+                ),
+            );
+            let timelock_id: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TimelockId)
+                .unwrap_or(0u64);
+            let commitment_id: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::CommitmentId)
+                .unwrap_or(0u64);
+            env.events().publish(
+                ("EmergencyMigrate", "counters"),
+                (timelock_id, commitment_id),
             );
         }
 
