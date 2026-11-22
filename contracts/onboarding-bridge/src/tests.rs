@@ -4180,6 +4180,54 @@ mod crosschain_tests {
     }
 
     #[test]
+    fn test_crosschain_fee_accrues_to_fee_collector() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+
+        let sk = make_signing_key([9u8; 32]);
+        bridge.add_relayer(
+            &BytesN::from_array(&env, sk.verifying_key().as_bytes()),
+            &None,
+        );
+        bridge.set_relayer_threshold(&1u32, &None);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0x5a; 32]);
+        let chain_id: u32 = 1;
+        let amount: i128 = 1000;
+
+        let payload_hash = build_payload_hash(&env, chain_id, &tx_hash, &target, &token_id, amount);
+        let sigs = Vec::from_array(&env, [make_relayer_sig(&env, &sk, &payload_hash)]);
+
+        bridge.fund_c_address_crosschain(&chain_id, &tx_hash, &target, &token_id, &amount, &sigs);
+
+        // 1% fee on 1000 = 10; net = 990.
+        assert_eq!(
+            TestTokenClient::new(&env, &token_id).balance(&target),
+            990i128
+        );
+        assert_eq!(bridge.query_crosschain_reserve(&token_id), 10_000 - 1000);
+        assert_eq!(bridge.query_accrued_fees(&token_id), 10i128);
+        assert_eq!(bridge.query_total_fees_collected(&token_id), 10i128);
+
+        let events = env.events().all();
+        let (contract_id, topics, data) = events.get(events.len() - 1).unwrap();
+        assert_eq!(contract_id, _bridge_id);
+        assert_eq!(
+            topics,
+            (
+                soroban_sdk::Symbol::new(&env, "CrossChainFunded"),
+                target.clone(),
+            )
+                .into_val(&env)
+        );
+        assert_eq!(
+            data,
+            (chain_id, tx_hash.clone(), amount, 10i128, token_id.clone()).into_val(&env)
+        );
+    }
+
+    #[test]
     fn test_crosschain_below_threshold_rejected() {
         let env = Env::default();
         let (_bridge_id, token_id, _admin, bridge) = setup(&env);

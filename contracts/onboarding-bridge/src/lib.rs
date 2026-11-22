@@ -4069,7 +4069,8 @@ impl OnboardingBridge {
     /// * `tx_hash` (`BytesN<32>`) — The 32-byte hash of the source-chain transaction.
     /// * `target` (`Address`) — The Soroban C-address to credit.
     /// * `asset` (`Address`) — Whitelisted token contract address.
-    /// * `amount` (`i128`) — Gross amount (fee is deducted before crediting `target`).
+    /// * `amount` (`i128`) — Gross amount (fee is deducted before crediting
+    ///   `target` and accrued to the fee collector).
     /// * `sigs` (`Vec<RelayerSig>`) — At least `threshold` distinct relayer Ed25519
     ///   signatures over the payload hash (see above).
     ///
@@ -4098,7 +4099,7 @@ impl OnboardingBridge {
     ///   or fewer than `threshold` valid signatures.
     /// * [`BridgeError::InvalidAddress`] — A strkey exceeds `MAX_STRKEY_LEN` (64) bytes.
     /// * [`BridgeError::InsufficientCrossChainReserve`] — The reserve cannot
-    ///   cover `net_amount`.
+    ///   cover the gross `amount`.
     ///
     /// # Events
     ///
@@ -4108,8 +4109,11 @@ impl OnboardingBridge {
     ///
     /// The nonce is derived deterministically from `(chain_id, tx_hash)` and
     /// marked used before the token transfer, preventing replay attacks.
-    /// Cross-chain payouts do not accrue fees: they spend pre-funded reserve
-    /// liquidity rather than depositing tokens in this call.
+    /// The reserve is debited by the gross `amount`; the fee portion is
+    /// credited to `accrued_fees` and `total_fees_collected` so it is
+    /// withdrawable only by the fee collector via `withdraw_fees`, never by the
+    /// admin through `withdraw_crosschain_reserve`. The event reports the same
+    /// `fee` that was accrued.
     /// Ed25519 signatures are verified strictly before the nonce is consumed;
     /// invalid signatures return [`BridgeError::MetaTxInvalidSignature`].
     /// The contract verifies that `sigs` contains distinct pubkeys — a relayer
@@ -4196,18 +4200,21 @@ impl OnboardingBridge {
             return Err(BridgeError::BelowThreshold);
         }
 
+        // Cross-chain payouts spend pre-funded reserve liquidity, so the fee is
+        // charged against the reserve and accrued to the fee collector rather
+        // than left in the reserve for the admin to withdraw.
         let global_fee_bps = read_fee_bps(&env);
         let effective_fee_bps = get_effective_fee_bps(&env, &asset, global_fee_bps);
         let fee = calculate_fee(amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(amount, fee)?;
-        decrement_crosschain_reserve(&env, &asset, net_amount)?;
+        decrement_crosschain_reserve(&env, &asset, amount)?;
         mark_nonce_used(&env, &nonce);
 
         if net_amount > 0 {
             let token_client = token::Client::new(&env, &asset);
             token_client.transfer(&env.current_contract_address(), &target, &net_amount);
         }
-        update_asset_counters_split(&env, &asset, 0, 0, net_amount)?;
+        update_asset_counters_split(&env, &asset, fee, fee, net_amount)?;
         mint_loyalty_tokens(&env, &target);
         extend_instance_ttl(&env);
 
