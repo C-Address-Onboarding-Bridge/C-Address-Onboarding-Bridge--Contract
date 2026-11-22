@@ -2084,14 +2084,18 @@ impl OnboardingBridge {
     ///
     /// # Authorization
     ///
-    /// No authorization is required because this operation only pays rent and
-    /// does not change contract state.
+    /// Requires the current admin's `require_auth()`.
     ///
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::FeeTooHigh`] — `max_fee_bps` exceeds 1 000.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("AssetFeeCapChanged", old_fee_cap, max_fee_bps)` — data:
+    ///   `(admin, asset)`
     ///
     /// # Examples
     ///
