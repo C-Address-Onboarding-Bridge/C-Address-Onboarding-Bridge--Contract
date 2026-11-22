@@ -745,7 +745,50 @@ fn calculate_fee(amount: i128, fee_bps: u32) -> Result<i128, BridgeError> {
     }
     let bps = fee_bps as i128;
     let product = safe_math::safe_mul(amount, bps)?;
-    safe_math::safe_div(product, FEE_DENOMINATOR)
+    // #1079: round the fee up so that splitting a payment into many small
+    // entries cannot floor the fee to zero. Any positive amount charged a
+    // non-zero fee_bps pays at least 1 unit.
+    let quotient = safe_math::safe_div(product, FEE_DENOMINATOR)?;
+    let remainder = product - quotient * FEE_DENOMINATOR;
+    if remainder > 0 {
+        Ok(quotient + 1)
+    } else {
+        Ok(quotient)
+    }
+}
+
+/// Splits `total_fee` across `weights` proportionally, rounding each share up
+/// and giving any leftover to the last non-zero weight so the shares always
+/// sum exactly to `total_fee`. Used by batch funding so that the fee is
+/// computed on the batch aggregate and cannot be reduced by splitting entries.
+fn allocate_fee(total_fee: i128, weights: &[i128]) -> Result<Vec<i128>, BridgeError> {
+    let mut shares = Vec::with_capacity(weights.len());
+    let mut weight_total: i128 = 0;
+    for weight in weights.iter() {
+        weight_total = safe_math::safe_add(weight_total, *weight)?;
+    }
+    let mut allocated: i128 = 0;
+    let mut last_non_zero: Option<usize> = None;
+    for (i, weight) in weights.iter().enumerate() {
+        if *weight <= 0 || weight_total <= 0 {
+            shares.push(0);
+            continue;
+        }
+        let product = safe_math::safe_mul(total_fee, *weight)?;
+        let quotient = safe_math::safe_div(product, weight_total)?;
+        let remainder = product - quotient * weight_total;
+        let share = if remainder > 0 { quotient + 1 } else { quotient };
+        allocated = safe_math::safe_add(allocated, share)?;
+        last_non_zero = Some(i);
+        shares.push(share);
+    }
+    if let Some(i) = last_non_zero {
+        let excess = allocated - total_fee;
+        if excess > 0 {
+            shares[i] -= excess;
+        }
+    }
+    Ok(shares)
 }
 
 fn is_blocked(env: &Env, addr: &Address) -> bool {
@@ -1676,8 +1719,8 @@ impl OnboardingBridge {
     ///
     /// Access checks (`check_access`) are evaluated before `require_auth` so
     /// that blocked/non-allowlisted targets are rejected without consuming the
-    /// caller's authorization budget. The fee is floored (integer division), so
-    /// for very small amounts the effective fee may be 0.
+    /// caller's authorization budget. The fee is rounded up (ceil), so any
+    /// positive amount with a non-zero fee rate pays at least 1 unit.
     ///
     /// # Examples
     ///
@@ -1792,6 +1835,9 @@ impl OnboardingBridge {
     /// blocked, those amounts are returned to `source` at the end of execution.
     /// The validation loop that checks for zero/negative amounts runs before
     /// the initial token pull, so no tokens are moved on validation failures.
+    /// The fee is computed once on the aggregate of the deliverable entries and
+    /// then split proportionally (rounding each share up), so splitting a
+    /// payment into many small entries cannot reduce the total fee.
     ///
     /// # Examples
     ///
@@ -1868,6 +1914,27 @@ impl OnboardingBridge {
         let mut num_failures: u32 = 0;
         let mut refund_total: i128 = 0;
 
+        // #1079: compute the fee on the aggregate of the entries that will
+        // actually be delivered, then split it proportionally. Charging per
+        // entry would let a caller split a payment into many tiny entries and
+        // pay (almost) no fee.
+        let mut fee_weights: Vec<i128> = Vec::new(&env);
+        for i in 0..targets.len() {
+            let target = targets.get(i).unwrap();
+            let amount = amounts.get(i).unwrap();
+            if check_access(&env, &target).is_err() {
+                fee_weights.push_back(0);
+            } else {
+                fee_weights.push_back(amount);
+            }
+        }
+        let batch_fee = calculate_fee(successful_total, effective_fee_bps)?;
+        let mut weights: Vec<i128> = Vec::new(&env);
+        for weight in fee_weights.iter() {
+            weights.push_back(weight);
+        }
+        let fee_shares = allocate_fee(batch_fee, &weights)?;
+
         for i in 0..targets.len() {
             let target = targets.get(i).unwrap();
             let amount = amounts.get(i).unwrap();
@@ -1881,7 +1948,7 @@ impl OnboardingBridge {
                 continue;
             }
 
-            let fee = calculate_fee(amount, effective_fee_bps)?;
+            let fee = fee_shares.get(i).unwrap();
             let net_amount = safe_math::safe_sub(amount, fee)?;
 
             if net_amount > 0 {
@@ -2801,8 +2868,9 @@ impl OnboardingBridge {
     ///
     /// # Returns
     ///
-    /// `(fee, net)` where `fee = floor(gross × fee_bps / 10_000)` and
-    /// `net = gross − fee`.
+    /// `(fee, net)` where `fee = ceil(gross × fee_bps / 10_000)` and
+    /// `net = gross − fee`. The fee is rounded up so that any positive amount
+    /// with a non-zero fee rate pays at least 1 unit.
     ///
     /// # Examples
     ///
@@ -2848,7 +2916,7 @@ impl OnboardingBridge {
     ///
     /// `(effective_fee_bps, fee, net)` where:
     /// - `effective_fee_bps` is the resolved basis-point rate after cap + tier.
-    /// - `fee = floor(amount × effective_fee_bps / 10_000)`.
+    /// - `fee = ceil(amount × effective_fee_bps / 10_000)`.
     /// - `net = amount − fee`.
     ///
     /// # Errors
