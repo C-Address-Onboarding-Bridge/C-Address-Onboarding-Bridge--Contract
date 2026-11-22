@@ -1699,6 +1699,7 @@ impl OnboardingBridge {
         }
 
         update_asset_counters(&env, &asset, fee, net_amount)?;
+        increment_user_deposit(&env, &source, &asset, amount)?;
         increment_source_bridged_volume(&env, &source, &asset, amount)?;
         extend_instance_ttl(&env);
         mint_loyalty_tokens(&env, &source);
@@ -1876,6 +1877,7 @@ impl OnboardingBridge {
             token_client.transfer(&contract_addr, &source, &refund_total);
         }
 
+        increment_user_deposit(&env, &source, &asset, successful_total)?;
         increment_source_bridged_volume(&env, &source, &asset, successful_total)?;
         extend_instance_ttl(&env);
         // #593: only reward loyalty when at least one transfer succeeded;
@@ -2024,6 +2026,30 @@ impl OnboardingBridge {
     ) -> Result<i128, BridgeError> {
         check_initialized(&env)?;
         Ok(read_source_daily_limit(&env, &source, &asset))
+    }
+
+    /// Returns the cumulative gross amount `source` has deposited in `asset`
+    /// across every funding path (`fund_c_address`, `batch_fund_c_address`,
+    /// `fund_c_address_with_referral`, `fund_c_address_timelocked`,
+    /// `reveal_fund`, and the meta-transaction funding path).
+    ///
+    /// Returns `0` if `source` has never funded with `asset`.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The depositing address to query.
+    /// * `asset` (`Address`) — The asset to query.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    pub fn query_user_deposit(env: Env, source: Address, asset: Address) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserDeposit(source, asset))
+            .unwrap_or(0))
     }
 
     /// Sets a per-asset maximum fee cap in basis points.
@@ -4472,6 +4498,7 @@ impl OnboardingBridge {
         );
         increment_locked_timelock(&env, &asset, amount)?;
         increment_user_deposit(&env, &source, &asset, amount)?;
+        increment_source_bridged_volume(&env, &source, &asset, amount)?;
         mint_loyalty_tokens(&env, &source);
         extend_instance_ttl(&env);
 
@@ -5286,6 +5313,7 @@ impl OnboardingBridge {
         }
 
         update_asset_counters(&env, &asset, fee, net_amount)?;
+        increment_user_deposit(&env, &source, &asset, amount)?;
         increment_source_bridged_volume(&env, &source, &asset, amount)?;
         extend_instance_ttl(&env);
 
