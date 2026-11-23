@@ -1320,8 +1320,8 @@ export class OnboardingBridgeSDK {
       throw new Error(`Failed to get fee: ${result.error}`);
     }
 
-    const scVal = (result as any).results?.[0]?.retval;
-    return scVal ? Number(scValToNative(scVal)) : 0;
+    const scVal = this.requireRetval(result, 'query_fee_bps');
+    return Number(scValToNative(scVal));
   }
 
   async queryReferralRate(): Promise<number> {
@@ -1336,8 +1336,8 @@ export class OnboardingBridgeSDK {
       throw new Error(`Failed to get referral rate: ${result.error}`);
     }
 
-    const scVal = (result as any).results?.[0]?.retval;
-    return scVal ? Number(scValToNative(scVal)) : 0;
+    const scVal = this.requireRetval(result, 'query_referral_rate');
+    return Number(scValToNative(scVal));
   }
 
   /**
@@ -1367,8 +1367,8 @@ export class OnboardingBridgeSDK {
       throw new Error(`Failed to get fee collector: ${result.error}`);
     }
 
-    const scVal = (result as any).results?.[0]?.retval;
-    return scVal ? scValToNative(scVal).toString() : '';
+    const scVal = this.requireRetval(result, 'query_fee_collector');
+    return scValToNative(scVal).toString();
   }
 
   /**
@@ -1399,8 +1399,8 @@ export class OnboardingBridgeSDK {
       throw new Error(`Failed to get admin: ${result.error}`);
     }
 
-    const scVal = (result as any).results?.[0]?.retval;
-    return scVal ? scValToNative(scVal).toString() : '';
+    const scVal = this.requireRetval(result, 'query_admin');
+    return scValToNative(scVal).toString();
   }
 
   /**
@@ -1437,8 +1437,8 @@ export class OnboardingBridgeSDK {
       throw new Error(`Failed to get balance: ${result.error}`);
     }
 
-    const scVal = (result as any).results?.[0]?.retval;
-    return scVal ? scValToNative(scVal).toString() : '0';
+    const scVal = this.requireRetval(result, 'query_balance');
+    return scValToNative(scVal).toString();
   }
 
   async queryCommitment(id: string | number | bigint): Promise<CommitmentEntry | null> {
@@ -1552,8 +1552,8 @@ export class OnboardingBridgeSDK {
       throw new Error(`Failed to get fee balance: ${result.error}`);
     }
 
-    const scVal = (result as any).results?.[0]?.retval;
-    return scVal ? scValToNative(scVal).toString() : '0';
+    const scVal = this.requireRetval(result, 'query_accrued_fees');
+    return scValToNative(scVal).toString();
   }
 
   /**
@@ -1577,8 +1577,8 @@ export class OnboardingBridgeSDK {
       throw new Error(`Failed to get contract balance: ${result.error}`);
     }
 
-    const scVal = (result as any).results?.[0]?.retval;
-    return scVal ? scValToNative(scVal).toString() : '0';
+    const scVal = this.requireRetval(result, 'query_contract_balance');
+    return scValToNative(scVal).toString();
   }
 
   /**
@@ -1658,8 +1658,8 @@ export class OnboardingBridgeSDK {
       throw new Error(`Failed to check initialization: ${result.error}`);
     }
 
-    const scVal = (result as any).results?.[0]?.retval;
-    return scVal ? Boolean(scValToNative(scVal)) : false;
+    const scVal = this.requireRetval(result, 'query_is_initialized');
+    return Boolean(scValToNative(scVal));
   }
 
   /**
@@ -3033,8 +3033,8 @@ export class OnboardingBridgeSDK {
     if ('error' in result && result.error) {
       throw new Error(`Failed to query relayer threshold: ${result.error}`);
     }
-    const scVal = (result as any).results?.[0]?.retval;
-    return scVal ? Number(scValToNative(scVal)) : 0;
+    const scVal = this.requireRetval(result, 'query_relayer_threshold');
+    return Number(scValToNative(scVal));
   }
 
   /**
@@ -3058,8 +3058,8 @@ export class OnboardingBridgeSDK {
     if ('error' in result && result.error) {
       throw new Error(`Failed to query relayer: ${result.error}`);
     }
-    const scVal = (result as any).results?.[0]?.retval;
-    return scVal ? Boolean(scValToNative(scVal)) : false;
+    const scVal = this.requireRetval(result, 'query_is_relayer');
+    return Boolean(scValToNative(scVal));
   }
 
   // ---------------------------------------------------------------------------
@@ -3170,8 +3170,8 @@ export class OnboardingBridgeSDK {
     if ('error' in result && result.error) {
       throw new Error(`Failed to query blocklist status: ${result.error}`);
     }
-    const scVal = (result as any).results?.[0]?.retval;
-    return scVal ? Boolean(scValToNative(scVal)) : false;
+    const scVal = this.requireRetval(result, 'query_is_blocked');
+    return Boolean(scValToNative(scVal));
   }
 
   /**
@@ -3206,8 +3206,8 @@ export class OnboardingBridgeSDK {
     if ('error' in result && result.error) {
       throw new Error(`Failed to query allowlist status: ${result.error}`);
     }
-    const scVal = (result as any).results?.[0]?.retval;
-    return scVal ? Boolean(scValToNative(scVal)) : false;
+    const scVal = this.requireRetval(result, 'query_is_allowlisted');
+    return Boolean(scValToNative(scVal));
   }
 
   /**
@@ -3351,6 +3351,15 @@ export class OnboardingBridgeSDK {
   /**
    * Convert JavaScript values to Soroban SCVals.
    */
+  /** Returns the simulation retval or throws if the RPC response carried none. */
+  private requireRetval(result: unknown, method: string): any {
+    const scVal = (result as any)?.results?.[0]?.retval;
+    if (!scVal) {
+      throw new Error(`${method} returned no value`);
+    }
+    return scVal;
+  }
+
   private buildSimulationTx(method: string, args: any[]) {
     return buildSharedSimTx(this.contract, method, args, this.networkPassphrase, this.config.timeout ?? 30);
   }
