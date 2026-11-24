@@ -735,7 +735,7 @@ export class OnboardingBridgeSDK {
   /**
    * Query a timelocked funding entry by ID.
    */
-  async queryTimelocked(id: number): Promise<TimelockEntry | null> {
+  async queryTimelocked(id: string | number | bigint): Promise<TimelockEntry | null> {
     const account = new Account('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF', '0');
     const tx = new TransactionBuilder(account, {
       fee: '100',
@@ -755,6 +755,9 @@ export class OnboardingBridgeSDK {
     );
 
     if ('error' in result && result.error) {
+      if (/Error\(Contract,\s*#?19\)/.test(result.error)) {
+        return null;
+      }
       throw new Error(`Failed to query timelocked entry: ${result.error}`);
     }
 
@@ -1455,6 +1458,9 @@ export class OnboardingBridgeSDK {
     );
 
     if ('error' in result && result.error) {
+      if (/Error\(Contract,\s*#?30\)/.test(result.error)) {
+        return null;
+      }
       throw new Error(`Failed to get commitment: ${result.error}`);
     }
 
