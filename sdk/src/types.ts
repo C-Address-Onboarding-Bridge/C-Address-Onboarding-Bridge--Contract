@@ -850,12 +850,6 @@ export interface RelayerManagementOptions {
 }
 
 // ---------------------------------------------------------------------------
-// C-address creation
-// ---------------------------------------------------------------------------
-
-
-
-// ---------------------------------------------------------------------------
 // Swap-and-bridge
 // ---------------------------------------------------------------------------
 
@@ -1025,4 +1019,19 @@ export interface CostEstimate {
    * Useful for UI feedback — if this is high, the RPC may be under load.
    */
   executionTimeMs: number;
+}
+
+/**
+ * TTL configuration returned by {@link OnboardingBridgeSDK.queryTtlConfig}.
+ * All values are in ledgers.
+ */
+export interface TtlConfig {
+  /** Configurable cap for instance-storage TTL extensions. */
+  maxInstanceTtl: number;
+  /** Configurable cap for persistent-storage TTL extensions. */
+  maxPersistentTtl: number;
+  /** Contract constant `MAX_ALLOWED_TTL`; neither cap can exceed it. */
+  hardCeiling: number;
+  /** Contract constant `CRITICAL_ENTRY_TTL_THRESHOLD`. */
+  criticalThreshold: number;
 }
