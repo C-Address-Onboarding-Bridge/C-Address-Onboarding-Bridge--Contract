@@ -2229,13 +2229,20 @@ describe("address validation", () => {
     expect(result.error).toMatch(/Invalid account address for "newAdmin"/);
   });
 
-  it("getCAddressBalance rejects a G-address as cAddress", async () => {
-    await expect(
-      sdk.getCAddressBalance(MOCK_ADDRESS, MOCK_ASSET),
-    ).rejects.toThrow(/Invalid contract address for "cAddress"/);
+  it("getCAddressBalance accepts a G-address as cAddress", async () => {
+    const provider = (rpc.Server as jest.Mock).mock.results.at(-1)?.value;
+    (scValToNative as jest.Mock).mockReturnValue({ toString: () => "500" });
+    provider.simulateTransaction.mockResolvedValue({
+      results: [{ retval: {} }],
+    });
+
+    const balance = await sdk.getCAddressBalance(MOCK_ADDRESS, MOCK_ASSET);
+
+    expect(balance).toBe("500");
+    expect(Address).toHaveBeenCalledWith(MOCK_ADDRESS);
   });
 
-  it("getCAddressBalance rejects a G-address as asset", async () => {
+  it("getCAddressBalance still rejects a G-address as asset", async () => {
     await expect(
       sdk.getCAddressBalance(MOCK_ASSET, MOCK_ADDRESS),
     ).rejects.toThrow(/Invalid contract address for "asset"/);
@@ -2380,7 +2387,7 @@ describe("Error handling - invalid inputs", () => {
 
   it("getCAddressBalance rejects invalid cAddress", async () => {
     await expect(sdk.getCAddressBalance("invalid", MOCK_ASSET)).rejects.toThrow(
-      /Invalid contract address for "cAddress"/,
+      /Invalid address for "cAddress"/,
     );
   });
 
