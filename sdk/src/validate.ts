@@ -107,3 +107,24 @@ export function assertRelayerPubkey(pubkeyHex: string, field: string): void {
     );
   }
 }
+
+/**
+ * Assert that a swap route contains exactly one pool.
+ *
+ * The bridge contract only supports single-hop swaps: `fund_c_address_with_swap`
+ * returns `MultiHopNotSupported` (`Error(Contract, #43)`) for any route whose
+ * length is not exactly 1. Checking here fails fast, before the caller signs
+ * and pays for a transaction that cannot succeed.
+ *
+ * @param route - The `swapRoute` array passed to `fundCAddressWithSwap`.
+ *
+ * @throws {Error} When `route` does not contain exactly one entry.
+ */
+export function assertSingleHopSwapRoute(route: readonly string[]): void {
+  if (!Array.isArray(route) || route.length !== 1) {
+    const len = Array.isArray(route) ? route.length : 0;
+    throw new Error(
+      `swapRoute must contain exactly one whitelisted pool; the contract rejects any other length with MultiHopNotSupported (Error(Contract, #43)), got ${len}`,
+    );
+  }
+}

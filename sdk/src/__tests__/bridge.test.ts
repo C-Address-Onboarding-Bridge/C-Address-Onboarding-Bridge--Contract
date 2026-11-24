@@ -1,5 +1,6 @@
 import { OnboardingBridgeSDK, BASE_RESERVE_STROOPS } from "../bridge";
 import { OffRampIntegration } from "../offramp";
+import * as observability from "../observability";
 import {
   rpc,
   Contract,
@@ -1178,6 +1179,126 @@ describe("OnboardingBridgeSDK", () => {
         expect.anything(),
         expect.anything(),
       );
+    });
+  });
+
+  describe("fundCAddressWithSwap route length", () => {
+    const base = {
+      source: MOCK_ADDRESS,
+      target: MOCK_ASSET,
+      sourceAsset: MOCK_ASSET,
+      targetAsset: MOCK_ASSET,
+      sourceAmount: "1000",
+      minTargetAmount: "900",
+    };
+
+    it.each([
+      ["an empty route", [] as string[]],
+      ["a two-pool route", [MOCK_ASSET, MOCK_ASSET]],
+    ])("rejects %s before any RPC call", async (_label, swapRoute) => {
+      const result = await sdk.fundCAddressWithSwap({ ...base, swapRoute }, mockKeypair);
+
+      expect(result.status).toBe("failed");
+      expect(result.error).toMatch(/MultiHopNotSupported/);
+      expect(mockProvider.getAccount).not.toHaveBeenCalled();
+      expect(mockProvider.sendTransaction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("cancelCommitment", () => {
+    let rpcHookSpy: jest.SpyInstance;
+    beforeEach(() => {
+      rpcHookSpy = jest
+        .spyOn(observability, "withRpcHook")
+        .mockImplementation(async (_hooks: any, _method: any, _params: any, fn: any) => fn());
+    });
+    afterEach(() => rpcHookSpy.mockRestore());
+
+    it("returns pending once the transaction is submitted", async () => {
+      const result = await sdk.cancelCommitment(7n, mockKeypair);
+      expect(result).toEqual({ hash: "mock_tx_hash", status: "pending" });
+      expect(mockProvider.sendTransaction).toHaveBeenCalled();
+    });
+
+    it("calls cancel_commitment with exactly one u64 argument", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      await sdk.cancelCommitment("42", mockKeypair);
+
+      expect(nativeToScVal).toHaveBeenCalledWith(42n, { type: "u64" });
+      const calls = contract.call.mock.calls.filter((c: any[]) => c[0] === "cancel_commitment");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toHaveLength(2); // method name + commitment_id
+      expect(mockProvider.getAccount).toHaveBeenCalledWith(MOCK_ADDRESS);
+    });
+
+    it("returns failed without an RPC call for an out-of-range id", async () => {
+      const result = await sdk.cancelCommitment(-1, mockKeypair);
+      expect(result.status).toBe("failed");
+      expect(result.error).toMatch(/u64/);
+      expect(mockProvider.getAccount).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("meta signer management", () => {
+    // Pass withRpcHook straight through so these tests exercise the new
+    // wrappers independently of the withRpcHook finally-block bug (#1121).
+    let rpcHookSpy: jest.SpyInstance;
+    beforeEach(() => {
+      rpcHookSpy = jest
+        .spyOn(observability, "withRpcHook")
+        .mockImplementation(async (_hooks: any, _method: any, _params: any, fn: any) => fn());
+    });
+    afterEach(() => rpcHookSpy.mockRestore());
+
+    it("registerMetaSigner calls register_meta_signer(source, pubkey)", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      await sdk.registerMetaSigner(MOCK_ADDRESS, "ab".repeat(32), mockKeypair);
+
+      const calls = contract.call.mock.calls.filter((c: any[]) => c[0] === "register_meta_signer");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toHaveLength(3);
+      expect(xdr.ScVal.scvBytes).toHaveBeenCalledWith(Buffer.from("ab".repeat(32), "hex"));
+    });
+
+    it("registerMetaSigner rejects a malformed pubkey before any RPC call", async () => {
+      const result = await sdk.registerMetaSigner(MOCK_ADDRESS, "abc", mockKeypair);
+      expect(result.status).toBe("failed");
+      expect(result.error).toMatch(/32-byte hex/);
+      expect(mockProvider.getAccount).not.toHaveBeenCalled();
+    });
+
+    it("unregisterMetaSigner calls unregister_meta_signer(source)", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      await sdk.unregisterMetaSigner(MOCK_ADDRESS, mockKeypair);
+
+      const calls = contract.call.mock.calls.filter((c: any[]) => c[0] === "unregister_meta_signer");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toHaveLength(2);
+    });
+
+    it("queryMetaSigner returns the registered key as hex", async () => {
+      (scValToNative as jest.Mock).mockReturnValue(Buffer.from("cd".repeat(32), "hex"));
+      mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+      await expect(sdk.queryMetaSigner(MOCK_ADDRESS)).resolves.toBe("cd".repeat(32));
+    });
+
+    it("queryMetaSigner returns null when no key is registered", async () => {
+      (scValToNative as jest.Mock).mockReturnValue(null);
+      mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+      await expect(sdk.queryMetaSigner(MOCK_ADDRESS)).resolves.toBeNull();
+    });
+
+    it("isMetaTxNonceUsed returns the contract boolean", async () => {
+      (scValToNative as jest.Mock).mockReturnValue(true);
+      mockProvider.simulateTransaction.mockResolvedValue({ results: [{ retval: {} }] });
+
+      await expect(sdk.isMetaTxNonceUsed(MOCK_ADDRESS, 3)).resolves.toBe(true);
+      expect(nativeToScVal).toHaveBeenCalledWith(3n, { type: "u64" });
     });
   });
 

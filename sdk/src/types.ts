@@ -864,7 +864,7 @@ export interface RelayerManagementOptions {
  *
  * The bridge contract will:
  * 1. Pull `sourceAmount` of `sourceAsset` from `source`.
- * 2. Route it through `swapRoute` (an ordered list of DEX pool addresses).
+ * 2. Swap it through the single whitelisted DEX pool in `swapRoute`.
  * 3. Deduct the protocol fee in `targetAsset`.
  * 4. Credit the net `targetAsset` amount to `target`.
  *
@@ -913,8 +913,10 @@ export interface FundCAddressWithSwapOptions {
   minTargetAmount: string;
 
   /**
-   * Ordered list of DEX pool contract addresses through which the swap is routed.
-   * Each pool must implement `swap(min_amount_out: i128, to: Address) → i128`.
+   * Exactly one whitelisted DEX pool contract address. The contract only
+   * supports single-hop swaps and rejects any other length with
+   * `MultiHopNotSupported` (#43); the SDK rejects it before submitting.
+   * The pool must implement `swap(min_amount_out: i128, to: Address) → i128`.
    */
   swapRoute: string[];
 

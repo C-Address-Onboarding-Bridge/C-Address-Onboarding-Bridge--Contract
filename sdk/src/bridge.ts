@@ -66,7 +66,13 @@ export const BATCH_TX_LIMIT = 100;
  * `BridgeConfig.baseReserveStroops` if the network uses a different value.
  */
 export const BASE_RESERVE_STROOPS = 5_000_000;
-import { assertAccountAddress, assertAddress, assertContractAddress, assertRelayerPubkey } from './validate';
+import {
+  assertAccountAddress,
+  assertAddress,
+  assertContractAddress,
+  assertRelayerPubkey,
+  assertSingleHopSwapRoute,
+} from './validate';
 import { withRpcRetry } from './retry';
 import { toScVals, buildSimulationTx as buildSharedSimTx } from './encoding';
 import {
@@ -114,6 +120,99 @@ export function computeCommitmentHash(options: CommitmentHashOptions): string {
     amountBytes,
     nonceBytes,
   ])).digest('hex');
+}
+
+const MAX_I128 = (1n << 127n) - 1n;
+const MAX_U64 = (1n << 64n) - 1n;
+
+function sha256(data: Buffer | string): Buffer {
+  return createHash('sha256').update(data).digest();
+}
+
+/**
+ * Compute the 32-byte payload hash that `execute_meta_fund` verifies.
+ *
+ * Mirrors the contract byte-for-byte:
+ *
+ * ```text
+ * sha256("meta_fund" || network_id || sha256(contract_strkey) ||
+ *        sha256(source_strkey) || sha256(target_strkey) || sha256(asset_strkey) ||
+ *        amount_be16 || nonce_be8 || deadline_be8)
+ * ```
+ *
+ * `params.networkId` must be the hex SHA-256 of the network passphrase
+ * (what `env.ledger().network_id()` returns on-chain).
+ *
+ * @param params     - The meta-fund parameters the user is signing.
+ * @param contractId - The bridge contract's C-address.
+ * @returns The 32-byte payload hash.
+ */
+export function computeMetaFundPayload(params: MetaFundParams, contractId: string): Buffer {
+  if (!/^[0-9a-fA-F]{64}$/.test(params.networkId ?? '')) {
+    throw new Error('networkId must be a 32-byte hex string');
+  }
+  const amount = BigInt(params.amount);
+  const nonce = BigInt(params.nonce);
+  const deadline = BigInt(params.deadline);
+  if (amount <= 0n || amount > MAX_I128) throw new Error('amount must fit a positive i128');
+  if (nonce < 0n || nonce > MAX_U64) throw new Error('nonce must fit a u64');
+  if (deadline < 0n || deadline > MAX_U64) throw new Error('deadline must fit a u64');
+
+  const amountBytes = Buffer.alloc(16);
+  amountBytes.writeBigUInt64BE(amount >> 64n, 0);
+  amountBytes.writeBigUInt64BE(amount & MAX_U64, 8);
+  const nonceBytes = Buffer.alloc(8);
+  nonceBytes.writeBigUInt64BE(nonce);
+  const deadlineBytes = Buffer.alloc(8);
+  deadlineBytes.writeBigUInt64BE(deadline);
+
+  return sha256(Buffer.concat([
+    Buffer.from('meta_fund'),
+    Buffer.from(params.networkId, 'hex'),
+    sha256(contractId),
+    sha256(params.source),
+    sha256(params.target),
+    sha256(params.asset),
+    amountBytes,
+    nonceBytes,
+    deadlineBytes,
+  ]));
+}
+
+/** Result of {@link signMetaFund}; spread it into `executeMetaFund` options. */
+export interface SignedMetaFund {
+  /** Hex of the 32-byte payload hash that was signed. */
+  payloadHash: string;
+  /** Hex of the signer's 32-byte Ed25519 public key. */
+  pubkey: string;
+  /** Hex of the 64-byte Ed25519 signature. */
+  signature: string;
+}
+
+/**
+ * Sign a meta-fund request with the source's Ed25519 key.
+ *
+ * The returned `pubkey` must already be registered for `params.source`
+ * via {@link OnboardingBridgeSDK.registerMetaSigner}, or the contract rejects
+ * the call with `MetaTxPubkeySourceMismatch`.
+ *
+ * @example
+ * ```ts
+ * const { pubkey, signature } = signMetaFund(params, contractId, userKeypair);
+ * await sdk.executeMetaFund({ params, pubkey, signature }, relayerKeypair);
+ * ```
+ */
+export function signMetaFund(
+  params: MetaFundParams,
+  contractId: string,
+  keypair: Keypair,
+): SignedMetaFund {
+  const payloadHash = computeMetaFundPayload(params, contractId);
+  return {
+    payloadHash: payloadHash.toString('hex'),
+    pubkey: Buffer.from(keypair.rawPublicKey()).toString('hex'),
+    signature: Buffer.from(keypair.sign(payloadHash)).toString('hex'),
+  };
 }
 
 /**
@@ -553,6 +652,84 @@ export class OnboardingBridgeSDK {
   }
 
   /**
+   * Cancel an unrevealed commitment and remove its persistent entry.
+   *
+   * Calls `cancel_commitment(commitment_id: u64)`. Only the commitment's
+   * `source` can cancel (the contract calls `source.require_auth()`), so
+   * `sourceKeypair` must be that account. Cancelling is allowed after the
+   * reveal deadline, which is how an expired (`CommitmentExpired`) commitment
+   * gets cleaned up.
+   *
+   * Contract errors: `CommitmentNotFound` (#30) if the id does not exist,
+   * `CommitmentAlreadyRevealed` (#31) if it was already revealed.
+   *
+   * @param commitmentId  - ID returned by {@link commitFundAndWait}.
+   * @param sourceKeypair - Keypair of the account that created the commitment.
+   */
+  async cancelCommitment(
+    commitmentId: string | number | bigint,
+    sourceKeypair: Keypair,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'cancelCommitment',
+      { commitmentId },
+      async () => {
+        try {
+          const id = BigInt(commitmentId);
+          if (id < 0n || id > MAX_U64) throw new Error('commitmentId must fit a u64');
+
+          const sourceAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: sourceKeypair.publicKey() },
+            () => this.provider.getAccount(sourceKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(sourceAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'cancel_commitment',
+                nativeToScVal(id, { type: 'u64' }),
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'cancel_commitment' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(sourceKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'cancel_commitment' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
    * Create a timelocked funding entry for a C-address.
    *
    * Transfers `options.amount` of `options.asset` from `source` into the bridge
@@ -778,7 +955,10 @@ export class OnboardingBridgeSDK {
    *
    * Calls `fund_c_address_with_swap` on the bridge contract which:
    * 1. Pulls `sourceAmount` of `sourceAsset` from `source`.
-   * 2. Routes it through the DEX pools in `swapRoute`.
+   * 2. Swaps it through the single DEX pool in `swapRoute`. The contract only
+   *    supports single-hop swaps: `swapRoute` must contain exactly one
+   *    whitelisted pool, and any other length is rejected here, before any RPC
+   *    call, instead of failing on-chain with `MultiHopNotSupported` (#43).
    * 3. Deducts the fee in `targetAsset` and forwards the net to `target`.
    *
    * @example
@@ -820,6 +1000,7 @@ export class OnboardingBridgeSDK {
           assertContractAddress(options.target, 'target');
           assertContractAddress(options.sourceAsset, 'sourceAsset');
           assertContractAddress(options.targetAsset, 'targetAsset');
+          assertSingleHopSwapRoute(options.swapRoute);
           options.swapRoute.forEach((p, i) => assertContractAddress(p, `swapRoute[${i}]`));
 
           const sourceAccount = await withRpcHook(
@@ -2683,6 +2864,25 @@ export class OnboardingBridgeSDK {
     };
   }
 
+  /**
+   * Submit a user-signed meta-fund as a relayer.
+   *
+   * The call only succeeds once these hold:
+   * 1. **Registered signer**: `options.pubkey` is the key `params.source`
+   *    bound with {@link registerMetaSigner}. Otherwise the contract returns
+   *    `MetaTxPubkeySourceMismatch` (#49).
+   * 2. **Allowance**: `params.source` has approved the bridge contract on
+   *    `params.asset` for at least `params.amount` (token `approve(source,
+   *    bridgeContractId, amount, expirationLedger)`). The bridge pulls funds with
+   *    `transfer_from`, so the relayer's transaction carries no auth from the
+   *    source.
+   * 3. **Signature**: `options.signature` signs the payload from
+   *    {@link computeMetaFundPayload}. {@link signMetaFund} produces
+   *    `pubkey` and `signature` together.
+   * 4. `params.nonce` is unused ({@link isMetaTxNonceUsed}),
+   *    `params.deadline` is in the future, and `params.networkId` matches the
+   *    ledger's network id.
+   */
   async executeMetaFund(
     options: ExecuteMetaFundOptions,
     relayerKeypair: Keypair,
@@ -2731,6 +2931,167 @@ export class OnboardingBridgeSDK {
             this.hooks,
             'sendTransaction',
             { contractMethod: 'execute_meta_fund' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Bind an Ed25519 public key to `source` for meta-transactions.
+   *
+   * `execute_meta_fund` rejects every call with `MetaTxPubkeySourceMismatch`
+   * unless the signing key was first registered here. Requires `source` auth,
+   * so `sourceKeypair` must be the `source` account.
+   *
+   * @param source        - G-address the key may sign for.
+   * @param pubkeyHex     - 32-byte Ed25519 public key as hex.
+   * @param sourceKeypair - Keypair of `source`.
+   */
+  async registerMetaSigner(
+    source: string,
+    pubkeyHex: string,
+    sourceKeypair: Keypair,
+  ): Promise<TransactionResult> {
+    return this.submitSourceCall(
+      'registerMetaSigner',
+      'register_meta_signer',
+      source,
+      sourceKeypair,
+      () => [
+        new Address(source).toScVal(),
+        this.hexBytesToScVal(pubkeyHex, 32, 'pubkeyHex'),
+      ],
+    );
+  }
+
+  /**
+   * Remove the meta-transaction key bound to `source`. Later meta-funds for
+   * `source` fail until a new key is registered. Requires `source` auth.
+   */
+  async unregisterMetaSigner(
+    source: string,
+    sourceKeypair: Keypair,
+  ): Promise<TransactionResult> {
+    return this.submitSourceCall(
+      'unregisterMetaSigner',
+      'unregister_meta_signer',
+      source,
+      sourceKeypair,
+      () => [new Address(source).toScVal()],
+    );
+  }
+
+  /**
+   * Return the Ed25519 key registered for `source` as hex, or `null` when
+   * none is registered.
+   */
+  async queryMetaSigner(source: string): Promise<string | null> {
+    assertAccountAddress(source, 'source');
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_meta_signer' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTxWithScVals('query_meta_signer', [new Address(source).toScVal()]),
+      ),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query meta signer: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    if (!scVal) return null;
+    const native = scValToNative(scVal);
+    if (native === null || native === undefined) return null;
+    const hex = this.bytesToHex(native);
+    return hex || null;
+  }
+
+  /** Return `true` if `nonce` has already been consumed for `source`. */
+  async isMetaTxNonceUsed(source: string, nonce: string | number | bigint): Promise<boolean> {
+    assertAccountAddress(source, 'source');
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_meta_tx_nonce_used' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTxWithScVals('query_meta_tx_nonce_used', [
+          new Address(source).toScVal(),
+          nativeToScVal(BigInt(nonce), { type: 'u64' }),
+        ]),
+      ),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query meta-tx nonce: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? Boolean(scValToNative(scVal)) : false;
+  }
+
+  /**
+   * Shared write path for calls authorised by the `source` account itself.
+   * Follows the same hooks / timeout / `status: 'failed'` pattern as the
+   * other mutating methods.
+   */
+  private async submitSourceCall(
+    sdkMethod: string,
+    contractMethod: string,
+    source: string,
+    sourceKeypair: Keypair,
+    buildArgs: () => xdr.ScVal[],
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      sdkMethod,
+      { source },
+      async () => {
+        try {
+          assertAccountAddress(source, 'source');
+          const args = buildArgs();
+
+          const sourceAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: source },
+            () => this.provider.getAccount(source),
+          );
+
+          const tx = new TransactionBuilder(sourceAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(this.contract.call(contractMethod, ...args))
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(sourceKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod },
             () => this.provider.sendTransaction(preparedTx),
           );
 

@@ -5847,6 +5847,58 @@ fn test_meta_fund_accepts_documented_payload_layout() {
     assert_eq!(check_balance(&env, &token_id, &user), 500i128);
 }
 
+/// Fixed cross-check vector for the TypeScript SDK's `computeMetaFundPayload`
+/// and `signMetaFund` (sdk/src/__tests__/metaFundPayload.test.ts). The SDK test
+/// asserts the same hex values, so both sides stay byte-for-byte aligned.
+#[test]
+fn test_meta_fund_payload_matches_sdk_vector() {
+    fn from_hex<const N: usize>(hex: &str) -> [u8; N] {
+        let digit = |c: u8| match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => panic!("bad hex digit"),
+        };
+        let raw = hex.as_bytes();
+        assert_eq!(raw.len(), N * 2);
+        let mut out = [0u8; N];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = (digit(raw[2 * i]) << 4) | digit(raw[2 * i + 1]);
+        }
+        out
+    }
+
+    let env = Env::default();
+    let addr = |s: &str| Address::from_string(&soroban_sdk::String::from_str(&env, s));
+    let bridge = addr("CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526");
+    let source = addr("GDVEU3DD4KOFECV66VIHWEZOYX4ZKR3WV27L464SIIPOU2IUI3JCZA57");
+    let target = addr("CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ");
+    let asset = addr("CABQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGAYDAMBQGCK3");
+    // sha256("Test SDF Network ; September 2015")
+    let network_id: BytesN<32> = env
+        .crypto()
+        .sha256(&Bytes::from_slice(&env, b"Test SDF Network ; September 2015"))
+        .into();
+
+    let hash = build_meta_fund_payload_hash(
+        &env, &bridge, &network_id, &source, &target, &asset, 500, 7, 2_000_000,
+    );
+    assert_eq!(
+        hash.to_array(),
+        from_hex::<32>("fac2414dcdfa5435abbce2b83899586628a7e65bc3d4e482b56050e1080df43f")
+    );
+
+    let signing_key = SigningKey::from_bytes(&[0x42u8; 32]);
+    assert_eq!(
+        *signing_key.verifying_key().as_bytes(),
+        from_hex::<32>("2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12")
+    );
+    let signature = sign_meta_fund_payload(&env, &signing_key, &hash);
+    assert_eq!(
+        signature.to_array(),
+        from_hex::<64>("6e5d0d03a04f9f4baff800aae0cf7443aa5d307f99e21f3ee2ac9a257d1259feb3a3b5c7b6c3dfd6bce7762b01e1e20ebc02e1f05a3a9cea062d7db0513a7d04")
+    );
+}
+
 #[test]
 fn test_meta_fund_expired_deadline_fails() {
     let env = Env::default();
