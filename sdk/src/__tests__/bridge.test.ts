@@ -2206,13 +2206,13 @@ describe("address validation", () => {
     expect(result.error).toMatch(/Invalid contract address for "asset"/);
   });
 
-  it("reclaimTokens rejects C-address as to", async () => {
+  it("reclaimTokens accepts a C-address as to", async () => {
     const result = await sdk.reclaimTokens(
       { asset: MOCK_ASSET, amount: "100", to: MOCK_ASSET },
       mockKeypair,
     );
-    expect(result.status).toBe("failed");
-    expect(result.error).toMatch(/Invalid account address for "to"/);
+    expect(result.status).toBe("pending");
+    expect(Address).toHaveBeenCalledWith(MOCK_ASSET);
   });
 
   it("setFeeCollector rejects a C-address", async () => {
@@ -2369,13 +2369,13 @@ describe("Error handling - invalid inputs", () => {
     expect(mockProvider.getAccount).not.toHaveBeenCalled();
   });
 
-  it("reclaimTokens rejects invalid to address (C-address)", async () => {
+  it("reclaimTokens rejects invalid to address", async () => {
     const result = await sdk.reclaimTokens(
-      { asset: MOCK_ASSET, amount: "100", to: MOCK_ASSET },
+      { asset: MOCK_ASSET, amount: "100", to: "not-an-address" },
       mockKeypair,
     );
     expect(result.status).toBe("failed");
-    expect(result.error).toMatch(/Invalid account address for "to"/);
+    expect(result.error).toMatch(/Invalid address for "to"/);
   });
 
   it("getCAddressBalance rejects invalid cAddress", async () => {

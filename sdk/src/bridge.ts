@@ -1208,7 +1208,9 @@ export class OnboardingBridgeSDK {
    * Reclaim tokens accidentally sent directly to the bridge contract address.
    *
    * Admin only.  This is an emergency recovery tool — it moves the contract's
-   * raw token balance (minus any accrued fees for that asset) to `options.to`.
+   * reclaimable token balance to `options.to`. The reclaimable amount is the
+   * contract's raw token balance minus accrued fees for that asset, minus any
+   * funds locked in active timelocks, and minus the cross-chain reserve.
    *
    * @param options     - Asset, amount, and destination address.
    * @param adminKeypair - Keypair of the admin account.
@@ -1236,7 +1238,7 @@ export class OnboardingBridgeSDK {
       async () => {
         try {
           assertContractAddress(options.asset, 'asset');
-          assertAccountAddress(options.to, 'to');
+          assertAddress(options.to, 'to');
           const adminAccount = await withRpcHook(
             this.hooks,
             'getAccount',
@@ -2835,7 +2837,7 @@ export class OnboardingBridgeSDK {
     );
   }
 
-  /** 
+  /**
    * Register an Ed25519 relayer public key on the contract (admin only).
    *
    * Registered relayers are authorised to submit attestation signatures for
