@@ -10,6 +10,7 @@ import {
   bigintReplacer,
   composeHooks,
   createOpenTelemetryHooks,
+  withRpcHook,
 } from '../observability';
 
 describe('bigintReplacer', () => {
@@ -118,5 +119,31 @@ describe('composeHooks', () => {
 
     expect(a.onRpcCall).toHaveBeenCalledWith('m', { nonce: 1n }, 4, err);
     expect(b.onRpcCall).toHaveBeenCalledWith('m', { nonce: 1n }, 4, err);
+  });
+});
+
+describe('withRpcHook (#1121)', () => {
+  it('resolves to the wrapped value when no hooks are configured', async () => {
+    await expect(withRpcHook(undefined, 'x', {}, async () => 42)).resolves.toBe(42);
+  });
+
+  it('rejects with the same error when no hooks are configured', async () => {
+    const err = new Error('rpc down');
+    await expect(withRpcHook(undefined, 'x', {}, async () => { throw err; })).rejects.toBe(err);
+  });
+
+  it('calls onRpcCall exactly once on success, with no error', async () => {
+    const onRpcCall = jest.fn();
+    await expect(withRpcHook({ onRpcCall }, 'getAccount', { a: 1 }, async () => 'ok')).resolves.toBe('ok');
+    expect(onRpcCall).toHaveBeenCalledTimes(1);
+    expect(onRpcCall).toHaveBeenCalledWith('getAccount', { a: 1 }, expect.any(Number), undefined);
+  });
+
+  it('calls onRpcCall exactly once on failure, with the error', async () => {
+    const onRpcCall = jest.fn();
+    const err = new Error('boom');
+    await expect(withRpcHook({ onRpcCall }, 'sendTransaction', {}, async () => { throw err; })).rejects.toBe(err);
+    expect(onRpcCall).toHaveBeenCalledTimes(1);
+    expect(onRpcCall).toHaveBeenCalledWith('sendTransaction', {}, expect.any(Number), err);
   });
 });

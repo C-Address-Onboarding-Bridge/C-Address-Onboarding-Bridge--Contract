@@ -39,6 +39,7 @@ import {
   CostEstimate,
   TimelockEntry,
   TtlConfig,
+  CrosschainReserveOptions,
 } from './types';
 import {
   type ObservabilityHooks,
@@ -2135,6 +2136,10 @@ export class OnboardingBridgeSDK {
    * {@link acceptAdmin}) before the role is moved — `setAdmin` transfers
    * control immediately and unrecoverably if the new key is unusable.
    *
+   * Until it is accepted, the proposal can be withdrawn with
+   * {@link clearPendingAdmin}, for example after proposing a mistyped or
+   * compromised address.
+   *
    * @param newAdmin     - G-address of the proposed admin.
    * @param adminKeypair - Keypair of the current admin account.
    *
@@ -2319,6 +2324,9 @@ export class OnboardingBridgeSDK {
    * operations because it proves the proposed collector controls the key
    * (via {@link acceptFeeCollector}) before the role is moved.
    *
+   * Until it is accepted, the proposal can be withdrawn with
+   * {@link clearPendingFeeCollector}.
+   *
    * @param newCollector - G-address of the proposed fee collector.
    * @param adminKeypair - Keypair of the admin account.
    *
@@ -2495,6 +2503,44 @@ export class OnboardingBridgeSDK {
     if (!scVal) return null;
     const native = scValToNative(scVal);
     return native ? native.toString() : null;
+  }
+
+  /**
+   * Cancel a pending admin handover (`clear_pending_admin`). Admin only.
+   *
+   * Use this when {@link proposeNewAdmin} named the wrong address: until it
+   * is cleared, the proposed address can still call `accept_admin`.
+   *
+   * @param adminKeypair - Keypair of the current admin.
+   * @param nonce        - Optional sequential admin nonce (`void` when omitted).
+   */
+  async clearPendingAdmin(
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return this.submitAdminCall('clearPendingAdmin', 'clear_pending_admin', adminKeypair, { nonce }, () => [
+      this.optionalNonceToScVal(nonce),
+    ]);
+  }
+
+  /**
+   * Cancel a pending fee-collector handover (`clear_pending_fee_collector`).
+   * Admin only.
+   *
+   * @param adminKeypair - Keypair of the current admin.
+   * @param nonce        - Optional sequential admin nonce (`void` when omitted).
+   */
+  async clearPendingFeeCollector(
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return this.submitAdminCall(
+      'clearPendingFeeCollector',
+      'clear_pending_fee_collector',
+      adminKeypair,
+      { nonce },
+      () => [this.optionalNonceToScVal(nonce)],
+    );
   }
 
   /**
@@ -2768,6 +2814,11 @@ export class OnboardingBridgeSDK {
   /**
    * Fund a C-address from a cross-chain event (called by the relayer service).
    * Requires at least `threshold` valid relayer signatures over the canonical payload hash.
+   *
+   * The payout comes from the contract's cross-chain liquidity reserve for
+   * `asset`, not from accrued fees. If the reserve is smaller than the payout
+   * the contract rejects it with `InsufficientCrossChainReserve`. Check it with
+   * {@link getCrosschainReserve} and top it up with {@link fundCrosschainReserve}.
    */
   async fundCrosschain(
     options: CrossChainFundOptions,
@@ -2847,6 +2898,134 @@ export class OnboardingBridgeSDK {
         }
       },
     );
+  }
+
+  /**
+   * Deposit `amount` of `asset` from the admin into the cross-chain liquidity
+   * reserve (`fund_crosschain_reserve(asset, amount)`). Admin only.
+   *
+   * Takes exactly two contract arguments and **no nonce**, unlike most admin
+   * setters.
+   */
+  async fundCrosschainReserve(
+    options: CrosschainReserveOptions,
+    adminKeypair: Keypair,
+  ): Promise<TransactionResult> {
+    return this.submitAdminCall(
+      'fundCrosschainReserve',
+      'fund_crosschain_reserve',
+      adminKeypair,
+      { asset: options.asset, amount: options.amount },
+      () => this.crosschainReserveArgs(options),
+    );
+  }
+
+  /**
+   * Withdraw unused liquidity from the cross-chain reserve back to the admin
+   * (`withdraw_crosschain_reserve(asset, amount)`). Admin only, no nonce.
+   * Fails with `InsufficientCrossChainReserve` if `amount` exceeds the reserve.
+   */
+  async withdrawCrosschainReserve(
+    options: CrosschainReserveOptions,
+    adminKeypair: Keypair,
+  ): Promise<TransactionResult> {
+    return this.submitAdminCall(
+      'withdrawCrosschainReserve',
+      'withdraw_crosschain_reserve',
+      adminKeypair,
+      { asset: options.asset, amount: options.amount },
+      () => this.crosschainReserveArgs(options),
+    );
+  }
+
+  /**
+   * Current cross-chain reserve balance for `asset`
+   * (`query_crosschain_reserve`), as a decimal string in the asset's
+   * smallest unit.
+   *
+   * @throws {Error} On RPC or contract error.
+   */
+  async getCrosschainReserve(asset: string): Promise<string> {
+    assertContractAddress(asset, 'asset');
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_crosschain_reserve' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTxWithScVals('query_crosschain_reserve', [new Address(asset).toScVal()]),
+      ),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get cross-chain reserve: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    if (!scVal) throw new Error('Failed to get cross-chain reserve: no return value');
+    return scValToNative(scVal).toString();
+  }
+
+  private crosschainReserveArgs(options: CrosschainReserveOptions): xdr.ScVal[] {
+    assertContractAddress(options.asset, 'asset');
+    const amount = BigInt(options.amount);
+    if (amount <= 0n || amount > (1n << 127n) - 1n) {
+      throw new Error('amount must be a positive i128');
+    }
+    return [new Address(options.asset).toScVal(), nativeToScVal(amount, { type: 'i128' })];
+  }
+
+  /**
+   * Shared write path for admin calls added for #1134/#1135. Same hooks /
+   * `config.timeout` / `status: 'failed'` pattern as the other mutating methods.
+   */
+  private async submitAdminCall(
+    sdkMethod: string,
+    contractMethod: string,
+    adminKeypair: Keypair,
+    params: Record<string, unknown>,
+    buildArgs: () => xdr.ScVal[],
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(this.hooks, sdkMethod, params, async () => {
+      try {
+        const args = buildArgs();
+        const adminAccount = await withRpcHook(
+          this.hooks,
+          'getAccount',
+          { address: adminKeypair.publicKey() },
+          () => this.provider.getAccount(adminKeypair.publicKey()),
+        );
+
+        const tx = new TransactionBuilder(adminAccount, {
+          fee: BASE_FEE,
+          networkPassphrase: this.networkPassphrase,
+        })
+          .addOperation(this.contract.call(contractMethod, ...args))
+          .setTimeout(this.config.timeout ?? 30)
+          .build();
+
+        const preparedTx = await withRpcHook(
+          this.hooks,
+          'prepareTransaction',
+          { contractMethod },
+          () => this.provider.prepareTransaction(tx),
+        );
+        preparedTx.sign(adminKeypair);
+
+        const response = await withRpcHook(
+          this.hooks,
+          'sendTransaction',
+          { contractMethod },
+          () => this.provider.sendTransaction(preparedTx),
+        );
+
+        return {
+          hash: response.hash,
+          status: response.status === 'PENDING' ? 'pending' : 'failed',
+        };
+      } catch (error: any) {
+        return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
+      }
+    });
   }
 
   /** 
