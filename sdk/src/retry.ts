@@ -300,6 +300,8 @@ const VIEW_RPC_METHODS = new Set([
   'getEvents',
   'getLedgerEntries',
   'getContractData',
+  'getFeeStats',
+  'getVersionInfo',
 ]);
 
 /** RPC methods that mutate on-chain state — retried with the conservative policy. */

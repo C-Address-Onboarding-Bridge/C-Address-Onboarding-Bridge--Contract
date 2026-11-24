@@ -736,22 +736,15 @@ export class OnboardingBridgeSDK {
    * Query a timelocked funding entry by ID.
    */
   async queryTimelocked(id: string | number | bigint): Promise<TimelockEntry | null> {
-    const account = new Account('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF', '0');
-    const tx = new TransactionBuilder(account, {
-      fee: '100',
-      networkPassphrase: this.networkPassphrase,
-    })
-      .addOperation(
-        this.contract.call(
-          'query_timelocked',
-          nativeToScVal(BigInt(id), { type: 'u64' }),
-        ),
-      )
-      .setTimeout(this.config.timeout ?? 30)
-      .build();
+    const tx = this.buildSimulationTxWithScVals('query_timelocked', [
+      nativeToScVal(BigInt(id), { type: 'u64' }),
+    ]);
 
-    const result = await this.provider.simulateTransaction(
-      tx,
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_timelocked' },
+      () => this.provider.simulateTransaction(tx),
     );
 
     if ('error' in result && result.error) {
@@ -2665,7 +2658,12 @@ export class OnboardingBridgeSDK {
 
   async queryPendingUpgrade(): Promise<PendingUpgrade | null> {
     const tx = this.buildSimulationTx('query_pending_upgrade', []);
-    const result = await this.provider.simulateTransaction(tx);
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_pending_upgrade' },
+      () => this.provider.simulateTransaction(tx),
+    );
     if ('error' in result && result.error) {
       throw new Error(`Failed to query pending upgrade: ${result.error}`);
     }
@@ -3301,7 +3299,12 @@ export class OnboardingBridgeSDK {
         ? String(simResult.minResourceFee)
         : '0';
 
-    const feeStats = await this.provider.getFeeStats();
+    const feeStats = await withRpcHook(
+      this.hooks,
+      'getFeeStats',
+      { contractMethod: 'estimate_cost' },
+      () => this.provider.getFeeStats(),
+    );
     const inclusionFee = String(feeStats.sorobanInclusionFee?.p50 ?? BASE_FEE);
 
     // Total fee = inclusion + resource
