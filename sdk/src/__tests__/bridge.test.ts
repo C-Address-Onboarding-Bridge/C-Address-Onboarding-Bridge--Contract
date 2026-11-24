@@ -2008,6 +2008,196 @@ describe("OnboardingBridgeSDK", () => {
     });
   });
 
+  describe("isAssetWhitelisted", () => {
+    it("calls query_is_asset_whitelisted and returns its boolean result", async () => {
+      (scValToNative as jest.Mock).mockReturnValue(true);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const result = await sdk.isAssetWhitelisted(MOCK_ASSET);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith(
+        "query_is_asset_whitelisted",
+        expect.anything(),
+      );
+      expect(result).toBe(true);
+    });
+
+    it("returns false when no results", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+
+      const result = await sdk.isAssetWhitelisted(MOCK_ASSET);
+
+      expect(result).toBe(false);
+    });
+
+    it("throws on simulation error", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({ error: "fail" });
+
+      await expect(sdk.isAssetWhitelisted(MOCK_ASSET)).rejects.toThrow(
+        "Failed to query asset whitelist status",
+      );
+    });
+
+    it("rejects a G-address before simulation", async () => {
+      await expect(sdk.isAssetWhitelisted(MOCK_ADDRESS)).rejects.toThrow(
+        'Invalid contract address for "asset"',
+      );
+      expect(mockProvider.simulateTransaction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("isPoolWhitelisted", () => {
+    it("calls query_is_pool_whitelisted and returns its boolean result", async () => {
+      (scValToNative as jest.Mock).mockReturnValue(true);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+
+      const result = await sdk.isPoolWhitelisted(MOCK_ASSET);
+
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      expect(contract.call).toHaveBeenCalledWith(
+        "query_is_pool_whitelisted",
+        expect.anything(),
+      );
+      expect(result).toBe(true);
+    });
+
+    it("returns false when no results", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+
+      const result = await sdk.isPoolWhitelisted(MOCK_ASSET);
+
+      expect(result).toBe(false);
+    });
+
+    it("throws on simulation error", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({ error: "fail" });
+
+      await expect(sdk.isPoolWhitelisted(MOCK_ASSET)).rejects.toThrow(
+        "Failed to query pool whitelist status",
+      );
+    });
+
+    it("rejects a G-address before simulation", async () => {
+      await expect(sdk.isPoolWhitelisted(MOCK_ADDRESS)).rejects.toThrow(
+        'Invalid contract address for "pool"',
+      );
+      expect(mockProvider.simulateTransaction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("addAsset", () => {
+    it("returns pending status on success", async () => {
+      const result = await sdk.addAsset(MOCK_ASSET, mockKeypair);
+
+      expect(result.status).toBe("pending");
+    });
+
+    it("calls add_asset with Address ScVal and nonce ScVal", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      await sdk.addAsset(MOCK_ASSET, mockKeypair, 1);
+
+      expect(contract.call).toHaveBeenCalledWith(
+        "add_asset",
+        expect.anything(), // Address ScVal for asset
+        expect.anything(), // nonce ScVal
+      );
+    });
+
+    it("returns failed status when asset is a G-address", async () => {
+      const result = await sdk.addAsset(MOCK_ADDRESS, mockKeypair);
+
+      expect(result.status).toBe("failed");
+      expect(result.error).toMatch(/Invalid contract address for "asset"/);
+    });
+  });
+
+  describe("removeAsset", () => {
+    it("returns pending status on success", async () => {
+      const result = await sdk.removeAsset(MOCK_ASSET, mockKeypair);
+
+      expect(result.status).toBe("pending");
+    });
+
+    it("calls remove_asset with Address ScVal and nonce ScVal", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      await sdk.removeAsset(MOCK_ASSET, mockKeypair, 2);
+
+      expect(contract.call).toHaveBeenCalledWith(
+        "remove_asset",
+        expect.anything(), // Address ScVal for asset
+        expect.anything(), // nonce ScVal
+      );
+    });
+
+    it("returns failed status when asset is a G-address", async () => {
+      const result = await sdk.removeAsset(MOCK_ADDRESS, mockKeypair);
+
+      expect(result.status).toBe("failed");
+      expect(result.error).toMatch(/Invalid contract address for "asset"/);
+    });
+  });
+
+  describe("addSwapPool", () => {
+    it("returns pending status on success", async () => {
+      const result = await sdk.addSwapPool(MOCK_ASSET, mockKeypair);
+
+      expect(result.status).toBe("pending");
+    });
+
+    it("calls add_swap_pool with Address ScVal and nonce ScVal", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      await sdk.addSwapPool(MOCK_ASSET, mockKeypair, 3);
+
+      expect(contract.call).toHaveBeenCalledWith(
+        "add_swap_pool",
+        expect.anything(), // Address ScVal for pool
+        expect.anything(), // nonce ScVal
+      );
+    });
+
+    it("returns failed status when pool is a G-address", async () => {
+      const result = await sdk.addSwapPool(MOCK_ADDRESS, mockKeypair);
+
+      expect(result.status).toBe("failed");
+      expect(result.error).toMatch(/Invalid contract address for "pool"/);
+    });
+  });
+
+  describe("removeSwapPool", () => {
+    it("returns pending status on success", async () => {
+      const result = await sdk.removeSwapPool(MOCK_ASSET, mockKeypair);
+
+      expect(result.status).toBe("pending");
+    });
+
+    it("calls remove_swap_pool with Address ScVal and nonce ScVal", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+
+      await sdk.removeSwapPool(MOCK_ASSET, mockKeypair, 4);
+
+      expect(contract.call).toHaveBeenCalledWith(
+        "remove_swap_pool",
+        expect.anything(), // Address ScVal for pool
+        expect.anything(), // nonce ScVal
+      );
+    });
+
+    it("returns failed status when pool is a G-address", async () => {
+      const result = await sdk.removeSwapPool(MOCK_ADDRESS, mockKeypair);
+
+      expect(result.status).toBe("failed");
+      expect(result.error).toMatch(/Invalid contract address for "pool"/);
+    });
+  });
+
   describe("estimateCost minimum balance", () => {
     const ESTIMATE_ARGS = {
       source: MOCK_ADDRESS,
