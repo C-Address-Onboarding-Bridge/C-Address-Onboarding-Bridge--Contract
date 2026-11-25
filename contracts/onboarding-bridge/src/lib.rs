@@ -5575,9 +5575,11 @@ impl OnboardingBridge {
     ///   on the swap-pool whitelist.
     /// * [`BridgeError::DailyLimitExceeded`] — `source_amount` exceeds the
     ///   source's daily limit for `source_asset`.
-    /// * [`BridgeError::SwapFailed`] — The pool returned zero tokens out or
-    ///   transferred no target tokens.
-    /// * [`BridgeError::SlippageExceeded`] — Swap output < `min_target_amount`.
+    /// * [`BridgeError::SwapFailed`] — The pool returned a non-positive
+    ///   `amount_out` or transferred no target tokens.
+    /// * [`BridgeError::SlippageExceeded`] — The pool reported a positive
+    ///   `amount_out` below `min_target_amount`, or the tokens actually
+    ///   received are below `min_target_amount`.
     ///
     /// # Security Considerations
     ///
@@ -5667,8 +5669,17 @@ impl OnboardingBridge {
         ];
         let amount_out: i128 = env.invoke_contract(&pool, &swap_sym, swap_args);
 
+        // A non-positive `amount_out` means the pool did not perform a swap at
+        // all (e.g. it failed or returned nothing), which is a pool failure
+        // rather than a slippage condition.
         if amount_out <= 0 {
             return Err(BridgeError::SwapFailed);
+        }
+
+        // A positive `amount_out` below the caller's minimum is the pool
+        // under-delivering: report it as slippage, not as a pool failure.
+        if amount_out < min_target_amount {
+            return Err(BridgeError::SlippageExceeded);
         }
 
         let balance_after = target_token.balance(&contract_addr);

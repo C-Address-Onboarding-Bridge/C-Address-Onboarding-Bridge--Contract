@@ -68,6 +68,16 @@ pub enum BridgeEventType {
     ContractUpgraded,
     EmergencyMigrated,
     ReferralRateChanged,
+    AdminChanged,
+    FeeCollectorChanged,
+    AdminTransferCancelled,
+    FeeCollectorTransferCancelled,
+    RelayerAdded,
+    MetaSignerRegistered,
+    MetaSignerUnregistered,
+    FeeTiersSet,
+    LoyaltyTokenSet,
+    CommitmentCancelled,
 }
 
 impl BridgeEventType {
@@ -104,6 +114,16 @@ impl BridgeEventType {
             "ContractUpgraded" => Some(Self::ContractUpgraded),
             "EmergencyMigrated" => Some(Self::EmergencyMigrated),
             "ReferralRateChanged" => Some(Self::ReferralRateChanged),
+            "AdminChanged" => Some(Self::AdminChanged),
+            "FeeCollectorChanged" => Some(Self::FeeCollectorChanged),
+            "AdminTransferCancelled" => Some(Self::AdminTransferCancelled),
+            "FeeCollectorTransferCancelled" => Some(Self::FeeCollectorTransferCancelled),
+            "RelayerAdded" => Some(Self::RelayerAdded),
+            "MetaSignerRegistered" => Some(Self::MetaSignerRegistered),
+            "MetaSignerUnregistered" => Some(Self::MetaSignerUnregistered),
+            "FeeTiersSet" => Some(Self::FeeTiersSet),
+            "LoyaltyTokenSet" => Some(Self::LoyaltyTokenSet),
+            "CommitmentCancelled" => Some(Self::CommitmentCancelled),
             _ => None,
         }
     }
@@ -141,6 +161,16 @@ impl BridgeEventType {
             Self::ContractUpgraded => "ContractUpgraded",
             Self::EmergencyMigrated => "EmergencyMigrated",
             Self::ReferralRateChanged => "ReferralRateChanged",
+            Self::AdminChanged => "AdminChanged",
+            Self::FeeCollectorChanged => "FeeCollectorChanged",
+            Self::AdminTransferCancelled => "AdminTransferCancelled",
+            Self::FeeCollectorTransferCancelled => "FeeCollectorTransferCancelled",
+            Self::RelayerAdded => "RelayerAdded",
+            Self::MetaSignerRegistered => "MetaSignerRegistered",
+            Self::MetaSignerUnregistered => "MetaSignerUnregistered",
+            Self::FeeTiersSet => "FeeTiersSet",
+            Self::LoyaltyTokenSet => "LoyaltyTokenSet",
+            Self::CommitmentCancelled => "CommitmentCancelled",
         }
     }
 }
@@ -160,6 +190,8 @@ mod tests {
             ("CAddressFunded", "CAddressFunded"),
             ("FeesWithdrawn", "FeesWithdrawn"),
             // #641: contract emits these four role-change topics, not AdminChanged / FeeCollectorChanged
+            // (#888: the one-step set_admin / set_fee_collector paths do emit
+            // AdminChanged / FeeCollectorChanged, indexed below.)
             ("AdminProposed", "AdminProposed"),
             ("AdminTransferred", "AdminTransferred"),
             ("FeeCollectorTransferProposed", "FeeCollectorTransferProposed"),
@@ -189,6 +221,16 @@ mod tests {
             ("ContractUpgraded", "ContractUpgraded"),
             ("EmergencyMigrated", "EmergencyMigrated"),
             ("ReferralRateChanged", "ReferralRateChanged"),
+            ("AdminChanged", "AdminChanged"),
+            ("FeeCollectorChanged", "FeeCollectorChanged"),
+            ("AdminTransferCancelled", "AdminTransferCancelled"),
+            ("FeeCollectorTransferCancelled", "FeeCollectorTransferCancelled"),
+            ("RelayerAdded", "RelayerAdded"),
+            ("MetaSignerRegistered", "MetaSignerRegistered"),
+            ("MetaSignerUnregistered", "MetaSignerUnregistered"),
+            ("FeeTiersSet", "FeeTiersSet"),
+            ("LoyaltyTokenSet", "LoyaltyTokenSet"),
+            ("CommitmentCancelled", "CommitmentCancelled"),
         ];
 
         for (topic, expected_str) in cases {
@@ -276,6 +318,32 @@ mod tests {
             BridgeEventType::from_topic("UnknownEventXYZ").is_none(),
             "unknown topic must yield None"
         );
+    }
+
+    /// #888: security-relevant topics must each resolve to their own variant.
+    #[test]
+    fn test_from_topic_recognises_security_topics() {
+        let cases: &[(&str, &str)] = &[
+            ("AdminChanged", "AdminChanged"),
+            ("FeeCollectorChanged", "FeeCollectorChanged"),
+            ("AdminTransferCancelled", "AdminTransferCancelled"),
+            ("FeeCollectorTransferCancelled", "FeeCollectorTransferCancelled"),
+            ("RelayerAdded", "RelayerAdded"),
+            ("MetaSignerRegistered", "MetaSignerRegistered"),
+            ("MetaSignerUnregistered", "MetaSignerUnregistered"),
+            ("FeeTiersSet", "FeeTiersSet"),
+            ("LoyaltyTokenSet", "LoyaltyTokenSet"),
+            ("CommitmentCancelled", "CommitmentCancelled"),
+        ];
+        for (topic, expected_str) in cases {
+            let variant = BridgeEventType::from_topic(topic)
+                .unwrap_or_else(|| panic!("from_topic must recognise '{topic}'"));
+            assert_eq!(
+                variant.as_str(),
+                *expected_str,
+                "as_str() mismatch for topic '{topic}'"
+            );
+        }
     }
 
     /// An empty string must return None.

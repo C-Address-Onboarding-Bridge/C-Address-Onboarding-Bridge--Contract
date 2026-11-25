@@ -309,9 +309,8 @@ async fn poll_once(state: &AppState) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Build an [`IndexedEvent`] from a raw `getEvents` entry.
 ///
-/// `event_index` is the position of this event within its transaction and is
-/// folded into the SHA-256 id so two events in the same transaction cannot
-/// produce the same id.
+/// The id is `sha256(rpc_event_id)` (#885). `event_index` is only used as a
+/// fallback when the raw event carries no RPC `id` (older fixtures).
 fn parse_contract_event(
     raw: &serde_json::Value,
     contract_id: &str,
@@ -397,7 +396,10 @@ fn parse_contract_event(
             }
         }
         // ("AdminProposed", admin, new_admin) / ("AdminTransferred", old_admin, pending)
-        BridgeEventType::AdminProposed | BridgeEventType::AdminTransferred => {
+        // ("AdminChanged", old_admin, new_admin) - one-step set_admin path
+        BridgeEventType::AdminProposed
+        | BridgeEventType::AdminTransferred
+        | BridgeEventType::AdminChanged => {
             if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
                 data.insert(
                     "from".to_string(),
@@ -409,9 +411,11 @@ fn parse_contract_event(
             }
         }
         // ("FeeCollectorTransferProposed", admin, new_collector) /
-        // ("FeeCollectorTransferred", old, pending)
+        // ("FeeCollectorTransferred", old, pending) /
+        // ("FeeCollectorChanged", old_collector, new_collector)
         BridgeEventType::FeeCollectorTransferProposed
-        | BridgeEventType::FeeCollectorTransferred => {
+        | BridgeEventType::FeeCollectorTransferred
+        | BridgeEventType::FeeCollectorChanged => {
             if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
                 data.insert(
                     "from".to_string(),
@@ -422,6 +426,22 @@ fn parse_contract_event(
                 data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
             }
         }
+        // ("MetaSignerRegistered", source) / ("MetaSignerUnregistered", source)
+        BridgeEventType::MetaSignerRegistered | BridgeEventType::MetaSignerUnregistered => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "source");
+        }
+        // ("RelayerAdded",) - admin and pubkey carried in value, not topics
+        BridgeEventType::RelayerAdded => {}
+        // ("AdminTransferCancelled",) / ("FeeCollectorTransferCancelled",) /
+        // ("FeeTiersSet", admin) / ("LoyaltyTokenSet", admin) - admin in topics[1]
+        BridgeEventType::AdminTransferCancelled
+        | BridgeEventType::FeeCollectorTransferCancelled
+        | BridgeEventType::FeeTiersSet
+        | BridgeEventType::LoyaltyTokenSet => {
+            insert_topic_str(&mut data, &decoded_topics, 1, "admin");
+        }
+        // ("CommitmentCancelled",) - commitment_id and source carried in value
+        BridgeEventType::CommitmentCancelled => {}
         _ => {
             // CommitFund, BatchTransferFailed, and the remaining admin/config
             // events all publish (name, source, target).
@@ -430,22 +450,26 @@ fn parse_contract_event(
         }
     }
 
-    // #634 - Deterministic ID: sha256(ledger || tx_hash || event_type ||
-    // first_topic || event_index) encoded as a 64-char hex string.
+    // #885 - Deterministic ID derived from the Soroban RPC event id.
     //
-    // Using SHA-256 (rather than std::hash::DefaultHasher, whose output is
-    // explicitly NOT stable across Rust releases) ensures:
-    //   1. The id never changes when the toolchain is upgraded.
-    //   2. The id space is large enough (256 bits) to avoid collisions.
-    //   3. Re-indexing the same on-chain event always produces the same id,
-    //      so `INSERT OR IGNORE` remains the sole deduplication mechanism.
+    // The RPC `id` is unique per event across the whole chain, so it is
+    // stable across pages, polls and re-index runs. The previous scheme
+    // folded a per-page event counter into the hash, which reset on every
+    // page and made two events of the same transaction collide when a batch
+    // spanned pages. `event_index` is only used as a fallback for fixtures
+    // that predate the RPC `id` field.
     let id = {
         let mut hasher = Sha256::new();
-        hasher.update(ledger.to_le_bytes());
-        hasher.update(tx_hash.as_bytes());
-        hasher.update(event_type.as_str().as_bytes());
-        hasher.update(first_topic.as_bytes());
-        hasher.update(event_index.to_le_bytes());
+        match raw.get("id").and_then(|v| v.as_str()) {
+            Some(rpc_id) => hasher.update(rpc_id.as_bytes()),
+            None => {
+                hasher.update(ledger.to_le_bytes());
+                hasher.update(tx_hash.as_bytes());
+                hasher.update(event_type.as_str().as_bytes());
+                hasher.update(first_topic.as_bytes());
+                hasher.update(event_index.to_le_bytes());
+            }
+        }
         hex::encode(hasher.finalize())
     };
 
@@ -1049,6 +1073,115 @@ mod tests {
         assert_ne!(id1, id2, "different tx_hash must produce different IDs");
     }
 
+    /// #885: a 150-event batch from a single transaction split over two pages
+    /// must store 150 rows. The per-page counter used to reset, so the second
+    /// page's events collided with the first page's ids.
+    #[tokio::test]
+    async fn test_poll_once_single_tx_batch_across_pages_stores_all_events() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        fn make_event_json(ledger: i64, rpc_id: &str) -> serde_json::Value {
+            serde_json::json!({
+                "id": rpc_id,
+                "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
+                "ledger": ledger,
+                "txHash": "same-tx-hash",
+                "createdAt": "2024-06-01T12:00:00Z",
+                "value": null,
+            })
+        }
+
+        let page1_events: Vec<_> = (0..MAX_EVENTS_PER_POLL)
+            .map(|i| make_event_json(100, &format!("rpc-batch-{}", i)))
+            .collect();
+        let page2_events: Vec<_> = (MAX_EVENTS_PER_POLL..150)
+            .map(|i| make_event_json(100, &format!("rpc-batch-{}", i)))
+            .collect();
+
+        let page1_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "events": page1_events, "cursor": "cursor-page-2", "latestLedger": 300 }
+        });
+        let page2_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "events": page2_events, "cursor": "cursor-page-3", "latestLedger": 300 }
+        });
+
+        let request_count = Arc::new(AtomicU32::new(0));
+        let request_count_clone = Arc::clone(&request_count);
+
+        let mock_router = axum::Router::new().route(
+            "/",
+            post(move || {
+                let count = request_count_clone.fetch_add(1, Ordering::SeqCst);
+                let response = if count == 0 {
+                    page1_response.clone()
+                } else {
+                    page2_response.clone()
+                };
+                async move { axum::Json(response) }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.unwrap();
+        });
+
+        let db = crate::db::Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        db.set_last_ledger(99).await.unwrap();
+
+        let state = crate::AppState {
+            db: db.clone(),
+            rpc_url: format!("http://{}", addr),
+            contract_id: "C_TEST".to_string(),
+            rpc_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::new(),
+            api_key_hash: String::new(),
+            lookback_ledgers: 720,
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), poll_once(&state))
+            .await
+            .expect("poll_once must terminate")
+            .expect("poll_once must succeed");
+
+        let events = db.list_events(1000, 0).await.expect("list events");
+        assert_eq!(
+            events.len(),
+            150,
+            "all 150 events of the single-tx batch must be stored"
+        );
+    }
+
+    /// #885: the id is derived from the RPC event id, so the same event keeps
+    /// its id regardless of its position within a page.
+    #[test]
+    fn test_parse_id_derives_from_rpc_event_id() {
+        let raw = serde_json::json!({
+            "id": "0000000123-0000000001",
+            "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
+            "ledger": 10,
+            "txHash": "cafebabe00000000",
+            "createdAt": "2024-06-01T12:00:00Z",
+        });
+        let id_at_0 = parse_contract_event(&raw, "C1", 0).unwrap().id;
+        let id_at_7 = parse_contract_event(&raw, "C1", 7).unwrap().id;
+        assert_eq!(id_at_0, id_at_7, "id must not depend on the page counter");
+
+        let expected = {
+            let mut hasher = Sha256::new();
+            hasher.update(b"0000000123-0000000001");
+            hex::encode(hasher.finalize())
+        };
+        assert_eq!(id_at_0, expected, "id must be sha256(rpc event id)");
+    }
+
     // -----------------------------------------------------------------------
     // Issue #879 - ScAddress decoding to Stellar strkeys
     // -----------------------------------------------------------------------
@@ -1214,8 +1347,9 @@ mod tests {
         use axum::routing::post;
         use std::sync::atomic::{AtomicU32, Ordering};
 
-        fn make_event_json(ledger: i64, tx_hash: &str) -> serde_json::Value {
+        fn make_event_json(ledger: i64, tx_hash: &str, rpc_id: &str) -> serde_json::Value {
             serde_json::json!({
+                "id": rpc_id,
                 "topic": ["CAddressFunded", "CASSET", "GSOURCE", "CTARGET"],
                 "ledger": ledger,
                 "txHash": tx_hash,
@@ -1226,11 +1360,11 @@ mod tests {
 
         // Page 1: MAX_EVENTS_PER_POLL events (full page).
         let page1_events: Vec<_> = (0..MAX_EVENTS_PER_POLL)
-            .map(|i| make_event_json(100 + i as i64, &format!("tx-p1-{}", i)))
+            .map(|i| make_event_json(100 + i as i64, &format!("tx-p1-{}", i), &format!("rpc-p1-{}", i)))
             .collect();
         // Page 2: 50 events (partial page -> must break).
         let page2_events: Vec<_> = (0..50)
-            .map(|i| make_event_json(200 + i as i64, &format!("tx-p2-{}", i)))
+            .map(|i| make_event_json(200 + i as i64, &format!("tx-p2-{}", i), &format!("rpc-p2-{}", i)))
             .collect();
 
         let page1_response = serde_json::json!({
