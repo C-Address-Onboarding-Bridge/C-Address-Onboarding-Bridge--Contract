@@ -1072,11 +1072,7 @@ export class OnboardingBridgeSDK {
             }
 
             try {
-              let confirmation = await this.provider.getTransaction(result.hash);
-              while (confirmation.status === 'NOT_FOUND') {
-                await new Promise((resolve) => setTimeout(resolve, 1_000));
-                confirmation = await this.provider.getTransaction(result.hash);
-              }
+              const confirmation = await this.pollTransaction(result.hash, 'batch_fund_c_addresses');
 
               if (confirmation.status === 'FAILED') {
                 results[results.length - 1] = {
@@ -3565,6 +3561,35 @@ export class OnboardingBridgeSDK {
       .build();
   }
 
+  /**
+   * Polls getTransaction until the transaction leaves NOT_FOUND. Gives up after
+   * the transaction time bound (config.timeout) plus slack, since an expired or
+   * dropped transaction will never be found.
+   */
+  private async pollTransaction(hash: string, contractMethod?: string): Promise<any> {
+    const intervalMs = 1000;
+    const timeoutSeconds = this.config.timeout ?? 30;
+    const maxSeconds = timeoutSeconds + 10;
+    const maxAttempts = Math.max(1, Math.ceil((maxSeconds * 1000) / intervalMs));
+    const fetchOnce = () =>
+      withRpcHook(
+        this.hooks,
+        'getTransaction',
+        { hash, ...(contractMethod ? { contractMethod } : {}) },
+        () => this.provider.getTransaction(hash),
+      );
+
+    let response = await fetchOnce();
+    for (let attempt = 0; response.status === 'NOT_FOUND' && attempt < maxAttempts; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      response = await fetchOnce();
+    }
+    if (response.status === 'NOT_FOUND') {
+      throw new Error(`Transaction ${hash} not found after ${maxSeconds}s (expired or dropped)`);
+    }
+    return response;
+  }
+
   private async waitForContractReturnValue<T>(
     submitted: TransactionResult,
     method: string,
@@ -3575,19 +3600,7 @@ export class OnboardingBridgeSDK {
     }
 
     try {
-      const getTransaction = () =>
-        withRpcHook(
-          this.hooks,
-          'getTransaction',
-          { hash: submitted.hash, contractMethod: method },
-          () => this.provider.getTransaction(submitted.hash),
-        );
-      let response = await getTransaction();
-
-      while (response.status === 'NOT_FOUND') {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        response = await getTransaction();
-      }
+      const response = await this.pollTransaction(submitted.hash, method);
 
       if (response.status === 'FAILED') {
         return {
