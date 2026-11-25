@@ -1497,10 +1497,8 @@ fn consume_auth_nonce(
     // 2. Enforce monotonic sequencing. A nonce below the counter has already
     //    been consumed; a nonce above it skips ahead.
     let current = read_auth_nonce(env, source);
-    if nonce < current {
-        return Err(BridgeError::AuthNonceAlreadyUsed);
-    }
-    if nonce > current {
+    // (`AuthNonceAlreadyUsed` is retired; both cases report `DuplicateNonce`.)
+    if nonce != current {
         return Err(BridgeError::DuplicateNonce);
     }
 
