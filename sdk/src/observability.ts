@@ -284,8 +284,9 @@ export async function withRpcHook<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   const start = Date.now();
+  let value: T;
   try {
-    return await fn();
+    value = await fn();
   } catch (err: any) {
     fireRpcCall(
       hooks,
@@ -295,10 +296,9 @@ export async function withRpcHook<T>(
       err instanceof Error ? err : new Error(String(err)),
     );
     throw err;
-  } finally {
-    // Success path fires here; the error path already fired above.
-    if (!hooks?.onRpcCall) return;
   }
+  fireRpcCall(hooks, rpcMethod, params, Date.now() - start);
+  return value;
 }
 
 // -----------------------------------------------------
