@@ -341,9 +341,9 @@ async getCAddressBalance(
   asset: string
 ): Promise<string>
 ```
-Queries the balance of a C-address for a specific whitelisted token.
+Queries the token balance of any address (G-address or C-address) for a specific whitelisted token.
 - **Parameters**:
-  - `cAddress`: `string` — Target contract address.
+  - `cAddress`: `string` — The address to query (G-address or C-address).
   - `asset`: `string` — Token contract address.
 - **Returns**: `Promise<string>` (in the smallest unit of the token)
 

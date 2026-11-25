@@ -1790,7 +1790,7 @@ export class OnboardingBridgeSDK {
     cAddress: string,
     asset: string,
   ): Promise<string> {
-    assertContractAddress(cAddress, 'cAddress');
+    assertAddress(cAddress, 'cAddress');
     assertContractAddress(asset, 'asset');
     const result = await withRpcHook(
       this.hooks,
@@ -3381,7 +3381,7 @@ export class OnboardingBridgeSDK {
     );
   }
 
-  /** 
+  /**
    * Register an Ed25519 relayer public key on the contract (admin only).
    *
    * Registered relayers are authorised to submit attestation signatures for
