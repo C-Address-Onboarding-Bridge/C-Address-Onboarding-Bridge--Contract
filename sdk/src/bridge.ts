@@ -1310,8 +1310,11 @@ export class OnboardingBridgeSDK {
    * @example
    * ```ts
    * const balance = await sdk.getFeeBalance('CD...usdc');
+   * const maxPerTx = await sdk.queryMaxWithdrawPerTx();
+   * const amount  = maxPerTx !== '0' && BigInt(balance) > BigInt(maxPerTx)
+   *   ? maxPerTx : balance;
    * const result  = await sdk.withdrawFees(
-   *   { asset: 'CD...usdc', amount: balance },
+   *   { asset: 'CD...usdc', amount },
    *   feeCollectorKeypair,
    * );
    * ```
@@ -3987,6 +3990,333 @@ export class OnboardingBridgeSDK {
     );
   }
 
+  /**
+   * Set the daily transfer limit for a (source, asset) pair (admin only).
+   *
+   * A limit of `0` means transfers are unrestricted for that pair.
+   * `fundCAddress` returns `DailyLimitExceeded` when the source's
+   * cumulative daily volume for that asset exceeds the limit.
+   *
+   * @param source        - G-address of the source account.
+   * @param asset         - Token contract C-address.
+   * @param limitAmount   - Daily limit in the token's smallest unit (≥ 0).
+   * @param adminKeypair  - Keypair of the admin account.
+   * @param nonce         - Optional sequential nonce to prevent replay.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   */
+  async setSourceDailyLimit(
+    source: string,
+    asset: string,
+    limitAmount: string | number | bigint,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'setSourceDailyLimit',
+      { source, asset, limitAmount, nonce },
+      async () => {
+        try {
+          assertAccountAddress(source, 'source');
+          assertContractAddress(asset, 'asset');
+          const amount = BigInt(limitAmount);
+          if (amount < 0n) throw new Error('limitAmount must be a non-negative i128');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'set_source_daily_limit',
+                new Address(source).toScVal(),
+                new Address(asset).toScVal(),
+                nativeToScVal(amount, { type: 'i128' }),
+                this.optionalNonceToScVal(nonce),
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'set_source_daily_limit' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'set_source_daily_limit' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Set a per-asset fee cap in basis points (admin only).
+   *
+   * The effective fee for `asset` is `min(global_fee_bps, cap)`.
+   * Useful for stablecoins or high-value assets where the global rate
+   * would otherwise be too aggressive.
+   *
+   * @param asset        - Token contract C-address to cap.
+   * @param maxFeeBps    - Cap in basis points (0–1000).
+   * @param adminKeypair - Keypair of the admin account.
+   * @param nonce        - Optional sequential nonce to prevent replay.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   */
+  async setAssetFeeCap(
+    asset: string,
+    maxFeeBps: number,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'setAssetFeeCap',
+      { asset, maxFeeBps, nonce },
+      async () => {
+        try {
+          assertContractAddress(asset, 'asset');
+          if (!Number.isInteger(maxFeeBps) || maxFeeBps < 0 || maxFeeBps > 1000) {
+            throw new Error('maxFeeBps must be an integer between 0 and 1000');
+          }
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'set_asset_fee_cap',
+                new Address(asset).toScVal(),
+                nativeToScVal(maxFeeBps, { type: 'u32' }),
+                this.optionalNonceToScVal(nonce),
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'set_asset_fee_cap' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'set_asset_fee_cap' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Set the global minimum transfer amount (admin only).
+   *
+   * `fundCAddress` rejects amounts below this value with `InvalidAmount`.
+   * A value of `0` disables the minimum.
+   *
+   * @param amount       - Minimum amount in the token's smallest unit (≥ 0).
+   * @param adminKeypair - Keypair of the admin account.
+   * @param nonce        - Optional sequential nonce to prevent replay.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   */
+  async setMinimumAmount(
+    amount: string | number | bigint,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'setMinimumAmount',
+      { amount, nonce },
+      async () => {
+        try {
+          const amt = BigInt(amount);
+          if (amt < 0n) throw new Error('amount must be a non-negative i128');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'set_minimum_amount',
+                nativeToScVal(amt, { type: 'i128' }),
+                this.optionalNonceToScVal(nonce),
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'set_minimum_amount' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'set_minimum_amount' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Set the maximum withdrawable amount per `withdrawFees` transaction (admin only).
+   *
+   * `withdrawFees` returns `WithdrawExceedsLimit` when `amount` exceeds this
+   * value. A value of `0` disables the limit.
+   *
+   * @param amount       - Max withdraw per tx in the token's smallest unit (≥ 0).
+   * @param adminKeypair - Keypair of the admin account.
+   * @param nonce        - Optional sequential nonce to prevent replay.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   */
+  async setMaxWithdrawPerTx(
+    amount: string | number | bigint,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'setMaxWithdrawPerTx',
+      { amount, nonce },
+      async () => {
+        try {
+          const amt = BigInt(amount);
+          if (amt < 0n) throw new Error('amount must be a non-negative i128');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'set_max_withdraw_per_tx',
+                nativeToScVal(amt, { type: 'i128' }),
+                this.optionalNonceToScVal(nonce),
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'set_max_withdraw_per_tx' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'set_max_withdraw_per_tx' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
   // ---------------------------------------------------------------------------
   // Pagination helpers
   // ---------------------------------------------------------------------------
@@ -4190,6 +4520,92 @@ export class OnboardingBridgeSDK {
     }
     const scVal = (result as any).results?.[0]?.retval;
     return scVal ? Boolean(scValToNative(scVal)) : false;
+  }
+
+  /**
+   * Query the daily transfer limit for a (source, asset) pair.
+   *
+   * Returns `'0'` if no limit has been configured, meaning transfers are
+   * unrestricted for that pair.
+   *
+   * @param source - G-address of the source account.
+   * @param asset  - Token contract C-address.
+   *
+   * @returns The daily limit in the token's smallest unit as a decimal string.
+   *
+   * @throws {Error} On RPC failure.
+   */
+  async querySourceDailyLimit(source: string, asset: string): Promise<string> {
+    assertAccountAddress(source, 'source');
+    assertContractAddress(asset, 'asset');
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_source_daily_limit' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_source_daily_limit', [new Address(source), new Address(asset)]),
+      ),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query source daily limit: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? scValToNative(scVal).toString() : '0';
+  }
+
+  /**
+   * Query the per-asset fee cap in basis points.
+   *
+   * Returns `1000` (the contract-wide maximum) if no cap has been set,
+   * meaning the global rate applies uncapped.
+   *
+   * @param asset - Token contract C-address.
+   *
+   * @returns The fee cap in basis points as a `number`.
+   *
+   * @throws {Error} On RPC failure.
+   */
+  async queryAssetFeeCap(asset: string): Promise<number> {
+    assertContractAddress(asset, 'asset');
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_asset_fee_cap' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_asset_fee_cap', [new Address(asset)]),
+      ),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query asset fee cap: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? Number(scValToNative(scVal)) : 0;
+  }
+
+  /**
+   * Query the maximum withdrawable amount per `withdrawFees` transaction.
+   *
+   * Returns `'0'` if no limit has been configured, meaning there is no
+   * per-transaction cap.
+   *
+   * @returns The max withdraw per tx as a decimal string.
+   *
+   * @throws {Error} On RPC failure.
+   */
+  async queryMaxWithdrawPerTx(): Promise<string> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_max_withdraw_per_tx' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_max_withdraw_per_tx', []),
+      ),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query max withdraw per tx: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? scValToNative(scVal).toString() : '0';
   }
 
   /**

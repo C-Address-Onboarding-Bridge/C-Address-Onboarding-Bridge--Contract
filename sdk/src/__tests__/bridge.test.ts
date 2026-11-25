@@ -2319,6 +2319,199 @@ describe("OnboardingBridgeSDK", () => {
     });
   });
 
+  describe("setSourceDailyLimit", () => {
+    it("returns pending status on success", async () => {
+      const result = await sdk.setSourceDailyLimit(
+        MOCK_ADDRESS, MOCK_ASSET, "1000000", mockKeypair,
+      );
+      expect(result.status).toBe("pending");
+    });
+
+    it("calls set_source_daily_limit with Address, Address, i128, nonce ScVals", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      await sdk.setSourceDailyLimit(MOCK_ADDRESS, MOCK_ASSET, "500", mockKeypair, 7);
+      expect(contract.call).toHaveBeenCalledWith(
+        "set_source_daily_limit",
+        expect.anything(), // source Address ScVal
+        expect.anything(), // asset Address ScVal
+        expect.anything(), // i128 ScVal
+        expect.anything(), // nonce ScVal
+      );
+    });
+
+    it("returns failed status when source is a C-address", async () => {
+      const result = await sdk.setSourceDailyLimit(
+        MOCK_ASSET, MOCK_ASSET, "100", mockKeypair,
+      );
+      expect(result.status).toBe("failed");
+      expect(result.error).toMatch(/Invalid account address for "source"/);
+    });
+
+    it("returns failed status when limitAmount is negative", async () => {
+      const result = await sdk.setSourceDailyLimit(
+        MOCK_ADDRESS, MOCK_ASSET, "-1", mockKeypair,
+      );
+      expect(result.status).toBe("failed");
+      expect(result.error).toMatch(/non-negative i128/);
+    });
+  });
+
+  describe("setAssetFeeCap", () => {
+    it("returns pending status on success", async () => {
+      const result = await sdk.setAssetFeeCap(MOCK_ASSET, 50, mockKeypair);
+      expect(result.status).toBe("pending");
+    });
+
+    it("calls set_asset_fee_cap with Address, u32, nonce ScVals", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      await sdk.setAssetFeeCap(MOCK_ASSET, 50, mockKeypair, 3);
+      expect(contract.call).toHaveBeenCalledWith(
+        "set_asset_fee_cap",
+        expect.anything(), // asset Address ScVal
+        expect.anything(), // u32 ScVal
+        expect.anything(), // nonce ScVal
+      );
+    });
+
+    it("returns failed status when maxFeeBps exceeds 1000", async () => {
+      const result = await sdk.setAssetFeeCap(MOCK_ASSET, 1001, mockKeypair);
+      expect(result.status).toBe("failed");
+      expect(result.error).toMatch(/between 0 and 1000/);
+    });
+  });
+
+  describe("setMinimumAmount", () => {
+    it("returns pending status on success", async () => {
+      const result = await sdk.setMinimumAmount("1000", mockKeypair);
+      expect(result.status).toBe("pending");
+    });
+
+    it("calls set_minimum_amount with i128, nonce ScVals", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      await sdk.setMinimumAmount("1000", mockKeypair, 5);
+      expect(contract.call).toHaveBeenCalledWith(
+        "set_minimum_amount",
+        expect.anything(), // i128 ScVal
+        expect.anything(), // nonce ScVal
+      );
+    });
+
+    it("returns failed status when amount is negative", async () => {
+      const result = await sdk.setMinimumAmount("-1", mockKeypair);
+      expect(result.status).toBe("failed");
+      expect(result.error).toMatch(/non-negative i128/);
+    });
+  });
+
+  describe("setMaxWithdrawPerTx", () => {
+    it("returns pending status on success", async () => {
+      const result = await sdk.setMaxWithdrawPerTx("5000000", mockKeypair);
+      expect(result.status).toBe("pending");
+    });
+
+    it("calls set_max_withdraw_per_tx with i128, nonce ScVals", async () => {
+      const contract = (Contract as jest.Mock).mock.results[0].value;
+      await sdk.setMaxWithdrawPerTx("5000000", mockKeypair, 9);
+      expect(contract.call).toHaveBeenCalledWith(
+        "set_max_withdraw_per_tx",
+        expect.anything(), // i128 ScVal
+        expect.anything(), // nonce ScVal
+      );
+    });
+
+    it("returns failed status when amount is negative", async () => {
+      const result = await sdk.setMaxWithdrawPerTx("-1", mockKeypair);
+      expect(result.status).toBe("failed");
+      expect(result.error).toMatch(/non-negative i128/);
+    });
+  });
+
+  describe("querySourceDailyLimit", () => {
+    it("returns the limit as a string from simulation result", async () => {
+      (scValToNative as jest.Mock).mockReturnValue({ toString: () => "1000000" });
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+      const limit = await sdk.querySourceDailyLimit(MOCK_ADDRESS, MOCK_ASSET);
+      expect(limit).toBe("1000000");
+    });
+
+    it("returns '0' when no results", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+      const limit = await sdk.querySourceDailyLimit(MOCK_ADDRESS, MOCK_ASSET);
+      expect(limit).toBe("0");
+    });
+
+    it("throws on simulation error", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({ error: "fail" });
+      await expect(sdk.querySourceDailyLimit(MOCK_ADDRESS, MOCK_ASSET)).rejects.toThrow(
+        "Failed to query source daily limit",
+      );
+    });
+
+    it("rejects a C-address as source before simulation", async () => {
+      await expect(sdk.querySourceDailyLimit(MOCK_ASSET, MOCK_ASSET)).rejects.toThrow(
+        'Invalid account address for "source"',
+      );
+      expect(mockProvider.simulateTransaction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("queryAssetFeeCap", () => {
+    it("returns the fee cap as a number from simulation result", async () => {
+      (scValToNative as jest.Mock).mockReturnValue(50);
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+      const cap = await sdk.queryAssetFeeCap(MOCK_ASSET);
+      expect(cap).toBe(50);
+    });
+
+    it("returns 0 when no results", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+      const cap = await sdk.queryAssetFeeCap(MOCK_ASSET);
+      expect(cap).toBe(0);
+    });
+
+    it("throws on simulation error", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({ error: "fail" });
+      await expect(sdk.queryAssetFeeCap(MOCK_ASSET)).rejects.toThrow(
+        "Failed to query asset fee cap",
+      );
+    });
+
+    it("rejects a G-address before simulation", async () => {
+      await expect(sdk.queryAssetFeeCap(MOCK_ADDRESS)).rejects.toThrow(
+        'Invalid contract address for "asset"',
+      );
+      expect(mockProvider.simulateTransaction).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("queryMaxWithdrawPerTx", () => {
+    it("returns the max as a string from simulation result", async () => {
+      (scValToNative as jest.Mock).mockReturnValue({ toString: () => "5000000" });
+      mockProvider.simulateTransaction.mockResolvedValue({
+        results: [{ retval: {} }],
+      });
+      const max = await sdk.queryMaxWithdrawPerTx();
+      expect(max).toBe("5000000");
+    });
+
+    it("returns '0' when no results", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({});
+      const max = await sdk.queryMaxWithdrawPerTx();
+      expect(max).toBe("0");
+    });
+
+    it("throws on simulation error", async () => {
+      mockProvider.simulateTransaction.mockResolvedValue({ error: "fail" });
+      await expect(sdk.queryMaxWithdrawPerTx()).rejects.toThrow(
+        "Failed to query max withdraw per tx",
+      );
+    });
+  });
+
   describe("estimateCost minimum balance", () => {
     const ESTIMATE_ARGS = {
       source: MOCK_ADDRESS,

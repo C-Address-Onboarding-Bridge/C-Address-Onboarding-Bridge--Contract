@@ -70,17 +70,17 @@ runs before any admin exists.
 |---|---|---|
 | `initialize` | `admin, fee_collector, fee_bps` | — |
 | `set_fee_bps` | `new_fee_bps` | `setFee` |
-| `set_source_daily_limit` | `source, asset, limit_amount` | — |
-| `set_asset_fee_cap` | `asset, max_fee_bps` | — |
+| `set_source_daily_limit` | `source, asset, limit_amount` | `setSourceDailyLimit` |
+| `set_asset_fee_cap` | `asset, max_fee_bps` | `setAssetFeeCap` |
 | `set_fee_collector` | `new_fee_collector` | `setFeeCollector` |
 | `propose_new_fee_collector` | `new_collector` | `proposeNewFeeCollector` |
 | `set_admin` | `new_admin` | `setAdmin` |
 | `propose_new_admin` | `new_admin` | `proposeNewAdmin` |
 | `clear_pending_admin` | — | — |
 | `clear_pending_fee_collector` | — | — |
-| `set_minimum_amount` | `amount` | — |
+| `set_minimum_amount` | `amount` | `setMinimumAmount` |
 | `withdraw_fees` | `asset, amount` | `withdrawFees` (`options.nonce`) |
-| `set_max_withdraw_per_tx` | `amount` | — |
+| `set_max_withdraw_per_tx` | `amount` | `setMaxWithdrawPerTx` |
 | `set_referral_rate` | `bps` | `setReferralRate` |
 | `pause` | — | — |
 | `unpause` | — | — |
@@ -110,9 +110,9 @@ runs before any admin exists.
 | `set_max_instance_ttl` | `ttl` | — |
 | `set_max_persistent_ttl` | `ttl` | — |
 
-The SDK exposes the nonce on the 17 methods named in the last column. It is
+The SDK exposes the nonce on the 21 methods named in the last column. It is
 either a trailing `nonce?` parameter or, where marked, a `nonce` field on the
-options object. The remaining 24 contract methods have no SDK wrapper that
+options object. The remaining 20 contract methods have no SDK wrapper that
 accepts a nonce. Call them through the contract client with the listed
 arguments followed by the optional nonce.
 
@@ -652,6 +652,78 @@ removal, `fundCAddressWithSwap` calls referencing this pool return `PoolNotWhite
   - `nonce`: optional sequential admin nonce (`string | number | bigint`)
 - **Returns**: `Promise<TransactionResult>`
 
+##### `setSourceDailyLimit`
+```ts
+async setSourceDailyLimit(
+  source: string,
+  asset: string,
+  limitAmount: string | number | bigint,
+  adminKeypair: Keypair,
+  nonce?: string | number | bigint
+): Promise<TransactionResult>
+```
+Sets the daily transfer limit for a (source, asset) pair (admin only). A limit
+of `0` means unrestricted. `fundCAddress` returns `DailyLimitExceeded` when the
+cumulative daily volume exceeds the limit.
+- **Parameters**:
+  - `source`: `string` — Source G-address.
+  - `asset`: `string` — Token contract C-address.
+  - `limitAmount`: `string | number | bigint` — Daily limit (≥ 0).
+  - `adminKeypair`: `Keypair`
+  - `nonce`: optional sequential admin nonce
+- **Returns**: `Promise<TransactionResult>`
+
+##### `setAssetFeeCap`
+```ts
+async setAssetFeeCap(
+  asset: string,
+  maxFeeBps: number,
+  adminKeypair: Keypair,
+  nonce?: string | number | bigint
+): Promise<TransactionResult>
+```
+Sets a per-asset fee cap in basis points (admin only). The effective fee for
+`asset` is `min(global_fee_bps, cap)`. Must be ≤ 1000.
+- **Parameters**:
+  - `asset`: `string` — Token contract C-address.
+  - `maxFeeBps`: `number` — Cap in basis points (0–1000).
+  - `adminKeypair`: `Keypair`
+  - `nonce`: optional sequential admin nonce
+- **Returns**: `Promise<TransactionResult>`
+
+##### `setMinimumAmount`
+```ts
+async setMinimumAmount(
+  amount: string | number | bigint,
+  adminKeypair: Keypair,
+  nonce?: string | number | bigint
+): Promise<TransactionResult>
+```
+Sets the global minimum transfer amount (admin only). `fundCAddress` rejects
+amounts below this value. A value of `0` disables the minimum.
+- **Parameters**:
+  - `amount`: `string | number | bigint` — Minimum amount (≥ 0).
+  - `adminKeypair`: `Keypair`
+  - `nonce`: optional sequential admin nonce
+- **Returns**: `Promise<TransactionResult>`
+
+##### `setMaxWithdrawPerTx`
+```ts
+async setMaxWithdrawPerTx(
+  amount: string | number | bigint,
+  adminKeypair: Keypair,
+  nonce?: string | number | bigint
+): Promise<TransactionResult>
+```
+Sets the maximum withdrawable amount per `withdrawFees` transaction (admin
+only). `withdrawFees` returns `WithdrawExceedsLimit` when exceeded. A value of
+`0` disables the limit.
+- **Parameters**:
+  - `amount`: `string | number | bigint` — Max withdraw per tx (≥ 0).
+  - `adminKeypair`: `Keypair`
+  - `nonce`: optional sequential admin nonce
+- **Returns**: `Promise<TransactionResult>`
+
 ##### `getWhitelistedAssets`
 ```ts
 async getWhitelistedAssets(
@@ -706,6 +778,35 @@ whitelisted pools may appear in the `swap_route` passed to `fundCAddressWithSwap
 - **Parameters**:
   - `pool`: `string` — DEX pool contract address (C-address).
 - **Returns**: `Promise<boolean>`
+
+##### `querySourceDailyLimit`
+```ts
+async querySourceDailyLimit(source: string, asset: string): Promise<string>
+```
+Queries the daily transfer limit for a (source, asset) pair. Returns `'0'` if
+no limit is configured (unrestricted).
+- **Parameters**:
+  - `source`: `string` — Source G-address.
+  - `asset`: `string` — Token contract C-address.
+- **Returns**: `Promise<string>`
+
+##### `queryAssetFeeCap`
+```ts
+async queryAssetFeeCap(asset: string): Promise<number>
+```
+Queries the per-asset fee cap in basis points. Returns `1000` if no cap has
+been set (global rate applies uncapped).
+- **Parameters**:
+  - `asset`: `string` — Token contract C-address.
+- **Returns**: `Promise<number>`
+
+##### `queryMaxWithdrawPerTx`
+```ts
+async queryMaxWithdrawPerTx(): Promise<string>
+```
+Queries the maximum withdrawable amount per `withdrawFees` transaction. Returns
+`'0'` if no limit is configured.
+- **Returns**: `Promise<string>`
 
 ##### `estimateCost`
 ```ts
