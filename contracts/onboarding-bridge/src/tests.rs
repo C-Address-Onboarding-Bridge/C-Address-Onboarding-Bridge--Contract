@@ -1673,7 +1673,6 @@ fn test_query_all_balances_empty_input() {
     assert_eq!(balances.len(), 0);
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
 #[test]
 fn test_query_all_balances_rejects_oversized_input() {
     let env = Env::default();
@@ -1682,19 +1681,25 @@ fn test_query_all_balances_rejects_oversized_input() {
     let bridge = create_bridge_client(&env, &bridge_id);
     bridge.initialize(&admin, &fee_collector, &0u32, &None);
 
-    // MAX_BATCH_SIZE is 100 — one more than that must be rejected.
+    // Register 100 real token contracts so the accepted-size call below
+    // exercises actual token balance lookups rather than random addresses.
     let mut assets: Vec<Address> = Vec::new(&env);
-    for _ in 0..101 {
-        assets.push_back(Address::generate(&env));
+    for _ in 0..100 {
+        let token_id = env.register(TestToken, ());
+        init_token(&env, &token_id, &admin);
+        assets.push_back(token_id);
     }
+
+    // Exactly MAX_BATCH_SIZE is accepted.
+    let balances = bridge.query_all_balances(&assets);
+    assert_eq!(balances.len(), 100);
+
+    // MAX_BATCH_SIZE is 100 — one more than that must be rejected.
+    assets.push_back(Address::generate(&env));
     assert_eq!(
         bridge.try_query_all_balances(&assets),
         Err(Ok(BridgeError::BatchTooLarge))
     );
-
-    // Exactly MAX_BATCH_SIZE is accepted.
-    assets.pop_back();
-    assert_eq!(bridge.query_all_balances(&assets).len(), 100);
 }
 
 #[test]
