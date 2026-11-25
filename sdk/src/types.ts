@@ -487,7 +487,9 @@ export interface ExecuteMetaFundOptions {
  * address via {@link OnboardingBridgeSDK.reclaimTokens}.
  *
  * Admin only. Intended as an emergency recovery mechanism — reclaims the
- * contract's raw token balance minus any accrued fees for that asset.
+ * contract's reclaimable token balance for that asset. The reclaimable amount
+ * is the raw token balance minus accrued fees, minus funds locked in active
+ * timelocks, and minus the cross-chain reserve.
  *
  * @example
  * ```ts
@@ -504,7 +506,7 @@ export interface ReclaimTokensOptions {
   /** Amount to reclaim, in the token's smallest unit. */
   amount: string;
 
-  /** Destination G-address that will receive the reclaimed tokens. */
+  /** Destination G-address or C-address that will receive the reclaimed tokens. */
   to: string;
 
   /**
