@@ -26,8 +26,6 @@ This document provides a comprehensive API reference for all exported classes, i
    - [ConfirmedTransactionResult](#confirmedtransactionresult)
    - [FundCAddressWithSwapOptions](#fundcaddresswithswapoptions)
    - [CrossChainFundOptions](#crosschainfundoptions)
-   - [CreateCOptions](#createcoptions)
-   - [CreateCAddressResult](#createcaddressresult)
    - [PaginatedResult](#paginatedresult)
    - [PaginationOptions](#paginationoptions)
    - [CostEstimate](#costestimate)
@@ -568,17 +566,6 @@ async queryRelayerThreshold(): Promise<number>
 Queries the current signature threshold for cross-chain transactions.
 - **Returns**: `Promise<number>`
 
-##### `createCAddress`
-```ts
-async createCAddress(
-  options: CreateCOptions
-): Promise<CreateCAddressResult>
-```
-Deploys a new C-address contract deterministically and optionally funds it immediately.
-- **Parameters**:
-  - `options`: [`CreateCOptions`](#createcoptions)
-- **Returns**: `Promise<CreateCAddressResult>`
-
 ##### `queryIsRelayer`
 ```ts
 async queryIsRelayer(pubkeyHex: string): Promise<boolean>
@@ -807,6 +794,77 @@ async queryMaxWithdrawPerTx(): Promise<string>
 Queries the maximum withdrawable amount per `withdrawFees` transaction. Returns
 `'0'` if no limit is configured.
 - **Returns**: `Promise<string>`
+
+##### TTL maintenance
+
+Wrappers for the contract's storage-TTL entry points. The admin-only ones take
+an optional trailing `nonce` (sent as `void` when omitted). The three
+per-entry extenders take no nonce and need no admin auth: any account can pay
+to keep an entry alive. That matters for a timelock with a distant
+`release_time`, which can be archived before it is claimable unless someone
+calls [`extendTimelockTtl`](#extendtimelockttl). All `ttl` values are ledgers
+(`u32`). Call [`queryTtlConfig`](#queryttlconfig) for the caps.
+
+| SDK method | Contract call | Auth |
+|---|---|---|
+| [`extendInstanceTtl`](#extendinstancettl) | `extend_instance_ttl(ttl, nonce?)` | admin |
+| [`extendPersistentTtl`](#extendpersistentttl) | `extend_persistent_ttl(key_asset, ttl, nonce?)` | admin |
+| [`extendSourcePersistentTtl`](#extendsourcepersistentttl) | `extend_source_persistent_ttl(source, asset, ttl, nonce?)` | admin |
+| [`extendTimelockTtl`](#extendtimelockttl) | `extend_timelock_ttl(id, ttl)` | any signer |
+| [`extendCommitmentTtl`](#extendcommitmentttl) | `extend_commitment_ttl(id, ttl)` | any signer |
+| [`extendRelayerTtl`](#extendrelayerttl) | `extend_relayer_ttl(pubkey, ttl)` | any signer |
+| [`setMaxInstanceTtl`](#setmaxinstancettl) | `set_max_instance_ttl(ttl, nonce?)` | admin |
+| [`setMaxPersistentTtl`](#setmaxpersistentttl) | `set_max_persistent_ttl(ttl, nonce?)` | admin |
+| [`queryTtlConfig`](#queryttlconfig) | `query_ttl_config()` | read-only |
+
+##### `extendInstanceTtl`
+```ts
+async extendInstanceTtl(ttl: number, adminKeypair: Keypair, nonce?: string | number | bigint): Promise<TransactionResult>
+```
+
+##### `extendPersistentTtl`
+```ts
+async extendPersistentTtl(keyAsset: string, ttl: number, adminKeypair: Keypair, nonce?: string | number | bigint): Promise<TransactionResult>
+```
+
+##### `extendSourcePersistentTtl`
+```ts
+async extendSourcePersistentTtl(source: string, asset: string, ttl: number, adminKeypair: Keypair, nonce?: string | number | bigint): Promise<TransactionResult>
+```
+
+##### `extendTimelockTtl`
+```ts
+async extendTimelockTtl(id: string | number | bigint, ttl: number, signerKeypair: Keypair): Promise<TransactionResult>
+```
+
+##### `extendCommitmentTtl`
+```ts
+async extendCommitmentTtl(id: string | number | bigint, ttl: number, signerKeypair: Keypair): Promise<TransactionResult>
+```
+
+##### `extendRelayerTtl`
+```ts
+async extendRelayerTtl(pubkeyHex: string, ttl: number, signerKeypair: Keypair): Promise<TransactionResult>
+```
+`pubkeyHex` is the relayer's 32-byte Ed25519 key as 64 lowercase hex characters
+(validated with `assertRelayerPubkey` before any RPC call).
+
+##### `setMaxInstanceTtl`
+```ts
+async setMaxInstanceTtl(ttl: number, adminKeypair: Keypair, nonce?: string | number | bigint): Promise<TransactionResult>
+```
+
+##### `setMaxPersistentTtl`
+```ts
+async setMaxPersistentTtl(ttl: number, adminKeypair: Keypair, nonce?: string | number | bigint): Promise<TransactionResult>
+```
+
+##### `queryTtlConfig`
+```ts
+async queryTtlConfig(): Promise<TtlConfig>
+```
+Returns `{ maxInstanceTtl, maxPersistentTtl, hardCeiling, criticalThreshold }`
+(all in ledgers) instead of the raw `(u32, u32, u32, u32)` tuple.
 
 ##### `estimateCost`
 ```ts
@@ -1382,27 +1440,6 @@ Parameters for bridge relay submissions.
 | `asset` | `string` | Whitelisted token contract on Soroban. |
 | `amount` | `string` | Total gross amount. |
 | `sigs` | `RelayerSig[]` | Attestations signed by authorized relayers. |
-
----
-
-### `CreateCOptions`
-Options to deploy a new C-address contract deterministically.
-
-| Field | Type | Description |
-| :--- | :--- | :--- |
-| `deployerKeypair` | `any` | Deployer's keypair. |
-| `salt` | `string` | *Optional*. 32-byte hex salt for address derivation. |
-| `initialFunds` | `{ asset: string, amount: string }` | *Optional*. Initial transfer details. |
-
----
-
-### `CreateCAddressResult`
-The return value of C-address deployment.
-
-| Field | Type | Description |
-| :--- | :--- | :--- |
-| `cAddress` | `string` | Deployed contract C-address. |
-| `txHash` | `string` | Transaction hash. |
 
 ---
 

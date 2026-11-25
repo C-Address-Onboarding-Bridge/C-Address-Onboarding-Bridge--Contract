@@ -40,6 +40,7 @@ import {
   TimelockEntry,
   CalculatedFee,
   EffectiveFee,
+  TtlConfig,
 } from './types';
 import {
   type ObservabilityHooks,
@@ -1159,6 +1160,13 @@ export class OnboardingBridgeSDK {
           ? xdr.ScVal.scvVoid()
           : nativeToScVal(BigInt(options.deadline), { type: 'u64' });
 
+        // One Account object is reused for every chunk. TransactionBuilder.build()
+        // increments its sequence number, so chunk N+1 gets the next sequence
+        // even though chunk N has not landed in the ledger yet. Re-reading the
+        // account per chunk would return the same on-ledger sequence for every
+        // chunk and Core would reject chunks 2..N with txBAD_SEQ (#1123).
+        let sourceAccount: Account | undefined;
+
         // Split targets/amounts into chunks of at most BATCH_TX_LIMIT.
         for (let offset = 0; offset < total; offset += BATCH_TX_LIMIT) {
           const chunkTargets = options.targets.slice(offset, offset + BATCH_TX_LIMIT);
@@ -1172,12 +1180,14 @@ export class OnboardingBridgeSDK {
 
           let result: TransactionResult;
           try {
-            const sourceAccount = await withRpcHook(
-              this.hooks,
-              'getAccount',
-              { address: options.source },
-              () => this.provider.getAccount(options.source),
-            );
+            if (!sourceAccount) {
+              sourceAccount = await withRpcHook(
+                this.hooks,
+                'getAccount',
+                { address: options.source },
+                () => this.provider.getAccount(options.source),
+              );
+            }
 
             const tx = new TransactionBuilder(sourceAccount, {
               fee: BASE_FEE,
@@ -1225,6 +1235,10 @@ export class OnboardingBridgeSDK {
               error: error.message || 'Unknown error',
             };
           }
+
+          // A chunk that was not accepted did not consume its sequence number;
+          // re-read the account so the next chunk starts from the ledger value.
+          if (result.status === 'failed') sourceAccount = undefined;
 
           results.push(result);
           completed += chunkTargets.length;
@@ -4928,6 +4942,242 @@ export class OnboardingBridgeSDK {
         }
       },
     );
+  }
+
+  // --- TTL maintenance ---
+
+  /**
+   * Extend the contract's instance-storage TTL (`extend_instance_ttl`). Admin only.
+   *
+   * @param ttl          - Target TTL in ledgers (`u32`), capped by the configured max.
+   * @param adminKeypair - Admin keypair.
+   * @param nonce        - Optional sequential admin nonce (`void` when omitted).
+   */
+  async extendInstanceTtl(
+    ttl: number,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return this.submitTtlCall('extendInstanceTtl', 'extend_instance_ttl', adminKeypair, { ttl, nonce }, () => [
+      this.u32ToScVal(ttl, 'ttl'),
+      this.optionalNonceToScVal(nonce),
+    ]);
+  }
+
+  /**
+   * Extend the TTL of the persistent entries keyed by `keyAsset`
+   * (`extend_persistent_ttl`). Admin only.
+   */
+  async extendPersistentTtl(
+    keyAsset: string,
+    ttl: number,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return this.submitTtlCall('extendPersistentTtl', 'extend_persistent_ttl', adminKeypair, { keyAsset, ttl, nonce }, () => {
+      assertContractAddress(keyAsset, 'keyAsset');
+      return [new Address(keyAsset).toScVal(), this.u32ToScVal(ttl, 'ttl'), this.optionalNonceToScVal(nonce)];
+    });
+  }
+
+  /**
+   * Extend the TTL of the per-source persistent entries for `(source, asset)`
+   * (`extend_source_persistent_ttl`). Admin only.
+   */
+  async extendSourcePersistentTtl(
+    source: string,
+    asset: string,
+    ttl: number,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return this.submitTtlCall(
+      'extendSourcePersistentTtl',
+      'extend_source_persistent_ttl',
+      adminKeypair,
+      { source, asset, ttl, nonce },
+      () => {
+        assertAddress(source, 'source');
+        assertContractAddress(asset, 'asset');
+        return [
+          new Address(source).toScVal(),
+          new Address(asset).toScVal(),
+          this.u32ToScVal(ttl, 'ttl'),
+          this.optionalNonceToScVal(nonce),
+        ];
+      },
+    );
+  }
+
+  /**
+   * Extend the TTL of a timelock entry (`extend_timelock_ttl`). Takes no nonce
+   * and needs no admin auth: any account can pay to keep a timelock with a
+   * distant `release_time` from being archived before it is claimable.
+   */
+  async extendTimelockTtl(
+    id: string | number | bigint,
+    ttl: number,
+    signerKeypair: Keypair,
+  ): Promise<TransactionResult> {
+    return this.submitTtlCall('extendTimelockTtl', 'extend_timelock_ttl', signerKeypair, { id, ttl }, () => [
+      this.u64ToScVal(id, 'id'),
+      this.u32ToScVal(ttl, 'ttl'),
+    ]);
+  }
+
+  /**
+   * Extend the TTL of a commit-reveal commitment (`extend_commitment_ttl`).
+   * No nonce, no admin auth.
+   */
+  async extendCommitmentTtl(
+    id: string | number | bigint,
+    ttl: number,
+    signerKeypair: Keypair,
+  ): Promise<TransactionResult> {
+    return this.submitTtlCall('extendCommitmentTtl', 'extend_commitment_ttl', signerKeypair, { id, ttl }, () => [
+      this.u64ToScVal(id, 'id'),
+      this.u32ToScVal(ttl, 'ttl'),
+    ]);
+  }
+
+  /**
+   * Extend the TTL of a relayer registration (`extend_relayer_ttl`).
+   * No nonce, no admin auth.
+   *
+   * @param pubkeyHex - The relayer's 32-byte Ed25519 key as 64 lowercase hex chars.
+   */
+  async extendRelayerTtl(
+    pubkeyHex: string,
+    ttl: number,
+    signerKeypair: Keypair,
+  ): Promise<TransactionResult> {
+    return this.submitTtlCall('extendRelayerTtl', 'extend_relayer_ttl', signerKeypair, { pubkey: pubkeyHex, ttl }, () => {
+      assertRelayerPubkey(pubkeyHex, 'pubkeyHex');
+      return [xdr.ScVal.scvBytes(Buffer.from(pubkeyHex, 'hex')), this.u32ToScVal(ttl, 'ttl')];
+    });
+  }
+
+  /** Set the maximum instance-storage TTL (`set_max_instance_ttl`). Admin only. */
+  async setMaxInstanceTtl(
+    ttl: number,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return this.submitTtlCall('setMaxInstanceTtl', 'set_max_instance_ttl', adminKeypair, { ttl, nonce }, () => [
+      this.u32ToScVal(ttl, 'ttl'),
+      this.optionalNonceToScVal(nonce),
+    ]);
+  }
+
+  /** Set the maximum persistent-storage TTL (`set_max_persistent_ttl`). Admin only. */
+  async setMaxPersistentTtl(
+    ttl: number,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return this.submitTtlCall('setMaxPersistentTtl', 'set_max_persistent_ttl', adminKeypair, { ttl, nonce }, () => [
+      this.u32ToScVal(ttl, 'ttl'),
+      this.optionalNonceToScVal(nonce),
+    ]);
+  }
+
+  /**
+   * Read the TTL configuration (`query_ttl_config`).
+   *
+   * @returns `maxInstanceTtl` and `maxPersistentTtl` (the configurable caps),
+   *   `hardCeiling` (`MAX_ALLOWED_TTL`) and `criticalThreshold`
+   *   (`CRITICAL_ENTRY_TTL_THRESHOLD`), all in ledgers.
+   */
+  async queryTtlConfig(): Promise<TtlConfig> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_ttl_config' },
+      () => this.provider.simulateTransaction(this.buildSimulationTx('query_ttl_config', [])),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query TTL config: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    if (!scVal) throw new Error('Failed to query TTL config: no return value');
+    const [maxInstanceTtl, maxPersistentTtl, hardCeiling, criticalThreshold] =
+      scValToNative(scVal) as Array<number | bigint>;
+    return {
+      maxInstanceTtl: Number(maxInstanceTtl),
+      maxPersistentTtl: Number(maxPersistentTtl),
+      hardCeiling: Number(hardCeiling),
+      criticalThreshold: Number(criticalThreshold),
+    };
+  }
+
+  private u32ToScVal(value: number, field: string): xdr.ScVal {
+    if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+      throw new Error(`${field} must be a u32 integer`);
+    }
+    return nativeToScVal(value, { type: 'u32' });
+  }
+
+  private u64ToScVal(value: string | number | bigint, field: string): xdr.ScVal {
+    const big = BigInt(value);
+    if (big < 0n || big > (1n << 64n) - 1n) throw new Error(`${field} must fit a u64`);
+    return nativeToScVal(big, { type: 'u64' });
+  }
+
+  /**
+   * Shared write path for the TTL wrappers: validates and encodes the
+   * arguments, then follows the usual hooks / `config.timeout` /
+   * `status: 'failed'` pattern.
+   */
+  private async submitTtlCall(
+    sdkMethod: string,
+    contractMethod: string,
+    signerKeypair: Keypair,
+    params: Record<string, unknown>,
+    buildArgs: () => xdr.ScVal[],
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(this.hooks, sdkMethod, params, async () => {
+      try {
+        const args = buildArgs();
+        const signerAccount = await withRpcHook(
+          this.hooks,
+          'getAccount',
+          { address: signerKeypair.publicKey() },
+          () => this.provider.getAccount(signerKeypair.publicKey()),
+        );
+
+        const tx = new TransactionBuilder(signerAccount, {
+          fee: BASE_FEE,
+          networkPassphrase: this.networkPassphrase,
+        })
+          .addOperation(this.contract.call(contractMethod, ...args))
+          .setTimeout(this.config.timeout ?? 30)
+          .build();
+
+        const preparedTx = await withRpcHook(
+          this.hooks,
+          'prepareTransaction',
+          { contractMethod },
+          () => this.provider.prepareTransaction(tx),
+        );
+        preparedTx.sign(signerKeypair);
+
+        const response = await withRpcHook(
+          this.hooks,
+          'sendTransaction',
+          { contractMethod },
+          () => this.provider.sendTransaction(preparedTx),
+        );
+
+        return {
+          hash: response.hash,
+          status: response.status === 'PENDING' ? 'pending' : 'failed',
+        };
+      } catch (error: any) {
+        return { hash: '', status: 'failed', error: error.message || 'Unknown error' };
+      }
+    });
   }
 
   private hexBytesToScVal(hex: string, expectedBytes: number, fieldName: string): xdr.ScVal {

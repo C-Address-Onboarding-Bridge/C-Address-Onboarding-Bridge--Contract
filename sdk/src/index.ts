@@ -104,6 +104,7 @@ export {
   ConsoleLogger,
   createOpenTelemetryHooks,
   composeHooks,
+  bigintReplacer,
   withTransactionHooks,
   withRpcHook,
 } from './observability';
