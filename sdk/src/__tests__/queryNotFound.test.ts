@@ -10,7 +10,6 @@ function makeSdk(simulate: jest.Mock) {
   sdk.networkPassphrase = Networks.TESTNET;
   sdk.contract = new Contract(CONTRACT_ID);
   sdk.provider = { simulateTransaction: simulate };
-  sdk.buildSimulationTxWithScVals = (method: string, args: any[]) => ({ method, args });
   return sdk as OnboardingBridgeSDK;
 }
 
