@@ -116,9 +116,9 @@ For USDC bridged from Ethereum (6 decimals on Ethereum, but may be 7 on Stellar 
 `fundCAddress` returns `status: 'pending'` after submission. Always poll for finality before showing success to users:
 
 ```ts
-import { SorobanRpc } from '@stellar/stellar-sdk';
+import { rpc } from '@stellar/stellar-sdk';
 
-const server = new SorobanRpc.Server(rpcUrl);
+const server = new rpc.Server(rpcUrl);
 let tx = await server.getTransaction(result.hash);
 while (tx.status === 'NOT_FOUND') {
   await new Promise((r) => setTimeout(r, 2000));

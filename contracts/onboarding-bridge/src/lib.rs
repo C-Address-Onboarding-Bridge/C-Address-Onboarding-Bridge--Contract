@@ -5362,6 +5362,20 @@ impl OnboardingBridge {
         is_auth_nonce_used(&env, &source, nonce)
     }
 
+    /// Returns `true` if `nonce` has already been consumed by a successful
+    /// `execute_meta_fund` call for `source`.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` (`Address`) — The address the meta-tx was signed for.
+    /// * `nonce` (`u64`) — The meta-tx nonce to check.
+    pub fn query_meta_tx_nonce_used(env: Env, source: Address, nonce: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MetaTxNonce(source, nonce))
+            .unwrap_or(false)
+    }
+
     /// Returns the accrued (pending, not yet withdrawn) fee balance for `asset`.
     ///
     /// Accrued fees accumulate on every `fund_c_address` call and are
