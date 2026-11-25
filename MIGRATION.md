@@ -148,6 +148,19 @@ The contract uses two storage tiers:
    - TTL: Must be explicitly extended
    - May expire if not used for 6 months
 
+3. **Temporary Storage** — short-lived, self-expiring data
+   - Per-day `DailyUsage` counters (`DataKey::DailyUsage(source, asset, day)`)
+   - TTL: Set on every write to cover the remainder of the day plus a margin
+   - Not extended by `extend_source_persistent_ttl`
+
+### DailyUsage Storage-Tier Change
+
+`DailyUsage` counters moved from persistent to temporary storage. No migration
+step is required: any `DailyUsage` entries left in persistent storage by an
+older contract version are simply ignored by the new code and expire on their
+own. Daily usage tracking restarts from zero for the current day after the
+upgrade, so a source may briefly regain its full daily allowance for that day.
+
 ### Migration Strategy
 
 #### For Configuration Changes (v0.1.0 → v0.2.0)

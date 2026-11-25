@@ -72,6 +72,23 @@ use soroban_sdk::{
 /// Every public function that can fail returns `Result<_, BridgeError>`.
 /// Callers should match on these variants to distinguish recoverable from
 /// unrecoverable conditions.
+///
+/// # 50-case limit
+///
+/// `#[contracterror]` expands to a `TryFrom<u32>` match over every variant and
+/// the Soroban spec caps that at 50 cases; exceeding it makes the macro panic
+/// with `LengthExceedsMax` and the crate stops building. Keep this enum at
+/// **50 variants or fewer** — `error_variant_count_is_within_spec_limit` in
+/// `tests.rs` fails with a readable message when the limit is exceeded.
+///
+/// # Retired discriminants (never reuse)
+///
+/// These values were removed to stay under the limit. They must never be
+/// assigned to a new variant, because clients match on the numeric code:
+///
+/// * `23` — `AuthNonceAlreadyUsed` (unreachable: `consume_auth_nonce` rejects a
+///   stale nonce with `DuplicateNonce` before the used-nonce set is consulted).
+/// * `24` — `AuthNonceExpired` (merged into `TransactionExpired`).
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum BridgeError {
@@ -121,10 +138,8 @@ pub enum BridgeError {
     InvalidReleaseTime = 21,
     /// The caller is not authorized to perform this action (e.g. double-claim).
     Unauthorized = 22,
-    /// The auth-entry nonce supplied to `verify_auth_entry` has already been used.
-    AuthNonceAlreadyUsed = 23,
-    /// The current ledger sequence is outside the `[valid_after, valid_before)` window.
-    AuthNonceExpired = 24,
+    // Discriminants 23 (`AuthNonceAlreadyUsed`) and 24 (`AuthNonceExpired`) are
+    // retired — see the enum-level docs. Do not reuse them.
     /// `execute_upgrade` was called but no upgrade has been scheduled.
     UpgradeNotScheduled = 25,
     /// The `expected_hash` passed to `execute_upgrade` does not match the scheduled hash.
@@ -296,6 +311,10 @@ const MIN_ALLOWED_TTL: u32 = 120_960;
 const CRITICAL_ENTRY_TTL_THRESHOLD: u32 = 100_000;
 /// Minimum ledgers that must pass before a scheduled upgrade becomes executable (~24 h at 5 s/ledger).
 const UPGRADE_TIMELOCK_LEDGERS: u32 = 17_280;
+/// TTL applied to per-day `DailyUsage` temporary entries: one day of ledgers
+/// (17 280 at 5 s/ledger) plus a margin so the counter outlives the day it
+/// tracks and then expires naturally.
+const DAILY_USAGE_TTL_LEDGERS: u32 = 17_280 + 1_000;
 /// Maximum ledgers an upgrade remains executable after its timelock elapses (~24 h at 5 s/ledger).
 const UPGRADE_EXECUTION_WINDOW_LEDGERS: u32 = UPGRADE_TIMELOCK_LEDGERS;
 /// Minimum ledgers between commit_fund and reveal_fund (~25 s at 5 s/ledger).
@@ -1257,7 +1276,7 @@ fn consume_auth_nonce(
     // 1. Ledger-sequence window check (guards against stale / premature replays)
     let seq = env.ledger().sequence();
     if seq < valid_after_ledger || seq >= valid_before_ledger {
-        return Err(BridgeError::AuthNonceExpired);
+        return Err(BridgeError::TransactionExpired);
     }
 
     // 2. Enforce monotonic sequencing before checking the used-nonce set.
@@ -1265,9 +1284,12 @@ fn consume_auth_nonce(
         return Err(BridgeError::DuplicateNonce);
     }
 
-    // 3. Used-nonce check (prevents exact replay of this (source, nonce) pair)
+    // 3. Used-nonce check (prevents exact replay of this (source, nonce) pair).
+    // Unreachable in practice: step 2 already rejects any nonce that is not the
+    // next expected one, so a used nonce can never get here. Kept as a
+    // defensive guard; `DuplicateNonce` is the code clients observe.
     if is_auth_nonce_used(env, source, nonce) {
-        return Err(BridgeError::AuthNonceAlreadyUsed);
+        return Err(BridgeError::DuplicateNonce);
     }
 
     // 4. Mark as used and advance the per-address counter
@@ -1461,7 +1483,7 @@ fn rolling_window_usage(env: &Env, source: &Address, asset: &Address, bucket: u6
     let first = bucket.saturating_sub(DAILY_WINDOW_BUCKETS - 1);
     for b in first..=bucket {
         let key = DataKey::DailyUsage(source.clone(), asset.clone(), b);
-        let used: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let used: i128 = env.storage().temporary().get(&key).unwrap_or(0);
         total = total.saturating_add(used);
     }
     total
@@ -1483,7 +1505,7 @@ fn check_daily_limit(
     let limit = read_source_daily_limit(env, source, asset);
     let bucket = current_day(env);
     let key = DataKey::DailyUsage(source.clone(), asset.clone(), bucket);
-    let used: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+    let used: i128 = env.storage().temporary().get(&key).unwrap_or(0);
     let updated = safe_math::safe_add(used, amount)?;
     if limit != 0 {
         let window_used = rolling_window_usage(env, source, asset, bucket);
@@ -1492,7 +1514,12 @@ fn check_daily_limit(
             return Err(BridgeError::DailyLimitExceeded);
         }
     }
-    env.storage().persistent().set(&key, &updated);
+    env.storage().temporary().set(&key, &updated);
+    // Temporary entries are not auto-extended; keep the counter alive for the
+    // remainder of the day (plus a margin) so it expires once the day rolls over.
+    env.storage()
+        .temporary()
+        .extend_ttl(&key, DAILY_USAGE_TTL_LEDGERS, DAILY_USAGE_TTL_LEDGERS);
     Ok(())
 }
 
@@ -3672,6 +3699,17 @@ impl OnboardingBridge {
     ///   whitelist status.
     /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
     ///
+    /// # Events
+    ///
+    /// When `migrate_data` is true, publishes `("EmergencyMigrate", "config")`,
+    /// `("EmergencyMigrate", "collector")`, `("EmergencyMigrate", "assets")`,
+    /// `("EmergencyMigrate", "fees")`, `("EmergencyMigrate", "relayers")`,
+    /// `("EmergencyMigrate", "limits")` (minimum amount, max withdraw per tx,
+    /// max instance TTL, max persistent TTL), `("EmergencyMigrate", "roles")`
+    /// (admin, pending admin, pending fee collector, current wasm hash) and
+    /// `("EmergencyMigrate", "counters")` (TimelockId, CommitmentId).
+    /// Always publishes `("EmergencyMigrated", admin)`.
+    ///
     /// # Authorization
     ///
     /// Requires the current admin's `require_auth()`.
@@ -3752,6 +3790,38 @@ impl OnboardingBridge {
             env.events().publish(
                 ("EmergencyMigrate", "relayers"),
                 (read_relayer_set(&env), relayer_threshold(&env)),
+            );
+            env.events().publish(
+                ("EmergencyMigrate", "limits"),
+                (
+                    read_minimum_amount(&env),
+                    read_max_withdraw_per_tx(&env),
+                    read_max_instance_ttl(&env),
+                    read_max_persistent_ttl(&env),
+                ),
+            );
+            env.events().publish(
+                ("EmergencyMigrate", "roles"),
+                (
+                    admin.clone(),
+                    read_pending_admin(&env),
+                    read_pending_fee_collector(&env),
+                    read_current_wasm_hash(&env),
+                ),
+            );
+            let timelock_id: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TimelockId)
+                .unwrap_or(0u64);
+            let commitment_id: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::CommitmentId)
+                .unwrap_or(0u64);
+            env.events().publish(
+                ("EmergencyMigrate", "counters"),
+                (timelock_id, commitment_id),
             );
         }
 
@@ -4801,6 +4871,14 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::BelowThreshold`] — Removing this relayer would remove
     ///   the last relayer or drop the count below the required threshold.
+    ///
+    /// Removing a `pubkey` that is not a registered relayer is a no-op: it
+    /// succeeds and emits no event.
+    ///
+    /// # Events
+    ///
+    /// * `("RelayerRemoved",)` — data: `(admin, pubkey)`, emitted only when
+    ///   `pubkey` was a registered relayer.
     pub fn remove_relayer(
         env: Env,
         pubkey: BytesN<32>,
@@ -4810,7 +4888,8 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        if is_relayer(&env, &pubkey) {
+        let was_registered = is_relayer(&env, &pubkey);
+        if was_registered {
             let count = relayer_count(&env);
             if count <= 1 || count.saturating_sub(1) < relayer_threshold(&env) {
                 return Err(BridgeError::BelowThreshold);
@@ -4818,7 +4897,9 @@ impl OnboardingBridge {
         }
         remove_relayer(&env, &pubkey);
         extend_instance_ttl(&env);
-        if was_registered { env.events().publish(("RelayerRemoved",), (admin, pubkey)); }
+        if was_registered {
+            env.events().publish(("RelayerRemoved",), (admin, pubkey));
+        }
         Ok(())
     }
 
@@ -5437,9 +5518,11 @@ impl OnboardingBridge {
 
     /// Extends the persistent-storage TTL for all per-`(source, asset)` and
     /// per-`source` keys used by the core funding paths: `SourceDailyLimit`,
-    /// the current hourly `DailyUsage` bucket, `UserDeposit`,
-    /// `SourceBridgedVolume`, the sequential `Nonce`, and the auth-entry
-    /// `AuthNonce` counter.
+    /// `UserDeposit`, `SourceBridgedVolume`, the sequential `Nonce`, and the
+    /// auth-entry `AuthNonce` counter.
+    ///
+    /// `DailyUsage` is intentionally excluded: it lives in temporary storage
+    /// and expires on its own once the window it tracks has passed.
     ///
     /// Only keys that already exist in storage are extended; missing keys are
     /// silently skipped, mirroring `extend_persistent_ttl`.
@@ -5476,7 +5559,6 @@ impl OnboardingBridge {
         let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
         for key in [
             DataKey::SourceDailyLimit(source.clone(), asset.clone()),
-            DataKey::DailyUsage(source.clone(), asset.clone(), current_day(&env)),
             DataKey::UserDeposit(source.clone(), asset.clone()),
             DataKey::SourceBridgedVolume(source.clone(), asset.clone()),
             DataKey::Nonce(source.clone()),

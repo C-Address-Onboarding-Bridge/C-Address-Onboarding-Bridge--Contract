@@ -836,6 +836,44 @@ fn test_unpause_emits_event() {
 }
 
 #[test]
+fn test_remove_relayer_emits_event() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let first = BytesN::from_array(&env, &[7u8; 32]);
+    let second = BytesN::from_array(&env, &[8u8; 32]);
+    bridge.add_relayer(&first, &None);
+    bridge.add_relayer(&second, &None);
+    bridge.remove_relayer(&first, &None);
+
+    assert!(!bridge.query_is_relayer(&first));
+    let events = env.events().all();
+    let (contract_id, topics, data) = events.get(events.len() - 1).unwrap();
+    assert_eq!(contract_id, bridge_id);
+    assert_eq!(topics, ("RelayerRemoved",).into_val(&env));
+    assert_eq!(data, (admin, first).into_val(&env));
+}
+
+#[test]
+fn test_remove_unknown_relayer_emits_nothing() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let unknown = BytesN::from_array(&env, &[9u8; 32]);
+    let events_before = env.events().all().len();
+    bridge.remove_relayer(&unknown, &None);
+
+    assert!(!bridge.query_is_relayer(&unknown));
+    assert_eq!(env.events().all().len(), events_before);
+}
+
+#[test]
 fn test_fund_works_after_unpause() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
@@ -1299,7 +1337,7 @@ fn test_reclaim_accidentally_sent_tokens() {
 #[test]
 fn test_emergency_migration_keeps_reserved_tokens_recoverable() {
     let env = Env::default();
-    let (bridge, user, token_id, _admin) = setup_bridge(&env);
+    let (bridge, user, token_id, admin) = setup_bridge(&env);
     let new_contract = Address::generate(&env);
 
     bridge.set_fee_bps(&1000u32, &None);
@@ -1308,6 +1346,45 @@ fn test_emergency_migration_keeps_reserved_tokens_recoverable() {
     assert_eq!(check_balance(&env, &token_id, &bridge.address), 100i128);
 
     bridge.emergency_migrate(&new_contract, &true, &None);
+
+    // The snapshot must also publish limits, roles and counters.
+    let events = env.events().all();
+    let mut found_limits = false;
+    let mut found_roles = false;
+    let mut found_counters = false;
+    for (contract_id, topics, data) in events.iter() {
+        if contract_id != bridge.address {
+            continue;
+        }
+        let topics: Vec<soroban_sdk::Val> = topics.clone();
+        if topics.len() != 2 {
+            continue;
+        }
+        let kind: soroban_sdk::Symbol = topics.get(1).unwrap().into_val(&env);
+        if kind == soroban_sdk::Symbol::new(&env, "limits") {
+            let payload: (i128, i128, u32, u32) = data.into_val(&env);
+            assert_eq!(payload.0, 0i128);
+            assert_eq!(payload.1, 0i128);
+            assert_eq!(payload.2, MAX_ALLOWED_TTL);
+            assert_eq!(payload.3, MAX_ALLOWED_TTL);
+            found_limits = true;
+        } else if kind == soroban_sdk::Symbol::new(&env, "roles") {
+            let payload: (Address, Option<Address>, Option<Address>, BytesN<32>) =
+                data.into_val(&env);
+            assert_eq!(payload.0, admin);
+            assert_eq!(payload.1, None);
+            assert_eq!(payload.2, None);
+            assert_eq!(payload.3, BytesN::from_array(&env, &[0u8; 32]));
+            found_roles = true;
+        } else if kind == soroban_sdk::Symbol::new(&env, "counters") {
+            let payload: (u64, u64) = data.into_val(&env);
+            assert_eq!(payload, (0u64, 0u64));
+            found_counters = true;
+        }
+    }
+    assert!(found_limits, "missing EmergencyMigrate limits event");
+    assert!(found_roles, "missing EmergencyMigrate roles event");
+    assert!(found_counters, "missing EmergencyMigrate counters event");
 
     bridge.withdraw_fees(&token_id, &100i128, &None);
     assert_eq!(check_balance(&env, &token_id, &bridge.address), 0i128);
@@ -6904,16 +6981,12 @@ fn test_extend_source_persistent_ttl_extends_source_keys() {
     let seq = env.ledger().sequence();
     bridge.verify_auth_entry(&user, &0u64, &0u32, &(seq + 100));
 
-    // The daily-usage key is scoped by hourly bucket, derived the same way
-    // `check_daily_limit` derives it internally.
-    let day = env.ledger().timestamp() / 3_600;
-
+    // `DailyUsage` lives in temporary storage and is not extended here.
     env.ledger().set_sequence_number(MAX_ALLOWED_TTL - 10);
     bridge.extend_source_persistent_ttl(&user, &token_id, &200_000u32, &None);
 
     let expected_keys = [
         DataKey::SourceDailyLimit(user.clone(), token_id.clone()),
-        DataKey::DailyUsage(user.clone(), token_id.clone(), day),
         DataKey::UserDeposit(user.clone(), token_id.clone()),
         DataKey::SourceBridgedVolume(user.clone(), token_id.clone()),
         DataKey::Nonce(user.clone()),
