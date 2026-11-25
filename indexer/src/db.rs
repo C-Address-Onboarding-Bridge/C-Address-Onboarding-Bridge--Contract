@@ -366,12 +366,14 @@ impl Database {
             .collect())
     }
 
-    pub async fn delete_subscription(&self, id: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE subscriptions SET active = 0 WHERE id = ?1")
+    /// Soft-deletes a subscription. Returns `true` when a row was updated and
+    /// `false` when no active subscription matched `id`.
+    pub async fn delete_subscription(&self, id: &str) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("UPDATE subscriptions SET active = 0 WHERE id = ?1")
             .bind(id)
             .execute(&self.pool)
             .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn queue_webhook_deliveries(&self, event: &IndexedEvent) -> Result<(), sqlx::Error> {

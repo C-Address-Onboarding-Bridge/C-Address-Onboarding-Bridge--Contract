@@ -45,9 +45,10 @@
 //! 1. **Sequential nonce** (`DataKey::Nonce`) — optional `nonce: Option<u64>` parameter
 //!    on every mutating function. Pass `None` to skip (standard Stellar transaction
 //!    replay protection applies). Pass `Some(n)` to enforce strict ordering.
-//! 2. **Auth-entry nonce** (`DataKey::UsedAuthNonce`) — used by `verify_auth_entry` to
+//! 2. **Auth-entry nonce** (`DataKey::AuthNonce`) — used by `verify_auth_entry` to
 //!    permanently burn a `(source, nonce)` pair within a ledger-sequence window, preventing
-//!    Soroban authorization-entry reuse.
+//!    Soroban authorization-entry reuse. A single per-source counter records the next
+//!    expected nonce; every nonce below it is considered used.
 //!
 //! Meta-transactions (`execute_meta_fund`) use a third, unordered scheme: any
 //! unused `(source, nonce)` pair is accepted and nonce ordering is not enforced.
@@ -255,8 +256,9 @@ pub enum DataKey {
     MaxInstanceTtl,
     MaxPersistentTtl,
     BridgeConfig,
-    // Issue #95: per-address auth nonce counter and used-nonce set
+    // Issue #95: per-address auth nonce counter (nonces below it are used)
     AuthNonce(Address),
+    // Deprecated: superseded by `AuthNonce`; kept so the enum layout is stable.
     UsedAuthNonce(Address, u64),
     // Issue #72: timelocked upgrade path
     PendingUpgrade,
@@ -296,7 +298,15 @@ pub enum DataKey {
     MigratedTo,
     // Admin-managed whitelist of DEX pool addresses usable in `swap_route`.
     PoolWhitelist,
+    AssetWhitelistEntry(Address),
+    PoolWhitelistEntry(Address),
     RelayerSet,
+    // Issue #897: paginated enumeration indexes and lengths for the per-key
+    // whitelist entries, plus the relayer set size cap.
+    AssetWhitelistIndex(u32),
+    AssetWhitelistLen,
+    PoolWhitelistIndex(u32),
+    PoolWhitelistLen,
     CrossChainReserve(Address),
     // Issue #1099: every asset that ever had counters or a cross-chain
     // reserve, so `emergency_migrate` can export de-whitelisted assets.
@@ -1106,23 +1116,78 @@ fn check_party_access(env: &Env, party: &Address) -> Result<(), BridgeError> {
     check_access(env, party)
 }
 
-#[inline(never)]
-fn read_whitelist(env: &Env) -> Map<Address, bool> {
+// Issue #897: whitelists live in per-key persistent entries so that the cost of
+// a membership check is independent of how many assets/pools are whitelisted.
+// Enumeration is served by a paginated index (`*WhitelistIndex(i)`), and removal
+// is O(1) via swap-and-pop on that index.
+
+fn is_asset_whitelisted(env: &Env, asset: &Address) -> bool {
     env.storage()
-        .instance()
-        .get(&DataKey::AssetWhitelist)
-        .unwrap_or_else(|| Map::new(env))
+        .persistent()
+        .get(&DataKey::AssetWhitelistEntry(asset.clone()))
+        .unwrap_or(false)
 }
 
-#[inline(never)]
-fn save_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
+fn asset_whitelist_len(env: &Env) -> u32 {
     env.storage()
         .instance()
-        .set(&DataKey::AssetWhitelist, whitelist);
+        .get(&DataKey::AssetWhitelistLen)
+        .unwrap_or(0u32)
+}
+
+fn asset_whitelist_index(env: &Env, i: u32) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AssetWhitelistIndex(i))
+}
+
+fn set_asset_whitelisted(env: &Env, asset: &Address, present: bool) -> bool {
+    let was_present = is_asset_whitelisted(env, asset);
+    if present && !was_present {
+        let len = asset_whitelist_len(env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AssetWhitelistEntry(asset.clone()), &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AssetWhitelistIndex(len), asset);
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetWhitelistLen, &(len + 1));
+    } else if !present && was_present {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AssetWhitelistEntry(asset.clone()));
+        let len = asset_whitelist_len(env);
+        let mut found: Option<u32> = None;
+        for i in 0..len {
+            if asset_whitelist_index(env, i).as_ref() == Some(asset) {
+                found = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = found {
+            let last = len - 1;
+            if i != last {
+                if let Some(moved) = asset_whitelist_index(env, last) {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::AssetWhitelistIndex(i), &moved);
+                }
+            }
+            env.storage()
+                .persistent()
+                .remove(&DataKey::AssetWhitelistIndex(last));
+            env.storage()
+                .instance()
+                .set(&DataKey::AssetWhitelistLen, &last);
+        }
+    }
+    was_present
 }
 
 fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError> {
-    if !read_whitelist(env).get(asset.clone()).unwrap_or(false) {
+    if !is_asset_whitelisted(env, asset) {
         return Err(BridgeError::AssetNotWhitelisted);
     }
     Ok(())
@@ -1130,23 +1195,73 @@ fn check_asset_whitelisted(env: &Env, asset: &Address) -> Result<(), BridgeError
 
 // fund_c_address_with_swap must not invoke arbitrary caller-supplied pool
 // addresses. Mirrors the asset whitelist pattern above.
-#[inline(never)]
-fn read_pool_whitelist(env: &Env) -> Map<Address, bool> {
+fn is_pool_whitelisted(env: &Env, pool: &Address) -> bool {
     env.storage()
-        .instance()
-        .get(&DataKey::PoolWhitelist)
-        .unwrap_or_else(|| Map::new(env))
+        .persistent()
+        .get(&DataKey::PoolWhitelistEntry(pool.clone()))
+        .unwrap_or(false)
 }
 
-#[inline(never)]
-fn save_pool_whitelist(env: &Env, whitelist: &Map<Address, bool>) {
+fn pool_whitelist_len(env: &Env) -> u32 {
     env.storage()
         .instance()
-        .set(&DataKey::PoolWhitelist, whitelist);
+        .get(&DataKey::PoolWhitelistLen)
+        .unwrap_or(0u32)
+}
+
+fn pool_whitelist_index(env: &Env, i: u32) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PoolWhitelistIndex(i))
+}
+
+fn set_pool_whitelisted(env: &Env, pool: &Address, present: bool) -> bool {
+    let was_present = is_pool_whitelisted(env, pool);
+    if present && !was_present {
+        let len = pool_whitelist_len(env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolWhitelistEntry(pool.clone()), &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PoolWhitelistIndex(len), pool);
+        env.storage()
+            .instance()
+            .set(&DataKey::PoolWhitelistLen, &(len + 1));
+    } else if !present && was_present {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PoolWhitelistEntry(pool.clone()));
+        let len = pool_whitelist_len(env);
+        let mut found: Option<u32> = None;
+        for i in 0..len {
+            if pool_whitelist_index(env, i).as_ref() == Some(pool) {
+                found = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = found {
+            let last = len - 1;
+            if i != last {
+                if let Some(moved) = pool_whitelist_index(env, last) {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::PoolWhitelistIndex(i), &moved);
+                }
+            }
+            env.storage()
+                .persistent()
+                .remove(&DataKey::PoolWhitelistIndex(last));
+            env.storage()
+                .instance()
+                .set(&DataKey::PoolWhitelistLen, &last);
+        }
+    }
+    was_present
 }
 
 fn check_pool_whitelisted(env: &Env, pool: &Address) -> Result<(), BridgeError> {
-    if !read_pool_whitelist(env).get(pool.clone()).unwrap_or(false) {
+    if !is_pool_whitelisted(env, pool) {
         return Err(BridgeError::PoolNotWhitelisted);
     }
     Ok(())
@@ -1330,7 +1445,7 @@ fn consume_nonce(env: &Env, caller: &Address, nonce: Option<u64>) -> Result<(), 
 //   1. Binds the nonce to the current contract ID (implicitly — stored under this
 //      contract's own persistent storage, keyed by source address).
 //   2. Checks that the current ledger sequence is within the caller-supplied window.
-//   3. Records the (source, nonce) pair as used, preventing replay in any future
+//   3. Advances the per-source counter, preventing replay in any future
 //      transaction regardless of ledger sequence.
 //   4. Emits `AuthUsed(source, nonce)` so off-chain indexers can track usage.
 
@@ -1342,25 +1457,18 @@ fn read_auth_nonce(env: &Env, source: &Address) -> u64 {
 }
 
 fn is_auth_nonce_used(env: &Env, source: &Address, nonce: u64) -> bool {
-    env.storage()
-        .persistent()
-        .get(&DataKey::UsedAuthNonce(source.clone(), nonce))
-        .unwrap_or(false)
+    // The counter is the single source of truth: every nonce below it has been
+    // consumed, so no per-nonce entry needs to be stored.
+    nonce < read_auth_nonce(env, source)
 }
 
 fn mark_auth_nonce_used(env: &Env, source: &Address, nonce: u64) -> Result<(), BridgeError> {
-    env.storage()
-        .persistent()
-        .set(&DataKey::UsedAuthNonce(source.clone(), nonce), &true);
     // Advance the per-address counter so clients can always discover the next
     // expected nonce without scanning storage.
-    let current = read_auth_nonce(env, source);
-    if nonce >= current {
-        let next = nonce.checked_add(1).ok_or(BridgeError::Overflow)?;
-        env.storage()
-            .persistent()
-            .set(&DataKey::AuthNonce(source.clone()), &next);
-    }
+    let next = nonce.checked_add(1).ok_or(BridgeError::Overflow)?;
+    env.storage()
+        .persistent()
+        .set(&DataKey::AuthNonce(source.clone()), &next);
     Ok(())
 }
 
@@ -1386,20 +1494,17 @@ fn consume_auth_nonce(
         return Err(BridgeError::TransactionExpired);
     }
 
-    // 2. Enforce monotonic sequencing before checking the used-nonce set.
-    if nonce != read_auth_nonce(env, source) {
+    // 2. Enforce monotonic sequencing. A nonce below the counter has already
+    //    been consumed; a nonce above it skips ahead.
+    let current = read_auth_nonce(env, source);
+    if nonce < current {
+        return Err(BridgeError::AuthNonceAlreadyUsed);
+    }
+    if nonce > current {
         return Err(BridgeError::DuplicateNonce);
     }
 
-    // 3. Used-nonce check (prevents exact replay of this (source, nonce) pair).
-    // Unreachable in practice: step 2 already rejects any nonce that is not the
-    // next expected one, so a used nonce can never get here. Kept as a
-    // defensive guard; `DuplicateNonce` is the code clients observe.
-    if is_auth_nonce_used(env, source, nonce) {
-        return Err(BridgeError::DuplicateNonce);
-    }
-
-    // 4. Mark as used and advance the per-address counter
+    // 3. Mark as used by advancing the per-address counter
     mark_auth_nonce_used(env, source, nonce)?;
 
     // 4. Emit AuthUsed event for off-chain indexers
@@ -3951,8 +4056,18 @@ impl OnboardingBridge {
                 ("EmergencyMigrate", "collector"),
                 (read_fee_collector(&env),),
             );
-            let asset_whitelist = read_whitelist(&env);
-            let pool_whitelist = read_pool_whitelist(&env);
+            let mut asset_whitelist: Map<Address, bool> = Map::new(&env);
+            for i in 0..asset_whitelist_len(&env) {
+                if let Some(a) = asset_whitelist_index(&env, i) {
+                    asset_whitelist.set(a, true);
+                }
+            }
+            let mut pool_whitelist: Map<Address, bool> = Map::new(&env);
+            for i in 0..pool_whitelist_len(&env) {
+                if let Some(a) = pool_whitelist_index(&env, i) {
+                    pool_whitelist.set(a, true);
+                }
+            }
             let mut assets = Vec::new(&env);
             for (asset, enabled) in asset_whitelist.iter() {
                 if enabled {
@@ -4359,10 +4474,7 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
-        let mut whitelist = read_whitelist(&env);
-        let was_whitelisted = whitelist.get(asset.clone()).unwrap_or(false);
-        whitelist.set(asset.clone(), true);
-        save_whitelist(&env, &whitelist);
+        let was_whitelisted = set_asset_whitelisted(&env, &asset, true);
         env.events()
             .publish(("AssetAdded",), (admin, asset, was_whitelisted));
         Ok(())
@@ -4394,10 +4506,7 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
-        let mut whitelist = read_whitelist(&env);
-        let was_present = whitelist.get(asset.clone()).unwrap_or(false);
-        whitelist.remove(asset.clone());
-        save_whitelist(&env, &whitelist);
+        let was_present = set_asset_whitelisted(&env, &asset, false);
         env.events().publish(("AssetRemoved",), (admin, asset, was_present));
         Ok(())
     }
@@ -4409,7 +4518,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_is_asset_whitelisted(env: Env, asset: Address) -> Result<bool, BridgeError> {
         check_initialized(&env)?;
-        Ok(read_whitelist(&env).get(asset).unwrap_or(false))
+        Ok(is_asset_whitelisted(&env, &asset))
     }
 
     /// Returns a page of currently whitelisted asset addresses.
@@ -4438,15 +4547,13 @@ impl OnboardingBridge {
             limit
         };
         let mut out: Vec<Address> = Vec::new(&env);
-        let mut idx: u32 = 0;
-        for (asset, allowed) in read_whitelist(&env).iter() {
-            if !allowed {
-                continue;
-            }
-            if idx >= offset && out.len() < limit {
+        let len = asset_whitelist_len(&env);
+        let mut i = offset;
+        while i < len && out.len() < limit {
+            if let Some(asset) = asset_whitelist_index(&env, i) {
                 out.push_back(asset);
             }
-            idx += 1;
+            i += 1;
         }
         Ok(out)
     }
@@ -4481,10 +4588,7 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
-        let mut whitelist = read_pool_whitelist(&env);
-        let was_present = whitelist.get(pool.clone()).unwrap_or(false);
-        whitelist.set(pool.clone(), true);
-        save_pool_whitelist(&env, &whitelist);
+        let was_present = set_pool_whitelisted(&env, &pool, true);
         env.events().publish(("SwapPoolAdded",), (admin, pool, was_present));
         Ok(())
     }
@@ -4518,10 +4622,7 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
-        let mut whitelist = read_pool_whitelist(&env);
-        let was_present = whitelist.get(pool.clone()).unwrap_or(false);
-        whitelist.remove(pool.clone());
-        save_pool_whitelist(&env, &whitelist);
+        let was_present = set_pool_whitelisted(&env, &pool, false);
         env.events().publish(("SwapPoolRemoved",), (admin, pool, was_present));
         Ok(())
     }
@@ -4533,7 +4634,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     pub fn query_is_pool_whitelisted(env: Env, pool: Address) -> Result<bool, BridgeError> {
         check_initialized(&env)?;
-        Ok(read_pool_whitelist(&env).get(pool).unwrap_or(false))
+        Ok(is_pool_whitelisted(&env, &pool))
     }
 
     // -----------------------------------------------------------------------
@@ -5956,8 +6057,8 @@ impl OnboardingBridge {
     ///
     /// 1. Requiring the current ledger sequence to be within
     ///    `[valid_after_ledger, valid_before_ledger)`.
-    /// 2. Checking that `(source, nonce)` has not been used before.
-    /// 3. Permanently marking the pair as used in persistent storage.
+    /// 2. Checking that `nonce` equals the source's current auth nonce counter.
+    /// 3. Advancing the counter, which permanently burns the pair.
     /// 4. Emitting `AuthUsed(source, nonce)` for off-chain tracking.
     ///
     /// The nonce is scoped to this contract's own persistent storage, so the
@@ -5966,7 +6067,7 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `source` (`Address`) — The address whose authorization entry is consumed.
-    /// * `nonce` (`u64`) — The nonce to burn. Must not have been used before.
+    /// * `nonce` (`u64`) — The nonce to burn. Must equal the current counter.
     /// * `valid_after_ledger` (`u32`) — Inclusive lower bound on the current
     ///   ledger sequence number.
     /// * `valid_before_ledger` (`u32`) — Exclusive upper bound on the current
@@ -5982,8 +6083,9 @@ impl OnboardingBridge {
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
     /// * [`BridgeError::AuthNonceExpired`] — Current ledger sequence is outside
     ///   the `[valid_after_ledger, valid_before_ledger)` window.
-    /// * [`BridgeError::AuthNonceAlreadyUsed`] — This `(source, nonce)` pair has
-    ///   already been consumed.
+    /// * [`BridgeError::AuthNonceAlreadyUsed`] — `nonce` is below the current
+    ///   counter, i.e. this `(source, nonce)` pair has already been consumed.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` is above the current counter.
     ///
     /// # Events
     ///
@@ -6040,6 +6142,9 @@ impl OnboardingBridge {
     }
 
     /// Returns `true` if a specific auth nonce has already been consumed for `source`.
+    ///
+    /// A nonce is considered used when it is below the source's current auth
+    /// nonce counter.
     ///
     /// # Arguments
     ///

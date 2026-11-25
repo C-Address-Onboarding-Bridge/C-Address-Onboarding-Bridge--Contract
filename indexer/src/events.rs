@@ -78,6 +78,12 @@ pub enum BridgeEventType {
     FeeTiersSet,
     LoyaltyTokenSet,
     CommitmentCancelled,
+    CommitFund,
+    CommitRevealFunded,
+    SwapAndFunded,
+    MetaFundExecuted,
+    ReferralPaid,
+    BatchTransferFailed,
 }
 
 impl BridgeEventType {
@@ -124,6 +130,12 @@ impl BridgeEventType {
             "FeeTiersSet" => Some(Self::FeeTiersSet),
             "LoyaltyTokenSet" => Some(Self::LoyaltyTokenSet),
             "CommitmentCancelled" => Some(Self::CommitmentCancelled),
+            "CommitFund" => Some(Self::CommitFund),
+            "CommitRevealFunded" => Some(Self::CommitRevealFunded),
+            "SwapAndFunded" => Some(Self::SwapAndFunded),
+            "MetaFundExecuted" => Some(Self::MetaFundExecuted),
+            "ReferralPaid" => Some(Self::ReferralPaid),
+            "BatchTransferFailed" => Some(Self::BatchTransferFailed),
             _ => None,
         }
     }
@@ -171,6 +183,12 @@ impl BridgeEventType {
             Self::FeeTiersSet => "FeeTiersSet",
             Self::LoyaltyTokenSet => "LoyaltyTokenSet",
             Self::CommitmentCancelled => "CommitmentCancelled",
+            Self::CommitFund => "CommitFund",
+            Self::CommitRevealFunded => "CommitRevealFunded",
+            Self::SwapAndFunded => "SwapAndFunded",
+            Self::MetaFundExecuted => "MetaFundExecuted",
+            Self::ReferralPaid => "ReferralPaid",
+            Self::BatchTransferFailed => "BatchTransferFailed",
         }
     }
 }
