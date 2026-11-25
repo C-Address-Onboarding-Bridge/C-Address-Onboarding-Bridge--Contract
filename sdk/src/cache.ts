@@ -88,6 +88,11 @@ export class InMemoryCache implements ICacheProvider {
     this.store.clear();
   }
 
+  /** Number of entries currently retained (including not-yet-swept expired ones). */
+  get size(): number {
+    return this.store.size;
+  }
+
   /**
    * Remove all expired entries. Throttled by `sweepIntervalMs` so frequent
    * writes do not repeatedly scan the whole store.

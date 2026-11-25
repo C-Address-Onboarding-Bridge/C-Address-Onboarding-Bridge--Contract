@@ -53,19 +53,8 @@
 //! unused `(source, nonce)` pair is accepted and nonce ordering is not enforced.
 
 #![no_std]
-// TODO(next-bounty): both allows below cover a backlog left by the first bounty
-// programme, not a decision to stop linting. CI runs clippy with `-D warnings`,
-// so without these the whole job fails on known, pre-existing findings and never
-// reaches anything new.
-//
-// `dead_code`: ~24 storage helpers, constants and one struct field (fee tiers,
-// timelock entries, relayer thresholds, auth nonces, pool whitelist, loyalty
-// tokens) were written but never wired into a public contract function. They are
-// the unfinished half of those features -- implement the callers, then drop this.
-//
 // `clippy::too_many_arguments`: three funding entry points take 8-10 arguments.
 // Narrowing them means changing the public contract ABI, which is not a cleanup.
-#![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
 
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -220,7 +209,6 @@ pub enum DataKey {
     Nonce(Address),
     ReferralRate,
     // Extended variants used throughout the contract
-    Config,
     AssetStats(Address),
     Relayer(BytesN<32>),
     RelayerCount,
@@ -267,8 +255,6 @@ pub enum DataKey {
     Deactivated,
     // Admin-managed whitelist of DEX pool addresses usable in `swap_route`.
     PoolWhitelist,
-    AssetWhitelistEntry(Address),
-    PoolWhitelistEntry(Address),
     RelayerSet,
     CrossChainReserve(Address),
     // Issue #1099: every asset that ever had counters or a cross-chain
@@ -932,13 +918,6 @@ fn read_asset_counters(env: &Env, asset: &Address) -> AssetCounters {
         })
 }
 
-fn increment_locked_timelock(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
-    let mut c = read_asset_counters(env, asset);
-    c.locked_timelock = safe_math::safe_add(c.locked_timelock, amount)?;
-    save_asset_counters(env, asset, &c);
-    Ok(())
-}
-
 fn decrement_locked_timelock(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
     let mut c = read_asset_counters(env, asset);
     c.locked_timelock = safe_math::safe_sub(c.locked_timelock, amount)?;
@@ -1012,16 +991,6 @@ fn write_crosschain_reserve(env: &Env, asset: &Address, amount: i128) {
         .extend_ttl(&key, max_ttl / 4, max_ttl);
 }
 
-fn increment_crosschain_reserve(
-    env: &Env,
-    asset: &Address,
-    amount: i128,
-) -> Result<(), BridgeError> {
-    let reserve = safe_math::safe_add(read_crosschain_reserve(env, asset), amount)?;
-    write_crosschain_reserve(env, asset, reserve);
-    Ok(())
-}
-
 fn decrement_crosschain_reserve(
     env: &Env,
     asset: &Address,
@@ -1032,13 +1001,6 @@ fn decrement_crosschain_reserve(
         return Err(BridgeError::InsufficientCrossChainReserve);
     }
     write_crosschain_reserve(env, asset, safe_math::safe_sub(reserve, amount)?);
-    Ok(())
-}
-
-fn increment_accrued_fees(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
-    let mut c = read_asset_counters(env, asset);
-    c.accrued_fees = safe_math::safe_add(c.accrued_fees, amount)?;
-    save_asset_counters(env, asset, &c);
     Ok(())
 }
 
@@ -1053,26 +1015,8 @@ fn read_total_bridged(env: &Env, asset: &Address) -> i128 {
     read_asset_counters(env, asset).total_bridged
 }
 
-fn increment_total_bridged(env: &Env, asset: &Address, amount: i128) -> Result<(), BridgeError> {
-    let mut c = read_asset_counters(env, asset);
-    c.total_bridged = safe_math::safe_add(c.total_bridged, amount)?;
-    save_asset_counters(env, asset, &c);
-    Ok(())
-}
-
 fn read_total_fees_collected(env: &Env, asset: &Address) -> i128 {
     read_asset_counters(env, asset).total_fees_collected
-}
-
-fn increment_total_fees_collected(
-    env: &Env,
-    asset: &Address,
-    amount: i128,
-) -> Result<(), BridgeError> {
-    let mut c = read_asset_counters(env, asset);
-    c.total_fees_collected = safe_math::safe_add(c.total_fees_collected, amount)?;
-    save_asset_counters(env, asset, &c);
-    Ok(())
 }
 
 /// Atomically update all three counters in a single storage read+write

@@ -40,6 +40,11 @@ export interface TypedArg {
    * encoded with `nativeToScVal`'s default inference (no string heuristics).
    */
   type?: string;
+  /**
+   * Element type descriptor for `vec` and `option` arguments, forwarded to
+   * `nativeToScVal`'s `type` options.
+   */
+  elementType?: { type: string };
 }
 
 /**
@@ -54,7 +59,7 @@ export interface TypedArg {
  */
 export function toSingleScVal(arg: any): xdr.ScVal {
   if (arg !== null && typeof arg === 'object' && 'value' in arg) {
-    const { value, type } = arg as TypedArg;
+    const { value, type, elementType } = arg as TypedArg;
     if (value === null || value === undefined) {
       return xdr.ScVal.scvVoid();
     }
@@ -64,7 +69,10 @@ export function toSingleScVal(arg: any): xdr.ScVal {
     if (Array.isArray(value)) {
       return xdr.ScVal.scvVec(value.map((item) => toSingleScVal(item)));
     }
-    return type ? nativeToScVal(value, { type }) : nativeToScVal(value);
+    if (!type) {
+      return nativeToScVal(value);
+    }
+    return nativeToScVal(value, elementType ? { type, elementType } : { type });
   }
 
   if (arg === null || arg === undefined) {

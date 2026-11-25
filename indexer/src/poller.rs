@@ -1,3 +1,5 @@
+#![deny(unreachable_patterns)]
+
 use crate::events::{BridgeEventType, IndexedEvent};
 use crate::AppState;
 use base64::Engine;
@@ -369,6 +371,9 @@ fn parse_contract_event(
     //   FeeCollector*Proposed/...  -> (from, to)
     //   CommitFund / BatchTransferFailed / remaining admin/config events
     //                              -> (source, target)
+    //
+    // The generic arm must stay last: any arm after it would be unreachable
+    // (see #891).
     match &event_type {
         BridgeEventType::SwapAndFunded => {
             insert_topic_str(&mut data, &decoded_topics, 1, "source_asset");
@@ -389,27 +394,15 @@ fn parse_contract_event(
         }
         // ("FeesWithdrawn", fee_collector) - asset carried in value, not topics
         BridgeEventType::FeesWithdrawn => {
-            if let Some(collector) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert(
-                    "fee_collector".to_string(),
-                    serde_json::Value::String(collector.to_string()),
-                );
-            }
+            insert_topic_str(&mut data, &decoded_topics, 1, "fee_collector");
         }
         // ("AdminProposed", admin, new_admin) / ("AdminTransferred", old_admin, pending)
         // ("AdminChanged", old_admin, new_admin) - one-step set_admin path
         BridgeEventType::AdminProposed
         | BridgeEventType::AdminTransferred
         | BridgeEventType::AdminChanged => {
-            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert(
-                    "from".to_string(),
-                    serde_json::Value::String(from.to_string()),
-                );
-            }
-            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
-                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
-            }
+            insert_topic_str(&mut data, &decoded_topics, 1, "from");
+            insert_topic_str(&mut data, &decoded_topics, 2, "to");
         }
         // ("FeeCollectorTransferProposed", admin, new_collector) /
         // ("FeeCollectorTransferred", old, pending) /
@@ -417,15 +410,8 @@ fn parse_contract_event(
         BridgeEventType::FeeCollectorTransferProposed
         | BridgeEventType::FeeCollectorTransferred
         | BridgeEventType::FeeCollectorChanged => {
-            if let Some(from) = decoded_topics.get(1).and_then(|t| t.as_str()) {
-                data.insert(
-                    "from".to_string(),
-                    serde_json::Value::String(from.to_string()),
-                );
-            }
-            if let Some(to) = decoded_topics.get(2).and_then(|t| t.as_str()) {
-                data.insert("to".to_string(), serde_json::Value::String(to.to_string()));
-            }
+            insert_topic_str(&mut data, &decoded_topics, 1, "from");
+            insert_topic_str(&mut data, &decoded_topics, 2, "to");
         }
         // ("MetaSignerRegistered", source) / ("MetaSignerUnregistered", source)
         BridgeEventType::MetaSignerRegistered | BridgeEventType::MetaSignerUnregistered => {
@@ -443,9 +429,9 @@ fn parse_contract_event(
         }
         // ("CommitmentCancelled",) - commitment_id and source carried in value
         BridgeEventType::CommitmentCancelled => {}
+        // CommitFund, BatchTransferFailed, and the remaining admin/config
+        // events all publish (name, source, target).
         _ => {
-            // CommitFund, BatchTransferFailed, and the remaining admin/config
-            // events all publish (name, source, target).
             insert_topic_str(&mut data, &decoded_topics, 1, "source");
             insert_topic_str(&mut data, &decoded_topics, 2, "target");
         }
@@ -1052,6 +1038,29 @@ mod tests {
         assert_eq!(event.event_type, "BatchTransferFailed");
         assert_eq!(event.data["source"].as_str(), Some("GSRC"));
         assert_eq!(event.data["target"].as_str(), Some("CTGT"));
+    }
+
+    /// #891: FeesWithdrawn must not fall through to the generic arm, which
+    /// would mislabel the fee collector as `source`.
+    #[test]
+    fn test_fees_withdrawn_does_not_populate_source() {
+        let raw = raw_event(serde_json::json!(["FeesWithdrawn", "GCOLLECTOR"]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert!(
+            event.data["source"].is_null(),
+            "FeesWithdrawn must not label topics[1] as source"
+        );
+    }
+
+    /// #891: role-change events must not fall through to the generic arm.
+    #[test]
+    fn test_role_change_events_do_not_populate_source() {
+        let raw = raw_event(serde_json::json!(["AdminProposed", "GADMIN", "GNEWADMIN"]));
+        let event = parse_contract_event(&raw, "C1", 0).expect("must parse");
+        assert!(
+            event.data["source"].is_null(),
+            "AdminProposed must not label topics[1] as source"
+        );
     }
 
     /// Deterministic ID: different tx_hash -> different id.

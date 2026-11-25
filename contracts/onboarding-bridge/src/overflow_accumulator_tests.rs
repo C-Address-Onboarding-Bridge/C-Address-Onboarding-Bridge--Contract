@@ -1,14 +1,13 @@
 //! Property and edge-case coverage for the storage accumulators that were
-//! switched from raw `+=` to `safe_math::safe_add` (see lib.rs `increment_*`
-//! / `update_asset_counters` / `check_daily_limit`). Each of these functions
+//! switched from raw `+=` to `safe_math::safe_add` (see lib.rs
+//! `update_asset_counters` / `check_daily_limit`). Each of these functions
 //! must return `BridgeError::Overflow` instead of panicking/wrapping when the
 //! running total would exceed `i128::MAX`.
 
 #![cfg(test)]
 
 use crate::{
-    check_daily_limit, increment_accrued_fees, increment_source_bridged_volume,
-    increment_total_bridged, increment_total_fees_collected, increment_user_deposit,
+    check_daily_limit, increment_source_bridged_volume, increment_user_deposit,
     save_source_daily_limit, update_asset_counters, BridgeError, OnboardingBridge,
 };
 use proptest::prelude::*;
@@ -26,9 +25,9 @@ fn setup() -> (Env, Address, Address, Address) {
 fn accrued_fees_overflow_returns_error_not_panic() {
     let (env, bridge_id, asset, _source) = setup();
     env.as_contract(&bridge_id, || {
-        increment_accrued_fees(&env, &asset, i128::MAX).unwrap();
+        update_asset_counters(&env, &asset, i128::MAX, 0).unwrap();
         assert_eq!(
-            increment_accrued_fees(&env, &asset, 1),
+            update_asset_counters(&env, &asset, 1, 0),
             Err(BridgeError::Overflow)
         );
     });
@@ -38,9 +37,9 @@ fn accrued_fees_overflow_returns_error_not_panic() {
 fn total_bridged_overflow_returns_error_not_panic() {
     let (env, bridge_id, asset, _source) = setup();
     env.as_contract(&bridge_id, || {
-        increment_total_bridged(&env, &asset, i128::MAX).unwrap();
+        update_asset_counters(&env, &asset, 0, i128::MAX).unwrap();
         assert_eq!(
-            increment_total_bridged(&env, &asset, 1),
+            update_asset_counters(&env, &asset, 0, 1),
             Err(BridgeError::Overflow)
         );
     });
@@ -50,9 +49,9 @@ fn total_bridged_overflow_returns_error_not_panic() {
 fn total_fees_collected_overflow_returns_error_not_panic() {
     let (env, bridge_id, asset, _source) = setup();
     env.as_contract(&bridge_id, || {
-        increment_total_fees_collected(&env, &asset, i128::MAX).unwrap();
+        update_asset_counters(&env, &asset, i128::MAX, 0).unwrap();
         assert_eq!(
-            increment_total_fees_collected(&env, &asset, 1),
+            update_asset_counters(&env, &asset, 1, 0),
             Err(BridgeError::Overflow)
         );
     });
@@ -115,9 +114,9 @@ fn daily_limit_usage_overflow_returns_error_not_panic() {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 256, .. ProptestConfig::default() })]
 
-    /// Every `increment_*` accumulator must agree with `checked_add` on
-    /// whether a given (base, delta) pair overflows i128, regardless of how
-    /// close `base` sits to `i128::MAX`.
+    /// Every accumulator must agree with `checked_add` on whether a given
+    /// (base, delta) pair overflows i128, regardless of how close `base` sits
+    /// to `i128::MAX`.
     #[test]
     fn accrued_fees_matches_checked_add_near_i128_max(
         base in (i128::MAX - 1_000_000)..=i128::MAX,
@@ -125,8 +124,8 @@ proptest! {
     ) {
         let (env, bridge_id, asset, _source) = setup();
         env.as_contract(&bridge_id, || {
-            increment_accrued_fees(&env, &asset, base).unwrap();
-            let result = increment_accrued_fees(&env, &asset, delta);
+            update_asset_counters(&env, &asset, base, 0).unwrap();
+            let result = update_asset_counters(&env, &asset, delta, 0);
             let expected_overflow = base.checked_add(delta).is_none();
             prop_assert_eq!(result.is_err(), expected_overflow);
             if let Err(e) = result {
