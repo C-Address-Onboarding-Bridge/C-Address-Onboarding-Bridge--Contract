@@ -3919,6 +3919,32 @@ mod commit_reveal_tests {
             Err(Ok(BridgeError::CommitmentNotFound))
         );
     }
+
+    #[test]
+    fn test_source_can_cancel_commitment_while_paused() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(
+            &env,
+            &bridge.address,
+            &user,
+            &target,
+            &token_id,
+            500i128,
+            13u64,
+        );
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &2_000u64);
+
+        bridge.pause(&None);
+        bridge.cancel_commitment(&id);
+        assert_eq!(
+            bridge.try_query_commitment(&id),
+            Err(Ok(BridgeError::CommitmentNotFound))
+        );
+    }
 }
 
 /********** Cross-chain Onboarding Tests **********/
@@ -5709,6 +5735,62 @@ fn test_meta_signer_can_be_unregistered() {
     assert_eq!(bridge.query_meta_signer(&user), None);
 }
 
+#[test]
+fn test_meta_signer_can_be_unregistered_while_paused() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let network_id = env.ledger().network_id();
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 1000i128);
+
+    let seed = [0x42u8; 32];
+    let signing_key = SigningKey::from_bytes(&seed);
+    let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+    bridge.register_meta_signer(&user, &pubkey);
+
+    bridge.pause(&None);
+    bridge.unregister_meta_signer(&user);
+    assert_eq!(bridge.query_meta_signer(&user), None);
+    bridge.unpause(&None);
+
+    let target = Address::generate(&env);
+    let amount: i128 = 500;
+    let nonce: u64 = 0;
+    let deadline: u64 = 2_000_000;
+    let payload_hash = build_meta_fund_payload_hash(
+        &env,
+        &bridge_id,
+        &network_id,
+        &user,
+        &target,
+        &token_id,
+        amount,
+        nonce,
+        deadline,
+    );
+    let signature = sign_meta_fund_payload(&env, &signing_key, &payload_hash);
+
+    let params = MetaFundParams {
+        network_id: network_id.clone(),
+        source: user.clone(),
+        target,
+        asset: token_id.clone(),
+        amount,
+        nonce,
+        deadline,
+    };
+
+    assert_eq!(
+        bridge.try_execute_meta_fund(&params, &pubkey, &signature),
+        Err(Ok(BridgeError::MetaTxPubkeySourceMismatch))
+    );
+}
+
 /// Replicates the contract's payload-hash construction for `execute_meta_fund`
 /// so tests can produce valid Ed25519 signatures.
 fn build_meta_fund_payload_hash(
@@ -5970,6 +6052,63 @@ fn test_meta_fund_nonce_replay_rejected() {
         bridge.try_execute_meta_fund(&params2, &pubkey, &signature),
         Err(Ok(BridgeError::MetaTxNonceAlreadyUsed))
     );
+}
+
+// Documents the chosen nonce semantics: any unused `u64` is accepted for a
+// source and ordering is not enforced. A high nonce may be used before a lower
+// one, and the lower one is still accepted afterwards; only reuse is rejected.
+#[test]
+fn test_meta_fund_accepts_out_of_order_nonces() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    let network_id = env.ledger().network_id();
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.add_asset(&token_id, &None);
+    mint_tokens(&env, &token_id, &user, 2000i128);
+
+    let seed = [0x5Au8; 32];
+    let signing_key = SigningKey::from_bytes(&seed);
+    let pubkey = BytesN::from_array(&env, signing_key.verifying_key().as_bytes());
+    bridge.register_meta_signer(&user, &pubkey);
+
+    let amount: i128 = 500;
+    let deadline: u64 = 2_000_000;
+    soroban_sdk::token::Client::new(&env, &token_id).approve(&user, &bridge_id, &2000i128, &100u32);
+
+    // Use a high nonce first, then a lower, never-used nonce.
+    for nonce in [1_000u64, 7u64] {
+        let target = Address::generate(&env);
+        let payload_hash = build_meta_fund_payload_hash(
+            &env,
+            &bridge_id,
+            &network_id,
+            &user,
+            &target,
+            &token_id,
+            amount,
+            nonce,
+            deadline,
+        );
+        let signature = sign_meta_fund_payload(&env, &signing_key, &payload_hash);
+        let params = MetaFundParams {
+            network_id: network_id.clone(),
+            source: user.clone(),
+            target: target.clone(),
+            asset: token_id.clone(),
+            amount,
+            nonce,
+            deadline,
+        };
+
+        assert!(!bridge.query_meta_tx_nonce_used(&user, &nonce));
+        bridge.execute_meta_fund(&params, &pubkey, &signature);
+        assert!(bridge.query_meta_tx_nonce_used(&user, &nonce));
+        assert_eq!(check_balance(&env, &token_id, &target), 500i128);
+    }
 }
 
 #[test]

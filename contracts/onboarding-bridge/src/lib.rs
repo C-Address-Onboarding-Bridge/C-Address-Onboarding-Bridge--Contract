@@ -48,6 +48,9 @@
 //! 2. **Auth-entry nonce** (`DataKey::UsedAuthNonce`) — used by `verify_auth_entry` to
 //!    permanently burn a `(source, nonce)` pair within a ledger-sequence window, preventing
 //!    Soroban authorization-entry reuse.
+//!
+//! Meta-transactions (`execute_meta_fund`) use a third, unordered scheme: any
+//! unused `(source, nonce)` pair is accepted and nonce ordering is not enforced.
 
 #![no_std]
 // TODO(next-bounty): both allows below cover a backlog left by the first bounty
@@ -275,7 +278,9 @@ const MAX_BATCH_SIZE: u32 = 100;
 /// / `find_current_tier` scan the full tier list linearly on every funding
 /// call, so this bounds the per-call cost of that scan.
 const MAX_FEE_TIERS: u32 = 50;
-const MAX_ALLOWED_TTL: u32 = 3_110_400; // ~1 year in ledgers (5s/ledger)
+/// Maximum TTL in ledgers (~180 days at 5 s/ledger). Matches the network's
+/// `max_entry_ttl` limit.
+const MAX_ALLOWED_TTL: u32 = 3_110_400;
 /// Minimum configurable value for `MaxInstanceTtl` / `MaxPersistentTtl`.
 ///
 /// Without a floor, an admin setting either max to `0` would make
@@ -4418,6 +4423,8 @@ impl OnboardingBridge {
     /// The fee rate applied is the rate at **claim time**, not deposit time.
     /// If the global fee rate changes between deposit and claim, the net amount
     /// received by `target` may differ from the amount at deposit time.
+    /// The deposit credits `source`'s bridged volume for `asset`, so the
+    /// volume fee tier in effect at claim time applies to the claim.
     pub fn fund_c_address_timelocked(
         env: Env,
         source: Address,
@@ -4472,6 +4479,9 @@ impl OnboardingBridge {
         );
         increment_locked_timelock(&env, &asset, amount)?;
         increment_user_deposit(&env, &source, &asset, amount)?;
+        // Volume is credited at deposit time (when `source` is known and
+        // authorises the call) so the tier applies to the claim.
+        increment_source_bridged_volume(&env, &source, &asset, amount)?;
         mint_loyalty_tokens(&env, &source);
         extend_instance_ttl(&env);
 
@@ -4513,7 +4523,8 @@ impl OnboardingBridge {
     /// The `claimed` flag is persisted before the token transfer. Because
     /// Soroban execution is single-threaded within a ledger, this effectively
     /// prevents re-entrancy. The fee rate is the **current** global rate at
-    /// claim time, which may differ from the rate at deposit time.
+    /// claim time, which may differ from the rate at deposit time, reduced by
+    /// `entry.source`'s volume fee tier (if any) and capped by the asset fee cap.
     /// Claims remain available after emergency deactivation so existing
     /// timelock deposits are not stranded.
     pub fn claim_timelocked(env: Env, id: u64) -> Result<(), BridgeError> {
@@ -4534,7 +4545,8 @@ impl OnboardingBridge {
         save_timelock_entry(&env, id, &entry);
 
         let global_fee_bps = read_fee_bps(&env);
-        let effective_fee_bps = get_effective_fee_bps(&env, &entry.asset, global_fee_bps);
+        let tiered_fee_bps = get_tiered_fee_bps(&env, &entry.source, &entry.asset, global_fee_bps);
+        let effective_fee_bps = get_effective_fee_bps(&env, &entry.asset, tiered_fee_bps);
         let fee = calculate_fee(entry.amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(entry.amount, fee)?;
 
@@ -4572,7 +4584,8 @@ impl OnboardingBridge {
 
     /// Extends the instance-storage TTL to ensure contract state does not expire.
     ///
-    /// `ttl` is capped at `MAX_ALLOWED_TTL` (3 110 400 ledgers, ~1 year).
+    /// `ttl` is capped at `MAX_ALLOWED_TTL` (3 110 400 ledgers, ~180 days),
+    /// which matches the network's `max_entry_ttl`.
     /// The threshold used to trigger extension is `ttl / 4`.
     ///
     /// # Arguments
@@ -5303,10 +5316,12 @@ impl OnboardingBridge {
     /// The committed source may cancel at any time, including after the
     /// reveal deadline has passed. This lets abandoned commitments be cleaned
     /// up without waiting for storage TTL expiry.
+    ///
+    /// Deliberately not gated on the pause flag: it only removes the caller's
+    /// own unrevealed record, so it stays available during a pause.
     pub fn cancel_commitment(env: Env, commitment_id: u64) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
 
         let entry = read_commitment(&env, commitment_id).ok_or(BridgeError::CommitmentNotFound)?;
         if entry.revealed {
@@ -5563,10 +5578,12 @@ impl OnboardingBridge {
     ///
     /// Requires `source.require_auth()`. Subsequent meta-transactions for the
     /// source are rejected until a new key is registered.
+    ///
+    /// Deliberately not gated on the pause flag: a leaked meta-tx key must be
+    /// revocable during a pause or after `emergency_migrate`.
     pub fn unregister_meta_signer(env: Env, source: Address) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
-        check_not_paused(&env)?;
         source.require_auth();
         clear_meta_signer(&env, &source);
         env.events().publish(("MetaSignerUnregistered", source), ());
@@ -5807,8 +5824,11 @@ impl OnboardingBridge {
     /// Returns `true` if the given meta-transaction nonce has already been used
     /// for `source`.
     ///
-    /// Call this before constructing a `MetaFundParams` to get the next safe nonce,
-    /// or to verify a pending meta-tx has not been replayed.
+    /// Nonces are *not* sequential: any unused `u64` is accepted for a source
+    /// and ordering is not enforced, so there is no "next nonce" to query.
+    /// Call this to check whether a specific nonce is still free before
+    /// constructing a `MetaFundParams`, or to verify a pending meta-tx has not
+    /// been replayed.
     ///
     /// # Arguments
     ///
@@ -5842,7 +5862,8 @@ pub struct MetaFundParams {
     pub asset: Address,
     /// Gross amount to transfer (fee deducted from this).
     pub amount: i128,
-    /// Monotonically-increasing per-user nonce; prevents replay.
+    /// Per-source replay-prevention nonce. Any unused `u64` is accepted;
+    /// ordering is not enforced (nonces need not be sequential or increasing).
     pub nonce: u64,
     /// Unix timestamp (seconds) after which this meta-tx is rejected.
     pub deadline: u64,
