@@ -3610,6 +3610,315 @@ export class OnboardingBridgeSDK {
     return Boolean(scValToNative(scVal));
   }
 
+  /**
+   * Add a token contract address to the asset whitelist (admin only).
+   *
+   * Only whitelisted assets can be used in `fundCAddress` and batch calls.
+   * Adding an asset that is already whitelisted is idempotent.
+   *
+   * @param asset        - Token contract C-address to whitelist.
+   * @param adminKeypair - Keypair of the admin account.
+   * @param nonce        - Optional sequential nonce to prevent replay.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   */
+  async addAsset(
+    asset: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'addAsset',
+      { asset, nonce },
+      async () => {
+        try {
+          assertContractAddress(asset, 'asset');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'add_asset',
+                ...toScVals([new Address(asset)]),
+                this.optionalNonceToScVal(nonce),
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'add_asset' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'add_asset' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Remove a token contract address from the asset whitelist (admin only).
+   *
+   * After removal, funding calls that reference this asset return
+   * `AssetNotWhitelisted`. Existing fee counters for the asset are retained.
+   *
+   * @param asset        - Token contract C-address to remove.
+   * @param adminKeypair - Keypair of the admin account.
+   * @param nonce        - Optional sequential nonce to prevent replay.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   */
+  async removeAsset(
+    asset: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'removeAsset',
+      { asset, nonce },
+      async () => {
+        try {
+          assertContractAddress(asset, 'asset');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'remove_asset',
+                ...toScVals([new Address(asset)]),
+                this.optionalNonceToScVal(nonce),
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'remove_asset' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'remove_asset' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Add a DEX pool contract address to the swap-pool whitelist (admin only).
+   *
+   * Only whitelisted pools may appear in the `swap_route` passed to
+   * `fundCAddressWithSwap`. Adding a pool that is already whitelisted is
+   * idempotent.
+   *
+   * @param pool         - DEX pool contract C-address to whitelist.
+   * @param adminKeypair - Keypair of the admin account.
+   * @param nonce        - Optional sequential nonce to prevent replay.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   */
+  async addSwapPool(
+    pool: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'addSwapPool',
+      { pool, nonce },
+      async () => {
+        try {
+          assertContractAddress(pool, 'pool');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'add_swap_pool',
+                ...toScVals([new Address(pool)]),
+                this.optionalNonceToScVal(nonce),
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'add_swap_pool' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'add_swap_pool' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
+  /**
+   * Remove a DEX pool contract address from the swap-pool whitelist (admin only).
+   *
+   * After removal, `fundCAddressWithSwap` calls whose `swap_route` references
+   * this pool return `PoolNotWhitelisted`.
+   *
+   * @param pool         - DEX pool contract C-address to remove.
+   * @param adminKeypair - Keypair of the admin account.
+   * @param nonce        - Optional sequential nonce to prevent replay.
+   *
+   * @returns A {@link TransactionResult}.
+   *
+   * @throws Never — errors are returned as `status: 'failed'`.
+   */
+  async removeSwapPool(
+    pool: string,
+    adminKeypair: Keypair,
+    nonce?: string | number | bigint,
+  ): Promise<TransactionResult> {
+    return withTransactionHooks(
+      this.hooks,
+      'removeSwapPool',
+      { pool, nonce },
+      async () => {
+        try {
+          assertContractAddress(pool, 'pool');
+          const adminAccount = await withRpcHook(
+            this.hooks,
+            'getAccount',
+            { address: adminKeypair.publicKey() },
+            () => this.provider.getAccount(adminKeypair.publicKey()),
+          );
+
+          const tx = new TransactionBuilder(adminAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(
+              this.contract.call(
+                'remove_swap_pool',
+                ...toScVals([new Address(pool)]),
+                this.optionalNonceToScVal(nonce),
+              ),
+            )
+            .setTimeout(this.config.timeout ?? 30)
+            .build();
+
+          const preparedTx = await withRpcHook(
+            this.hooks,
+            'prepareTransaction',
+            { contractMethod: 'remove_swap_pool' },
+            () => this.provider.prepareTransaction(tx),
+          );
+          preparedTx.sign(adminKeypair);
+
+          const response = await withRpcHook(
+            this.hooks,
+            'sendTransaction',
+            { contractMethod: 'remove_swap_pool' },
+            () => this.provider.sendTransaction(preparedTx),
+          );
+
+          return {
+            hash: response.hash,
+            status: response.status === 'PENDING' ? 'pending' : 'failed',
+          };
+        } catch (error: any) {
+          return {
+            hash: '',
+            status: 'failed',
+            error: error.message || 'Unknown error',
+          };
+        }
+      },
+    );
+  }
+
   // ---------------------------------------------------------------------------
   // Pagination helpers
   // ---------------------------------------------------------------------------
@@ -3756,6 +4065,63 @@ export class OnboardingBridgeSDK {
     }
     const scVal = this.requireRetval(result, 'query_is_allowlisted');
     return Boolean(scValToNative(scVal));
+  }
+
+  /**
+   * Check whether a token contract address is on the asset whitelist.
+   *
+   * Only whitelisted assets can be used in `fundCAddress` and batch calls.
+   *
+   * @param asset - Token contract C-address to check.
+   *
+   * @returns `true` if `asset` is whitelisted.
+   *
+   * @throws {Error} On RPC failure.
+   */
+  async isAssetWhitelisted(asset: string): Promise<boolean> {
+    assertContractAddress(asset, 'asset');
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_is_asset_whitelisted' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_is_asset_whitelisted', [new Address(asset)]),
+      ),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query asset whitelist status: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? Boolean(scValToNative(scVal)) : false;
+  }
+
+  /**
+   * Check whether a DEX pool contract address is on the swap-pool whitelist.
+   *
+   * Only whitelisted pools may appear in the `swap_route` passed to
+   * `fundCAddressWithSwap`.
+   *
+   * @param pool - DEX pool contract C-address to check.
+   *
+   * @returns `true` if `pool` is whitelisted.
+   *
+   * @throws {Error} On RPC failure.
+   */
+  async isPoolWhitelisted(pool: string): Promise<boolean> {
+    assertContractAddress(pool, 'pool');
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_is_pool_whitelisted' },
+      () => this.provider.simulateTransaction(
+        this.buildSimulationTx('query_is_pool_whitelisted', [new Address(pool)]),
+      ),
+    );
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to query pool whitelist status: ${result.error}`);
+    }
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? Boolean(scValToNative(scVal)) : false;
   }
 
   /**

@@ -588,6 +588,70 @@ Checks if a given public key (hex) is a registered relayer.
   - `pubkeyHex`: `string`
 - **Returns**: `Promise<boolean>`
 
+##### `addAsset`
+```ts
+async addAsset(
+  asset: string,
+  adminKeypair: Keypair,
+  nonce?: string | number | bigint
+): Promise<TransactionResult>
+```
+Adds a token contract address to the asset whitelist (admin only). Only whitelisted
+assets can be used in `fundCAddress` and batch calls.
+- **Parameters**:
+  - `asset`: `string` — Token contract address (C-address).
+  - `adminKeypair`: `Keypair`
+  - `nonce`: optional sequential admin nonce (`string | number | bigint`)
+- **Returns**: `Promise<TransactionResult>`
+
+##### `removeAsset`
+```ts
+async removeAsset(
+  asset: string,
+  adminKeypair: Keypair,
+  nonce?: string | number | bigint
+): Promise<TransactionResult>
+```
+Removes a token contract address from the asset whitelist (admin only). After removal,
+funding calls that reference this asset return `AssetNotWhitelisted`.
+- **Parameters**:
+  - `asset`: `string` — Token contract address (C-address).
+  - `adminKeypair`: `Keypair`
+  - `nonce`: optional sequential admin nonce (`string | number | bigint`)
+- **Returns**: `Promise<TransactionResult>`
+
+##### `addSwapPool`
+```ts
+async addSwapPool(
+  pool: string,
+  adminKeypair: Keypair,
+  nonce?: string | number | bigint
+): Promise<TransactionResult>
+```
+Adds a DEX pool contract address to the swap-pool whitelist (admin only). Only
+whitelisted pools may appear in the `swap_route` passed to `fundCAddressWithSwap`.
+- **Parameters**:
+  - `pool`: `string` — DEX pool contract address (C-address).
+  - `adminKeypair`: `Keypair`
+  - `nonce`: optional sequential admin nonce (`string | number | bigint`)
+- **Returns**: `Promise<TransactionResult>`
+
+##### `removeSwapPool`
+```ts
+async removeSwapPool(
+  pool: string,
+  adminKeypair: Keypair,
+  nonce?: string | number | bigint
+): Promise<TransactionResult>
+```
+Removes a DEX pool contract address from the swap-pool whitelist (admin only). After
+removal, `fundCAddressWithSwap` calls referencing this pool return `PoolNotWhitelisted`.
+- **Parameters**:
+  - `pool`: `string` — DEX pool contract address (C-address).
+  - `adminKeypair`: `Keypair`
+  - `nonce`: optional sequential admin nonce (`string | number | bigint`)
+- **Returns**: `Promise<TransactionResult>`
+
 ##### `getWhitelistedAssets`
 ```ts
 async getWhitelistedAssets(
@@ -621,6 +685,26 @@ per-address membership check (`query_is_allowlisted`) — there is no call that
 lists the full allowlist.
 - **Parameters**:
   - `address`: `string`
+- **Returns**: `Promise<boolean>`
+
+##### `isAssetWhitelisted`
+```ts
+async isAssetWhitelisted(asset: string): Promise<boolean>
+```
+Checks whether a token contract address is on the asset whitelist. Only whitelisted
+assets can be used in `fundCAddress` and batch calls.
+- **Parameters**:
+  - `asset`: `string` — Token contract address (C-address).
+- **Returns**: `Promise<boolean>`
+
+##### `isPoolWhitelisted`
+```ts
+async isPoolWhitelisted(pool: string): Promise<boolean>
+```
+Checks whether a DEX pool contract address is on the swap-pool whitelist. Only
+whitelisted pools may appear in the `swap_route` passed to `fundCAddressWithSwap`.
+- **Parameters**:
+  - `pool`: `string` — DEX pool contract address (C-address).
 - **Returns**: `Promise<boolean>`
 
 ##### `estimateCost`
