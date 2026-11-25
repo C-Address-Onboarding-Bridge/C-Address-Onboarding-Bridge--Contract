@@ -60,7 +60,7 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
-    BytesN, Env, IntoVal, Map, Vec,
+    BytesN, Env, IntoVal, Map, Val, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -116,7 +116,8 @@ pub enum BridgeError {
     TimelockNotFound = 19,
     /// The timelock's `release_time` has not been reached yet.
     TimelockNotMatured = 20,
-    /// `release_time` is in the past, or `cliff_time` is after `release_time`.
+    /// `release_time` is in the past, more than `MAX_TIMELOCK_DELAY_SECONDS`
+    /// in the future, or `cliff_time` is after `release_time`.
     InvalidReleaseTime = 21,
     /// The caller is not authorized to perform this action (e.g. double-claim).
     Unauthorized = 22,
@@ -299,6 +300,11 @@ const MAX_STRKEY_LEN: usize = 64;
 /// Binds every signature to this payload format, so attestations produced for
 /// an older format (or another protocol) can never be replayed here.
 const CROSSCHAIN_DOMAIN_TAG: &[u8] = b"onboarding_bridge_crosschain_v2";
+/// Maximum delay between `now` and a timelock's `release_time` (~10 years).
+const MAX_TIMELOCK_DELAY_SECONDS: u64 = 10 * 365 * 86_400;
+/// Grace period after `release_time` during which only `target` may claim a
+/// timelock. Once it elapses, `source` may reclaim the unclaimed entry.
+const RECLAIM_GRACE_SECONDS: u64 = 365 * 86_400;
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -402,10 +408,37 @@ pub struct TimelockEntry {
     pub amount: i128,
     /// Unix timestamp (seconds) after which `claim_timelocked` may be called.
     pub release_time: u64,
-    /// Optional cliff timestamp; informational only in the current implementation.
+    /// Unix timestamp (seconds) before which nothing may be claimed. `0` means
+    /// no cliff: vesting starts at deposit time.
     pub cliff_time: u64,
-    /// Set to `true` once `claim_timelocked` has been successfully called.
+    /// Gross amount already released by previous `claim_timelocked` calls.
+    pub claimed_amount: i128,
+    /// Set to `true` once the full `amount` has been released.
     pub claimed: bool,
+    /// Set to `true` once `cancel_timelocked` or `reclaim_timelocked` has
+    /// refunded the entry to `source`.
+    pub cancelled: bool,
+}
+
+/// Gross amount of `entry` that has vested at `now`.
+///
+/// Vesting is linear between `cliff_time` (or the deposit time when
+/// `cliff_time == 0`) and `release_time`. Before the cliff nothing has vested;
+/// at or after `release_time` the whole amount has vested.
+fn vested_amount(entry: &TimelockEntry, now: u64) -> i128 {
+    if now >= entry.release_time {
+        return entry.amount;
+    }
+    let start = entry.cliff_time;
+    if start == 0 || now < start {
+        return 0;
+    }
+    let elapsed = (now - start) as i128;
+    let duration = (entry.release_time - start) as i128;
+    if duration <= 0 {
+        return entry.amount;
+    }
+    entry.amount * elapsed / duration
 }
 
 /// A scheduled WASM upgrade waiting for its timelock to elapse.
@@ -679,7 +712,7 @@ fn increment_user_deposit(
     let key = DataKey::UserDeposit(source.clone(), asset.clone());
     let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
     let updated = safe_math::safe_add(current, amount)?;
-    env.storage().persistent().set(&key, &updated);
+    persist(env, &key, &updated);
     Ok(())
 }
 
@@ -971,9 +1004,7 @@ fn decrement_locked_timelock(env: &Env, asset: &Address, amount: i128) -> Result
 }
 
 fn save_asset_counters(env: &Env, asset: &Address, counters: &AssetCounters) {
-    env.storage()
-        .persistent()
-        .set(&DataKey::AssetStats(asset.clone()), counters);
+    persist(env, &DataKey::AssetStats(asset.clone()), counters);
     track_known_asset(env, asset);
 }
 
@@ -1026,14 +1057,28 @@ fn reserved_balance(env: &Env, asset: &Address) -> Result<i128, BridgeError> {
     )
 }
 
-fn write_crosschain_reserve(env: &Env, asset: &Address, amount: i128) {
-    let key = DataKey::CrossChainReserve(asset.clone());
-    env.storage().persistent().set(&key, &amount);
-    track_known_asset(env, asset);
+/// Persist a hot entry and bump its TTL so it never expires under activity.
+fn persist<V: IntoVal<Env, Val>>(env: &Env, key: &DataKey, value: &V) {
+    env.storage().persistent().set(key, value);
     let max_ttl = read_max_persistent_ttl(env);
     env.storage()
         .persistent()
-        .extend_ttl(&key, max_ttl / 4, max_ttl);
+        .extend_ttl(key, max_ttl / 4, max_ttl);
+}
+
+fn write_crosschain_reserve(env: &Env, asset: &Address, amount: i128) {
+    persist(env, &DataKey::CrossChainReserve(asset.clone()), &amount);
+    track_known_asset(env, asset);
+}
+
+fn increment_crosschain_reserve(
+    env: &Env,
+    asset: &Address,
+    amount: i128,
+) -> Result<(), BridgeError> {
+    let reserve = safe_math::safe_add(read_crosschain_reserve(env, asset), amount)?;
+    write_crosschain_reserve(env, asset, reserve);
+    Ok(())
 }
 
 fn decrement_crosschain_reserve(
@@ -1104,9 +1149,7 @@ fn consume_nonce(env: &Env, caller: &Address, nonce: Option<u64>) -> Result<(), 
         if n != stored {
             return Err(BridgeError::DuplicateNonce);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::Nonce(caller.clone()), &(stored + 1));
+        persist(env, &DataKey::Nonce(caller.clone()), &(stored + 1));
     }
     Ok(())
 }
@@ -1307,6 +1350,15 @@ fn save_relayer_threshold(env: &Env, threshold: u32) {
         .set(&DataKey::RelayerThreshold, &threshold);
 }
 
+/// Derives the replay-protection nonce for a cross-chain event:
+/// `sha256(chain_id_be4 || tx_hash)`.
+fn derive_crosschain_nonce(env: &Env, chain_id: u32, tx_hash: &BytesN<32>) -> BytesN<32> {
+    let mut preimage = soroban_sdk::Bytes::new(env);
+    preimage.extend_from_array(&chain_id.to_be_bytes());
+    preimage.append(&tx_hash.clone().into());
+    env.crypto().sha256(&preimage).into()
+}
+
 fn is_nonce_used(env: &Env, nonce: &BytesN<32>) -> bool {
     env.storage()
         .persistent()
@@ -1440,7 +1492,8 @@ fn increment_source_bridged_volume(
 ) -> Result<(), BridgeError> {
     let current = read_source_bridged_volume(env, source, asset);
     let updated = safe_math::safe_add(current, amount)?;
-    env.storage().persistent().set(
+    persist(
+        env,
         &DataKey::SourceBridgedVolume(source.clone(), asset.clone()),
         &updated,
     );
@@ -4437,10 +4490,7 @@ impl OnboardingBridge {
         }
 
         let tx_hash_bytes: soroban_sdk::Bytes = tx_hash.clone().into();
-        let mut nonce_pre = soroban_sdk::Bytes::new(&env);
-        nonce_pre.extend_from_array(&chain_id.to_be_bytes());
-        nonce_pre.append(&tx_hash_bytes);
-        let nonce: BytesN<32> = env.crypto().sha256(&nonce_pre).into();
+        let nonce = derive_crosschain_nonce(&env, chain_id, &tx_hash);
         if is_nonce_used(&env, &nonce) {
             return Err(BridgeError::ReplayedNonce);
         }
@@ -4527,6 +4577,35 @@ impl OnboardingBridge {
             (chain_id, tx_hash, amount, fee, asset),
         );
         Ok(())
+    }
+
+    /// Returns whether a cross-chain `(chain_id, tx_hash)` event has already
+    /// been processed by `fund_c_address_crosschain`.
+    ///
+    /// The nonce is derived exactly as in `fund_c_address_crosschain`:
+    /// `sha256(chain_id_be4 || tx_hash)`. Relayers can use this to skip
+    /// re-submitting an event that has already been credited.
+    ///
+    /// # Arguments
+    ///
+    /// * `chain_id` (`u32`) — Numeric source-chain ID.
+    /// * `tx_hash` (`BytesN<32>`) — The 32-byte hash of the source-chain transaction.
+    ///
+    /// # Authorization
+    ///
+    /// None — read-only.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    pub fn query_crosschain_processed(
+        env: Env,
+        chain_id: u32,
+        tx_hash: BytesN<32>,
+    ) -> Result<bool, BridgeError> {
+        check_initialized(&env)?;
+        let nonce = derive_crosschain_nonce(&env, chain_id, &tx_hash);
+        Ok(is_nonce_used(&env, &nonce))
     }
 
     /// Registers an Ed25519 public key as a trusted relayer.
@@ -4686,12 +4765,19 @@ impl OnboardingBridge {
     /// * `amount` (`i128`) — Gross amount to lock. Must be > 0.
     /// * `release_time` (`u64`) — Unix timestamp (seconds) after which the
     ///   tokens may be claimed. Must be strictly in the future.
-    /// * `cliff_time` (`u64`) — Optional cliff timestamp. If > 0 it must be
-    ///   ≤ `release_time`. Currently informational only; not enforced by
-    ///   `claim_timelocked`.
+    /// * `cliff_time` (`u64`) — Unix timestamp (seconds) before which nothing
+    ///   may be claimed. Pass `0` for no cliff (vesting starts at deposit
+    ///   time). If > 0 it must be ≤ `release_time`.
     /// * `nonce` (`Option<u64>`) — Optional sequential nonce for `source`.
     /// * `deadline` (`Option<u64>`) — Optional Unix timestamp (seconds) after
     ///   which the call is rejected. Pass `None` for no expiry.
+    ///
+    /// # Vesting
+    ///
+    /// The gross `amount` vests linearly between `cliff_time` (or the deposit
+    /// timestamp when `cliff_time == 0`) and `release_time`. `claim_timelocked`
+    /// may be called repeatedly to release the vested portion; the fee is
+    /// charged on each released portion.
     ///
     /// # Authorization
     ///
@@ -4712,7 +4798,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::DailyLimitExceeded`] — Transfer would exceed `source`'s
     ///   daily limit for this asset.
     /// * [`BridgeError::InvalidReleaseTime`] — `release_time` ≤ current timestamp,
-    ///   or `cliff_time > release_time`.
+    ///   `release_time` > current timestamp + `MAX_TIMELOCK_DELAY_SECONDS`
+    ///   (~10 years), or `cliff_time > release_time`.
     /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode on and `target`
     ///   is not allowlisted.
@@ -4754,7 +4841,10 @@ impl OnboardingBridge {
         if amount <= 0 || amount < read_minimum_amount(&env) {
             return Err(BridgeError::InvalidAmount);
         }
-        if release_time <= env.ledger().timestamp() || (cliff_time > 0 && cliff_time > release_time)
+        let now = env.ledger().timestamp();
+        if release_time <= now
+            || release_time > now.saturating_add(MAX_TIMELOCK_DELAY_SECONDS)
+            || (cliff_time > 0 && cliff_time > release_time)
         {
             return Err(BridgeError::InvalidReleaseTime);
         }
@@ -4780,7 +4870,9 @@ impl OnboardingBridge {
                 amount,
                 release_time,
                 cliff_time,
+                claimed_amount: 0,
                 claimed: false,
+                cancelled: false,
             },
         );
         increment_locked_timelock(&env, &asset, amount)?;
@@ -4839,7 +4931,7 @@ impl OnboardingBridge {
         check_recovery_allowed(&env)?;
 
         let mut entry = read_timelock_entry(&env, id).ok_or(BridgeError::TimelockNotFound)?;
-        if entry.claimed {
+        if entry.claimed || entry.cancelled {
             return Err(BridgeError::Unauthorized);
         }
         if env.ledger().timestamp() < entry.release_time {
@@ -4867,6 +4959,112 @@ impl OnboardingBridge {
         env.events().publish(
             ("TimelockClaimed", entry.target.clone()),
             (id, net_amount, fee, entry.asset.clone()),
+        );
+        Ok(())
+    }
+
+    /// Cancels an unclaimed timelock entry before its `release_time` and
+    /// refunds the gross amount to `source`.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` (`u64`) — The timelock entry ID returned by `fund_c_address_timelocked`.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `source.require_auth()` (the depositor of the entry).
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused and not deactivated.
+    /// * [`BridgeError::TimelockNotFound`] — No entry exists for `id`.
+    /// * [`BridgeError::Unauthorized`] — The entry was already claimed or cancelled.
+    /// * [`BridgeError::TimelockNotMatured`] — `release_time` has already passed;
+    ///   use `reclaim_timelocked` after the grace period instead.
+    ///
+    /// # Events
+    ///
+    /// * `("TimelockCancelled", source)` — data: `(id, amount, asset)`
+    pub fn cancel_timelocked(env: Env, id: u64) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_recovery_allowed(&env)?;
+
+        let mut entry = read_timelock_entry(&env, id).ok_or(BridgeError::TimelockNotFound)?;
+        if entry.claimed || entry.cancelled {
+            return Err(BridgeError::Unauthorized);
+        }
+        if env.ledger().timestamp() >= entry.release_time {
+            return Err(BridgeError::TimelockNotMatured);
+        }
+        entry.source.require_auth();
+
+        entry.cancelled = true;
+        save_timelock_entry(&env, id, &entry);
+
+        decrement_locked_timelock(&env, &entry.asset, entry.amount)?;
+        let token_client = token::Client::new(&env, &entry.asset);
+        token_client.transfer(&env.current_contract_address(), &entry.source, &entry.amount);
+        extend_instance_ttl(&env);
+
+        env.events().publish(
+            ("TimelockCancelled", entry.source.clone()),
+            (id, entry.amount, entry.asset.clone()),
+        );
+        Ok(())
+    }
+
+    /// Reclaims an unclaimed timelock entry after `release_time + RECLAIM_GRACE_SECONDS`,
+    /// refunding the gross amount to `source`.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` (`u64`) — The timelock entry ID returned by `fund_c_address_timelocked`.
+    ///
+    /// # Authorization
+    ///
+    /// Requires `source.require_auth()` (the depositor of the entry).
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::ContractPaused`] — Contract is paused and not deactivated.
+    /// * [`BridgeError::TimelockNotFound`] — No entry exists for `id`.
+    /// * [`BridgeError::Unauthorized`] — The entry was already claimed or cancelled.
+    /// * [`BridgeError::TimelockNotMatured`] — The grace period has not elapsed yet.
+    ///
+    /// # Events
+    ///
+    /// * `("TimelockReclaimed", source)` — data: `(id, amount, asset)`
+    pub fn reclaim_timelocked(env: Env, id: u64) -> Result<(), BridgeError> {
+        let _guard = ReentrancyGuard::enter(&env)?;
+        check_initialized(&env)?;
+        check_recovery_allowed(&env)?;
+
+        let mut entry = read_timelock_entry(&env, id).ok_or(BridgeError::TimelockNotFound)?;
+        if entry.claimed || entry.cancelled {
+            return Err(BridgeError::Unauthorized);
+        }
+        let reclaimable_at = entry
+            .release_time
+            .saturating_add(RECLAIM_GRACE_SECONDS);
+        if env.ledger().timestamp() < reclaimable_at {
+            return Err(BridgeError::TimelockNotMatured);
+        }
+        entry.source.require_auth();
+
+        entry.cancelled = true;
+        save_timelock_entry(&env, id, &entry);
+
+        decrement_locked_timelock(&env, &entry.asset, entry.amount)?;
+        let token_client = token::Client::new(&env, &entry.asset);
+        token_client.transfer(&env.current_contract_address(), &entry.source, &entry.amount);
+        extend_instance_ttl(&env);
+
+        env.events().publish(
+            ("TimelockReclaimed", entry.source.clone()),
+            (id, entry.amount, entry.asset.clone()),
         );
         Ok(())
     }
