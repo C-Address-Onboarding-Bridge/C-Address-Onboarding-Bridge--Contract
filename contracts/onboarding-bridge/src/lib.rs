@@ -265,6 +265,9 @@ pub enum DataKey {
     PoolWhitelistEntry(Address),
     RelayerSet,
     CrossChainReserve(Address),
+    // Issue #1099: every asset that ever had counters or a cross-chain
+    // reserve, so `emergency_migrate` can export de-whitelisted assets.
+    KnownAssets,
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +302,11 @@ const COMMIT_REVEAL_MIN_DELAY_LEDGERS: u32 = 5;
 /// Size of the stack buffer used to hold an address's strkey while hashing it.
 /// Soroban strkeys are 56 bytes; anything longer is rejected rather than copied.
 const MAX_STRKEY_LEN: usize = 64;
+/// Domain tag prepended to the cross-chain relayer attestation payload.
+///
+/// Binds every signature to this payload format, so attestations produced for
+/// an older format (or another protocol) can never be replayed here.
+const CROSSCHAIN_DOMAIN_TAG: &[u8] = b"onboarding_bridge_crosschain_v2";
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -355,6 +363,8 @@ pub struct MigrationAssetState {
     pub counters: AssetCounters,
     pub fee_cap_bps: u32,
     pub crosschain_reserve: i128,
+    /// Whether the asset is still on the whitelist at migration time.
+    pub whitelisted: bool,
 }
 
 /// A volume-based fee tier.
@@ -863,6 +873,31 @@ fn save_asset_counters(env: &Env, asset: &Address, counters: &AssetCounters) {
     env.storage()
         .persistent()
         .set(&DataKey::AssetStats(asset.clone()), counters);
+    track_known_asset(env, asset);
+}
+
+/// Records `asset` in the `KnownAssets` set the first time it is seen.
+///
+/// `emergency_migrate` iterates this set so assets that were removed from the
+/// whitelist but still hold fees, timelocks or a cross-chain reserve are not
+/// dropped from the migration snapshot.
+fn track_known_asset(env: &Env, asset: &Address) {
+    let mut known: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&DataKey::KnownAssets)
+        .unwrap_or_else(|| Vec::new(env));
+    if !known.contains(asset.clone()) {
+        known.push_back(asset.clone());
+        env.storage().instance().set(&DataKey::KnownAssets, &known);
+    }
+}
+
+fn read_known_assets(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::KnownAssets)
+        .unwrap_or_else(|| Vec::new(env))
 }
 
 fn read_accrued_fees(env: &Env, asset: &Address) -> i128 {
@@ -876,9 +911,24 @@ fn read_crosschain_reserve(env: &Env, asset: &Address) -> i128 {
         .unwrap_or(0)
 }
 
+/// Balance of `asset` held by the contract that is not ring-fenced for
+/// accrued fees, timelocked deposits, or the cross-chain liquidity reserve.
+fn reserved_balance(env: &Env, asset: &Address) -> Result<i128, BridgeError> {
+    let balance = token::Client::new(env, asset).balance(&env.current_contract_address());
+    let counters = read_asset_counters(env, asset);
+    safe_math::safe_sub(
+        safe_math::safe_sub(
+            safe_math::safe_sub(balance, counters.accrued_fees)?,
+            counters.locked_timelock,
+        )?,
+        read_crosschain_reserve(env, asset),
+    )
+}
+
 fn write_crosschain_reserve(env: &Env, asset: &Address, amount: i128) {
     let key = DataKey::CrossChainReserve(asset.clone());
     env.storage().persistent().set(&key, &amount);
+    track_known_asset(env, asset);
     let max_ttl = read_max_persistent_ttl(env);
     env.storage()
         .persistent()
@@ -1367,27 +1417,35 @@ fn read_loyalty_amount_per_fund(env: &Env) -> i128 {
 /// Mints (transfers) the configured loyalty reward to `recipient`, unless the
 /// contract's loyalty-token reserve is insufficient.
 ///
-/// The contract's loyalty-token balance, less any accrued fees and timelocked
-/// deposits for that asset, is checked before attempting the transfer. If the
-/// available reserve is depleted, minting is skipped and a `LoyaltyMintSkipped`
-/// event is emitted instead of letting the underlying token transfer trap.
+/// The contract's loyalty-token balance, less any accrued fees, timelocked
+/// deposits, and cross-chain liquidity reserve for that asset, is checked
+/// before attempting the transfer. If the available reserve is depleted,
+/// minting is skipped and a `LoyaltyMintSkipped` event is emitted instead of
+/// letting the underlying token transfer trap.
+///
+/// The transfer itself is attempted with `try_transfer`: if the loyalty token
+/// rejects the transfer (e.g. a failing or panicking token implementation), the
+/// error is swallowed and a `LoyaltyMintFailed` event is emitted, so the
+/// surrounding funding call still succeeds.
 fn mint_loyalty_tokens(env: &Env, recipient: &Address) {
     if let Some(loyalty_token) = read_loyalty_token(env) {
         let amount = read_loyalty_amount_per_fund(env);
         if amount > 0 {
             let token_client = token::Client::new(env, &loyalty_token);
             let contract_addr = env.current_contract_address();
-            let balance = token_client.balance(&contract_addr);
-            let counters = read_asset_counters(env, &loyalty_token);
-            let reserve = balance
-                .saturating_sub(counters.accrued_fees)
-                .saturating_sub(counters.locked_timelock);
+            let reserve = reserved_balance(env, &loyalty_token).unwrap_or(0);
             if reserve < amount {
                 env.events()
                     .publish(("LoyaltyMintSkipped", recipient.clone()), (amount, reserve));
                 return;
             }
-            token_client.transfer(&contract_addr, recipient, &amount);
+            if token_client
+                .try_transfer(&contract_addr, recipient, &amount)
+                .is_err()
+            {
+                env.events()
+                    .publish(("LoyaltyMintFailed", recipient.clone()), amount);
+            }
         }
     }
 }
@@ -3223,7 +3281,11 @@ impl OnboardingBridge {
     ///
     /// * `new_contract` (`Address`) — The address of the new contract.
     /// * `migrate_data` (`bool`) — If true, emits a complete snapshot of the
-    ///   supported configuration and accounting state as events.
+    ///   supported configuration and accounting state as events. The
+    ///   `("EmergencyMigrate", "assets")` event includes every asset that ever
+    ///   had counters or a cross-chain reserve, including assets that have
+    ///   since been removed from the whitelist, each flagged with its current
+    ///   whitelist status.
     /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
     ///
     /// # Authorization
@@ -3264,8 +3326,31 @@ impl OnboardingBridge {
                         counters: read_asset_counters(&env, &asset),
                         fee_cap_bps: read_asset_fee_cap(&env, &asset),
                         crosschain_reserve: read_crosschain_reserve(&env, &asset),
+                        whitelisted: true,
                     });
                 }
+            }
+            // Issue #1099: assets removed from the whitelist may still hold
+            // fees, timelocks or a cross-chain reserve, so export them too.
+            for asset in read_known_assets(&env).iter() {
+                if asset_whitelist.get(asset.clone()).unwrap_or(false) {
+                    continue;
+                }
+                let counters = read_asset_counters(&env, &asset);
+                let crosschain_reserve = read_crosschain_reserve(&env, &asset);
+                if counters.accrued_fees == 0
+                    && counters.locked_timelock == 0
+                    && crosschain_reserve == 0
+                {
+                    continue;
+                }
+                assets.push_back(MigrationAssetState {
+                    asset: asset.clone(),
+                    counters,
+                    fee_cap_bps: read_asset_fee_cap(&env, &asset),
+                    crosschain_reserve,
+                    whitelisted: false,
+                });
             }
             env.events().publish(
                 ("EmergencyMigrate", "assets"),
@@ -3561,15 +3646,7 @@ impl OnboardingBridge {
         extend_instance_ttl(&env);
 
         let token_client = token::Client::new(&env, &asset);
-        let contract_balance = token_client.balance(&env.current_contract_address());
-        let counters = read_asset_counters(&env, &asset);
-        let reclaimable = safe_math::safe_sub(
-            safe_math::safe_sub(
-                safe_math::safe_sub(contract_balance, counters.accrued_fees)?,
-                counters.locked_timelock,
-            )?,
-            read_crosschain_reserve(&env, &asset),
-        )?;
+        let reclaimable = reserved_balance(&env, &asset)?;
 
         if reclaimable < amount {
             return Err(BridgeError::InsufficientReclaimable);
@@ -4059,13 +4136,22 @@ impl OnboardingBridge {
     ///
     /// ```text
     /// nonce   = sha256(chain_id_be4 || tx_hash)
-    /// payload = chain_id_be4
+    /// payload = b"onboarding_bridge_crosschain_v2"
+    ///        || network_id
+    ///        || sha256(contract_strkey_bytes)
+    ///        || chain_id_be4
     ///        || tx_hash
     ///        || sha256(target_strkey_bytes)
     ///        || sha256(asset_strkey_bytes)
     ///        || amount_be16
     ///        || nonce
     /// ```
+    ///
+    /// The leading domain tag, `network_id` (`env.ledger().network_id()`) and
+    /// the hash of this contract's own strkey bind the attestation to this
+    /// deployment: a signature produced for another bridge contract or another
+    /// Stellar network is rejected with
+    /// [`BridgeError::MetaTxInvalidSignature`].
     ///
     /// ## Parameters
     ///
@@ -4172,7 +4258,20 @@ impl OnboardingBridge {
         let ast_hash: soroban_sdk::Bytes = env.crypto().sha256(&ast_raw).into();
 
         let nonce_bytes: soroban_sdk::Bytes = nonce.clone().into();
+
+        let contract_str = env.current_contract_address().to_string();
+        let clen = contract_str.len() as usize;
+        if clen > MAX_STRKEY_LEN {
+            return Err(BridgeError::InvalidAddress);
+        }
+        contract_str.copy_into_slice(&mut addr_buf[..clen]);
+        let contract_raw = soroban_sdk::Bytes::from_slice(&env, &addr_buf[..clen]);
+        let contract_hash: soroban_sdk::Bytes = env.crypto().sha256(&contract_raw).into();
+
         let mut payload = soroban_sdk::Bytes::new(&env);
+        payload.extend_from_slice(CROSSCHAIN_DOMAIN_TAG);
+        payload.append(&env.ledger().network_id());
+        payload.append(&contract_hash);
         payload.extend_from_array(&chain_id.to_be_bytes());
         payload.append(&tx_hash_bytes);
         payload.append(&tgt_hash);
