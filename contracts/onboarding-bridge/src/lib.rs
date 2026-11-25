@@ -2416,6 +2416,7 @@ impl OnboardingBridge {
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if amount < 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -3029,6 +3030,7 @@ impl OnboardingBridge {
     /// so that an upgrade can fix whatever condition required the pause.
     pub fn pause(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
@@ -3060,6 +3062,7 @@ impl OnboardingBridge {
     /// * `("ContractUnpaused",)` — data: `(admin,)`
     pub fn unpause(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
