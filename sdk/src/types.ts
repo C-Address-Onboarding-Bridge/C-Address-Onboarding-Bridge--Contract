@@ -892,7 +892,8 @@ export interface RelayerManagementOptions {
  * 1. Pull `sourceAmount` of `sourceAsset` from `source`.
  * 2. Swap it through the single whitelisted DEX pool in `swapRoute`.
  * 3. Deduct the protocol fee in `targetAsset`.
- * 4. Credit the net `targetAsset` amount to `target`.
+ * 4. Credit the net `targetAsset` amount to `target`, reverting with
+ *    `SlippageExceeded` if that net amount is below `minTargetAmount`.
  *
  * @example
  * ```ts
@@ -932,8 +933,10 @@ export interface FundCAddressWithSwapOptions {
   sourceAmount: string;
 
   /**
-   * Minimum acceptable `targetAsset` amount after the swap.
-   * The transaction reverts with `SlippageExceeded` if the DEX returns less.
+   * Minimum acceptable `targetAsset` amount the target receives after the
+   * swap and the protocol fee are applied.
+   * The transaction reverts with `SlippageExceeded` if the post-fee net
+   * amount is less.
    * Set this to protect against price manipulation or large slippage.
    */
   minTargetAmount: string;

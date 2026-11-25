@@ -205,7 +205,9 @@ pub enum BridgeError {
     InvalidPubkey = 54,
     /// The effective fee exceeds the caller-supplied `max_fee_bps` cap.
     FeeExceedsMaxFeeBps = 55,
-    // Next free discriminant: 56. Always take the next unused value here and
+    /// A basis-point rate exceeds `FEE_DENOMINATOR` (10 000).
+    InvalidFeeBps = 56,
+    // Next free discriminant: 57. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
 
@@ -240,6 +242,9 @@ pub enum DataKey {
     SourceBridgedVolume(Address, Address),
     LoyaltyToken,
     LoyaltyAmountPerFund,
+    // Issue #1080: proportional loyalty reward configuration
+    LoyaltyRewardBps,
+    LoyaltyMinQualifyingAmount,
     TimelockId,
     Timelock(u64),
     UserDeposit(Address, Address),
@@ -999,6 +1004,15 @@ fn check_access(env: &Env, target: &Address) -> Result<(), BridgeError> {
     Ok(())
 }
 
+/// Access check for the *source* side of a funding path.
+///
+/// The blocklist always gates sources. Allowlist mode gates sources too, so a
+/// non-allowlisted account cannot move funds through the bridge while the
+/// allowlist is enabled.
+fn check_party_access(env: &Env, party: &Address) -> Result<(), BridgeError> {
+    check_access(env, party)
+}
+
 #[inline(never)]
 fn read_whitelist(env: &Env) -> Map<Address, bool> {
     env.storage()
@@ -1630,6 +1644,32 @@ fn read_loyalty_amount_per_fund(env: &Env) -> i128 {
         .unwrap_or(0)
 }
 
+fn save_loyalty_reward_bps(env: &Env, bps: &u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::LoyaltyRewardBps, bps);
+}
+
+fn read_loyalty_reward_bps(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::LoyaltyRewardBps)
+        .unwrap_or(0)
+}
+
+fn save_loyalty_min_qualifying_amount(env: &Env, amount: &i128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::LoyaltyMinQualifyingAmount, amount);
+}
+
+fn read_loyalty_min_qualifying_amount(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::LoyaltyMinQualifyingAmount)
+        .unwrap_or(0)
+}
+
 // Loyalty minting policy: every funding path that pulls tokens from a
 // caller-controlled `source` and delivers them to a `target` mints loyalty
 // tokens to the funder (`source`), matching the advertised "general funding
@@ -1646,6 +1686,12 @@ fn read_loyalty_amount_per_fund(env: &Env) -> i128 {
 /// Mints (transfers) the configured loyalty reward to `recipient`, unless the
 /// contract's loyalty-token reserve is insufficient.
 ///
+/// The reward is proportional to the amount actually bridged (issue #1080):
+/// `bridged_amount * reward_bps / 10_000`, where `bridged_amount` is the net
+/// amount delivered to the target. Self-funding (`source == target`) never
+/// earns a reward, and amounts below the configured minimum qualifying amount
+/// are not rewarded, so 1-stroop self-funding loops cannot farm the reserve.
+///
 /// The contract's loyalty-token balance, less any accrued fees, timelocked
 /// deposits, and cross-chain liquidity reserve for that asset, is checked
 /// before attempting the transfer. If the available reserve is depleted,
@@ -1656,9 +1702,16 @@ fn read_loyalty_amount_per_fund(env: &Env) -> i128 {
 /// rejects the transfer (e.g. a failing or panicking token implementation), the
 /// error is swallowed and a `LoyaltyMintFailed` event is emitted, so the
 /// surrounding funding call still succeeds.
-fn mint_loyalty_tokens(env: &Env, recipient: &Address) {
+fn mint_loyalty_tokens(env: &Env, recipient: &Address, bridged_amount: i128) {
     if let Some(loyalty_token) = read_loyalty_token(env) {
-        let amount = read_loyalty_amount_per_fund(env);
+        let reward_bps = read_loyalty_reward_bps(env);
+        if reward_bps == 0 || bridged_amount < read_loyalty_min_qualifying_amount(env) {
+            return;
+        }
+        let amount = match calculate_fee(bridged_amount, reward_bps) {
+            Ok(amount) => amount,
+            Err(_) => return,
+        };
         if amount > 0 {
             let token_client = token::Client::new(env, &loyalty_token);
             let contract_addr = env.current_contract_address();
@@ -1980,6 +2033,7 @@ impl OnboardingBridge {
         }
 
         check_access(&env, &target)?;
+        check_party_access(&env, &source)?;
         check_asset_whitelisted(&env, &asset)?;
         check_daily_limit(&env, &source, &asset, amount)?;
 
@@ -2003,7 +2057,9 @@ impl OnboardingBridge {
         increment_user_deposit(&env, &source, &asset, amount)?;
         increment_source_bridged_volume(&env, &source, &asset, amount)?;
         extend_instance_ttl(&env);
-        mint_loyalty_tokens(&env, &source);
+        if source != target {
+            mint_loyalty_tokens(&env, &source, net_amount);
+        }
 
         env.events()
             .publish(("CAddressFunded", asset, source, target), (amount, fee));
@@ -2106,6 +2162,7 @@ impl OnboardingBridge {
             return Err(BridgeError::MismatchedArrays);
         }
 
+        check_party_access(&env, &source)?;
         check_asset_whitelisted(&env, &asset)?;
 
         // Validate every amount before any tokens move.
@@ -2127,6 +2184,8 @@ impl OnboardingBridge {
                 successful_total = safe_math::safe_add(successful_total, amounts.get(i).unwrap())?;
             }
         }
+        // Issue #1080: self-funding entries never earn loyalty rewards.
+        let mut rewardable_total: i128 = 0;
         check_daily_limit(&env, &source, &asset, successful_total)?;
 
         source.require_auth();
@@ -2185,6 +2244,9 @@ impl OnboardingBridge {
                 token_client.transfer(&contract_addr, &target, &net_amount);
             }
             update_asset_counters(&env, &asset, fee, net_amount)?;
+            if source != target {
+                rewardable_total = safe_math::safe_add(rewardable_total, net_amount)?;
+            }
 
             num_success += 1;
             env.events().publish(
@@ -2208,7 +2270,7 @@ impl OnboardingBridge {
         // #593: only reward loyalty when at least one transfer succeeded;
         // minting when every entry was blocked/refunded hands out free rewards.
         if num_success > 0 {
-            mint_loyalty_tokens(&env, &source);
+            mint_loyalty_tokens(&env, &source, rewardable_total);
         }
 
         env.events()
@@ -2289,6 +2351,16 @@ impl OnboardingBridge {
     /// Usage is recorded even while no limit is configured, so setting a limit
     /// mid-window immediately counts volume already bridged in the trailing
     /// 24 hours.
+    ///
+    /// # Which amount counts
+    ///
+    /// * `fund_c_address` — the gross amount pulled from `source`.
+    /// * `fund_c_address_with_swap` — two limits are enforced: the gross
+    ///   `source_amount` against the `(source, source_asset)` limit, and the
+    ///   gross `received_amount` produced by the swap (before the fee is
+    ///   deducted) against the `(source, target_asset)` limit. Net-of-fee
+    ///   amounts are never used, so a `target_asset` limit cannot be bypassed
+    ///   by swapping into it.
     ///
     /// # Arguments
     ///
@@ -3024,6 +3096,7 @@ impl OnboardingBridge {
         }
 
         check_access(&env, &target)?;
+        check_party_access(&env, &source)?;
         if let Some(referrer_addr) = referrer.clone() {
             check_access(&env, &referrer_addr)?;
         }
@@ -3072,7 +3145,9 @@ impl OnboardingBridge {
 
         extend_instance_ttl(&env);
 
-        mint_loyalty_tokens(&env, &source);
+        if source != target {
+            mint_loyalty_tokens(&env, &source, net_amount);
+        }
 
         env.events()
             .publish(("CAddressFunded", asset, source, target), (amount, fee));
@@ -4323,8 +4398,14 @@ impl OnboardingBridge {
     // Loyalty token
     // -----------------------------------------------------------------------
 
-    /// Configures the loyalty token and the fixed reward minted to the source
-    /// on every successful `fund_c_address` call.
+    /// Configures the loyalty token and the proportional reward paid to the
+    /// source on every successful funding call.
+    ///
+    /// The reward is `bridged_amount * reward_bps / 10_000`, where
+    /// `bridged_amount` is the net amount actually delivered to the target
+    /// (issue #1080). Self-funding (`source == target`) never earns a reward,
+    /// and calls whose bridged amount is below `min_qualifying_amount` earn
+    /// nothing, so 1-stroop funding loops cannot farm the reserve.
     ///
     /// The contract must already hold a balance of `token` equal to or greater
     /// than the rewards it intends to distribute. There is no automatic minting;
@@ -4333,9 +4414,10 @@ impl OnboardingBridge {
     /// # Arguments
     ///
     /// * `token` (`Address`) — The loyalty token contract address.
-    /// * `amount_per_fund` (`i128`) — Fixed amount transferred to `source` on
-    ///   each `fund_c_address` call. Use `0` to effectively disable rewards.
-    ///   Must be ≥ 0.
+    /// * `reward_bps` (`u32`) — Reward rate in basis points of the bridged
+    ///   amount. Use `0` to effectively disable rewards. Must be ≤ 10_000.
+    /// * `min_qualifying_amount` (`i128`) — Minimum bridged amount required to
+    ///   earn a reward. Use `0` for no minimum. Must be ≥ 0.
     ///
     /// # Authorization
     ///
@@ -4344,46 +4426,59 @@ impl OnboardingBridge {
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
-    /// * [`BridgeError::InvalidAmount`] — `amount_per_fund` < 0.
+    /// * [`BridgeError::InvalidAmount`] — `min_qualifying_amount` < 0.
+    /// * [`BridgeError::InvalidFeeBps`] — `reward_bps` > 10_000.
     ///
     /// # Events
     ///
-    /// * `("LoyaltyTokenSet", admin)` — data: `(token, amount_per_fund)`
+    /// * `("LoyaltyTokenSet", admin)` — data:
+    ///   `(token, reward_bps, min_qualifying_amount)`
     pub fn set_loyalty_token(
         env: Env,
         token: Address,
-        amount_per_fund: i128,
+        reward_bps: u32,
+        min_qualifying_amount: i128,
         nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         check_initialized(&env)?;
-        if amount_per_fund < 0 {
+        if min_qualifying_amount < 0 {
             return Err(BridgeError::InvalidAmount);
+        }
+        if reward_bps > FEE_DENOMINATOR as u32 {
+            return Err(BridgeError::InvalidFeeBps);
         }
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         save_loyalty_token(&env, &token);
-        save_loyalty_amount_per_fund(&env, &amount_per_fund);
+        save_loyalty_reward_bps(&env, &reward_bps);
+        save_loyalty_min_qualifying_amount(&env, &min_qualifying_amount);
         extend_instance_ttl(&env);
-        env.events()
-            .publish(("LoyaltyTokenSet", admin), (token, amount_per_fund));
+        env.events().publish(
+            ("LoyaltyTokenSet", admin),
+            (token, reward_bps, min_qualifying_amount),
+        );
         Ok(())
     }
 
-    /// Returns the loyalty token address and reward amount per fund.
+    /// Returns the loyalty token address and its reward configuration.
     ///
     /// # Returns
     ///
-    /// `(token_address, amount_per_fund)`.
+    /// `(token_address, reward_bps, min_qualifying_amount)`.
     ///
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::LoyaltyTokenNotSet`] — No loyalty token has been configured.
-    pub fn query_loyalty_token(env: Env) -> Result<(Address, i128), BridgeError> {
+    pub fn query_loyalty_token(env: Env) -> Result<(Address, u32, i128), BridgeError> {
         check_initialized(&env)?;
         let token = read_loyalty_token(&env).ok_or(BridgeError::LoyaltyTokenNotSet)?;
-        Ok((token, read_loyalty_amount_per_fund(&env)))
+        Ok((
+            token,
+            read_loyalty_reward_bps(&env),
+            read_loyalty_min_qualifying_amount(&env),
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -4773,7 +4868,7 @@ impl OnboardingBridge {
             token_client.transfer(&env.current_contract_address(), &target, &net_amount);
         }
         update_asset_counters_split(&env, &asset, 0, 0, net_amount)?;
-        mint_loyalty_tokens(&env, &target);
+        mint_loyalty_tokens(&env, &target, net_amount);
         extend_instance_ttl(&env);
 
         env.events().publish(
@@ -5097,7 +5192,9 @@ impl OnboardingBridge {
         // Volume is credited at deposit time (when `source` is known and
         // authorises the call) so the tier applies to the claim.
         increment_source_bridged_volume(&env, &source, &asset, amount)?;
-        mint_loyalty_tokens(&env, &source);
+        if source != target {
+            mint_loyalty_tokens(&env, &source, amount);
+        }
         extend_instance_ttl(&env);
 
         env.events().publish(
@@ -6040,7 +6137,9 @@ impl OnboardingBridge {
         increment_source_bridged_volume(&env, &source, &asset, amount)?;
         extend_instance_ttl(&env);
 
-        mint_loyalty_tokens(&env, &source);
+        if source != target {
+            mint_loyalty_tokens(&env, &source, net_amount);
+        }
 
         env.events().publish(
             ("CommitRevealFunded", asset, source, target),
@@ -6094,10 +6193,9 @@ impl OnboardingBridge {
     /// 1. Pull `source_amount` of `source_asset` from `source` into the contract.
     /// 2. Invoke the single whitelisted pool in `swap_route` using the standard
     ///    two-token `swap(min_amount_out, to)` interface.
-    /// 3. Verify the increase in the bridge's `target_asset` balance is
-    ///    ≥ `min_target_amount`.
-    /// 4. Deduct the fee (in `target_asset`) and transfer the net amount to
-    ///    `target`.
+    /// 3. Deduct the fee (in `target_asset`) from the swap output.
+    /// 4. Verify the post-fee net amount is ≥ `min_target_amount`, then
+    ///    transfer it to `target`.
     ///
     /// # Arguments
     ///
@@ -6106,7 +6204,8 @@ impl OnboardingBridge {
     /// * `source_asset` — Token contract the source holds (e.g. USDC).
     /// * `target_asset` — Token contract the target should receive (e.g. XLM).
     /// * `source_amount` — Gross amount of `source_asset` to pull from source.
-    /// * `min_target_amount` — Slippage guard: revert if the swap yields less.
+    /// * `min_target_amount` — Slippage guard on the amount `target` actually
+    ///   receives: revert if the swap output minus the fee is less.
     /// * `swap_route` — Must contain exactly one DEX pool contract address,
     ///   and that address must be on the swap-pool whitelist (see
     ///   `add_swap_pool`). The pool must implement:
@@ -6132,12 +6231,13 @@ impl OnboardingBridge {
     /// * [`BridgeError::PoolNotWhitelisted`] — The pool in `swap_route` is not
     ///   on the swap-pool whitelist.
     /// * [`BridgeError::DailyLimitExceeded`] — `source_amount` exceeds the
-    ///   source's daily limit for `source_asset`.
+    ///   source's daily limit for `source_asset`, or the gross amount received
+    ///   from the swap exceeds the source's daily limit for `target_asset`.
     /// * [`BridgeError::SwapFailed`] — The pool returned a non-positive
     ///   `amount_out` or transferred no target tokens.
     /// * [`BridgeError::SlippageExceeded`] — The pool reported a positive
-    ///   `amount_out` below `min_target_amount`, or the tokens actually
-    ///   received are below `min_target_amount`.
+    ///   `amount_out` below `min_target_amount`, or the post-fee net amount
+    ///   delivered to the target is below `min_target_amount`.
     ///
     /// # Security Considerations
     ///
@@ -6254,17 +6354,22 @@ impl OnboardingBridge {
             return Err(BridgeError::SwapFailed);
         }
 
-        // Step 3: slippage check on final output.
-        if received_amount < min_target_amount {
-            return Err(BridgeError::SlippageExceeded);
-        }
+        // Enforce the (source, target_asset) daily limit on the gross amount
+        // received from the swap, so a target_asset limit cannot be bypassed
+        // by swapping into it. The source_asset check above still applies.
+        check_daily_limit(&env, &source, &target_asset, received_amount)?;
 
-        // Step 4: deduct fee in target_asset and forward net to target.
+        // Step 3: deduct fee in target_asset and forward net to target.
         let global_fee_bps = read_fee_bps(&env);
         let tiered_fee_bps = get_tiered_fee_bps(&env, &source, &target_asset, global_fee_bps);
         let effective_fee_bps = get_effective_fee_bps(&env, &target_asset, tiered_fee_bps);
         let fee = calculate_fee(received_amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(received_amount, fee)?;
+
+        // Step 4: slippage check on the amount the target actually receives.
+        if net_amount < min_target_amount {
+            return Err(BridgeError::SlippageExceeded);
+        }
 
         if net_amount > 0 {
             target_token.transfer(&contract_addr, &target, &net_amount);
@@ -6273,7 +6378,9 @@ impl OnboardingBridge {
         update_asset_counters(&env, &target_asset, fee, net_amount)?;
         increment_source_bridged_volume(&env, &source, &target_asset, received_amount)?;
 
-        mint_loyalty_tokens(&env, &source);
+        if source != target {
+            mint_loyalty_tokens(&env, &source, net_amount);
+        }
 
         env.events().publish(
             ("SwapAndFunded", source_asset, target_asset, source, target),
@@ -6565,7 +6672,9 @@ impl OnboardingBridge {
 
         // execute_meta_fund replays the same transfer flow as fund_c_address on
         // the user's behalf, so it earns the same loyalty reward.
-        mint_loyalty_tokens(&env, &params.source);
+        if params.source != params.target {
+            mint_loyalty_tokens(&env, &params.source, net_amount);
+        }
 
         env.events().publish(
             (

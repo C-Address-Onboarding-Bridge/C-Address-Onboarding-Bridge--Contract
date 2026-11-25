@@ -958,6 +958,8 @@ export class OnboardingBridgeSDK {
    *    whitelisted pool, and any other length is rejected here, before any RPC
    *    call, instead of failing on-chain with `MultiHopNotSupported` (#43).
    * 3. Deducts the fee in `targetAsset` and forwards the net to `target`.
+   * 4. Reverts with `SlippageExceeded` if that post-fee net amount is below
+   *    `minTargetAmount`.
    *
    * @example
    * ```ts

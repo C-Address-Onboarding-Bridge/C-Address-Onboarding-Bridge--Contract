@@ -594,7 +594,85 @@ fn test_set_source_daily_limit_paused() {
     );
 }
 
-#[ignore = "TODO(next-bounty): exercises a contract entry point that is still a todo!() stub; un-ignore once it is implemented"]
+#[test]
+fn test_loyalty_reward_is_proportional_and_excludes_self_funding() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    // 1% of the bridged amount, no minimum qualifying amount.
+    bridge.set_loyalty_token(&token_id, &100u32, &0i128, &None);
+    assert_eq!(
+        bridge.query_loyalty_token(),
+        (token_id.clone(), 100u32, 0i128)
+    );
+
+    // Seed the contract's loyalty reserve.
+    mint_tokens(&env, &token_id, &bridge_id, 1_000_000i128);
+    mint_tokens(&env, &token_id, &user, 1_000_000i128);
+
+    // 1-stroop self-funding loop earns nothing.
+    for _ in 0..10 {
+        bridge.fund_c_address(&user, &user, &token_id, &1i128, &None, &None);
+    }
+    assert_eq!(check_balance(&env, &token_id, &user), 1_000_000i128);
+
+    // Proportional reward: 500 bridged, 1% fee -> 495 net -> 4 loyalty tokens.
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &500i128, &None, &None);
+    assert_eq!(check_balance(&env, &token_id, &user), 1_000_000i128 - 500 + 4);
+}
+
+#[test]
+fn test_loyalty_reward_respects_min_qualifying_amount() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+    bridge.set_loyalty_token(&token_id, &100u32, &1_000i128, &None);
+
+    mint_tokens(&env, &token_id, &bridge_id, 1_000_000i128);
+    mint_tokens(&env, &token_id, &user, 1_000_000i128);
+
+    let target = Address::generate(&env);
+    bridge.fund_c_address(&user, &target, &token_id, &500i128, &None, &None);
+    assert_eq!(check_balance(&env, &token_id, &user), 1_000_000i128 - 500);
+
+    bridge.fund_c_address(&user, &target, &token_id, &2_000i128, &None, &None);
+    // 2_000 bridged, 1% fee -> 1_980 net -> 19 loyalty tokens.
+    assert_eq!(
+        check_balance(&env, &token_id, &user),
+        1_000_000i128 - 500 - 2_000 + 19
+    );
+}
+
+#[test]
+fn test_set_loyalty_token_rejects_invalid_config() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    assert_eq!(
+        bridge.try_set_loyalty_token(&token_id, &10_001u32, &0i128, &None),
+        Err(Ok(BridgeError::InvalidFeeBps))
+    );
+    assert_eq!(
+        bridge.try_set_loyalty_token(&token_id, &10u32, &-1i128, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+}
+
 #[test]
 fn test_set_loyalty_token_paused() {
     let env = Env::default();
@@ -606,7 +684,7 @@ fn test_set_loyalty_token_paused() {
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
     bridge.pause(&None);
     assert_eq!(
-        bridge.try_set_loyalty_token(&token_id, &10i128, &None),
+        bridge.try_set_loyalty_token(&token_id, &10u32, &0i128, &None),
         Err(Ok(BridgeError::ContractPaused))
     );
 }
@@ -679,9 +757,9 @@ fn test_admin_mutators_reject_replayed_nonces() {
     bridge.add_relayer(&second_relayer, &None);
 
     let mut nonce = 0u64;
-    bridge.set_loyalty_token(&token_id, &1i128, &Some(nonce));
+    bridge.set_loyalty_token(&token_id, &1u32, &0i128, &Some(nonce));
     assert_eq!(
-        bridge.try_set_loyalty_token(&token_id, &1i128, &Some(nonce)),
+        bridge.try_set_loyalty_token(&token_id, &1u32, &0i128, &Some(nonce)),
         Err(Ok(BridgeError::DuplicateNonce))
     );
     nonce += 1;
@@ -2371,6 +2449,37 @@ fn test_swap_rejects_source_daily_limit_exceeded() {
 }
 
 #[test]
+fn test_swap_rejects_target_asset_daily_limit_exceeded() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+    // Only the target_asset limit is set; the source_asset limit is disabled.
+    bridge.set_source_daily_limit(&user, &target_token_id, &400i128, &None);
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &target_token_id, &1i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target,
+            &source_token_id,
+            &target_token_id,
+            &500i128,
+            &400i128,
+            &swap_route,
+            &None,
+            &None,
+        ),
+        Err(Ok(BridgeError::DailyLimitExceeded))
+    );
+    assert_eq!(check_balance(&env, &source_token_id, &user), 1_000i128);
+}
+
+#[test]
 fn test_swap_uses_actual_target_tokens_received() {
     let env = Env::default();
     let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
@@ -2394,6 +2503,37 @@ fn test_swap_uses_actual_target_tokens_received() {
             &target_token_id,
             &500i128,
             &400i128,
+            &swap_route,
+            &None,
+            &None,
+        ),
+        Err(Ok(BridgeError::SlippageExceeded))
+    );
+    assert_eq!(check_balance(&env, &target_token_id, &target), 0i128);
+}
+
+#[test]
+fn test_swap_slippage_guard_applies_to_post_fee_net_amount() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, target_token_id) = setup_swap(&env);
+    bridge.set_fee_bps(&100u32, &None);
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &target_token_id, &1i128);
+    mint_tokens(&env, &target_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+    // Pool returns exactly 500, fee is 1% (5), so the target would receive 495.
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target,
+            &source_token_id,
+            &target_token_id,
+            &500i128,
+            &500i128,
             &swap_route,
             &None,
             &None,
