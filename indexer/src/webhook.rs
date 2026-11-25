@@ -8,8 +8,22 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 pub const MAX_CONCURRENT_DELIVERIES: usize = 10;
-const MAX_RETRIES: i32 = 5;
+/// Total delivery attempts before a delivery is marked `dead`. With the
+/// backoff schedule below this spreads retries over roughly 24 hours.
+const MAX_RETRIES: i32 = 12;
+/// Base of the exponential backoff, in seconds.
+const BACKOFF_BASE_SECS: i64 = 2;
+/// Upper bound for a single backoff interval, in seconds (1 hour).
+const MAX_BACKOFF_SECS: i64 = 3600;
+/// Maximum random jitter added to a backoff interval, in seconds.
+const MAX_JITTER_SECS: i64 = 30;
 const DELIVERY_INTERVAL_MS: u64 = 2000;
+/// Maximum number of due rows fetched per subscription per pass, so one
+/// subscription with a large backlog cannot monopolise a pass (#1065).
+const MAX_ROWS_PER_SUBSCRIPTION: i64 = 10;
+/// Maximum time a single subscription's queue may run within one pass. Once
+/// exceeded the queue yields its slot so other subscribers are not delayed.
+const MAX_QUEUE_PASS_DURATION: std::time::Duration = std::time::Duration::from_secs(5);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -116,6 +130,32 @@ fn unwrap_ipv4_mapped_or_compatible(ip: IpAddr) -> IpAddr {
     ip
 }
 
+/// Resolves `host` and returns the first address that is safe to connect to.
+///
+/// Every resolved address is checked with [`is_private_or_reserved`]; if any
+/// address is private or reserved the whole host is rejected, because the
+/// caller cannot control which address the transport would pick. This is run
+/// again at delivery time so a DNS rebinding between subscription validation
+/// and delivery cannot reach an internal address (#1067).
+async fn resolve_public_ip(host: &str, port: u16) -> Result<IpAddr, UrlValidationError> {
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| UrlValidationError::UnresolvableHost(host.to_string()))?;
+
+    let mut chosen: Option<IpAddr> = None;
+    for addr in addrs {
+        let ip = unwrap_ipv4_mapped_or_compatible(addr.ip());
+        if is_private_or_reserved(ip) {
+            return Err(UrlValidationError::PrivateOrReservedHost(ip.to_string()));
+        }
+        if chosen.is_none() {
+            chosen = Some(ip);
+        }
+    }
+
+    chosen.ok_or_else(|| UrlValidationError::UnresolvableHost(host.to_string()))
+}
+
 /// Generate the signature for a webhook payload.
 /// Signature is: sha256=<hex(hmac_sha256(secret, timestamp + "." + body))>
 fn generate_signature(secret: &str, timestamp: &str, body: &str) -> String {
@@ -172,20 +212,7 @@ pub async fn validate_webhook_url(url: &str) -> Result<(), UrlValidationError> {
     }
 
     let port = parsed.port_or_known_default().unwrap_or(80);
-    let addrs = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|_| UrlValidationError::UnresolvableHost(host.to_string()))?;
-
-    for addr in addrs {
-        let ip = unwrap_ipv4_mapped_or_compatible(addr.ip());
-        if is_private_or_reserved(ip) {
-            return Err(UrlValidationError::PrivateOrReservedHost(
-                ip.to_string(),
-            ));
-        }
-    }
-
-    Ok(())
+    resolve_public_ip(host, port).await.map(|_| ())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,10 +333,18 @@ pub async fn run_delivery_worker(state: Arc<AppState>, token: CancellationToken)
 /// (by `created_at`). Different subscriptions are delivered concurrently up to
 /// `MAX_CONCURRENT_DELIVERIES`, ensuring that a slow or hanging endpoint does
 /// not block or delay deliveries to other subscribers.
+///
+/// Fairness (#1065): the fetch is bounded per subscription rather than by a
+/// global `LIMIT`, and each queue is bounded in rows and wall-clock time per
+/// pass. A queue stops on its first failure so later events are never
+/// delivered ahead of a failed one.
 pub async fn deliver_pending(
     state: &AppState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let deliveries = state.db.get_pending_deliveries().await?;
+    let deliveries = state
+        .db
+        .get_pending_deliveries(MAX_ROWS_PER_SUBSCRIPTION)
+        .await?;
     if deliveries.is_empty() {
         return Ok(());
     }
@@ -335,6 +370,8 @@ pub async fn deliver_pending(
         .filter_map(|sub_id| sub_queues.remove(&sub_id))
         .collect();
 
+    // `buffer_unordered` refills a free slot as soon as any queue finishes, so
+    // a finished queue never waits for the slowest one in the pass.
     futures::stream::iter(queues)
         .map(|queue| deliver_subscription_queue(state, queue))
         .buffer_unordered(MAX_CONCURRENT_DELIVERIES)
@@ -345,25 +382,82 @@ pub async fn deliver_pending(
 }
 
 async fn deliver_subscription_queue(state: &AppState, deliveries: Vec<WebhookDelivery>) {
+    let deadline = tokio::time::Instant::now() + MAX_QUEUE_PASS_DURATION;
     for delivery in deliveries {
-        if let Err(e) = deliver_single(state, &delivery).await {
-            tracing::error!(
-                "Failed to process delivery {} for subscription {}: {}",
-                delivery.id,
-                delivery.subscription_id,
-                e
+        if tokio::time::Instant::now() >= deadline {
+            tracing::debug!(
+                "Subscription {} hit its per-pass time budget; resuming next pass",
+                delivery.subscription_id
             );
-            // On error delivering to this subscription, abort remaining queued deliveries
-            // for this subscription in this poll cycle to preserve FIFO ordering.
             break;
+        }
+        match deliver_single(state, &delivery).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // Delivery failed (HTTP error, transport error, or retry scheduled).
+                // Stop this subscription's queue for the cycle so later events are
+                // not delivered ahead of the failed one (FIFO ordering).
+                tracing::debug!(
+                    "Delivery {} for subscription {} failed; holding back later deliveries",
+                    delivery.id,
+                    delivery.subscription_id
+                );
+                break;
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to process delivery {} for subscription {}: {}",
+                    delivery.id,
+                    delivery.subscription_id,
+                    e
+                );
+                // On error delivering to this subscription, abort remaining queued deliveries
+                // for this subscription in this poll cycle to preserve FIFO ordering.
+                break;
+            }
         }
     }
 }
 
+/// Attempts a single delivery. Returns `Ok(true)` when the delivery succeeded
+/// (or was terminally resolved as dead), and `Ok(false)` when it failed and was
+/// scheduled for retry, so the caller can stop the subscription's queue.
 async fn deliver_single(
     state: &AppState,
     delivery: &WebhookDelivery,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    deliver_single_with_resolver(state, delivery, |host, port| {
+        Box::pin(resolve_public_ip(host, port))
+    })
+    .await
+}
+
+/// Resolver used by [`deliver_single`]; injectable so tests can simulate a
+/// host that is rebound between validation and delivery (#1067).
+type DeliveryResolver<'a> = dyn Fn(
+        &'a str,
+        u16,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<IpAddr, UrlValidationError>>
+                + Send
+                + 'a,
+        >,
+    > + Send
+    + Sync
+    + 'a;
+
+async fn deliver_single_with_resolver(
+    state: &AppState,
+    delivery: &WebhookDelivery,
+    resolver: impl Fn(
+            &str,
+            u16,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<IpAddr, UrlValidationError>> + Send + '_>,
+        > + Send
+        + Sync,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let url = match state
         .db
         .get_subscription_url(&delivery.subscription_id)
@@ -375,7 +469,7 @@ async fn deliver_single(
                 .db
                 .mark_delivery_dead(&delivery.id, "subscription not found or inactive")
                 .await?;
-            return Ok(());
+            return Ok(true);
         }
     };
 
@@ -386,7 +480,7 @@ async fn deliver_single(
                 .db
                 .mark_delivery_dead(&delivery.id, "event not found")
                 .await?;
-            return Ok(());
+            return Ok(true);
         }
     };
 
@@ -407,9 +501,51 @@ async fn deliver_single(
         .ok_or_else(|| sqlx::Error::Protocol("subscription secret not found".into()))?;
     let signature = generate_signature(&secret, &timestamp, &body);
 
+    // Re-resolve and pin the address at delivery time (#1067). Validation at
+    // subscription time is not enough: a host can be rebound to a private
+    // address between registration and delivery.
+    let parsed = match url::Url::parse(&url) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            let error = format!("invalid webhook URL: {}", e);
+            state.db.mark_delivery_dead(&delivery.id, &error).await?;
+            tracing::warn!("Webhook delivery {} dead: {}", delivery.id, error);
+            return Ok(true);
+        }
+    };
+    let host = match parsed.host_str() {
+        Some(host) => host.to_string(),
+        None => {
+            let error = "invalid webhook URL: no host".to_string();
+            state.db.mark_delivery_dead(&delivery.id, &error).await?;
+            tracing::warn!("Webhook delivery {} dead: {}", delivery.id, error);
+            return Ok(true);
+        }
+    };
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let pinned_ip = match resolve_public_ip(&host, port).await {
+        Ok(ip) => ip,
+        Err(e) => {
+            let error = format!("SSRF check failed at delivery: {}", e);
+            state.db.mark_delivery_dead(&delivery.id, &error).await?;
+            tracing::warn!("Webhook delivery {} dead: {}", delivery.id, error);
+            return Ok(true);
+        }
+    };
+
+    // Connect to the vetted IP while keeping the original hostname for TLS SNI
+    // and the `Host` header, so virtual-hosted endpoints still work.
+    let mut pinned = parsed.clone();
+    let _ = pinned.set_host(Some(&pinned_ip.to_string()));
+    let host_header = match parsed.port() {
+        Some(p) => format!("{}:{}", host, p),
+        None => host.clone(),
+    };
+
     match state
         .webhook_client
-        .post(&url)
+        .post(pinned.as_str())
+        .header(reqwest::header::HOST, host_header)
         .header("X-Webhook-Timestamp", &timestamp)
         .header("X-Webhook-Signature", signature)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -421,17 +557,18 @@ async fn deliver_single(
         Ok(resp) if resp.status().is_success() => {
             state.db.mark_delivery_success(&delivery.id).await?;
             tracing::debug!("Delivered webhook {} to {}", delivery.id, url);
+            Ok(true)
         }
         Ok(resp) => {
             let error = format!("HTTP {}", resp.status());
             handle_retry(state, delivery, &error).await?;
+            Ok(false)
         }
         Err(e) => {
             handle_retry(state, delivery, &e.to_string()).await?;
+            Ok(false)
         }
     }
-
-    Ok(())
 }
 
 async fn handle_retry(
@@ -449,7 +586,7 @@ async fn handle_retry(
             error
         );
     } else {
-        let backoff_secs = (2i64).pow(attempt as u32);
+        let backoff_secs = backoff_secs(attempt);
         let next_retry =
             (chrono::Utc::now() + chrono::Duration::seconds(backoff_secs)).to_rfc3339();
         state
@@ -465,6 +602,19 @@ async fn handle_retry(
         );
     }
     Ok(())
+}
+
+/// Delay before the next attempt, in seconds: capped exponential backoff
+/// (`2^attempt`, capped at `MAX_BACKOFF_SECS`) plus random jitter of up to
+/// `MAX_JITTER_SECS` so that a fleet of failing deliveries does not retry in
+/// lockstep.
+fn backoff_secs(attempt: i32) -> i64 {
+    let exponent = attempt.clamp(0, 32) as u32;
+    let base = BACKOFF_BASE_SECS
+        .saturating_pow(exponent)
+        .min(MAX_BACKOFF_SECS);
+    let jitter = (uuid::Uuid::new_v4().as_u128() % (MAX_JITTER_SECS as u128 + 1)) as i64;
+    base + jitter
 }
 
 #[cfg(test)]
@@ -761,7 +911,7 @@ mod tests {
             .await
             .expect("queue deliveries");
 
-        let deliveries = db.get_pending_deliveries().await.expect("get pending");
+        let deliveries = db.get_pending_deliveries(MAX_ROWS_PER_SUBSCRIPTION).await.expect("get pending");
         assert_eq!(deliveries.len(), 1);
         let delivery = &deliveries[0];
         let delivery_id = delivery.id.clone();
@@ -791,7 +941,7 @@ mod tests {
             .expect("mark failed");
 
         let retried = db
-            .get_pending_deliveries()
+            .get_pending_deliveries(MAX_ROWS_PER_SUBSCRIPTION)
             .await
             .expect("get pending after retry");
         let retried_id = if retried.is_empty() {
@@ -810,26 +960,51 @@ mod tests {
     // Issue 3 — Backoff formula
     // -----------------------------------------------------------------------
 
-    /// The backoff is `2^attempt` seconds.  Verify the first several values so
-    /// a change to the formula is caught immediately.
+    /// The backoff is capped exponential (`2^attempt`, max 1 h) plus jitter.
+    /// Verify the bounds so a change to the formula is caught immediately.
     #[test]
     fn test_backoff_formula_grows_exponentially() {
-        // Mirrors: let backoff_secs = (2i64).pow(attempt as u32);
         let expected: Vec<(i32, i64)> = vec![
-            (1, 2),  // attempt 1 → 2 s
-            (2, 4),  // attempt 2 → 4 s
-            (3, 8),  // attempt 3 → 8 s
-            (4, 16), // attempt 4 → 16 s
+            (1, 2),    // attempt 1 → 2 s
+            (2, 4),    // attempt 2 → 4 s
+            (3, 8),    // attempt 3 → 8 s
+            (4, 16),   // attempt 4 → 16 s
+            (5, 32),   // attempt 5 → 32 s
+            (10, 1024), // attempt 10 → 1024 s
         ];
 
-        for (attempt, want_secs) in expected {
-            let got = (2i64).pow(attempt as u32);
-            assert_eq!(
-                got, want_secs,
-                "backoff for attempt {} must be {} seconds, got {}",
-                attempt, want_secs, got
+        for (attempt, want_base) in expected {
+            let got = backoff_secs(attempt);
+            assert!(
+                got >= want_base && got <= want_base + MAX_JITTER_SECS,
+                "backoff for attempt {} must be in [{}, {}] seconds, got {}",
+                attempt,
+                want_base,
+                want_base + MAX_JITTER_SECS,
+                got
             );
         }
+
+        // The cap holds for large attempt counts.
+        let capped = backoff_secs(40);
+        assert!(
+            capped >= MAX_BACKOFF_SECS && capped <= MAX_BACKOFF_SECS + MAX_JITTER_SECS,
+            "backoff must be capped at {}s (+jitter), got {}",
+            MAX_BACKOFF_SECS,
+            capped
+        );
+    }
+
+    /// The full retry schedule must span hours, not seconds, so a receiver
+    /// that is down for a deploy or restart does not lose events.
+    #[test]
+    fn test_retry_schedule_spans_hours() {
+        let total: i64 = (1..MAX_RETRIES).map(backoff_secs).sum();
+        assert!(
+            total >= 6 * 3600,
+            "retry schedule must span at least 6 hours, got {}s",
+            total
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -869,16 +1044,15 @@ mod tests {
             .expect("queue deliveries");
 
         // Retrieve the delivery that was queued.
-        let deliveries = db.get_pending_deliveries().await.expect("get pending");
+        let deliveries = db.get_pending_deliveries(MAX_ROWS_PER_SUBSCRIPTION).await.expect("get pending");
         assert_eq!(deliveries.len(), 1, "one delivery must be queued");
         let delivery_id = deliveries[0].id.clone();
 
         // Simulate MAX_RETRIES - 1 failed attempts so the next failure crosses
         // the threshold.  Each `mark_delivery_failed` increments `attempts`.
         for i in 0..(MAX_RETRIES - 1) {
-            let backoff_secs = (2i64).pow((i + 1) as u32);
             let next_retry =
-                (chrono::Utc::now() + chrono::Duration::seconds(backoff_secs)).to_rfc3339();
+                (chrono::Utc::now() + chrono::Duration::seconds(backoff_secs(i + 1))).to_rfc3339();
             db.mark_delivery_failed(&delivery_id, "transient error", &next_retry)
                 .await
                 .expect("mark failed");
@@ -891,7 +1065,7 @@ mod tests {
             .expect("mark dead");
 
         // Verify the row is now 'dead' and not returned by get_pending_deliveries.
-        let pending_after = db.get_pending_deliveries().await.expect("pending after");
+        let pending_after = db.get_pending_deliveries(MAX_ROWS_PER_SUBSCRIPTION).await.expect("pending after");
         assert!(
             pending_after.is_empty(),
             "dead delivery must not appear in pending queue"
@@ -943,11 +1117,12 @@ mod tests {
         db.insert_event(&event).await.expect("insert event");
         db.queue_webhook_deliveries(&event).await.expect("queue");
 
-        let deliveries = db.get_pending_deliveries().await.expect("get pending");
+        let deliveries = db.get_pending_deliveries(MAX_ROWS_PER_SUBSCRIPTION).await.expect("get pending");
         let delivery_id = deliveries[0].id.clone();
 
-        // Fail once — still well below MAX_RETRIES (5).
-        let next_retry = (chrono::Utc::now() + chrono::Duration::seconds(2)).to_rfc3339();
+        // Fail once — still well below MAX_RETRIES.
+        let next_retry =
+            (chrono::Utc::now() + chrono::Duration::seconds(backoff_secs(1))).to_rfc3339();
         db.mark_delivery_failed(&delivery_id, "first error", &next_retry)
             .await
             .expect("mark failed");
@@ -957,6 +1132,208 @@ mod tests {
         assert_eq!(
             pending_count, 1,
             "delivery must stay pending after only one failure"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1066 — handle_retry drives the retry/dead transition
+    // -----------------------------------------------------------------------
+
+    /// Seed a subscription, an event and one pending delivery; returns the
+    /// delivery row as stored.
+    async fn seed_delivery(db: &Database, event_id: &str) -> WebhookDelivery {
+        let _sub = db
+            .create_subscription(CreateSubscription {
+                url: "http://example.com/hook-retry".to_string(),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .expect("create subscription");
+
+        let event = IndexedEvent {
+            id: event_id.to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 3,
+            contract_id: "C_TEST".to_string(),
+            tx_hash: "cafebabe".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({}),
+        };
+        db.insert_event(&event).await.expect("insert event");
+        db.queue_webhook_deliveries(&event)
+            .await
+            .expect("queue deliveries");
+
+        db.get_pending_deliveries(MAX_ROWS_PER_SUBSCRIPTION)
+            .await
+            .expect("get pending")
+            .into_iter()
+            .next()
+            .expect("one delivery queued")
+    }
+
+    fn test_state(db: Database) -> AppState {
+        AppState {
+            db,
+            rpc_url: "http://localhost".to_string(),
+            contract_id: "C_TEST".to_string(),
+            webhook_client: reqwest::Client::new(),
+            lookback_ledgers: 0,
+        }
+    }
+
+    /// A failure below the retry limit must schedule a retry in the future
+    /// and keep the delivery pending.
+    #[tokio::test]
+    async fn test_handle_retry_schedules_retry_below_limit() {
+        let db = setup_db().await;
+        let delivery = seed_delivery(&db, "evt-retry-001").await;
+        let state = test_state(db);
+
+        handle_retry(&state, &delivery, "HTTP 503")
+            .await
+            .expect("handle retry");
+
+        let stats = state.db.get_stats().await.expect("stats");
+        assert_eq!(stats["pending_deliveries"].as_i64(), Some(1));
+        assert_eq!(stats["dead_deliveries"].as_i64(), Some(0));
+
+        // The retry must be scheduled in the future, so the delivery is not
+        // immediately re-fetched by the poller.
+        let pending = state.db.get_pending_deliveries(MAX_ROWS_PER_SUBSCRIPTION).await.expect("pending");
+        assert!(
+            pending.is_empty(),
+            "delivery must not be due before its backoff elapses"
+        );
+
+        // The attempt counter must have been incremented by the retry.
+        let attempts: (i64,) =
+            sqlx::query_as("SELECT attempts FROM webhook_deliveries WHERE id = ?1")
+                .bind(&delivery.id)
+                .fetch_one(&state.db.pool)
+                .await
+                .expect("fetch attempts");
+        assert_eq!(attempts.0, 1, "attempts must be incremented on retry");
+    }
+
+    /// The final allowed attempt must mark the delivery dead.
+    #[tokio::test]
+    async fn test_handle_retry_marks_dead_at_limit() {
+        let db = setup_db().await;
+        let mut delivery = seed_delivery(&db, "evt-retry-002").await;
+        delivery.attempts = MAX_RETRIES - 1;
+        let state = test_state(db);
+
+        handle_retry(&state, &delivery, "HTTP 500")
+            .await
+            .expect("handle retry");
+
+        let stats = state.db.get_stats().await.expect("stats");
+        assert_eq!(stats["dead_deliveries"].as_i64(), Some(1));
+        assert_eq!(stats["pending_deliveries"].as_i64(), Some(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1067 — re-validate and pin the resolved IP at delivery time
+    // -----------------------------------------------------------------------
+
+    /// A host that resolves to a public address at validation time but to
+    /// loopback at delivery time (DNS rebinding) must be rejected before any
+    /// request is sent, and the delivery must be marked dead.
+    #[tokio::test]
+    async fn test_delivery_rejects_rebound_private_ip() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    hits_clone.fetch_add(1, Ordering::SeqCst);
+                    let _ = tokio::io::AsyncWriteExt::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n",
+                    )
+                    .await;
+                }
+            }
+        });
+
+        let db = setup_db().await;
+        let _sub = db
+            .create_subscription(CreateSubscription {
+                url: format!("http://rebind.test:{}/hook", port),
+                event_type: None,
+                asset_filter: None,
+                source_filter: None,
+                target_filter: None,
+            })
+            .await
+            .expect("create subscription");
+
+        let event = IndexedEvent {
+            id: "evt-rebind-001".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 4,
+            contract_id: "C_TEST".to_string(),
+            tx_hash: "deadc0de".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({}),
+        };
+        db.insert_event(&event).await.expect("insert event");
+        db.queue_webhook_deliveries(&event)
+            .await
+            .expect("queue deliveries");
+
+        let delivery = db
+            .get_pending_deliveries(MAX_ROWS_PER_SUBSCRIPTION)
+            .await
+            .expect("get pending")
+            .into_iter()
+            .next()
+            .expect("one delivery queued");
+
+        let state = test_state(db);
+
+        // Resolver stub: public IP at validation, loopback at delivery.
+        let validation_ip: IpAddr = "93.184.216.34".parse().unwrap();
+        let delivery_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!(!is_private_or_reserved(validation_ip));
+        assert!(is_private_or_reserved(delivery_ip));
+
+        let resolved = deliver_single_with_resolver(&state, &delivery, |_host, _port| {
+            Box::pin(async move { Ok(vec![delivery_ip]) })
+        })
+        .await
+        .expect("deliver single");
+        assert!(resolved, "rebound delivery must be terminally resolved");
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no request may reach the local listener"
+        );
+
+        let stats = state.db.get_stats().await.expect("stats");
+        assert_eq!(stats["dead_deliveries"].as_i64(), Some(1));
+        assert_eq!(stats["pending_deliveries"].as_i64(), Some(0));
+
+        let last_error: (Option<String>,) =
+            sqlx::query_as("SELECT last_error FROM webhook_deliveries WHERE id = ?1")
+                .bind(&delivery.id)
+                .fetch_one(&state.db.pool)
+                .await
+                .expect("fetch last_error");
+        let last_error = last_error.0.unwrap_or_default();
+        assert!(
+            last_error.contains("SSRF check failed at delivery"),
+            "unexpected error: {}",
+            last_error
         );
     }
 
