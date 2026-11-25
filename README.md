@@ -322,7 +322,10 @@ its payout liquidity with `fund_crosschain_reserve`. Cross-chain payouts draw
 only from that reserve; their calculated fees are not credited as accrued fees
 because the payout call does not receive tokens. Use `query_crosschain_reserve`
 to monitor available liquidity and `withdraw_crosschain_reserve` to withdraw
-unused reserve funds.
+unused reserve funds. Both reserve calls accept an optional replay `nonce`
+(consumed after admin auth) and `fund_crosschain_reserve` is rejected once the
+contract is deactivated, while `withdraw_crosschain_reserve` stays available
+for recovery.
 
 ### SDK (`sdk/`)
 

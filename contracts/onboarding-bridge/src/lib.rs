@@ -185,7 +185,9 @@ pub enum BridgeError {
     /// A pending upgrade already exists; call `cancel_upgrade` before
     /// scheduling a replacement.
     UpgradeAlreadyScheduled = 53,
-    // Next free discriminant: 54. Always take the next unused value here and
+    /// The supplied 32-byte value is not a valid (non-weak) Ed25519 public key.
+    InvalidPubkey = 54,
+    // Next free discriminant: 55. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
 
@@ -1266,7 +1268,18 @@ fn is_relayer(env: &Env, pubkey: &BytesN<32>) -> bool {
         .unwrap_or(false)
 }
 
-fn add_relayer(env: &Env, pubkey: &BytesN<32>) {
+/// Rejects 32-byte values that are not valid, non-weak Ed25519 public keys.
+fn validate_pubkey(pubkey: &BytesN<32>) -> Result<(), BridgeError> {
+    let verifying_key =
+        VerifyingKey::from_bytes(&pubkey.to_array()).map_err(|_| BridgeError::InvalidPubkey)?;
+    if verifying_key.is_weak() {
+        return Err(BridgeError::InvalidPubkey);
+    }
+    Ok(())
+}
+
+fn add_relayer(env: &Env, pubkey: &BytesN<32>) -> Result<(), BridgeError> {
+    validate_pubkey(pubkey)?;
     if !is_relayer(env, pubkey) {
         env.storage()
             .persistent()
@@ -1280,6 +1293,7 @@ fn add_relayer(env: &Env, pubkey: &BytesN<32>) {
             .instance()
             .set(&DataKey::RelayerCount, &(relayer_count(env) + 1));
     }
+    Ok(())
 }
 
 fn read_relayer_set(env: &Env) -> Vec<BytesN<32>> {
@@ -4327,13 +4341,18 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
     /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
+    /// * [`BridgeError::ContractDeactivated`] — Contract has been deactivated.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` does not match the admin's
+    ///   current nonce.
     pub fn fund_crosschain_reserve(
         env: Env,
         asset: Address,
         amount: i128,
+        nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
+        check_not_deactivated(&env)?;
         if amount <= 0 {
             return Err(BridgeError::InvalidAmount);
         }
@@ -4341,6 +4360,7 @@ impl OnboardingBridge {
 
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         let token_client = token::Client::new(&env, &asset);
         token_client.transfer(&admin, &env.current_contract_address(), &amount);
         increment_crosschain_reserve(&env, &asset, amount)?;
@@ -4359,10 +4379,13 @@ impl OnboardingBridge {
     /// * [`BridgeError::InvalidAmount`] — `amount` ≤ 0.
     /// * [`BridgeError::InsufficientCrossChainReserve`] — `amount` exceeds the
     ///   reserve balance.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` does not match the admin's
+    ///   current nonce.
     pub fn withdraw_crosschain_reserve(
         env: Env,
         asset: Address,
         amount: i128,
+        nonce: Option<u64>,
     ) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
@@ -4372,6 +4395,7 @@ impl OnboardingBridge {
 
         let admin = read_admin(&env);
         admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
         decrement_crosschain_reserve(&env, &asset, amount)?;
         let token_client = token::Client::new(&env, &asset);
         token_client.transfer(&env.current_contract_address(), &admin, &amount);
@@ -4627,6 +4651,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` does not match the stored
     ///   admin nonce.
+    /// * [`BridgeError::InvalidPubkey`] — `pubkey` is not a valid, non-weak
+    ///   Ed25519 public key.
     ///
     /// # Events
     ///
@@ -4642,7 +4668,7 @@ impl OnboardingBridge {
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
-        add_relayer(&env, &pubkey);
+        add_relayer(&env, &pubkey)?;
         env.events().publish(("RelayerAdded",), (admin, pubkey));
         Ok(())
     }
@@ -5721,7 +5747,7 @@ impl OnboardingBridge {
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
     /// * [`BridgeError::CommitmentNotFound`] — No entry for `commitment_id`.
     /// * [`BridgeError::CommitmentAlreadyRevealed`] — Already revealed.
-    /// * [`BridgeError::CommitmentExpired`] — Past the reveal deadline.
+    /// * [`BridgeError::CommitmentExpired`] — At or past the reveal deadline.
     /// * [`BridgeError::CommitmentNotMatured`] — Minimum delay not yet elapsed.
     /// * [`BridgeError::Unauthorized`] — `source`, `target`, or `asset` do not
     ///   match the commitment.
@@ -5753,7 +5779,7 @@ impl OnboardingBridge {
             return Err(BridgeError::CommitmentAlreadyRevealed);
         }
 
-        if env.ledger().timestamp() > entry.deadline {
+        if env.ledger().timestamp() >= entry.deadline {
             return Err(BridgeError::CommitmentExpired);
         }
 
@@ -5903,7 +5929,8 @@ impl OnboardingBridge {
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
     /// * [`BridgeError::InvalidAmount`] — `source_amount` or `min_target_amount` ≤ 0,
-    ///   or `source_amount` is below the configured minimum.
+    ///   `source_amount` is below the configured minimum, or `source_asset`
+    ///   equals `target_asset` (a same-asset swap is rejected).
     /// * [`BridgeError::AddressBlocked`] — `target` is on the blocklist.
     /// * [`BridgeError::AddressNotAllowlisted`] — Allowlist mode is on and `target` is not listed.
     /// * [`BridgeError::AssetNotWhitelisted`] — `source_asset` or `target_asset`
@@ -5964,6 +5991,11 @@ impl OnboardingBridge {
             return Err(BridgeError::InvalidAmount);
         }
         if source_amount < read_minimum_amount(&env) {
+            return Err(BridgeError::InvalidAmount);
+        }
+        // A swap into the same asset is a no-op that would still charge the
+        // bridge fee and consume a nonce; reject it before `require_auth`.
+        if source_asset == target_asset {
             return Err(BridgeError::InvalidAmount);
         }
 
@@ -6086,6 +6118,8 @@ impl OnboardingBridge {
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::ContractPaused`] — Contract is paused.
+    /// * [`BridgeError::InvalidPubkey`] — `pubkey` is not a valid, non-weak
+    ///   Ed25519 public key.
     ///
     /// # Events
     ///
@@ -6099,6 +6133,7 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         check_not_paused(&env)?;
         source.require_auth();
+        validate_pubkey(&pubkey)?;
         save_meta_signer(&env, &source, &pubkey);
         env.events()
             .publish(("MetaSignerRegistered", source), (pubkey,));

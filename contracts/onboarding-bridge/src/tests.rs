@@ -595,7 +595,7 @@ fn test_add_relayer_paused() {
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
     bridge.pause(&None);
-    let pubkey = BytesN::from_array(&env, &[7u8; 32]);
+    let pubkey = BytesN::from_array(&env, &SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes());
     bridge.add_relayer(&pubkey, &None);
     assert!(bridge.query_is_relayer(&pubkey));
 }
@@ -608,8 +608,8 @@ fn test_add_relayer_nonce_replay_rejected() {
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
-    let first = BytesN::from_array(&env, &[7u8; 32]);
-    let second = BytesN::from_array(&env, &[8u8; 32]);
+    let first = BytesN::from_array(&env, &SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes());
+    let second = BytesN::from_array(&env, &SigningKey::from_bytes(&[8u8; 32]).verifying_key().to_bytes());
     bridge.add_relayer(&first, &Some(0u64));
     assert_eq!(
         bridge.try_add_relayer(&second, &Some(0u64)),
@@ -625,8 +625,8 @@ fn test_admin_mutators_reject_replayed_nonces() {
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &50u32, &None);
-    let first_relayer = BytesN::from_array(&env, &[7u8; 32]);
-    let second_relayer = BytesN::from_array(&env, &[8u8; 32]);
+    let first_relayer = BytesN::from_array(&env, &SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes());
+    let second_relayer = BytesN::from_array(&env, &SigningKey::from_bytes(&[8u8; 32]).verifying_key().to_bytes());
     bridge.add_relayer(&first_relayer, &None);
     bridge.add_relayer(&second_relayer, &None);
 
@@ -1267,6 +1267,57 @@ fn test_emergency_migration_keeps_reserved_tokens_recoverable() {
         check_balance(&env, &token_id, &bridge.query_fee_collector()),
         100i128
     );
+}
+
+#[test]
+fn test_fund_crosschain_reserve_rejects_wrong_nonce() {
+    let env = Env::default();
+    let (bridge, _user, token_id, admin) = setup_bridge(&env);
+    mint_tokens(&env, &token_id, &admin, 1_000i128);
+
+    assert_eq!(
+        bridge.try_fund_crosschain_reserve(&token_id, &500i128, &Some(1u64)),
+        Err(Ok(crate::BridgeError::DuplicateNonce))
+    );
+    bridge.fund_crosschain_reserve(&token_id, &500i128, &Some(0u64));
+    assert_eq!(bridge.query_crosschain_reserve(&token_id), 500i128);
+    assert_eq!(
+        bridge.try_fund_crosschain_reserve(&token_id, &500i128, &Some(0u64)),
+        Err(Ok(crate::BridgeError::DuplicateNonce))
+    );
+}
+
+#[test]
+fn test_withdraw_crosschain_reserve_rejects_wrong_nonce() {
+    let env = Env::default();
+    let (bridge, _user, token_id, admin) = setup_bridge(&env);
+    mint_tokens(&env, &token_id, &admin, 1_000i128);
+    bridge.fund_crosschain_reserve(&token_id, &500i128, &None);
+
+    assert_eq!(
+        bridge.try_withdraw_crosschain_reserve(&token_id, &100i128, &Some(5u64)),
+        Err(Ok(crate::BridgeError::DuplicateNonce))
+    );
+    bridge.withdraw_crosschain_reserve(&token_id, &100i128, &Some(0u64));
+    assert_eq!(bridge.query_crosschain_reserve(&token_id), 400i128);
+}
+
+#[test]
+fn test_fund_crosschain_reserve_rejected_after_deactivation() {
+    let env = Env::default();
+    let (bridge, _user, token_id, admin) = setup_bridge(&env);
+    mint_tokens(&env, &token_id, &admin, 1_000i128);
+    bridge.fund_crosschain_reserve(&token_id, &500i128, &None);
+
+    bridge.emergency_migrate(&Address::generate(&env), &false, &None);
+
+    assert_eq!(
+        bridge.try_fund_crosschain_reserve(&token_id, &100i128, &None),
+        Err(Ok(crate::BridgeError::ContractDeactivated))
+    );
+    // Withdrawals remain available for recovery after deactivation.
+    bridge.withdraw_crosschain_reserve(&token_id, &500i128, &None);
+    assert_eq!(bridge.query_crosschain_reserve(&token_id), 0i128);
 }
 
 #[test]
@@ -2132,6 +2183,36 @@ fn test_swap_rejects_non_whitelisted_source_asset() {
         Err(Ok(BridgeError::AssetNotWhitelisted))
     );
     assert_eq!(check_balance(&env, &unapproved_source, &user), 1_000i128);
+}
+
+#[test]
+fn test_swap_rejects_same_source_and_target_asset() {
+    let env = Env::default();
+    let (bridge, user, source_token_id, _target_token_id) = setup_swap(&env);
+
+    let pool_id = env.register(SwapPool, ());
+    SwapPoolClient::new(&env, &pool_id).initialize(&source_token_id, &source_token_id, &1i128);
+    mint_tokens(&env, &source_token_id, &pool_id, 10_000i128);
+    bridge.add_swap_pool(&pool_id, &None);
+
+    let target = Address::generate(&env);
+    let swap_route = Vec::from_array(&env, [pool_id]);
+    assert_eq!(
+        bridge.try_fund_c_address_with_swap(
+            &user,
+            &target,
+            &source_token_id,
+            &source_token_id,
+            &500i128,
+            &400i128,
+            &swap_route,
+            &None,
+            &None,
+        ),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+    assert_eq!(check_balance(&env, &source_token_id, &user), 1_000i128);
+    assert_eq!(check_balance(&env, &source_token_id, &target), 0i128);
 }
 
 #[test]
@@ -3933,6 +4014,59 @@ mod commit_reveal_tests {
     }
 
     #[test]
+    fn test_reveal_at_deadline_fails() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(
+            &env,
+            &bridge.address,
+            &user,
+            &target,
+            &token_id,
+            500i128,
+            10u64,
+        );
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &1_500u64);
+
+        advance_past_min_delay(&env);
+        env.ledger().set_timestamp(1_500);
+
+        assert_eq!(
+            bridge.try_reveal_fund(&id, &user, &target, &token_id, &500i128, &10u64),
+            Err(Ok(BridgeError::CommitmentExpired))
+        );
+        assert_eq!(check_balance(&env, &token_id, &target), 0i128);
+    }
+
+    #[test]
+    fn test_reveal_just_before_deadline_succeeds() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (bridge, user, token_id) = setup_commit_reveal(&env);
+        let target = Address::generate(&env);
+
+        let hash = amount_hash(
+            &env,
+            &bridge.address,
+            &user,
+            &target,
+            &token_id,
+            500i128,
+            12u64,
+        );
+        let id = bridge.commit_fund(&user, &target, &token_id, &hash, &1_500u64);
+
+        advance_past_min_delay(&env);
+        env.ledger().set_timestamp(1_499);
+
+        bridge.reveal_fund(&id, &user, &target, &token_id, &500i128, &12u64);
+        assert_eq!(check_balance(&env, &token_id, &target), 495i128);
+    }
+
+    #[test]
     fn test_reveal_twice_fails() {
         let env = Env::default();
         env.ledger().set_timestamp(1_000);
@@ -4153,7 +4287,7 @@ mod crosschain_tests {
 
         // Seed dedicated cross-chain liquidity via the admin deposit path.
         TestTokenClient::new(env, &token_id).mint(&admin, &10_000i128);
-        bridge.fund_crosschain_reserve(&token_id, &10_000i128);
+        bridge.fund_crosschain_reserve(&token_id, &10_000i128, &None);
 
         (bridge_id, token_id, admin, bridge)
     }
@@ -4635,7 +4769,7 @@ mod crosschain_tests {
                 <= bridge.query_contract_balance(&token_id)
         );
 
-        bridge.withdraw_crosschain_reserve(&token_id, &2_080i128);
+        bridge.withdraw_crosschain_reserve(&token_id, &2_080i128, &None);
         assert_eq!(bridge.query_crosschain_reserve(&token_id), 0i128);
         assert_eq!(bridge.query_contract_balance(&token_id), 5i128);
     }
@@ -5860,7 +5994,7 @@ fn test_meta_fund_rejects_pubkey_source_mismatch() {
     let target = Address::generate(&env);
 
     // `user` registers pubkey_a as their meta-tx signer.
-    let pubkey_a = BytesN::from_array(&env, &[0xAAu8; 32]);
+    let pubkey_a = BytesN::from_array(&env, &SigningKey::from_bytes(&[0xAAu8; 32]).verifying_key().to_bytes());
     bridge.register_meta_signer(&user, &pubkey_a);
 
     // A relayer attempts to submit a meta-tx for `user` using an unrelated
@@ -5907,7 +6041,6 @@ fn test_meta_fund_rejects_unregistered_source() {
     let target = Address::generate(&env);
     let pubkey = BytesN::from_array(&env, &[0xCCu8; 32]);
     let bogus_signature = BytesN::from_array(&env, &[0u8; 64]);
-
     let params = MetaFundParams {
         network_id: network_id.clone(),
         source: user.clone(),
@@ -5932,7 +6065,7 @@ fn test_meta_signer_can_be_unregistered() {
     let bridge = create_bridge_client(&env, &bridge_id);
 
     bridge.initialize(&admin, &fee_collector, &100u32, &None);
-    let pubkey = BytesN::from_array(&env, &[0xCCu8; 32]);
+    let pubkey = BytesN::from_array(&env, &SigningKey::from_bytes(&[0xCCu8; 32]).verifying_key().to_bytes());
     bridge.register_meta_signer(&user, &pubkey);
     assert_eq!(bridge.query_meta_signer(&user), Some(pubkey));
 
@@ -5994,6 +6127,57 @@ fn test_meta_signer_can_be_unregistered_while_paused() {
         bridge.try_execute_meta_fund(&params, &pubkey, &signature),
         Err(Ok(BridgeError::MetaTxPubkeySourceMismatch))
     );
+}
+
+#[test]
+fn test_add_relayer_rejects_invalid_pubkey() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // All-zero bytes are a small-order (weak) point.
+    let small_order = BytesN::from_array(&env, &[0u8; 32]);
+    assert_eq!(
+        bridge.try_add_relayer(&small_order, &None),
+        Err(Ok(BridgeError::InvalidPubkey))
+    );
+
+    // 0xFF..FF is not a valid compressed Edwards point.
+    let non_decompressing = BytesN::from_array(&env, &[0xFFu8; 32]);
+    assert_eq!(
+        bridge.try_add_relayer(&non_decompressing, &None),
+        Err(Ok(BridgeError::InvalidPubkey))
+    );
+
+    assert!(!bridge.query_is_relayer(&small_order));
+    assert!(!bridge.query_is_relayer(&non_decompressing));
+}
+
+#[test]
+fn test_register_meta_signer_rejects_invalid_pubkey() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    let small_order = BytesN::from_array(&env, &[0u8; 32]);
+    assert_eq!(
+        bridge.try_register_meta_signer(&user, &small_order),
+        Err(Ok(BridgeError::InvalidPubkey))
+    );
+
+    let non_decompressing = BytesN::from_array(&env, &[0xFFu8; 32]);
+    assert_eq!(
+        bridge.try_register_meta_signer(&user, &non_decompressing),
+        Err(Ok(BridgeError::InvalidPubkey))
+    );
+
+    assert_eq!(bridge.query_meta_signer(&user), None);
 }
 
 /// Replicates the contract's payload-hash construction for `execute_meta_fund`
@@ -6621,7 +6805,7 @@ fn test_extend_persistent_ttl_extends_asset_keys() {
     bridge.add_asset(&token_id, &None);
     mint_tokens(&env, &token_id, &user, 1000i128);
     mint_tokens(&env, &token_id, &admin, 1000i128);
-    bridge.fund_crosschain_reserve(&token_id, &1000i128);
+    bridge.fund_crosschain_reserve(&token_id, &1000i128, &None);
     bridge.fund_c_address(
         &user,
         &Address::generate(&env),
