@@ -33,7 +33,7 @@ import {
   OffRampIntegration,
   type TransactionResult,
 } from '@stellar/c-address-onboarding-bridge-sdk';
-import { Keypair, Networks, SorobanRpc } from '@stellar/stellar-sdk';
+import { Keypair, Networks, rpc } from '@stellar/stellar-sdk';
 
 // ---------------------------------------------------------------------------
 // Configuration - replace with real values or set environment variables
@@ -54,7 +54,7 @@ const CONFIG = {
 
 /** Poll until a submitted transaction is confirmed or times out. */
 async function waitForConfirmation(
-  server: SorobanRpc.Server,
+  server: rpc.Server,
   hash: string,
   label: string,
 ): Promise<void> {
@@ -77,7 +77,7 @@ async function waitForConfirmation(
 
 /** Assert a TransactionResult succeeded and wait for confirmation. */
 async function submitAndConfirm(
-  server: SorobanRpc.Server,
+  server: rpc.Server,
   result: TransactionResult,
   label: string,
 ): Promise<void> {
@@ -96,7 +96,7 @@ async function submitAndConfirm(
  * transaction, so a single `submitAndConfirm(result)` is not sufficient.
  */
 async function submitBatchAndConfirm(
-  server: SorobanRpc.Server,
+  server: rpc.Server,
   results: TransactionResult[],
   label: string,
 ): Promise<void> {
@@ -117,7 +117,7 @@ async function main(): Promise<void> {
 
   const sourceKeypair       = Keypair.fromSecret(CONFIG.sourceSecret);
   const feeCollectorKeypair = Keypair.fromSecret(CONFIG.feeCollectorSecret);
-  const server              = new SorobanRpc.Server(CONFIG.rpcUrl);
+  const server              = new rpc.Server(CONFIG.rpcUrl);
 
   // -------------------------------------------------------------------------
   // 1. Set up the SDK

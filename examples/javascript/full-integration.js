@@ -20,7 +20,7 @@ const {
   OnboardingBridgeSDK,
   OffRampIntegration,
 } = require('@stellar/c-address-onboarding-bridge-sdk');
-const { Keypair, Networks, SorobanRpc } = require('@stellar/stellar-sdk');
+const { Keypair, Networks, rpc } = require('@stellar/stellar-sdk');
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -83,7 +83,7 @@ async function main() {
 
   const sourceKeypair       = Keypair.fromSecret(CONFIG.sourceSecret);
   const feeCollectorKeypair = Keypair.fromSecret(CONFIG.feeCollectorSecret);
-  const server              = new SorobanRpc.Server(CONFIG.rpcUrl);
+  const server              = new rpc.Server(CONFIG.rpcUrl);
 
   // 1. Set up SDK
   console.log('1. Setting up SDK...');

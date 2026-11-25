@@ -1652,7 +1652,21 @@ impl OnboardingBridge {
     // Lifecycle
     // -----------------------------------------------------------------------
 
-    // Constructor removed to allow standard initialize lifecycle
+    /// Contract constructor. Runs atomically with deployment so the instance
+    /// can never be created uninitialised.
+    ///
+    /// Delegates to [`Self::initialize_inner`] with the same argument order as
+    /// the deploy tooling (`scripts/deploy.ts`).
+    pub fn __constructor(
+        env: Env,
+        admin: Address,
+        fee_collector: Address,
+        fee_bps: u32,
+        nonce: Option<u64>,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), BridgeError> {
+        Self::initialize_inner(env, admin, fee_collector, fee_bps, nonce, wasm_hash)
+    }
 
     /// Initialises the bridge contract. Must be called exactly once before any
     /// other function.
