@@ -1118,3 +1118,14 @@ export interface TtlConfig {
   /** Contract constant `CRITICAL_ENTRY_TTL_THRESHOLD`. */
   criticalThreshold: number;
 }
+
+/**
+ * Options for {@link OnboardingBridgeSDK.fundCrosschainReserve} and
+ * {@link OnboardingBridgeSDK.withdrawCrosschainReserve}.
+ */
+export interface CrosschainReserveOptions {
+  /** Whitelisted token contract address. */
+  asset: string;
+  /** Amount in the asset's smallest unit (positive `i128`). */
+  amount: string | number | bigint;
+}

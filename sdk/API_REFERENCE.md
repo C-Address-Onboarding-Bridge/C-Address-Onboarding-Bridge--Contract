@@ -437,7 +437,7 @@ async proposeNewAdmin(
   adminKeypair: Keypair
 ): Promise<TransactionResult>
 ```
-Proposes an admin handover (admin only). Prefer this over `setAdmin` — it proves the new admin controls the key (via `acceptAdmin`) before the role moves.
+Proposes an admin handover (admin only). Prefer this over `setAdmin` — it proves the new admin controls the key (via `acceptAdmin`) before the role moves. Until it is accepted, the proposal can be cancelled with [`clearPendingAdmin`](#clearpendingadmin). Do this if the wrong address was proposed, because that address can call `accept_admin` until the proposal is cleared.
 - **Parameters**:
   - `newAdmin`: `string` — Proposed admin's G-address.
   - `adminKeypair`: `Keypair`
@@ -466,7 +466,7 @@ async proposeNewFeeCollector(
   adminKeypair: Keypair
 ): Promise<TransactionResult>
 ```
-Proposes a fee-collector handover (admin only). Prefer this over `setFeeCollector` — it proves the new collector controls the key (via `acceptFeeCollector`) before the role moves.
+Proposes a fee-collector handover (admin only). Prefer this over `setFeeCollector` — it proves the new collector controls the key (via `acceptFeeCollector`) before the role moves. Until it is accepted, the proposal can be cancelled with [`clearPendingFeeCollector`](#clearpendingfeecollector).
 - **Parameters**:
   - `newCollector`: `string` — Proposed collector's G-address.
   - `adminKeypair`: `Keypair`
@@ -487,6 +487,32 @@ async getPendingFeeCollector(): Promise<string | null>
 ```
 Returns the pending fee collector's G-address, or `null` if there is no pending handover.
 - **Returns**: `Promise<string | null>`
+
+##### `clearPendingAdmin`
+```ts
+async clearPendingAdmin(
+  adminKeypair: Keypair,
+  nonce?: string | number | bigint
+): Promise<TransactionResult>
+```
+Cancels a pending admin handover started with [`proposeNewAdmin`](#proposenewadmin) (`clear_pending_admin(nonce)`). Admin only.
+- **Parameters**:
+  - `adminKeypair`: `Keypair` — the current admin.
+  - `nonce`: optional sequential admin nonce, sent as `u64` or `void` when omitted.
+- **Returns**: `Promise<TransactionResult>`
+
+##### `clearPendingFeeCollector`
+```ts
+async clearPendingFeeCollector(
+  adminKeypair: Keypair,
+  nonce?: string | number | bigint
+): Promise<TransactionResult>
+```
+Cancels a pending fee-collector handover started with [`proposeNewFeeCollector`](#proposenewfeecollector) (`clear_pending_fee_collector(nonce)`). Admin only.
+- **Parameters**:
+  - `adminKeypair`: `Keypair` — the current admin.
+  - `nonce`: optional sequential admin nonce, sent as `u64` or `void` when omitted.
+- **Returns**: `Promise<TransactionResult>`
 
 ##### `upgrade`
 ```ts
@@ -509,10 +535,44 @@ async fundCrosschain(
 ): Promise<TransactionResult>
 ```
 Submits a cross-chain funding transaction verified with relayer signatures (relayer only).
+The payout is drawn from the cross-chain liquidity reserve for `asset`. If the
+reserve is too small, the contract rejects the call with
+`InsufficientCrossChainReserve`, so check [`getCrosschainReserve`](#getcrosschainreserve)
+first and top up with [`fundCrosschainReserve`](#fundcrosschainreserve).
 - **Parameters**:
   - `options`: [`CrossChainFundOptions`](#crosschainfundoptions)
   - `relayerKeypair`: `Keypair`
 - **Returns**: `Promise<TransactionResult>`
+
+##### `fundCrosschainReserve`
+```ts
+async fundCrosschainReserve(
+  options: { asset: string; amount: string | number | bigint },
+  adminKeypair: Keypair
+): Promise<TransactionResult>
+```
+Moves `amount` of `asset` from the admin into the cross-chain reserve
+(`fund_crosschain_reserve(asset, amount)`). Admin only. Unlike most admin
+setters it takes exactly two arguments and **no nonce**. `amount` must be a
+positive `i128`, and `asset` must be whitelisted.
+
+##### `withdrawCrosschainReserve`
+```ts
+async withdrawCrosschainReserve(
+  options: { asset: string; amount: string | number | bigint },
+  adminKeypair: Keypair
+): Promise<TransactionResult>
+```
+Returns unused reserve liquidity to the admin (`withdraw_crosschain_reserve(asset, amount)`).
+Admin only, no nonce. Fails with `InsufficientCrossChainReserve` if `amount`
+exceeds the reserve.
+
+##### `getCrosschainReserve`
+```ts
+async getCrosschainReserve(asset: string): Promise<string>
+```
+Returns the reserve balance for `asset` (`query_crosschain_reserve`) as a
+decimal string in the asset's smallest unit. Throws on RPC or contract error.
 
 ##### `addRelayer`
 ```ts
