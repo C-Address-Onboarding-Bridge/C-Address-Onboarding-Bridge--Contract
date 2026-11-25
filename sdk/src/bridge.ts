@@ -1853,6 +1853,47 @@ export class OnboardingBridgeSDK {
     return { token, amount_per_fund: amount.toString() };
   }
 
+  /**
+   * Returns `true` once the contract has been emergency-migrated and is
+   * therefore deactivated.
+   */
+  async queryIsDeactivated(): Promise<boolean> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_is_deactivated' },
+      () => this.provider.simulateTransaction(this.buildSimulationTx('query_is_deactivated', [])),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get deactivated state: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    return scVal ? Boolean(scValToNative(scVal)) : false;
+  }
+
+  /**
+   * Returns the address the contract was emergency-migrated to, if any.
+   */
+  async queryMigratedTo(): Promise<string | null> {
+    const result = await withRpcHook(
+      this.hooks,
+      'simulateTransaction',
+      { contractMethod: 'query_migrated_to' },
+      () => this.provider.simulateTransaction(this.buildSimulationTx('query_migrated_to', [])),
+    );
+
+    if ('error' in result && result.error) {
+      throw new Error(`Failed to get migrated-to address: ${result.error}`);
+    }
+
+    const scVal = (result as any).results?.[0]?.retval;
+    if (!scVal) return null;
+    const native = scValToNative(scVal);
+    return native ? native.toString() : null;
+  }
+
   async queryFeeTiers(): Promise<FeeTier[]> {
     const result = await withRpcHook(
       this.hooks,

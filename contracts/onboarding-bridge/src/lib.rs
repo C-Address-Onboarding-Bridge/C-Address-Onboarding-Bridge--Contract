@@ -292,6 +292,8 @@ pub enum DataKey {
     // accept meta-transaction signatures from.
     MetaSigner(Address),
     Deactivated,
+    // Issue #1114: address the contract was emergency-migrated to.
+    MigratedTo,
     // Admin-managed whitelist of DEX pool addresses usable in `swap_route`.
     PoolWhitelist,
     RelayerSet,
@@ -322,6 +324,9 @@ const MAX_ALLOWED_TTL: u32 = 3_110_400;
 /// effectively disables TTL extension and risks near-term expiry of all
 /// instance (or persistent) data. Set to roughly one week of ledgers
 /// (5 s/ledger) — comfortably above `CRITICAL_ENTRY_TTL_THRESHOLD`.
+///
+/// The explicit public extenders always extend to the requested TTL, so this
+/// floor only bounds the configured maxima and the requested values.
 const MIN_ALLOWED_TTL: u32 = 120_960;
 const CRITICAL_ENTRY_TTL_THRESHOLD: u32 = 100_000;
 /// Minimum ledgers that must pass before a scheduled upgrade becomes executable (~24 h at 5 s/ledger).
@@ -787,12 +792,22 @@ fn read_max_persistent_ttl(env: &Env) -> u32 {
         .unwrap_or(MAX_ALLOWED_TTL)
 }
 
-fn persistent_ttl_request(ttl: u32, configured_max: u32) -> Result<(u32, u32), BridgeError> {
+/// Validates an explicit TTL request and returns the TTL to extend to.
+///
+/// Explicit extenders always extend to the requested TTL, so the extension
+/// threshold is the TTL itself (the entry is extended whenever its current
+/// TTL is below the requested value).
+fn persistent_ttl_request(ttl: u32, configured_max: u32) -> Result<u32, BridgeError> {
     if ttl < MIN_ALLOWED_TTL {
         return Err(BridgeError::InvalidTtl);
     }
-    let max_ttl = ttl.min(configured_max);
-    Ok((max_ttl, max_ttl / 4))
+    Ok(ttl.min(configured_max))
+}
+
+/// Extends `key` to `ttl` and returns the resulting TTL.
+fn extend_persistent_key(env: &Env, key: &DataKey, ttl: u32) -> u32 {
+    env.storage().persistent().extend_ttl(key, ttl, ttl);
+    env.storage().persistent().get_ttl(key)
 }
 
 fn extend_instance_ttl(env: &Env) {
@@ -967,6 +982,10 @@ fn set_paused(env: &Env, paused: bool) {
 
 fn is_deactivated(env: &Env) -> bool {
     env.storage().instance().has(&DataKey::Deactivated)
+}
+
+fn read_migrated_to(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::MigratedTo)
 }
 
 fn check_not_deactivated(env: &Env) -> Result<(), BridgeError> {
@@ -2819,6 +2838,17 @@ impl OnboardingBridge {
         read_pending_admin(&env)
     }
 
+    /// Returns `true` once the contract has been emergency-migrated and is
+    /// therefore deactivated.
+    pub fn query_is_deactivated(env: Env) -> bool {
+        is_deactivated(&env)
+    }
+
+    /// Returns the address the contract was emergency-migrated to, if any.
+    pub fn query_migrated_to(env: Env) -> Option<Address> {
+        read_migrated_to(&env)
+    }
+
     /// Cancels a pending admin handoff.
     pub fn clear_pending_admin(env: Env, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
@@ -3087,7 +3117,7 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
-    /// * `("ReferralRateChanged", bps)` — no additional data.
+    /// * `("ReferralRateChanged", old_bps, new_bps)` — data: `(admin,)`
     pub fn set_referral_rate(env: Env, bps: u32, nonce: Option<u64>) -> Result<(), BridgeError> {
         check_initialized(&env)?;
         let admin = read_admin(&env);
@@ -3097,8 +3127,10 @@ impl OnboardingBridge {
             return Err(BridgeError::FeeTooHigh);
         }
         extend_instance_ttl(&env);
+        let old_bps = read_referral_rate(&env);
         save_referral_rate(&env, bps);
-        env.events().publish(("ReferralRateChanged", bps), ());
+        env.events()
+            .publish(("ReferralRateChanged", old_bps, bps), (admin,));
         Ok(())
     }
 
@@ -4007,6 +4039,10 @@ impl OnboardingBridge {
         }
 
         env.storage().instance().set(&DataKey::Deactivated, &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::MigratedTo, &new_contract);
+        extend_instance_ttl(&env);
         env.events()
             .publish(("EmergencyMigrated", admin), (new_contract,));
 
@@ -4537,8 +4573,10 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
-    /// * `("LoyaltyTokenSet", admin)` — data:
-    ///   `(token, reward_bps, min_qualifying_amount)`
+    /// * `("LoyaltyTokenSet", old_token, new_token)` — data:
+    ///   `(admin, old_reward_bps, new_reward_bps, min_qualifying_amount)`.
+    ///   `old_token` is `None` when no loyalty token was configured before
+    ///   this call.
     pub fn set_loyalty_token(
         env: Env,
         token: Address,
@@ -4556,13 +4594,15 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
+        let old_token = read_loyalty_token(&env);
+        let old_reward_bps = read_loyalty_reward_bps(&env);
         save_loyalty_token(&env, &token);
         save_loyalty_reward_bps(&env, &reward_bps);
         save_loyalty_min_qualifying_amount(&env, &min_qualifying_amount);
         extend_instance_ttl(&env);
         env.events().publish(
-            ("LoyaltyTokenSet", admin),
-            (token, reward_bps, min_qualifying_amount),
+            ("LoyaltyTokenSet", old_token, token),
+            (admin, old_reward_bps, reward_bps, min_qualifying_amount),
         );
         Ok(())
     }
@@ -4625,7 +4665,8 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
-    /// * `("FeeTiersSet", admin)` — data: `(tiers.len(),)`
+    /// * `("FeeTiersSet", old_tier_count, new_tier_count)` — data:
+    ///   `(admin, tiers)` where `tiers` is the full `Vec<FeeTier>` now in force.
     pub fn set_fee_tiers(
         env: Env,
         tiers: Vec<FeeTier>,
@@ -4652,9 +4693,14 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
+        let old_tier_count = read_fee_tiers(&env).map_or(0, |old| old.len());
+        let new_tier_count = tiers.len();
         save_fee_tiers(&env, &tiers);
         extend_instance_ttl(&env);
-        env.events().publish(("FeeTiersSet", admin), (tiers.len(),));
+        env.events().publish(
+            ("FeeTiersSet", old_tier_count, new_tier_count),
+            (admin, tiers),
+        );
         Ok(())
     }
 
@@ -5143,7 +5189,8 @@ impl OnboardingBridge {
         let old_threshold = relayer_threshold(&env);
         save_relayer_threshold(&env, threshold);
         extend_instance_ttl(&env);
-        env.events().publish(("RelayerThresholdChanged",), (admin, old_threshold, threshold));
+        env.events()
+            .publish(("RelayerThresholdChanged", old_threshold, threshold), (admin,));
         Ok(())
     }
 
@@ -5517,7 +5564,8 @@ impl OnboardingBridge {
     ///
     /// `ttl` is capped at `MAX_ALLOWED_TTL` (3 110 400 ledgers, ~180 days),
     /// which matches the network's `max_entry_ttl`.
-    /// The threshold used to trigger extension is `ttl / 4`.
+    /// The instance entry is always extended to the requested TTL, and the
+    /// emitted `actual_ttl` is the resulting TTL read back from storage.
     ///
     /// # Arguments
     ///
@@ -5545,10 +5593,11 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_instance_ttl(&env))?;
-        env.storage().instance().extend_ttl(threshold, max_ttl);
+        let max_ttl = persistent_ttl_request(ttl, read_max_instance_ttl(&env))?;
+        env.storage().instance().extend_ttl(max_ttl, max_ttl);
+        let actual_ttl = env.storage().instance().get_ttl();
         env.events()
-            .publish(("InstanceTtlExtended",), (admin, max_ttl));
+            .publish(("InstanceTtlExtended",), (admin, actual_ttl));
         Ok(())
     }
 
@@ -5587,25 +5636,22 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
+        let max_ttl = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
         let key = DataKey::AssetStats(key_asset.clone());
+        let mut actual_ttl = max_ttl;
         if env.storage().persistent().has(&key) {
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, threshold, max_ttl);
+            actual_ttl = extend_persistent_key(&env, &key, max_ttl);
         }
         let reserve_key = DataKey::CrossChainReserve(key_asset.clone());
         if env.storage().persistent().has(&reserve_key) {
-            env.storage()
-                .persistent()
-                .extend_ttl(&reserve_key, threshold, max_ttl);
+            actual_ttl = extend_persistent_key(&env, &reserve_key, max_ttl);
         }
         let fee_cap_key = DataKey::AssetFeeCap(key_asset.clone());
         if env.storage().persistent().has(&fee_cap_key) {
-            env.storage().persistent().extend_ttl(&fee_cap_key, threshold, max_ttl);
+            actual_ttl = extend_persistent_key(&env, &fee_cap_key, max_ttl);
         }
         env.events()
-            .publish(("PersistentTtlExtended",), (admin, key_asset, max_ttl));
+            .publish(("PersistentTtlExtended",), (admin, key_asset, actual_ttl));
         Ok(())
     }
 
@@ -5645,12 +5691,10 @@ impl OnboardingBridge {
         if !env.storage().persistent().has(&key) {
             return Err(BridgeError::TimelockNotFound);
         }
-        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, threshold, max_ttl);
+        let max_ttl = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
+        let actual_ttl = extend_persistent_key(&env, &key, max_ttl);
         env.events()
-            .publish(("TimelockTtlExtended",), (id, max_ttl));
+            .publish(("TimelockTtlExtended",), (id, actual_ttl));
         Ok(())
     }
 
@@ -5681,12 +5725,10 @@ impl OnboardingBridge {
         if !env.storage().persistent().has(&key) {
             return Err(BridgeError::CommitmentNotFound);
         }
-        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, threshold, max_ttl);
+        let max_ttl = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
+        let actual_ttl = extend_persistent_key(&env, &key, max_ttl);
         env.events()
-            .publish(("CommitmentTtlExtended",), (id, max_ttl));
+            .publish(("CommitmentTtlExtended",), (id, actual_ttl));
         Ok(())
     }
 
@@ -5717,12 +5759,10 @@ impl OnboardingBridge {
         if !env.storage().persistent().has(&key) {
             return Err(BridgeError::NotRelayer);
         }
-        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, threshold, max_ttl);
+        let max_ttl = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
+        let actual_ttl = extend_persistent_key(&env, &key, max_ttl);
         env.events()
-            .publish(("RelayerTtlExtended",), (pubkey, max_ttl));
+            .publish(("RelayerTtlExtended",), (pubkey, actual_ttl));
         Ok(())
     }
 
@@ -5766,7 +5806,8 @@ impl OnboardingBridge {
         let admin = read_admin(&env);
         admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
-        let (max_ttl, threshold) = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
+        let max_ttl = persistent_ttl_request(ttl, read_max_persistent_ttl(&env))?;
+        let mut actual_ttl = max_ttl;
         for key in [
             DataKey::SourceDailyLimit(source.clone(), asset.clone()),
             DataKey::UserDeposit(source.clone(), asset.clone()),
@@ -5778,14 +5819,12 @@ impl OnboardingBridge {
             DataKey::MetaSigner(source.clone()),
         ] {
             if env.storage().persistent().has(&key) {
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&key, threshold, max_ttl);
+                actual_ttl = extend_persistent_key(&env, &key, max_ttl);
             }
         }
         env.events().publish(
             ("SourcePersistentTtlExtended",),
-            (admin, source, asset, max_ttl),
+            (admin, source, asset, actual_ttl),
         );
         Ok(())
     }
@@ -5794,13 +5833,12 @@ impl OnboardingBridge {
     /// `extend_instance_ttl` helper called on every mutating operation.
     ///
     /// Values above `MAX_ALLOWED_TTL` are silently capped. Values below
-    /// `MIN_ALLOWED_TTL` are rejected outright: `extend_instance_ttl` derives
-    /// its extension threshold as `max_ttl / 4`, so a max of `0` (or any very
-    /// small value) would make the threshold `0` too, effectively disabling
-    /// TTL extension and risking near-term expiry of all instance data.
+    /// `MIN_ALLOWED_TTL` are rejected outright: a max of `0` (or any very
+    /// small value) would make the internal extension threshold `0` too,
+    /// effectively disabling TTL extension and risking near-term expiry of all
+    /// instance data.
     ///
-    /// # Arguments
-    ///
+    /// # Arguments    ///
     /// * `ttl` (`u32`) — New maximum in ledgers. Must be ≥ `MIN_ALLOWED_TTL`.
     ///
     /// # Authorization
@@ -5833,7 +5871,8 @@ impl OnboardingBridge {
             .instance()
             .set(&DataKey::MaxInstanceTtl, &capped);
         extend_instance_ttl(&env);
-        env.events().publish(("MaxInstanceTtlChanged",), (admin, old_ttl, capped));
+        env.events()
+            .publish(("MaxInstanceTtlChanged", old_ttl, capped), (admin,));
         Ok(())
     }
 
@@ -5841,8 +5880,8 @@ impl OnboardingBridge {
     ///
     /// Values above `MAX_ALLOWED_TTL` are silently capped. Values below
     /// `MIN_ALLOWED_TTL` are rejected for the same reason as
-    /// `set_max_instance_ttl`: a near-zero max would collapse the extension
-    /// threshold to zero and disable TTL extension entirely.
+    /// `set_max_instance_ttl`: a near-zero max would collapse the internal
+    /// extension threshold to zero and disable TTL extension entirely.
     ///
     /// # Arguments
     ///
@@ -5974,13 +6013,17 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         check_not_paused(&env)?;
         source.require_auth();
-        consume_auth_nonce(
+        let result = consume_auth_nonce(
             &env,
             &source,
             nonce,
             valid_after_ledger,
             valid_before_ledger,
-        )
+        );
+        if result.is_ok() {
+            extend_instance_ttl(&env);
+        }
+        result
     }
 
     /// Returns the next unused auth nonce for `source`.
@@ -6282,6 +6325,7 @@ impl OnboardingBridge {
         env.storage()
             .persistent()
             .remove(&DataKey::Commitment(commitment_id));
+        extend_instance_ttl(&env);
         env.events()
             .publish(("CommitmentCancelled",), (commitment_id, entry.source));
         Ok(())
@@ -6547,6 +6591,7 @@ impl OnboardingBridge {
         source.require_auth();
         validate_pubkey(&pubkey)?;
         save_meta_signer(&env, &source, &pubkey);
+        extend_instance_ttl(&env);
         env.events()
             .publish(("MetaSignerRegistered", source), (pubkey,));
         Ok(())
@@ -6564,6 +6609,7 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         source.require_auth();
         clear_meta_signer(&env, &source);
+        extend_instance_ttl(&env);
         env.events().publish(("MetaSignerUnregistered", source), ());
         Ok(())
     }
