@@ -2664,7 +2664,11 @@ export class OnboardingBridgeSDK {
     const scVal = (result as any).results?.[0]?.retval;
     if (!scVal) return null;
     const native = scValToNative(scVal);
-    return native ? native.toString() : null;
+    if (!native) return null;
+    // The contract stores `{ address, expires_after_ledger }`; older
+    // deployments returned the bare address.
+    const address = native.address ?? native;
+    return address ? address.toString() : null;
   }
 
   /**
@@ -2849,7 +2853,24 @@ export class OnboardingBridgeSDK {
     const scVal = (result as any).results?.[0]?.retval;
     if (!scVal) return null;
     const native = scValToNative(scVal);
-    return native ? native.toString() : null;
+    if (!native) return null;
+    // The contract stores `{ address, expires_after_ledger }`; older
+    // deployments returned the bare address.
+    const address = native.address ?? native;
+    return address ? address.toString() : null;
+  }
+
+  /**
+   * Get the pending fee-collector proposal, including its expiry ledger.
+   *
+   * @returns The pending collector's G-address and the ledger sequence after
+   *          which the proposal can no longer be accepted, or `null` if there
+   *          is no pending handover.
+   *
+   * @throws {Error} On RPC failure.
+   */
+  async getPendingFeeCollectorProposal(): Promise<PendingTransfer | null> {
+    return this.getPendingTransfer('query_pending_fee_collector', 'fee collector');
   }
 
   /**

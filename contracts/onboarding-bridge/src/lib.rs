@@ -207,7 +207,9 @@ pub enum BridgeError {
     FeeExceedsMaxFeeBps = 55,
     /// A basis-point rate exceeds `FEE_DENOMINATOR` (10 000).
     InvalidFeeBps = 56,
-    // Next free discriminant: 57. Always take the next unused value here and
+    /// A pending admin or fee-collector proposal has passed its expiry ledger.
+    PendingTransferExpired = 57,
+    // Next free discriminant: 58. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
 
@@ -239,6 +241,8 @@ pub enum DataKey {
     CrossChainNonce(BytesN<32>),
     DailyUsage(Address, Address, u64),
     FeeTiers,
+    // Issue #1086: per-asset fee tiers, with `FeeTiers` as the global fallback.
+    FeeTiersFor(Address),
     SourceBridgedVolume(Address, Address),
     LoyaltyToken,
     LoyaltyAmountPerFund,
@@ -269,10 +273,16 @@ pub enum DataKey {
     // Issue #1088: rolling-window withdrawal cap and per-asset usage
     MaxWithdrawPerWindow,
     WithdrawWindowUsage(Address),
+    // Issue #1086: per-asset max withdraw per tx, `MaxWithdrawPerTx` is the
+    // global fallback.
+    MaxWithdrawPerTxFor(Address),
     // Issue #24: reentrancy guard flag
     Entered,
     // Minimum transfer amount for funded transfers
     MinimumAmount,
+    // Issue #1086: per-asset minimum transfer amount, `MinimumAmount` is the
+    // global fallback.
+    MinimumAmountFor(Address),
     // Issue #30: commit-reveal counter and entries
     CommitmentId,
     Commitment(u64),
@@ -324,6 +334,8 @@ const DAILY_USAGE_TTL_LEDGERS: u32 = 17_280 + 1_000;
 const UPGRADE_EXECUTION_WINDOW_LEDGERS: u32 = UPGRADE_TIMELOCK_LEDGERS;
 /// Minimum ledgers between commit_fund and reveal_fund (~25 s at 5 s/ledger).
 const COMMIT_REVEAL_MIN_DELAY_LEDGERS: u32 = 5;
+/// Ledgers a pending admin / fee-collector proposal stays acceptable (~7 days at 5 s/ledger).
+const PENDING_TRANSFER_EXPIRY_LEDGERS: u32 = 120_960;
 /// Size of the stack buffer used to hold an address's strkey while hashing it.
 /// Soroban strkeys are 56 bytes; anything longer is rejected rather than copied.
 const MAX_STRKEY_LEN: usize = 64;
@@ -487,6 +499,16 @@ pub struct PendingUpgrade {
     pub expires_after_ledger: u32,
 }
 
+/// A pending admin or fee-collector handoff awaiting acceptance.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingTransfer {
+    /// Address that must accept the role.
+    pub address: Address,
+    /// Ledger sequence at or after which the proposal can no longer be accepted.
+    pub expires_after_ledger: u32,
+}
+
 /// A pending commit-reveal entry created by `commit_fund`.
 ///
 /// The `amount_hash` is a domain-separated hash of the commitment parties,
@@ -545,10 +567,17 @@ fn clear_pending_upgrade(env: &Env) {
 }
 
 fn save_pending_admin(env: &Env, addr: &Address) {
-    env.storage().instance().set(&DataKey::PendingAdmin, addr);
+    let pending = PendingTransfer {
+        address: addr.clone(),
+        expires_after_ledger: env
+            .ledger()
+            .sequence()
+            .saturating_add(PENDING_TRANSFER_EXPIRY_LEDGERS),
+    };
+    env.storage().instance().set(&DataKey::PendingAdmin, &pending);
 }
 
-fn read_pending_admin(env: &Env) -> Option<Address> {
+fn read_pending_admin(env: &Env) -> Option<PendingTransfer> {
     env.storage().instance().get(&DataKey::PendingAdmin)
 }
 
@@ -570,12 +599,19 @@ fn read_pending_admin_proposer(env: &Env) -> Option<Address> {
 }
 
 fn save_pending_fee_collector(env: &Env, addr: &Address) {
+    let pending = PendingTransfer {
+        address: addr.clone(),
+        expires_after_ledger: env
+            .ledger()
+            .sequence()
+            .saturating_add(PENDING_TRANSFER_EXPIRY_LEDGERS),
+    };
     env.storage()
         .instance()
-        .set(&DataKey::PendingFeeCollector, addr);
+        .set(&DataKey::PendingFeeCollector, &pending);
 }
 
-fn read_pending_fee_collector(env: &Env) -> Option<Address> {
+fn read_pending_fee_collector(env: &Env) -> Option<PendingTransfer> {
     env.storage().instance().get(&DataKey::PendingFeeCollector)
 }
 
@@ -643,6 +679,24 @@ fn save_withdraw_window_usage(env: &Env, asset: &Address, start: u64, used: i128
     env.storage()
         .temporary()
         .extend_ttl(&key, WITHDRAW_WINDOW_SECONDS, WITHDRAW_WINDOW_SECONDS);
+}
+
+/// Stores the per-asset max withdraw per tx. `None` clears the override so the
+/// asset falls back to the global `MaxWithdrawPerTx` value.
+fn save_asset_max_withdraw_per_tx(env: &Env, asset: &Address, amount: Option<i128>) {
+    let key = DataKey::MaxWithdrawPerTxFor(asset.clone());
+    match amount {
+        Some(amount) => env.storage().instance().set(&key, &amount),
+        None => env.storage().instance().remove(&key),
+    }
+}
+
+/// Per-asset max withdraw per tx, falling back to the global value.
+fn read_asset_max_withdraw_per_tx(env: &Env, asset: &Address) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxWithdrawPerTxFor(asset.clone()))
+        .unwrap_or_else(|| read_max_withdraw_per_tx(env))
 }
 
 fn read_bridge_config(env: &Env) -> BridgeConfigData {
@@ -872,6 +926,26 @@ fn read_minimum_amount(env: &Env) -> i128 {
         .instance()
         .get(&DataKey::MinimumAmount)
         .unwrap_or(0)
+}
+
+/// Stores the per-asset minimum amount. `None` clears the override so the asset
+/// falls back to the global `MinimumAmount` value.
+#[inline(never)]
+fn save_asset_minimum_amount(env: &Env, asset: &Address, amount: Option<i128>) {
+    let key = DataKey::MinimumAmountFor(asset.clone());
+    match amount {
+        Some(amount) => env.storage().instance().set(&key, &amount),
+        None => env.storage().instance().remove(&key),
+    }
+}
+
+/// Per-asset minimum amount, falling back to the global value.
+#[inline(never)]
+fn read_asset_minimum_amount(env: &Env, asset: &Address) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MinimumAmountFor(asset.clone()))
+        .unwrap_or_else(|| read_minimum_amount(env))
 }
 
 fn check_initialized(env: &Env) -> Result<(), BridgeError> {
@@ -2544,7 +2618,9 @@ impl OnboardingBridge {
     ///
     /// # Authorization
     ///
-    /// Requires the current admin's `require_auth()`.
+    /// Requires the current admin's `require_auth()` **and** the new fee
+    /// collector's `require_auth()` in the same call (atomic two-party
+    /// handoff), so the incoming collector proves it controls its key.
     ///
     /// # Errors
     ///
@@ -2554,7 +2630,8 @@ impl OnboardingBridge {
     ///
     /// # Events
     ///
-    /// * `("FeeCollectorChanged", old_collector, new_fee_collector)` — data: `(admin,)`
+    /// * `("FeeCollectorTransferred", old_collector, new_fee_collector)` — data: `()`
+    ///   (same event as the two-step `accept_fee_collector` path)
     ///
     /// # Examples
     ///
@@ -2572,6 +2649,9 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        // Atomic two-party handoff: the incoming collector must prove it
+        // controls its key in the same call, so a typo cannot strand the role.
+        new_fee_collector.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         let old_collector = read_fee_collector(&env);
@@ -2587,8 +2667,8 @@ impl OnboardingBridge {
                 .publish(("FeeCollectorTransferCancelled",), (admin.clone(),));
         }
         env.events().publish(
-            ("FeeCollectorChanged", old_collector, new_fee_collector),
-            (admin,),
+            ("FeeCollectorTransferred", old_collector, new_fee_collector),
+            (),
         );
         Ok(())
     }
@@ -2623,7 +2703,10 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         check_not_deactivated(&env)?;
         let pending = read_pending_fee_collector(&env).ok_or(BridgeError::Unauthorized)?;
-        pending.require_auth();
+        if env.ledger().sequence() >= pending.expires_after_ledger {
+            return Err(BridgeError::PendingTransferExpired);
+        }
+        pending.address.require_auth();
         // Issue #1093: a proposal made by a previous admin must not be honoured.
         if read_pending_fee_collector_proposer(&env) != Some(read_admin(&env)) {
             remove_pending_fee_collector(&env);
@@ -2631,23 +2714,41 @@ impl OnboardingBridge {
         }
         extend_instance_ttl(&env);
         let old_collector = read_fee_collector(&env);
-        save_fee_collector(&env, &pending);
+        save_fee_collector(&env, &pending.address);
         remove_pending_fee_collector(&env);
-        env.events()
-            .publish(("FeeCollectorTransferred", old_collector, pending), ());
+        env.events().publish(
+            ("FeeCollectorTransferred", old_collector, pending.address),
+            (),
+        );
         Ok(())
     }
 
-    pub fn query_pending_fee_collector(env: Env) -> Option<Address> {
+    /// Returns the pending fee-collector proposal, including its expiry ledger.
+    pub fn query_pending_fee_collector(env: Env) -> Option<PendingTransfer> {
         read_pending_fee_collector(&env)
     }
 
+    /// Changes the admin in a single call.
+    ///
+    /// # Authorization
+    ///
+    /// Requires the current admin's `require_auth()` **and** the new admin's
+    /// `require_auth()` in the same call (atomic two-party handoff), so the
+    /// incoming admin proves it controls its key.
+    ///
+    /// # Events
+    ///
+    /// * `("AdminTransferred", old_admin, new_admin)` — data: `()`
+    ///   (same event as the two-step `accept_admin` path)
     pub fn set_admin(env: Env, new_admin: Address, nonce: Option<u64>) -> Result<(), BridgeError> {
         let _guard = ReentrancyGuard::enter(&env)?;
         check_initialized(&env)?;
         check_not_paused(&env)?;
         let admin = read_admin(&env);
         admin.require_auth();
+        // Atomic two-party handoff: the incoming admin must prove it controls
+        // its key in the same call, so a typo cannot strand the role.
+        new_admin.require_auth();
         consume_nonce(&env, &admin, nonce)?;
         extend_instance_ttl(&env);
         save_admin(&env, &new_admin);
@@ -2661,7 +2762,8 @@ impl OnboardingBridge {
             env.events()
                 .publish(("AdminTransferCancelled",), (admin.clone(),));
         }
-        env.events().publish(("AdminChanged", admin, new_admin), ());
+        env.events()
+            .publish(("AdminTransferred", admin, new_admin), ());
         Ok(())
     }
 
@@ -2694,7 +2796,10 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         check_not_deactivated(&env)?;
         let pending = read_pending_admin(&env).ok_or(BridgeError::Unauthorized)?;
-        pending.require_auth();
+        if env.ledger().sequence() >= pending.expires_after_ledger {
+            return Err(BridgeError::PendingTransferExpired);
+        }
+        pending.address.require_auth();
         // Issue #1093: a proposal made by a previous admin must not be honoured.
         if read_pending_admin_proposer(&env) != Some(read_admin(&env)) {
             remove_pending_admin(&env);
@@ -2702,14 +2807,15 @@ impl OnboardingBridge {
         }
         extend_instance_ttl(&env);
         let old_admin = read_admin(&env);
-        save_admin(&env, &pending);
+        save_admin(&env, &pending.address);
         remove_pending_admin(&env);
         env.events()
-            .publish(("AdminTransferred", old_admin, pending), ());
+            .publish(("AdminTransferred", old_admin, pending.address), ());
         Ok(())
     }
 
-    pub fn query_pending_admin(env: Env) -> Option<Address> {
+    /// Returns the pending admin proposal, including its expiry ledger.
+    pub fn query_pending_admin(env: Env) -> Option<PendingTransfer> {
         read_pending_admin(&env)
     }
 
@@ -4719,7 +4825,8 @@ impl OnboardingBridge {
     /// * `tx_hash` (`BytesN<32>`) — The 32-byte hash of the source-chain transaction.
     /// * `target` (`Address`) — The Soroban C-address to credit.
     /// * `asset` (`Address`) — Whitelisted token contract address.
-    /// * `amount` (`i128`) — Gross amount (fee is deducted before crediting `target`).
+    /// * `amount` (`i128`) — Gross amount (fee is deducted before crediting
+    ///   `target` and accrued to the fee collector).
     /// * `sigs` (`Vec<RelayerSig>`) — At least `threshold` distinct relayer Ed25519
     ///   signatures over the payload hash (see above).
     ///
@@ -4748,7 +4855,7 @@ impl OnboardingBridge {
     ///   or fewer than `threshold` valid signatures.
     /// * [`BridgeError::InvalidAddress`] — A strkey exceeds `MAX_STRKEY_LEN` (64) bytes.
     /// * [`BridgeError::InsufficientCrossChainReserve`] — The reserve cannot
-    ///   cover `net_amount`.
+    ///   cover the gross `amount`.
     ///
     /// # Events
     ///
@@ -4758,8 +4865,11 @@ impl OnboardingBridge {
     ///
     /// The nonce is derived deterministically from `(chain_id, tx_hash)` and
     /// marked used before the token transfer, preventing replay attacks.
-    /// Cross-chain payouts do not accrue fees: they spend pre-funded reserve
-    /// liquidity rather than depositing tokens in this call.
+    /// The reserve is debited by the gross `amount`; the fee portion is
+    /// credited to `accrued_fees` and `total_fees_collected` so it is
+    /// withdrawable only by the fee collector via `withdraw_fees`, never by the
+    /// admin through `withdraw_crosschain_reserve`. The event reports the same
+    /// `fee` that was accrued.
     /// Ed25519 signatures are verified strictly before the nonce is consumed;
     /// invalid signatures return [`BridgeError::MetaTxInvalidSignature`].
     /// The contract verifies that `sigs` contains distinct pubkeys — a relayer
@@ -4856,18 +4966,21 @@ impl OnboardingBridge {
             return Err(BridgeError::BelowThreshold);
         }
 
+        // Cross-chain payouts spend pre-funded reserve liquidity, so the fee is
+        // charged against the reserve and accrued to the fee collector rather
+        // than left in the reserve for the admin to withdraw.
         let global_fee_bps = read_fee_bps(&env);
         let effective_fee_bps = get_effective_fee_bps(&env, &asset, global_fee_bps);
         let fee = calculate_fee(amount, effective_fee_bps)?;
         let net_amount = safe_math::safe_sub(amount, fee)?;
-        decrement_crosschain_reserve(&env, &asset, net_amount)?;
+        decrement_crosschain_reserve(&env, &asset, amount)?;
         mark_nonce_used(&env, &nonce);
 
         if net_amount > 0 {
             let token_client = token::Client::new(&env, &asset);
             token_client.transfer(&env.current_contract_address(), &target, &net_amount);
         }
-        update_asset_counters_split(&env, &asset, 0, 0, net_amount)?;
+        update_asset_counters_split(&env, &asset, fee, fee, net_amount)?;
         mint_loyalty_tokens(&env, &target, net_amount);
         extend_instance_ttl(&env);
 

@@ -4710,6 +4710,54 @@ mod crosschain_tests {
     }
 
     #[test]
+    fn test_crosschain_fee_accrues_to_fee_collector() {
+        let env = Env::default();
+        let (_bridge_id, token_id, _admin, bridge) = setup(&env);
+
+        let sk = make_signing_key([9u8; 32]);
+        bridge.add_relayer(
+            &BytesN::from_array(&env, sk.verifying_key().as_bytes()),
+            &None,
+        );
+        bridge.set_relayer_threshold(&1u32, &None);
+
+        let target = soroban_sdk::Address::generate(&env);
+        let tx_hash = BytesN::from_array(&env, &[0x5a; 32]);
+        let chain_id: u32 = 1;
+        let amount: i128 = 1000;
+
+        let payload_hash = build_payload_hash(&env, chain_id, &tx_hash, &target, &token_id, amount);
+        let sigs = Vec::from_array(&env, [make_relayer_sig(&env, &sk, &payload_hash)]);
+
+        bridge.fund_c_address_crosschain(&chain_id, &tx_hash, &target, &token_id, &amount, &sigs);
+
+        // 1% fee on 1000 = 10; net = 990.
+        assert_eq!(
+            TestTokenClient::new(&env, &token_id).balance(&target),
+            990i128
+        );
+        assert_eq!(bridge.query_crosschain_reserve(&token_id), 10_000 - 1000);
+        assert_eq!(bridge.query_accrued_fees(&token_id), 10i128);
+        assert_eq!(bridge.query_total_fees_collected(&token_id), 10i128);
+
+        let events = env.events().all();
+        let (contract_id, topics, data) = events.get(events.len() - 1).unwrap();
+        assert_eq!(contract_id, _bridge_id);
+        assert_eq!(
+            topics,
+            (
+                soroban_sdk::Symbol::new(&env, "CrossChainFunded"),
+                target.clone(),
+            )
+                .into_val(&env)
+        );
+        assert_eq!(
+            data,
+            (chain_id, tx_hash.clone(), amount, 10i128, token_id.clone()).into_val(&env)
+        );
+    }
+
+    #[test]
     fn test_crosschain_below_threshold_rejected() {
         let env = Env::default();
         let (_bridge_id, token_id, _admin, bridge) = setup(&env);
@@ -7810,6 +7858,93 @@ fn test_clear_pending_fee_collector_cancels_handoff() {
     bridge.clear_pending_fee_collector(&None);
 
     assert_eq!(bridge.query_pending_fee_collector(), None);
+}
+
+/********** pending transfer expiry tests **********/
+
+#[test]
+fn test_accept_admin_within_window_succeeds() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_admin = Address::generate(&env);
+    bridge.propose_new_admin(&new_admin, &None);
+
+    let pending = bridge.query_pending_admin().unwrap();
+    assert_eq!(pending.address, new_admin);
+    assert!(pending.expires_after_ledger > env.ledger().sequence());
+
+    advance_ledger_sequence(&env, pending.expires_after_ledger - 1);
+    bridge.accept_admin();
+
+    assert_eq!(bridge.query_admin(), new_admin);
+    assert_eq!(bridge.query_pending_admin(), None);
+}
+
+#[test]
+fn test_accept_admin_after_window_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_admin = Address::generate(&env);
+    bridge.propose_new_admin(&new_admin, &None);
+
+    let pending = bridge.query_pending_admin().unwrap();
+    advance_ledger_sequence(&env, pending.expires_after_ledger);
+
+    assert_eq!(
+        bridge.try_accept_admin(),
+        Err(Ok(BridgeError::PendingTransferExpired))
+    );
+    assert_eq!(bridge.query_admin(), admin);
+}
+
+#[test]
+fn test_accept_fee_collector_within_window_succeeds() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_collector = Address::generate(&env);
+    bridge.propose_new_fee_collector(&new_collector, &None);
+
+    let pending = bridge.query_pending_fee_collector().unwrap();
+    assert_eq!(pending.address, new_collector);
+
+    advance_ledger_sequence(&env, pending.expires_after_ledger - 1);
+    bridge.accept_fee_collector();
+
+    assert_eq!(bridge.query_fee_collector(), new_collector);
+    assert_eq!(bridge.query_pending_fee_collector(), None);
+}
+
+#[test]
+fn test_accept_fee_collector_after_window_fails() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+    let new_collector = Address::generate(&env);
+    bridge.propose_new_fee_collector(&new_collector, &None);
+
+    let pending = bridge.query_pending_fee_collector().unwrap();
+    advance_ledger_sequence(&env, pending.expires_after_ledger);
+
+    assert_eq!(
+        bridge.try_accept_fee_collector(),
+        Err(Ok(BridgeError::PendingTransferExpired))
+    );
+    assert_eq!(bridge.query_fee_collector(), fee_collector);
 }
 
 /********** extend_timelock_ttl tests **********/
