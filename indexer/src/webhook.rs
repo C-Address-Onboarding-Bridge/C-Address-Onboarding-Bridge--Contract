@@ -197,6 +197,22 @@ pub struct CreatedSubscription {
     pub created_at: String,
 }
 
+impl From<Subscription> for CreatedSubscription {
+    fn from(sub: Subscription) -> Self {
+        Self {
+            id: sub.id,
+            url: sub.url,
+            event_type: sub.event_type,
+            asset_filter: sub.asset_filter,
+            source_filter: sub.source_filter,
+            target_filter: sub.target_filter,
+            active: sub.active,
+            secret: sub.secret,
+            created_at: sub.created_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookDelivery {
     pub id: String,

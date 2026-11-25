@@ -164,7 +164,7 @@ impl Database {
         let inserted = result.rows_affected() > 0;
 
         if inserted {
-            Self::queue_webhook_deliveries_tx(&mut tx, event).await?;
+            Self::queue_webhook_deliveries_tx(&mut tx, event, None).await?;
         }
 
         tx.commit().await?;
@@ -175,10 +175,14 @@ impl Database {
     /// [`Database::queue_webhook_deliveries`], but run against an open
     /// transaction so callers can commit it atomically alongside another
     /// write (see [`Database::insert_event_and_queue_deliveries`]).
+    ///
+    /// `only_subscription` restricts matching to a single subscription id.
+    /// Returns the number of deliveries inserted.
     async fn queue_webhook_deliveries_tx(
         tx: &mut Transaction<'_, Sqlite>,
         event: &IndexedEvent,
-    ) -> Result<(), sqlx::Error> {
+        only_subscription: Option<&str>,
+    ) -> Result<u64, sqlx::Error> {
         let subs: Vec<SubscriptionRow> = sqlx::query_as(
             "SELECT id, url, event_type, asset_filter, source_filter, target_filter, active, secret, created_at
              FROM subscriptions WHERE active = 1",
@@ -188,10 +192,16 @@ impl Database {
 
         let now = chrono::Utc::now().to_rfc3339();
         let data = &event.data;
+        let mut enqueued = 0u64;
 
         for (sub_id, _url, event_type, asset_filter, source_filter, target_filter, _active, _secret, _created_at) in
             subs
         {
+            if let Some(only) = only_subscription {
+                if only != sub_id {
+                    continue;
+                }
+            }
             if let Some(ref et) = event_type {
                 if et != &event.event_type {
                     continue;
@@ -218,8 +228,9 @@ impl Database {
             .bind(&now)
             .execute(&mut *tx)
             .await?;
+            enqueued += 1;
         }
-        Ok(())
+        Ok(enqueued)
     }
 
     pub async fn list_events(
@@ -406,6 +417,65 @@ impl Database {
         Ok(())
     }
 
+    /// Re-queues webhook deliveries for already-indexed events.
+    ///
+    /// Selects events by id (`event_ids`) and/or by ledger range
+    /// (`from_ledger`, ascending, capped at `limit`), then inserts a fresh
+    /// `pending` delivery for every active subscription that matches each
+    /// event -- all inside one transaction. Matching uses the same
+    /// fail-closed filter rules as [`Database::queue_webhook_deliveries`].
+    ///
+    /// Returns the number of deliveries enqueued, or `None` when `event_ids`
+    /// was non-empty but some of those ids are not indexed (nothing is
+    /// written in that case).
+    pub async fn enqueue_replay(
+        &self,
+        event_ids: &[String],
+        from_ledger: Option<i64>,
+        limit: i64,
+        subscription_id: Option<&str>,
+    ) -> Result<Option<u64>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+
+        let mut events: Vec<IndexedEvent> = Vec::new();
+        if !event_ids.is_empty() {
+            for id in event_ids {
+                let row: Option<(String, String, i64, String, String, String, String)> =
+                    sqlx::query_as(
+                        "SELECT id, event_type, ledger_sequence, contract_id, tx_hash, timestamp, data
+                         FROM events WHERE id = ?1",
+                    )
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                match row {
+                    Some(row) => events.push(row_to_event(row)),
+                    None => return Ok(None),
+                }
+            }
+        } else if let Some(from_ledger) = from_ledger {
+            let rows: Vec<(String, String, i64, String, String, String, String)> =
+                sqlx::query_as(
+                    "SELECT id, event_type, ledger_sequence, contract_id, tx_hash, timestamp, data
+                     FROM events WHERE ledger_sequence >= ?1
+                     ORDER BY ledger_sequence ASC LIMIT ?2",
+                )
+                .bind(from_ledger)
+                .bind(limit)
+                .fetch_all(&mut *tx)
+                .await?;
+            events = rows.into_iter().map(row_to_event).collect();
+        }
+
+        let mut enqueued = 0u64;
+        for event in &events {
+            enqueued += Self::queue_webhook_deliveries_tx(&mut tx, event, subscription_id).await?;
+        }
+
+        tx.commit().await?;
+        Ok(Some(enqueued))
+    }
+
     pub async fn get_pending_deliveries(&self) -> Result<Vec<WebhookDelivery>, sqlx::Error> {
         let now = chrono::Utc::now().to_rfc3339();
         let rows: Vec<WebhookDeliveryRow> =
@@ -419,32 +489,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(
-                |(
-                    id,
-                    subscription_id,
-                    event_id,
-                    status,
-                    attempts,
-                    next_retry_at,
-                    last_error,
-                    created_at,
-                )| {
-                    WebhookDelivery {
-                        id,
-                        subscription_id,
-                        event_id,
-                        status,
-                        attempts,
-                        next_retry_at,
-                        last_error,
-                        created_at,
-                    }
-                },
-            )
-            .collect())
+        Ok(rows.into_iter().map(row_to_delivery).collect())
     }
 
     pub async fn mark_delivery_success(&self, id: &str) -> Result<(), sqlx::Error> {
@@ -505,6 +550,27 @@ impl Database {
         Ok(row.map(|(secret,)| secret))
     }
 
+    /// Replaces the signing secret of an active subscription and returns the
+    /// new secret. Returns `None` when no active subscription has that id.
+    pub async fn rotate_subscription_secret(
+        &self,
+        id: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let secret = uuid::Uuid::new_v4().to_string();
+        let result = sqlx::query(
+            "UPDATE subscriptions SET secret = ?2 WHERE id = ?1 AND active = 1",
+        )
+        .bind(id)
+        .bind(&secret)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(secret))
+    }
+
     pub async fn get_event_by_id(&self, id: &str) -> Result<Option<IndexedEvent>, sqlx::Error> {
         let row: Option<(String, String, i64, String, String, String, String)> = sqlx::query_as(
             "SELECT id, event_type, ledger_sequence, contract_id, tx_hash, timestamp, data
@@ -517,73 +583,38 @@ impl Database {
         Ok(row.map(row_to_event))
     }
 
+    /// Lists webhook deliveries, newest first, optionally filtered by status.
     pub async fn list_deliveries(
         &self,
         status: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<WebhookDelivery>, sqlx::Error> {
-        let rows: Vec<WebhookDeliveryRow> = match status {
-            Some(s) => {
-                sqlx::query_as(
-                    "SELECT id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at
-                     FROM webhook_deliveries
-                     WHERE status = ?1
-                     ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
-                )
-                .bind(s)
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            None => {
-                sqlx::query_as(
-                    "SELECT id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at
-                     FROM webhook_deliveries
-                     ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
-                )
-                .bind(limit)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await?
-            }
-        };
+        let rows: Vec<WebhookDeliveryRow> = sqlx::query_as(
+            "SELECT id, subscription_id, event_id, status, attempts, next_retry_at, last_error, created_at
+             FROM webhook_deliveries
+             WHERE (?1 IS NULL OR status = ?1)
+             ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+        )
+        .bind(status)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
 
-        Ok(rows
-            .into_iter()
-            .map(
-                |(
-                    id,
-                    subscription_id,
-                    event_id,
-                    status,
-                    attempts,
-                    next_retry_at,
-                    last_error,
-                    created_at,
-                )| {
-                    WebhookDelivery {
-                        id,
-                        subscription_id,
-                        event_id,
-                        status,
-                        attempts,
-                        next_retry_at,
-                        last_error,
-                        created_at,
-                    }
-                },
-            )
-            .collect())
+        Ok(rows.into_iter().map(row_to_delivery).collect())
     }
 
+    /// Re-queues a dead delivery so the worker picks it up again.
+    ///
+    /// Only rows with `status = 'dead'` are touched; a delivered or pending
+    /// row is left alone. Returns `true` when a row changed.
     pub async fn retry_delivery(&self, id: &str) -> Result<bool, sqlx::Error> {
         let now = chrono::Utc::now().to_rfc3339();
         let result = sqlx::query(
             "UPDATE webhook_deliveries
-             SET status = 'pending', next_retry_at = ?2, attempts = 0
-             WHERE id = ?1",
+             SET status = 'pending', next_retry_at = ?2, attempts = 0, last_error = NULL
+             WHERE id = ?1 AND status = 'dead'",
         )
         .bind(id)
         .bind(&now)
@@ -591,6 +622,16 @@ impl Database {
         .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Returns the status of a delivery, or `None` when no such row exists.
+    pub async fn get_delivery_status(&self, id: &str) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM webhook_deliveries WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(status,)| status))
     }
 
     pub async fn get_stats(&self) -> Result<serde_json::Value, sqlx::Error> {
@@ -634,6 +675,30 @@ impl Database {
             "last_indexed_ledger": last_ledger,
             "event_counts": counts,
         }))
+    }
+}
+
+fn row_to_delivery(
+    (
+        id,
+        subscription_id,
+        event_id,
+        status,
+        attempts,
+        next_retry_at,
+        last_error,
+        created_at,
+    ): WebhookDeliveryRow,
+) -> WebhookDelivery {
+    WebhookDelivery {
+        id,
+        subscription_id,
+        event_id,
+        status,
+        attempts,
+        next_retry_at,
+        last_error,
+        created_at,
     }
 }
 

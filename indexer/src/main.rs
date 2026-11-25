@@ -66,7 +66,13 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
             get(list_subscriptions).post(create_subscription),
         )
         .route("/api/subscriptions/:id", delete(delete_subscription))
+        .route(
+            "/api/subscriptions/:id/rotate-secret",
+            post(rotate_subscription_secret),
+        )
         .route("/api/replay", post(replay_events))
+        .route("/api/deliveries", get(list_deliveries))
+        .route("/api/deliveries/:id/retry", post(retry_delivery))
 }
 
 pub fn build_app(state: Arc<AppState>) -> Router {
@@ -253,10 +259,10 @@ async fn health() -> impl IntoResponse {
 
 async fn list_events(
     State(state): State<Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<EventQuery>,
+    axum::extract::Query(params): axum::extract::Query<events::EventQuery>,
 ) -> impl IntoResponse {
-    let limit = params.limit.unwrap_or(50).min(500);
-    let offset = params.offset.unwrap_or(0);
+    let limit = events::clamp_limit(params.limit, 50);
+    let offset = events::clamp_offset(params.offset);
     match state.db.list_events(limit, offset).await {
         Ok(events) => Json(events).into_response(),
         Err(e) => {
@@ -269,10 +275,10 @@ async fn list_events(
 async fn list_events_by_type(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(event_type): axum::extract::Path<String>,
-    axum::extract::Query(params): axum::extract::Query<EventQuery>,
+    axum::extract::Query(params): axum::extract::Query<events::EventQuery>,
 ) -> impl IntoResponse {
-    let limit = params.limit.unwrap_or(50).min(500);
-    let offset = params.offset.unwrap_or(0);
+    let limit = events::clamp_limit(params.limit, 50);
+    let offset = events::clamp_offset(params.offset);
     match state
         .db
         .list_events_by_type(&event_type, limit, offset)
@@ -319,7 +325,11 @@ async fn create_subscription(
         .create_subscription(&body.url, &body.event_types)
         .await
     {
-        Ok(sub) => (StatusCode::CREATED, Json(sub)).into_response(),
+        Ok(sub) => (
+            StatusCode::CREATED,
+            Json(webhook::CreatedSubscription::from(sub)),
+        )
+            .into_response(),
         Err(e) => {
             tracing::error!("failed to create subscription: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
@@ -341,12 +351,46 @@ async fn delete_subscription(
     }
 }
 
+async fn rotate_subscription_secret(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.db.rotate_subscription_secret(&id).await {
+        Ok(Some(secret)) => Json(serde_json::json!({ "id": id, "secret": secret })).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Err(e) => {
+            tracing::error!("failed to rotate subscription secret: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+        }
+    }
+}
+
 async fn replay_events(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ReplayBody>,
 ) -> impl IntoResponse {
-    match state.db.enqueue_replay(&body.event_ids).await {
-        Ok(count) => Json(serde_json::json!({ "enqueued": count })).into_response(),
+    let has_ids = !body.event_ids.is_empty();
+    if !has_ids && body.from_ledger.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "provide event_ids or from_ledger",
+        )
+            .into_response();
+    }
+
+    let limit = events::clamp_limit(body.limit, 50);
+    match state
+        .db
+        .enqueue_replay(
+            &body.event_ids,
+            body.from_ledger,
+            limit,
+            body.subscription_id.as_deref(),
+        )
+        .await
+    {
+        Ok(Some(count)) => Json(serde_json::json!({ "enqueued": count })).into_response(),
+        Ok(None) => (StatusCode::BAD_REQUEST, "unknown event id").into_response(),
         Err(e) => {
             tracing::error!("failed to enqueue replay: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
@@ -354,10 +398,175 @@ async fn replay_events(
     }
 }
 
-#[derive(serde::Deserialize)]
-struct EventQuery {
-    limit: Option<i64>,
-    offset: Option<i64>,
+async fn list_deliveries(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<DeliveryQuery>,
+) -> impl IntoResponse {
+    let limit = events::clamp_limit(params.limit, 50);
+    let offset = events::clamp_offset(params.offset);
+    match state
+        .db
+        .list_deliveries(params.status.as_deref(), limit, offset)
+        .await
+    {
+        Ok(deliveries) => Json(deliveries).into_response(),
+        Err(e) => {
+            tracing::error!("failed to list deliveries: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+        }
+    }
+}
+
+async fn retry_delivery(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match state.db.retry_delivery(&id).await {
+        Ok(true) => Json(serde_json::json!({ "id": id, "status": "pending" })).into_response(),
+        Ok(false) => match state.db.get_delivery_status(&id).await {
+            Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
+            Ok(Some(_)) => (
+                StatusCode::CONFLICT,
+                "only dead deliveries can be retried",
+            )
+                .into_response(),
+            Err(e) => {
+                tracing::error!("failed to look up delivery: {e}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+            }
+        },
+        Err(e) => {
+            tracing::error!("failed to retry delivery: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    const TEST_API_KEY: &str = "test-api-key";
+
+    async fn test_app() -> Router {
+        let db = db::Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        for i in 0..3 {
+            db.insert_event(&events::IndexedEvent {
+                id: format!("evt-{i}"),
+                event_type: "CAddressFunded".to_string(),
+                ledger_sequence: i,
+                contract_id: "C...".to_string(),
+                tx_hash: format!("tx-{i}"),
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+                data: serde_json::json!({}),
+            })
+            .await
+            .expect("insert event");
+        }
+        build_app(Arc::new(AppState {
+            db,
+            rpc_url: String::new(),
+            contract_id: String::new(),
+            rpc_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::new(),
+            api_key_hash: sha256_hex(TEST_API_KEY),
+            lookback_ledgers: 0,
+        }))
+    }
+
+    /// Builds an app whose database holds one dead and one delivered delivery.
+    async fn test_app_with_deliveries() -> Router {
+        let db = db::Database::new("sqlite::memory:").await;
+        db.migrate().await;
+        let sub = db
+            .create_subscription("https://example.com/hook", &[])
+            .await
+            .expect("create subscription");
+        db.insert_event(&events::IndexedEvent {
+            id: "evt-0".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 0,
+            contract_id: "C...".to_string(),
+            tx_hash: "tx-0".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({}),
+        })
+        .await
+        .expect("insert event");
+        db.insert_event_and_queue_deliveries(&events::IndexedEvent {
+            id: "evt-1".to_string(),
+            event_type: "CAddressFunded".to_string(),
+            ledger_sequence: 1,
+            contract_id: "C...".to_string(),
+            tx_hash: "tx-1".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            data: serde_json::json!({}),
+        })
+        .await
+        .expect("insert event");
+
+        let deliveries = db
+            .list_deliveries(None, 10, 0)
+            .await
+            .expect("list deliveries");
+        assert_eq!(deliveries.len(), 1);
+        let id = deliveries[0].id.clone();
+        db.mark_delivery_dead(&id, "boom").await.expect("mark dead");
+        let _ = sub;
+        build_app(Arc::new(AppState {
+            db,
+            rpc_url: String::new(),
+            contract_id: String::new(),
+            rpc_client: reqwest::Client::new(),
+            webhook_client: reqwest::Client::new(),
+            api_key_hash: sha256_hex(TEST_API_KEY),
+            lookback_ledgers: 0,
+        }))
+    }
+
+    fn authorized(method: Method, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {TEST_API_KEY}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn get_events(uri: &str) -> Vec<serde_json::Value> {
+        let response = test_app()
+            .await
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .expect("request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        serde_json::from_slice(&body).expect("json")
+    }
+
+    #[tokio::test]
+    async fn list_events_clamps_negative_limit() {
+        let events = get_events("/api/events?limit=-1").await;
+        assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_events_clamps_oversized_limit() {
+        let events = get_events("/api/events?limit=100000").await;
+        assert!(events.len() <= events::MAX_PAGE_LIMIT as usize);
+    }
+
+    #[tokio::test]
+    async fn list_events_clamps_negative_offset() {
+        let events = get_events("/api/events?offset=-5").await;
+        assert_eq!(events.len(), 3);
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -368,6 +577,24 @@ struct CreateSubscriptionBody {
 }
 
 #[derive(serde::Deserialize)]
+struct DeliveryQuery {
+    /// Filter by delivery status (e.g. `dead`, `pending`, `delivered`).
+    status: Option<String>,
+    /// Clamped like the list endpoints (1..=MAX_PAGE_LIMIT).
+    limit: Option<i64>,
+    /// Clamped to be non-negative.
+    offset: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
 struct ReplayBody {
-    event_ids: Vec<i64>,
+    /// Hex event ids to re-deliver.
+    #[serde(default)]
+    event_ids: Vec<String>,
+    /// Re-deliver indexed events at or after this ledger (ascending).
+    from_ledger: Option<i64>,
+    /// Clamped like the list endpoints (1..=MAX_PAGE_LIMIT).
+    limit: Option<i64>,
+    /// Restrict re-delivery to a single subscription.
+    subscription_id: Option<String>,
 }
