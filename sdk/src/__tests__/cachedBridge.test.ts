@@ -397,4 +397,26 @@ describe('CachedContractClient', () => {
     expect(await otherWrapper.getFee()).toBe(75);
     expect(mockProvider.simulateTransaction).toHaveBeenCalledTimes(2);
   });
+
+  it.each([
+    ['an empty route', [] as string[]],
+    ['a two-pool route', ['CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4', 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4']],
+  ])('fundCAddressWithSwap rejects %s before any RPC call', async (_label, swapRoute) => {
+    const result = await wrapper.client.fundCAddressWithSwap(
+      {
+        source: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+        target: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4',
+        sourceAsset: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4',
+        targetAsset: 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4',
+        sourceAmount: '1000',
+        minTargetAmount: '900',
+        swapRoute,
+      },
+      mockKeypair,
+    );
+
+    expect(result.status).toBe('failed');
+    expect(result.error).toMatch(/MultiHopNotSupported/);
+    expect(mockProvider.getAccount).not.toHaveBeenCalled();
+  });
 });

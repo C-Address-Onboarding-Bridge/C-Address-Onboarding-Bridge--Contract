@@ -8,7 +8,7 @@ import {
   BridgeConfig,
   TransactionResult,
 } from './types';
-import { assertAccountAddress, assertContractAddress } from './validate';
+import { assertAccountAddress, assertContractAddress, assertSingleHopSwapRoute } from './validate';
 import { withRpcRetry } from './retry';
 import {
   rpc,
@@ -325,6 +325,13 @@ class ContractClient {
   }
 
   async fundCAddressWithSwap(options: any, sourceKeypair: Keypair): Promise<TransactionResult> {
+    // The contract only supports single-hop swaps; reject other route lengths
+    // before any RPC call instead of failing on-chain with MultiHopNotSupported.
+    try {
+      assertSingleHopSwapRoute(options.swapRoute);
+    } catch (error: any) {
+      return { hash: '', status: 'failed', error: error.message };
+    }
     assertAccountAddress(options.source, 'source');
     assertContractAddress(options.target, 'target');
     assertContractAddress(options.sourceAsset, 'sourceAsset');

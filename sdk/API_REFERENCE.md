@@ -12,6 +12,7 @@ This document provides a comprehensive API reference for all exported classes, i
    - [InMemoryCache](#inmemorycache)
    - [EventSubscriber](#eventsubscriber)
 2. [Functions](#functions)
+   - [Meta-transaction Helpers](#meta-transaction-helpers)
    - [Retry Utilities](#retry-utilities)
    - [Observability Helpers](#observability-helpers)
 3. [Constants](#constants)
@@ -54,30 +55,66 @@ This document provides a comprehensive API reference for all exported classes, i
 
 Main entry point for interacting with the deployed Onboarding Bridge Soroban contract.
 
-Admin-authorized state-changing contract methods accept an optional final
-`nonce: Option<u64>` ABI argument. Pass `undefined` in SDK methods that expose
-the nonce to send `void` and use Stellar transaction replay protection; pass a
-sequential value to enforce per-admin ordering. For direct Soroban calls, append
-this argument to each of these methods:
+State-changing contract methods that take an optional final
+`nonce: Option<u64>` argument are listed below. The list was taken from the
+signatures in
+[`contracts/onboarding-bridge/src/lib.rs`](../contracts/onboarding-bridge/src/lib.rs),
+which remains the authoritative source. Pass `undefined` (or `void` in a
+direct Soroban call) to skip nonce enforcement and rely on Stellar's
+transaction sequence-number replay protection. Pass a sequential value to
+enforce per-caller ordering. For `withdraw_fees` the nonce belongs to the fee
+collector; for the others it belongs to the admin, except `initialize`, which
+runs before any admin exists.
 
-| Contract method | Arguments before nonce |
-|---|---|
-| `set_loyalty_token` | `token, amount_per_fund` |
-| `set_fee_tiers` | `tiers` |
-| `remove_relayer` | `pubkey` |
-| `set_relayer_threshold` | `threshold` |
-| `extend_instance_ttl` | `ttl` |
-| `extend_persistent_ttl` | `key_asset, ttl` |
-| `extend_source_persistent_ttl` | `source, asset, ttl` |
-| `set_max_instance_ttl` | `ttl` |
-| `set_max_persistent_ttl` | `ttl` |
-| `set_meta_tx_network_id` | `network_id` |
+| Contract method | Arguments before nonce | SDK method exposing the nonce |
+|---|---|---|
+| `initialize` | `admin, fee_collector, fee_bps` | — |
+| `set_fee_bps` | `new_fee_bps` | `setFee` |
+| `set_source_daily_limit` | `source, asset, limit_amount` | — |
+| `set_asset_fee_cap` | `asset, max_fee_bps` | — |
+| `set_fee_collector` | `new_fee_collector` | `setFeeCollector` |
+| `propose_new_fee_collector` | `new_collector` | `proposeNewFeeCollector` |
+| `set_admin` | `new_admin` | `setAdmin` |
+| `propose_new_admin` | `new_admin` | `proposeNewAdmin` |
+| `clear_pending_admin` | — | — |
+| `clear_pending_fee_collector` | — | — |
+| `set_minimum_amount` | `amount` | — |
+| `withdraw_fees` | `asset, amount` | `withdrawFees` (`options.nonce`) |
+| `set_max_withdraw_per_tx` | `amount` | — |
+| `set_referral_rate` | `bps` | `setReferralRate` |
+| `pause` | — | — |
+| `unpause` | — | — |
+| `upgrade` | `new_wasm_hash` | `upgrade` (`options.nonce`) |
+| `schedule_upgrade` | `new_wasm_hash` | `scheduleUpgrade` (`options.nonce`) |
+| `execute_upgrade` | `expected_hash` | `executeUpgrade` (`options.nonce`) |
+| `cancel_upgrade` | — | `cancelUpgrade` (`options.nonce`) |
+| `emergency_migrate` | `new_contract, migrate_data` | — |
+| `add_to_blocklist` | `address` | — |
+| `remove_from_blocklist` | `address` | — |
+| `add_to_allowlist` | `address` | — |
+| `remove_from_allowlist` | `address` | — |
+| `set_allowlist_mode` | `enabled` | — |
+| `reclaim_tokens` | `asset, amount, destination` | `reclaimTokens` (`options.nonce`) |
+| `add_asset` | `asset` | — |
+| `remove_asset` | `asset` | — |
+| `add_swap_pool` | `pool` | — |
+| `remove_swap_pool` | `pool` | — |
+| `set_loyalty_token` | `token, amount_per_fund` | `setLoyaltyToken` |
+| `set_fee_tiers` | `tiers` | `setFeeTiers` |
+| `add_relayer` | `pubkey` | `addRelayer` (`options.nonce`) |
+| `remove_relayer` | `pubkey` | `removeRelayer` (`options.nonce`) |
+| `set_relayer_threshold` | `threshold` | `setRelayerThreshold` |
+| `extend_instance_ttl` | `ttl` | — |
+| `extend_persistent_ttl` | `key_asset, ttl` | — |
+| `extend_source_persistent_ttl` | `source, asset, ttl` | — |
+| `set_max_instance_ttl` | `ttl` | — |
+| `set_max_persistent_ttl` | `ttl` | — |
 
-The SDK exposes nonce parameters on `setLoyaltyToken`, `setFeeTiers`,
-`removeRelayer` (in `RelayerManagementOptions`), and `setRelayerThreshold`.
-The six TTL and network-ID methods in the table do not have SDK convenience
-wrappers; call them through the contract client with the listed arguments
-followed by the optional nonce.
+The SDK exposes the nonce on the 17 methods named in the last column. It is
+either a trailing `nonce?` parameter or, where marked, a `nonce` field on the
+options object. The remaining 24 contract methods have no SDK wrapper that
+accepts a nonce. Call them through the contract client with the listed
+arguments followed by the optional nonce.
 
 #### Constructor
 
@@ -113,7 +150,7 @@ async fundCAddressWithSwap(
   sourceKeypair: any
 ): Promise<TransactionResult>
 ```
-Funds a C-address by first swapping a source asset to a target asset via DEX pools, deducting the fee, and forwarding the remaining net amount.
+Funds a C-address by first swapping a source asset to a target asset through a single DEX pool, deducting the fee, and forwarding the remaining net amount. The contract only supports single-hop swaps: `swapRoute` must contain exactly one whitelisted pool. Any other length returns `status: 'failed'` (naming `MultiHopNotSupported`) before any RPC call, instead of failing on-chain with `Error(Contract, #43)` after the fee is paid. `CachedContractClient.client.fundCAddressWithSwap` applies the same check.
 - **Parameters**:
   - `options`: [`FundCAddressWithSwapOptions`](#fundcaddresswithswapoptions)
   - `sourceKeypair`: `Keypair`
@@ -152,6 +189,82 @@ async commitFundAndWait(
 Submits a commit-reveal funding commitment and waits for the transaction to
 reach `SUCCESS` or `FAILED`. On success, `commitmentId` is decoded from the
 contract return value and can be passed to `revealFund` or `cancelCommitment`.
+
+##### `cancelCommitment`
+```ts
+async cancelCommitment(
+  commitmentId: string | number | bigint,
+  sourceKeypair: Keypair
+): Promise<TransactionResult>
+```
+Cancels an unrevealed commitment by calling `cancel_commitment(commitment_id: u64)`,
+which removes its persistent entry. Only the commitment's `source` can cancel
+(`source.require_auth()`), so `sourceKeypair` must be that account. Cancelling
+is allowed after the reveal deadline, so this is how a commitment that hit
+`CommitmentExpired` gets cleaned up.
+- **Parameters**:
+  - `commitmentId`: `string | number | bigint` — ID from [`commitFundAndWait`](#commitfundandwait). Must fit a `u64`.
+  - `sourceKeypair`: `Keypair` — the committing source account.
+- **Returns**: `Promise<TransactionResult>`. Errors follow the usual pattern: `status: 'failed'` with `error`.
+- **Contract errors**: `CommitmentNotFound` (#30), `CommitmentAlreadyRevealed` (#31).
+
+##### `registerMetaSigner`
+```ts
+async registerMetaSigner(
+  source: string,
+  pubkeyHex: string,
+  sourceKeypair: Keypair
+): Promise<TransactionResult>
+```
+Binds a 32-byte Ed25519 public key to `source` (`register_meta_signer`).
+[`executeMetaFund`](#executemetafund) rejects every call with
+`MetaTxPubkeySourceMismatch` (#49) until the signing key is registered here.
+Requires `source` auth.
+
+##### `unregisterMetaSigner`
+```ts
+async unregisterMetaSigner(source: string, sourceKeypair: Keypair): Promise<TransactionResult>
+```
+Removes the key bound to `source` (`unregister_meta_signer`). Later meta-funds
+for `source` fail until a new key is registered. Requires `source` auth.
+
+##### `queryMetaSigner`
+```ts
+async queryMetaSigner(source: string): Promise<string | null>
+```
+Returns the registered public key as hex, or `null` when none is registered (`query_meta_signer`).
+
+##### `isMetaTxNonceUsed`
+```ts
+async isMetaTxNonceUsed(source: string, nonce: string | number | bigint): Promise<boolean>
+```
+Returns `true` if `nonce` has already been consumed for `source` (`query_meta_tx_nonce_used`).
+
+##### `executeMetaFund`
+```ts
+async executeMetaFund(
+  options: ExecuteMetaFundOptions,
+  relayerKeypair: Keypair
+): Promise<TransactionResult>
+```
+Submits a user-signed meta-fund as a relayer (`execute_meta_fund`). It
+succeeds only when all of these hold:
+1. **Registered signer**: `options.pubkey` is the key `params.source` registered with [`registerMetaSigner`](#registermetasigner).
+2. **Allowance**: `params.source` has approved the bridge contract on `params.asset` for at least `params.amount`, through the token's `approve(source, bridgeContractId, amount, expirationLedger)`. The bridge pulls funds with `transfer_from`, so the relayer's transaction carries no auth from the source.
+3. **Signature**: `options.signature` signs the payload from [`computeMetaFundPayload`](#computemetafundpayload). [`signMetaFund`](#signmetafund) returns `pubkey` and `signature` together.
+4. `params.nonce` is unused, `params.deadline` has not passed, and `params.networkId` equals the ledger's network id (SHA-256 of the passphrase).
+- **Example**:
+```ts
+import { signMetaFund } from '@stellar/c-address-onboarding-bridge-sdk';
+
+// One-time setup, signed by the user:
+await sdk.registerMetaSigner(user.publicKey(), user.rawPublicKey().toString('hex'), user);
+// ...plus a token approve() of the bridge for the amount.
+
+const params = { networkId, source: user.publicKey(), target, asset, amount: '500', nonce: 0, deadline };
+const { pubkey, signature } = signMetaFund(params, contractId, user);
+await sdk.executeMetaFund({ params, pubkey, signature }, relayerKeypair);
+```
 
 ##### `fundCAddressTimelockedAndWait`
 ```ts
@@ -801,6 +914,32 @@ subscriber.destroy();
 
 ## Functions
 
+### Meta-transaction Helpers
+
+##### `computeMetaFundPayload`
+```ts
+function computeMetaFundPayload(params: MetaFundParams, contractId: string): Buffer
+```
+Returns the 32-byte hash that `execute_meta_fund` verifies, built exactly as
+the contract builds it:
+```text
+sha256("meta_fund" || network_id || sha256(contract_strkey) ||
+       sha256(source_strkey) || sha256(target_strkey) || sha256(asset_strkey) ||
+       amount_be16 || nonce_be8 || deadline_be8)
+```
+`params.networkId` is the hex SHA-256 of the network passphrase. Throws on a
+malformed `networkId`, a non-positive or oversized `amount`, or a `nonce` /
+`deadline` outside `u64`. A fixed vector is shared with the contract test
+`test_meta_fund_payload_matches_sdk_vector`.
+
+##### `signMetaFund`
+```ts
+function signMetaFund(params: MetaFundParams, contractId: string, keypair: Keypair): SignedMetaFund
+```
+Signs the payload with `keypair` and returns `{ payloadHash, pubkey, signature }`
+as hex strings, ready to pass to [`executeMetaFund`](#executemetafund). The
+`pubkey` must already be registered via [`registerMetaSigner`](#registermetasigner).
+
 ### Retry Utilities
 
 Exported from the SDK root for use with any async operation, not just SDK calls.
@@ -1043,7 +1182,7 @@ Input details for swap-and-bridge operations.
 | `targetAsset` | `string` | Token contract address the target receives. |
 | `sourceAmount` | `string` | Raw input amount of the source asset. |
 | `minTargetAmount` | `string` | Minimum acceptable amount of the target asset (slippage limit). |
-| `swapRoute` | `string[]` | Ordered array of DEX pool contract addresses. |
+| `swapRoute` | `string[]` | Exactly one whitelisted DEX pool contract address. Multi-hop routes are not supported; any other length is rejected with `MultiHopNotSupported`. |
 
 ---
 
@@ -1287,6 +1426,7 @@ Catch-all for contract events without a dedicated type.
 The SDK performs frontend validation on Stellar address inputs using the following functions:
 - `assertAccountAddress(address: string, field: string)`: Validates that the input is a valid Stellar G-address (ed25519 public key). Throws if validation fails.
 - `assertContractAddress(address: string, field: string)`: Validates that the input is a valid Stellar contract C-address. Throws if validation fails.
+- `assertSingleHopSwapRoute(route: string[])`: Throws unless `route` has exactly one entry; the contract rejects other lengths with `MultiHopNotSupported` (#43).
 
 ---
 

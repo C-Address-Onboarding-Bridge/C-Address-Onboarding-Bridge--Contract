@@ -60,10 +60,23 @@
  * @packageDocumentation
  */
 
-export { OnboardingBridgeSDK, BATCH_TX_LIMIT, BASE_RESERVE_STROOPS, computeCommitmentHash } from './bridge';
-export type { CommitmentHashOptions } from './bridge';
+export {
+  OnboardingBridgeSDK,
+  BATCH_TX_LIMIT,
+  BASE_RESERVE_STROOPS,
+  computeCommitmentHash,
+  computeMetaFundPayload,
+  signMetaFund,
+} from './bridge';
+export type { CommitmentHashOptions, SignedMetaFund } from './bridge';
 export { OffRampIntegration } from './offramp';
-export { assertAccountAddress, assertAddress, assertContractAddress, assertRelayerPubkey } from './validate';
+export {
+  assertAccountAddress,
+  assertAddress,
+  assertContractAddress,
+  assertRelayerPubkey,
+  assertSingleHopSwapRoute,
+} from './validate';
 export { CachedContractClient } from './cachedBridge';
 export type { CacheOptions, CacheKey } from './cachedBridge';
 export { InMemoryCache } from './cache';
