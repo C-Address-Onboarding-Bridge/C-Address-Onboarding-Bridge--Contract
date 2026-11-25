@@ -403,6 +403,9 @@ fn bench_admin_setters() {
     measure(&env, "set_max_withdraw_per_tx", || {
         bridge.set_max_withdraw_per_tx(&500i128, &None);
     });
+    measure(&env, "set_max_withdraw_per_window", || {
+        bridge.set_max_withdraw_per_window(&5_000i128, &None);
+    });
     measure(&env, "set_source_daily_limit", || {
         bridge.set_source_daily_limit(&new_addr, &token_id, &10_000i128, &None);
     });

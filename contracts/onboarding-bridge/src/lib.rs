@@ -133,7 +133,8 @@ pub enum BridgeError {
     UpgradeTimelockActive = 27,
     /// The scheduled upgrade's execution window has elapsed.
     UpgradeTimelockExpired = 50,
-    // Issue #23: max withdraw per tx
+    /// A fee withdrawal exceeds the per-call cap or the rolling-window cap
+    /// configured by `set_max_withdraw_per_window`.
     WithdrawExceedsLimit = 28,
     /// An arithmetic operation overflowed i128 bounds.
     Overflow = 29,
@@ -187,7 +188,9 @@ pub enum BridgeError {
     UpgradeAlreadyScheduled = 53,
     /// The supplied 32-byte value is not a valid (non-weak) Ed25519 public key.
     InvalidPubkey = 54,
-    // Next free discriminant: 55. Always take the next unused value here and
+    /// The effective fee exceeds the caller-supplied `max_fee_bps` cap.
+    FeeExceedsMaxFeeBps = 55,
+    // Next free discriminant: 56. Always take the next unused value here and
     // never renumber an existing variant — clients match on these values.
 }
 
@@ -243,6 +246,9 @@ pub enum DataKey {
     PendingFeeCollectorProposer,
     // Issue #23: max withdraw per tx
     MaxWithdrawPerTx,
+    // Issue #1088: rolling-window withdrawal cap and per-asset usage
+    MaxWithdrawPerWindow,
+    WithdrawWindowUsage(Address),
     // Issue #24: reentrancy guard flag
     Entered,
     // Minimum transfer amount for funded transfers
@@ -307,6 +313,8 @@ const MAX_TIMELOCK_DELAY_SECONDS: u64 = 10 * 365 * 86_400;
 /// Grace period after `release_time` during which only `target` may claim a
 /// timelock. Once it elapses, `source` may reclaim the unclaimed entry.
 const RECLAIM_GRACE_SECONDS: u64 = 365 * 86_400;
+/// Length of the rolling window used by `max_withdraw_per_window` (24 h).
+const WITHDRAW_WINDOW_SECONDS: u64 = 86_400;
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -579,6 +587,38 @@ fn read_max_withdraw_per_tx(env: &Env) -> i128 {
         .instance()
         .get(&DataKey::MaxWithdrawPerTx)
         .unwrap_or(0)
+}
+
+fn save_max_withdraw_per_window(env: &Env, amount: i128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::MaxWithdrawPerWindow, &amount);
+}
+
+fn read_max_withdraw_per_window(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxWithdrawPerWindow)
+        .unwrap_or(0)
+}
+
+/// Returns the amount already withdrawn for `asset` inside the current
+/// rolling window, resetting the counter when the window has elapsed.
+fn read_withdraw_window_usage(env: &Env, asset: &Address) -> (u64, i128) {
+    let key = DataKey::WithdrawWindowUsage(asset.clone());
+    let now = env.ledger().timestamp();
+    match env.storage().temporary().get::<_, (u64, i128)>(&key) {
+        Some((start, used)) if now < start.saturating_add(WITHDRAW_WINDOW_SECONDS) => (start, used),
+        _ => (now, 0),
+    }
+}
+
+fn save_withdraw_window_usage(env: &Env, asset: &Address, start: u64, used: i128) {
+    let key = DataKey::WithdrawWindowUsage(asset.clone());
+    env.storage().temporary().set(&key, &(start, used));
+    env.storage()
+        .temporary()
+        .extend_ttl(&key, WITHDRAW_WINDOW_SECONDS, WITHDRAW_WINDOW_SECONDS);
 }
 
 fn read_bridge_config(env: &Env) -> BridgeConfigData {
@@ -2023,7 +2063,7 @@ impl OnboardingBridge {
         check_not_paused(&env)?;
 
         if targets.len() > MAX_BATCH_SIZE {
-            return Err(BridgeError::TooManyFeeTiers);
+            return Err(BridgeError::BatchTooLarge);
         }
         // #594: reject empty batches — a zero-length call transfers nothing but
         // would still emit BatchCompleted and mint loyalty rewards.
@@ -2334,14 +2374,18 @@ impl OnboardingBridge {
     ///
     /// # Authorization
     ///
-    /// No authorization is required because this operation only pays rent and
-    /// does not change contract state.
+    /// Requires the current admin's `require_auth()`.
     ///
     /// # Errors
     ///
     /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
     /// * [`BridgeError::FeeTooHigh`] — `max_fee_bps` exceeds 1 000.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("AssetFeeCapChanged", old_fee_cap, max_fee_bps)` — data:
+    ///   `(admin, asset)`
     ///
     /// # Examples
     ///
@@ -2660,6 +2704,10 @@ impl OnboardingBridge {
     /// * [`BridgeError::InsufficientReclaimable`] — `amount` exceeds the
     ///   accrued fee balance for `asset`.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    /// * [`BridgeError::WithdrawExceedsLimit`] — `amount` exceeds the per-call
+    ///   cap set by `set_max_withdraw_per_tx`, or the sum of withdrawals for
+    ///   `asset` inside the rolling 24 h window would exceed the cap set by
+    ///   `set_max_withdraw_per_window`. A cap of `0` disables that check.
     ///
     /// # Events
     ///
@@ -2705,11 +2753,28 @@ impl OnboardingBridge {
             return Err(BridgeError::InsufficientReclaimable);
         }
 
+        // Rolling-window cap: a compromised fee collector can otherwise drain
+        // the accrued balance in a burst of individually-legal withdrawals.
+        let max_withdraw_per_window = read_max_withdraw_per_window(&env);
+        let (window_start, window_used) = read_withdraw_window_usage(&env, &asset);
+        if max_withdraw_per_window != 0 {
+            let window_total = safe_math::safe_add(window_used, amount)?;
+            if window_total > max_withdraw_per_window {
+                return Err(BridgeError::WithdrawExceedsLimit);
+            }
+        }
+
         // Transfer the tokens to the fee collector, then decrement the accrued
         // fee counter so it always tracks the fee collector's entitlement.
         let token_client = token::Client::new(&env, &asset);
         token_client.transfer(&env.current_contract_address(), &fee_collector, &amount);
         decrement_accrued_fees(&env, &asset, amount)?;
+        save_withdraw_window_usage(
+            &env,
+            &asset,
+            window_start,
+            safe_math::safe_add(window_used, amount)?,
+        );
 
         env.events()
             .publish(("FeesWithdrawn", fee_collector.clone()), (amount, asset));
@@ -2741,6 +2806,51 @@ impl OnboardingBridge {
     pub fn query_max_withdraw_per_tx(env: Env) -> Result<i128, BridgeError> {
         check_initialized(&env)?;
         Ok(read_max_withdraw_per_tx(&env))
+    }
+
+    /// Sets the maximum total fee withdrawal per asset over a rolling 24 h window.
+    ///
+    /// Unlike `set_max_withdraw_per_tx`, which only caps a single call, this
+    /// bounds the sum of all `withdraw_fees` calls for one asset inside a
+    /// rolling 24 h window, so a compromised fee
+    /// collector cannot drain accrued fees in a burst of small withdrawals.
+    /// `0` disables the window cap.
+    ///
+    /// # Errors
+    ///
+    /// * [`BridgeError::NotInitialized`] — Contract not yet initialised.
+    /// * [`BridgeError::InvalidAmount`] — `amount` < 0.
+    /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
+    ///
+    /// # Events
+    ///
+    /// * `("MaxWithdrawPerWindowChanged", old_amount, amount)` — data: `(admin,)`
+    pub fn set_max_withdraw_per_window(
+        env: Env,
+        amount: i128,
+        nonce: Option<u64>,
+    ) -> Result<(), BridgeError> {
+        check_initialized(&env)?;
+        if amount < 0 {
+            return Err(BridgeError::InvalidAmount);
+        }
+        let admin = read_admin(&env);
+        admin.require_auth();
+        consume_nonce(&env, &admin, nonce)?;
+        let old_amount = read_max_withdraw_per_window(&env);
+        save_max_withdraw_per_window(&env, amount);
+        extend_instance_ttl(&env);
+        env.events().publish(
+            ("MaxWithdrawPerWindowChanged", old_amount, amount),
+            (admin,),
+        );
+        Ok(())
+    }
+
+    /// Returns the rolling-window withdrawal cap, or `0` when disabled.
+    pub fn query_max_withdraw_per_window(env: Env) -> Result<i128, BridgeError> {
+        check_initialized(&env)?;
+        Ok(read_max_withdraw_per_window(&env))
     }
 
     pub fn query_fee_bps(env: Env) -> Result<u32, BridgeError> {
@@ -4253,7 +4363,7 @@ impl OnboardingBridge {
         check_initialized(&env)?;
         check_not_paused(&env)?;
         if tiers.len() > MAX_FEE_TIERS {
-            return Err(BridgeError::BatchTooLarge);
+            return Err(BridgeError::TooManyFeeTiers);
         }
         let mut previous_max: Option<i128> = None;
         for tier in tiers.iter() {

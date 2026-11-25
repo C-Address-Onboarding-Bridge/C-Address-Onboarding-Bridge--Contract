@@ -202,6 +202,54 @@ fn test_batch_fund_c_addresses() {
 }
 
 #[test]
+fn test_batch_fund_c_address_rejects_oversized_batch() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &0u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    // MAX_BATCH_SIZE is 100 — one more than that must be rejected.
+    let mut targets: Vec<Address> = Vec::new(&env);
+    let mut amounts: Vec<i128> = Vec::new(&env);
+    for _ in 0..101 {
+        targets.push_back(Address::generate(&env));
+        amounts.push_back(1i128);
+    }
+    assert_eq!(
+        bridge.try_batch_fund_c_address(&user, &targets, &amounts, &token_id, &None, &None),
+        Err(Ok(BridgeError::BatchTooLarge))
+    );
+}
+
+#[test]
+fn test_set_fee_tiers_rejects_too_many_tiers() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    // MAX_FEE_TIERS is 50 — one more than that must be rejected.
+    let mut tiers: Vec<FeeTier> = Vec::new(&env);
+    for i in 0..51i128 {
+        tiers.push_back(FeeTier {
+            min_volume: i * 1000,
+            max_volume: i * 1000 + 999,
+            fee_bps: 50u32,
+        });
+    }
+    assert_eq!(
+        bridge.try_set_fee_tiers(&tiers, &None),
+        Err(Ok(BridgeError::TooManyFeeTiers))
+    );
+}
+
+#[test]
 fn test_fund_with_zero_fee() {
     let env = Env::default();
     let (admin, user, fee_collector) = create_test_users(&env);
@@ -7318,6 +7366,74 @@ fn test_set_max_withdraw_per_tx_rejects_negative_limit() {
         Err(Ok(BridgeError::InvalidAmount))
     );
     assert_eq!(bridge.query_max_withdraw_per_tx(), 0i128);
+}
+
+/********** Withdraw rolling-window cap unit tests **********/
+
+// Two withdrawals that are each under the per-call cap but together exceed the
+// rolling-window cap must fail on the second call.
+#[test]
+fn test_withdraw_fees_rejects_amount_over_max_per_window() {
+    let env = Env::default();
+    let (admin, user, fee_collector) = create_test_users(&env);
+    let (bridge_id, token_id) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+    init_token(&env, &token_id, &admin);
+
+    bridge.initialize(&admin, &fee_collector, &100u32, &None);
+    bridge.add_asset(&token_id, &None);
+
+    // Accrue 100 in fees (10_000 * 100 / 10_000).
+    mint_tokens(&env, &token_id, &user, 10_000i128);
+    bridge.fund_c_address(
+        &user,
+        &Address::generate(&env),
+        &token_id,
+        &10_000i128,
+        &None,
+        &None,
+    );
+    assert_eq!(bridge.query_accrued_fees(&token_id), 100i128);
+
+    // Per-call cap of 60, window cap of 100.
+    bridge.set_max_withdraw_per_tx(&60i128, &None);
+    bridge.set_max_withdraw_per_window(&100i128, &None);
+    assert_eq!(bridge.query_max_withdraw_per_window(), 100i128);
+
+    // First withdrawal is under both caps.
+    bridge.withdraw_fees(&token_id, &60i128, &None);
+    assert_eq!(check_balance(&env, &token_id, &fee_collector), 60i128);
+
+    // Second withdrawal is under the per-call cap but pushes the window total
+    // to 110 > 100, so it must be rejected.
+    assert_eq!(
+        bridge.try_withdraw_fees(&token_id, &50i128, &None),
+        Err(Ok(BridgeError::WithdrawExceedsLimit))
+    );
+    assert_eq!(check_balance(&env, &token_id, &fee_collector), 60i128);
+    assert_eq!(bridge.query_accrued_fees(&token_id), 40i128);
+
+    // Once the window has elapsed the counter resets and the withdrawal works.
+    advance_ledger_time(&env, env.ledger().timestamp() + 86_401);
+    bridge.withdraw_fees(&token_id, &40i128, &None);
+    assert_eq!(check_balance(&env, &token_id, &fee_collector), 100i128);
+}
+
+#[test]
+fn test_set_max_withdraw_per_window_rejects_negative_limit() {
+    let env = Env::default();
+    let (admin, _user, fee_collector) = create_test_users(&env);
+    let (bridge_id, _) = register_all_contracts_mocked(&env);
+    let bridge = create_bridge_client(&env, &bridge_id);
+
+    bridge.initialize(&admin, &fee_collector, &50u32, &None);
+
+    assert_eq!(bridge.query_max_withdraw_per_window(), 0i128);
+    assert_eq!(
+        bridge.try_set_max_withdraw_per_window(&-1i128, &None),
+        Err(Ok(BridgeError::InvalidAmount))
+    );
+    assert_eq!(bridge.query_max_withdraw_per_window(), 0i128);
 }
 
 #[test]
