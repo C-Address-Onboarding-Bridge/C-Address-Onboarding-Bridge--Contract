@@ -14,7 +14,7 @@
   "scripts": {
     "prepare": "husky install || true",
     "lint:docs:migration-sdk": "node scripts/check-migration-sdk-docs.js",
-    "test:scripts": "TS_NODE_TRANSPILE_ONLY=1 TS_NODE_COMPILER_OPTIONS='{\"module\":\"CommonJS\",\"moduleResolution\":\"node\"}' node -r ts-node/register --test scripts/deploy.test.ts",
+    "test:scripts": "TS_NODE_TRANSPILE_ONLY=1 TS_NODE_COMPILER_OPTIONS='{\"module\":\"CommonJS\",\"moduleResolution\":\"node\"}' node -r ts-node/register --test scripts/deploy.test.ts scripts/verify-release.test.js",
     "check:examples": "tsc -p examples/typescript --noEmit",
     "estimate-deploy-cost": "ts-node scripts/estimate-deploy-cost.ts",
     "estimate:mainnet": "npm run estimate-deploy-cost -- --network mainnet",

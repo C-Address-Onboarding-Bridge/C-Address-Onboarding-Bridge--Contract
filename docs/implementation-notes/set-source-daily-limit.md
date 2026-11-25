@@ -20,6 +20,20 @@ enforcement helpers (`save_source_daily_limit`, `read_source_daily_limit`,
 `check_daily_limit`) already existed; this function was simply the missing
 admin-facing setter that wires into them.
 
+## Rolling window semantics
+
+`check_daily_limit` no longer uses a fixed UTC calendar-day bucket. Usage is
+recorded in hourly buckets (`DataKey::DailyUsage(source, asset, bucket)` where
+`bucket = timestamp / 3_600`) and a call is measured against the current bucket
+plus the 23 preceding ones, i.e. a rolling 24-hour window. At most 24 bucket
+reads per call, so the per-call cost stays bounded; buckets older than the
+window are never read again and expire with their TTL.
+
+Usage is recorded even when no limit is configured (`limit == 0`), so a limit
+set mid-window immediately counts volume already bridged in the trailing 24
+hours. This costs one extra persistent write per funding call and is covered by
+`test_daily_limit_set_after_funding_counts_earlier_usage`.
+
 ## Verification
 
 `cargo check -p onboarding-bridge` passes with no new errors. As noted in the

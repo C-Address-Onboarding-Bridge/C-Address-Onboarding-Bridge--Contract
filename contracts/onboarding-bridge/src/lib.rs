@@ -794,7 +794,50 @@ fn calculate_fee(amount: i128, fee_bps: u32) -> Result<i128, BridgeError> {
     }
     let bps = fee_bps as i128;
     let product = safe_math::safe_mul(amount, bps)?;
-    safe_math::safe_div(product, FEE_DENOMINATOR)
+    // #1079: round the fee up so that splitting a payment into many small
+    // entries cannot floor the fee to zero. Any positive amount charged a
+    // non-zero fee_bps pays at least 1 unit.
+    let quotient = safe_math::safe_div(product, FEE_DENOMINATOR)?;
+    let remainder = product - quotient * FEE_DENOMINATOR;
+    if remainder > 0 {
+        Ok(quotient + 1)
+    } else {
+        Ok(quotient)
+    }
+}
+
+/// Splits `total_fee` across `weights` proportionally, rounding each share up
+/// and giving any leftover to the last non-zero weight so the shares always
+/// sum exactly to `total_fee`. Used by batch funding so that the fee is
+/// computed on the batch aggregate and cannot be reduced by splitting entries.
+fn allocate_fee(total_fee: i128, weights: &[i128]) -> Result<Vec<i128>, BridgeError> {
+    let mut shares = Vec::with_capacity(weights.len());
+    let mut weight_total: i128 = 0;
+    for weight in weights.iter() {
+        weight_total = safe_math::safe_add(weight_total, *weight)?;
+    }
+    let mut allocated: i128 = 0;
+    let mut last_non_zero: Option<usize> = None;
+    for (i, weight) in weights.iter().enumerate() {
+        if *weight <= 0 || weight_total <= 0 {
+            shares.push(0);
+            continue;
+        }
+        let product = safe_math::safe_mul(total_fee, *weight)?;
+        let quotient = safe_math::safe_div(product, weight_total)?;
+        let remainder = product - quotient * weight_total;
+        let share = if remainder > 0 { quotient + 1 } else { quotient };
+        allocated = safe_math::safe_add(allocated, share)?;
+        last_non_zero = Some(i);
+        shares.push(share);
+    }
+    if let Some(i) = last_non_zero {
+        let excess = allocated - total_fee;
+        if excess > 0 {
+            shares[i] -= excess;
+        }
+    }
+    Ok(shares)
 }
 
 fn is_blocked(env: &Env, addr: &Address) -> bool {
@@ -1304,10 +1347,38 @@ fn read_source_daily_limit(env: &Env, source: &Address, asset: &Address) -> i128
         .unwrap_or(0)
 }
 
+/// Length of one rolling-window bucket, in seconds.
+const DAILY_WINDOW_BUCKET_SECS: u64 = 3_600;
+
+/// Number of hourly buckets that make up the rolling 24-hour window.
+const DAILY_WINDOW_BUCKETS: u64 = 24;
+
+/// Index of the hourly bucket containing `timestamp`.
 fn current_day(env: &Env) -> u64 {
-    env.ledger().timestamp() / 86_400
+    env.ledger().timestamp() / DAILY_WINDOW_BUCKET_SECS
 }
 
+/// Sums the usage recorded in the rolling 24-hour window ending at the current
+/// hourly bucket. At most [`DAILY_WINDOW_BUCKETS`] buckets are read, so the
+/// per-call cost stays bounded regardless of how long the pair has been active.
+fn rolling_window_usage(env: &Env, source: &Address, asset: &Address, bucket: u64) -> i128 {
+    let mut total: i128 = 0;
+    let first = bucket.saturating_sub(DAILY_WINDOW_BUCKETS - 1);
+    for b in first..=bucket {
+        let key = DataKey::DailyUsage(source.clone(), asset.clone(), b);
+        let used: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        total = total.saturating_add(used);
+    }
+    total
+}
+
+/// Enforces the rolling 24-hour daily limit for `(source, asset)` and records
+/// `amount` against the current hourly bucket.
+///
+/// Usage is recorded even when no limit is configured (`limit == 0`), so a
+/// limit set later in the window immediately accounts for volume already
+/// bridged. The extra writes are bounded (one bucket per call) and are pruned
+/// implicitly: buckets older than the window are never read again.
 fn check_daily_limit(
     env: &Env,
     source: &Address,
@@ -1315,15 +1386,16 @@ fn check_daily_limit(
     amount: i128,
 ) -> Result<(), BridgeError> {
     let limit = read_source_daily_limit(env, source, asset);
-    if limit == 0 {
-        return Ok(()); // no limit set
-    }
-    let day = current_day(env);
-    let key = DataKey::DailyUsage(source.clone(), asset.clone(), day);
+    let bucket = current_day(env);
+    let key = DataKey::DailyUsage(source.clone(), asset.clone(), bucket);
     let used: i128 = env.storage().persistent().get(&key).unwrap_or(0);
     let updated = safe_math::safe_add(used, amount)?;
-    if updated > limit {
-        return Err(BridgeError::DailyLimitExceeded);
+    if limit != 0 {
+        let window_used = rolling_window_usage(env, source, asset, bucket);
+        let projected = safe_math::safe_add(window_used, amount)?;
+        if projected > limit {
+            return Err(BridgeError::DailyLimitExceeded);
+        }
     }
     env.storage().persistent().set(&key, &updated);
     Ok(())
@@ -1733,7 +1805,7 @@ impl OnboardingBridge {
     ///   `target` is not allowlisted.
     /// * [`BridgeError::AssetNotWhitelisted`] — `asset` has not been added.
     /// * [`BridgeError::DailyLimitExceeded`] — Transfer would exceed `source`'s
-    ///   daily limit for this asset.
+    ///   rolling 24-hour limit for this asset.
     /// * [`BridgeError::DuplicateNonce`] — `nonce` mismatch.
     ///
     /// # Events
@@ -1744,8 +1816,8 @@ impl OnboardingBridge {
     ///
     /// Access checks (`check_access`) are evaluated before `require_auth` so
     /// that blocked/non-allowlisted targets are rejected without consuming the
-    /// caller's authorization budget. The fee is floored (integer division), so
-    /// for very small amounts the effective fee may be 0.
+    /// caller's authorization budget. The fee is rounded up (ceil), so any
+    /// positive amount with a non-zero fee rate pays at least 1 unit.
     ///
     /// # Examples
     ///
@@ -1860,6 +1932,9 @@ impl OnboardingBridge {
     /// blocked, those amounts are returned to `source` at the end of execution.
     /// The validation loop that checks for zero/negative amounts runs before
     /// the initial token pull, so no tokens are moved on validation failures.
+    /// The fee is computed once on the aggregate of the deliverable entries and
+    /// then split proportionally (rounding each share up), so splitting a
+    /// payment into many small entries cannot reduce the total fee.
     ///
     /// # Examples
     ///
@@ -1936,6 +2011,27 @@ impl OnboardingBridge {
         let mut num_failures: u32 = 0;
         let mut refund_total: i128 = 0;
 
+        // #1079: compute the fee on the aggregate of the entries that will
+        // actually be delivered, then split it proportionally. Charging per
+        // entry would let a caller split a payment into many tiny entries and
+        // pay (almost) no fee.
+        let mut fee_weights: Vec<i128> = Vec::new(&env);
+        for i in 0..targets.len() {
+            let target = targets.get(i).unwrap();
+            let amount = amounts.get(i).unwrap();
+            if check_access(&env, &target).is_err() {
+                fee_weights.push_back(0);
+            } else {
+                fee_weights.push_back(amount);
+            }
+        }
+        let batch_fee = calculate_fee(successful_total, effective_fee_bps)?;
+        let mut weights: Vec<i128> = Vec::new(&env);
+        for weight in fee_weights.iter() {
+            weights.push_back(weight);
+        }
+        let fee_shares = allocate_fee(batch_fee, &weights)?;
+
         for i in 0..targets.len() {
             let target = targets.get(i).unwrap();
             let amount = amounts.get(i).unwrap();
@@ -1949,7 +2045,7 @@ impl OnboardingBridge {
                 continue;
             }
 
-            let fee = calculate_fee(amount, effective_fee_bps)?;
+            let fee = fee_shares.get(i).unwrap();
             let net_amount = safe_math::safe_sub(amount, fee)?;
 
             if net_amount > 0 {
@@ -2047,15 +2143,25 @@ impl OnboardingBridge {
     /// Sets a maximum daily transfer limit for a specific `(source, asset)` pair.
     ///
     /// Once set, any `fund_c_address` call from `source` using `asset` that
-    /// would push the day's cumulative volume past `limit_amount` is rejected.
-    /// Set `limit_amount` to `0` to disable the limit entirely.
+    /// would push the cumulative volume of the trailing 24 hours past
+    /// `limit_amount` is rejected. Set `limit_amount` to `0` to disable the
+    /// limit entirely.
+    ///
+    /// The window is rolling, not calendar-based: usage is recorded in hourly
+    /// buckets and a call is measured against the current bucket plus the 23
+    /// preceding ones. A source therefore cannot move twice its limit within
+    /// seconds by straddling a UTC midnight boundary.
+    ///
+    /// Usage is recorded even while no limit is configured, so setting a limit
+    /// mid-window immediately counts volume already bridged in the trailing
+    /// 24 hours.
     ///
     /// # Arguments
     ///
     /// * `source` (`Address`) — The address whose daily throughput is being capped.
     /// * `asset` (`Address`) — The asset the limit applies to.
-    /// * `limit_amount` (`i128`) — Maximum gross tokens allowed per calendar day
-    ///   (UTC, measured in ledger timestamp / 86 400). Use `0` to disable.
+    /// * `limit_amount` (`i128`) — Maximum gross tokens allowed in any rolling
+    ///   24-hour window (hourly buckets of 3 600 seconds). Use `0` to disable.
     /// * `nonce` (`Option<u64>`) — Optional sequential nonce for the admin.
     ///
     /// # Authorization
@@ -2886,8 +2992,9 @@ impl OnboardingBridge {
     ///
     /// # Returns
     ///
-    /// `(fee, net)` where `fee = floor(gross × fee_bps / 10_000)` and
-    /// `net = gross − fee`.
+    /// `(fee, net)` where `fee = ceil(gross × fee_bps / 10_000)` and
+    /// `net = gross − fee`. The fee is rounded up so that any positive amount
+    /// with a non-zero fee rate pays at least 1 unit.
     ///
     /// # Examples
     ///
@@ -2933,7 +3040,7 @@ impl OnboardingBridge {
     ///
     /// `(effective_fee_bps, fee, net)` where:
     /// - `effective_fee_bps` is the resolved basis-point rate after cap + tier.
-    /// - `fee = floor(amount × effective_fee_bps / 10_000)`.
+    /// - `fee = ceil(amount × effective_fee_bps / 10_000)`.
     /// - `net = amount − fee`.
     ///
     /// # Errors
@@ -4978,8 +5085,9 @@ impl OnboardingBridge {
 
     /// Extends the persistent-storage TTL for all per-`(source, asset)` and
     /// per-`source` keys used by the core funding paths: `SourceDailyLimit`,
-    /// the current day's `DailyUsage`, `UserDeposit`, `SourceBridgedVolume`,
-    /// the sequential `Nonce`, and the auth-entry `AuthNonce` counter.
+    /// the current hourly `DailyUsage` bucket, `UserDeposit`,
+    /// `SourceBridgedVolume`, the sequential `Nonce`, and the auth-entry
+    /// `AuthNonce` counter.
     ///
     /// Only keys that already exist in storage are extended; missing keys are
     /// silently skipped, mirroring `extend_persistent_ttl`.

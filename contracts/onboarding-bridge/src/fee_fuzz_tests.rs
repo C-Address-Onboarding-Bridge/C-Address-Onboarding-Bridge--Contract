@@ -6,9 +6,16 @@ fn max_safe_amount() -> i128 {
 }
 
 fn reference_fee(amount: i128, fee_bps: u32) -> Option<i128> {
-    amount
-        .checked_mul(fee_bps as i128)
-        .map(|product| product / FEE_DENOMINATOR)
+    amount.checked_mul(fee_bps as i128).map(|product| {
+        // #1079: the protocol fee rounds up, so any positive amount with a
+        // non-zero fee rate pays at least 1 unit.
+        let quotient = product / FEE_DENOMINATOR;
+        if product % FEE_DENOMINATOR > 0 {
+            quotient + 1
+        } else {
+            quotient
+        }
+    })
 }
 
 proptest! {
@@ -32,10 +39,14 @@ proptest! {
 
         if fee_bps == 0 {
             prop_assert_eq!(fee, 0);
+        } else if amount > 0 {
+            // #1079: rounding up guarantees a non-zero fee for any positive
+            // amount whenever the fee rate is non-zero.
+            prop_assert!(fee > 0);
         }
 
         let max_fee = amount * MAX_FEE_BPS as i128 / FEE_DENOMINATOR;
-        prop_assert!(fee <= max_fee);
+        prop_assert!(fee <= max_fee + 1);
         prop_assert_eq!(fee, reference_fee(amount, fee_bps).unwrap());
     }
 
